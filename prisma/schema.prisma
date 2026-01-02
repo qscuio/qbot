@@ -1,0 +1,36 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// User settings and preferences
+model User {
+  id            BigInt   @id // Telegram user ID
+  provider      String   @default("gemini")
+  model         String   @default("gemini-2.5-flash")
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  
+  conversations Conversation[]
+  
+  @@map("users")
+}
+
+// Conversation history for future features
+model Conversation {
+  id        String   @id @default(cuid())
+  userId    BigInt
+  user      User     @relation(fields: [userId], references: [id])
+  role      String   // "user" or "assistant"
+  content   String
+  provider  String?
+  model     String?
+  createdAt DateTime @default(now())
+  
+  @@index([userId, createdAt])
+  @@map("conversations")
+}

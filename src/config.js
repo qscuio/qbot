@@ -1,0 +1,36 @@
+import dotenv from "dotenv";
+dotenv.config();
+
+// Required environment variables
+const required = ["BOT_TOKEN", "BOT_SECRET"];
+
+for (const key of required) {
+  if (!process.env[key]) {
+    throw new Error(`Missing required environment variable: ${key}`);
+  }
+}
+
+export const config = {
+  // Server
+  port: parseInt(process.env.PORT || "3000"),
+  nodeEnv: process.env.NODE_ENV || "development",
+
+  // Telegram
+  botToken: process.env.BOT_TOKEN,
+  botSecret: process.env.BOT_SECRET,
+  webhookUrl: process.env.WEBHOOK_URL,
+
+  // AI Providers
+  geminiApiKey: process.env.GEMINI_API_KEY || "",
+  openaiApiKey: process.env.OPENAI_API_KEY || "",
+  claudeApiKey: process.env.CLAUDE_API_KEY || "",
+
+  // Access Control
+  allowedUsers: process.env.ALLOWED_USERS
+    ? process.env.ALLOWED_USERS.split(",").map((id) => id.trim())
+    : [],
+
+  // Database
+  databaseUrl: process.env.DATABASE_URL,
+  redisUrl: process.env.REDIS_URL || "redis://localhost:6379",
+};

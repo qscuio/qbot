@@ -1,0 +1,27 @@
+{
+  "name": "qbot",
+  "version": "1.0.0",
+  "description": "Multi-provider AI Telegram Bot",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "db:generate": "prisma generate",
+    "db:migrate": "prisma migrate deploy",
+    "db:push": "prisma db push",
+    "setup-webhook": "node scripts/setup-webhook.js"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.0.0",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "ioredis": "^5.3.2"
+  },
+  "devDependencies": {
+    "prisma": "^6.0.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

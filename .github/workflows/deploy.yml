@@ -1,0 +1,103 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    name: Deploy
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Docker if needed
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            # Check if Docker is installed
+            if ! command -v docker &> /dev/null; then
+              echo "🐳 Docker not found. Installing..."
+              curl -fsSL https://get.docker.com | sh
+              sudo usermod -aG docker $USER
+              echo "✅ Docker installed"
+            else
+              echo "✅ Docker is already installed: $(docker --version)"
+            fi
+            
+            # Check if Docker Compose plugin is installed
+            if ! docker compose version &> /dev/null; then
+              echo "📦 Docker Compose not found. Installing..."
+              sudo apt-get update
+              sudo apt-get install -y docker-compose-plugin
+              echo "✅ Docker Compose installed"
+            else
+              echo "✅ Docker Compose is already installed: $(docker compose version)"
+            fi
+            
+            # Start Docker service if not running
+            if ! sudo systemctl is-active --quiet docker; then
+              sudo systemctl start docker
+              sudo systemctl enable docker
+            fi
+
+      - name: Deploy to VPS via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            # Navigate to project directory
+            cd /opt/qbot || {
+              echo "Creating project directory..."
+              sudo mkdir -p /opt/qbot
+              sudo chown $USER:$USER /opt/qbot
+              cd /opt/qbot
+              git clone https://github.com/${{ github.repository }}.git .
+            }
+            
+            # Pull latest changes
+            git fetch origin main
+            git reset --hard origin/main
+            
+            # Create .env file from secrets
+            cat > .env << 'EOF'
+            BOT_TOKEN=${{ secrets.BOT_TOKEN }}
+            BOT_SECRET=${{ secrets.BOT_SECRET }}
+            WEBHOOK_URL=${{ secrets.WEBHOOK_URL }}
+            GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}
+            OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+            CLAUDE_API_KEY=${{ secrets.CLAUDE_API_KEY }}
+            ALLOWED_USERS=${{ secrets.ALLOWED_USERS }}
+            EOF
+            
+            # Build and deploy with Docker Compose
+            docker compose down || true
+            docker compose build --no-cache
+            docker compose up -d
+            
+            # Wait for services to be ready
+            sleep 10
+            
+            # Run database migrations
+            docker compose exec -T bot npm run db:push
+            
+            # Health check
+            curl -f http://localhost:3000/health || echo "Health check failed"
+
+      - name: Register Webhook
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            cd /opt/qbot
+            docker compose exec -T bot npm run setup-webhook
