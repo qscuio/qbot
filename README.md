@@ -13,20 +13,61 @@ A feature-rich Telegram Bot with multi-provider AI support (Gemini, OpenAI, Clau
 
 ## Quick Deploy (GitHub Actions)
 
-### Step 1: Fork or Clone
+### Step 1: Set Up SSH Key (on your VPS)
+
+#### Why Private Key?
+
+SSH authentication flow:
+
+```
+┌─────────────────┐                      ┌─────────────────┐
+│    Client       │                      │     Server      │
+│ (initiates SSH) │  ──── connect ────→  │  (accepts SSH)  │
+│                 │                      │                 │
+│  holds PRIVATE  │  ← challenge ──────  │  holds PUBLIC   │
+│      KEY        │                      │      KEY        │
+│                 │  ── sign challenge → │                 │
+│                 │                      │  verify with    │
+│                 │  ← ✅ success ─────  │  public key     │
+└─────────────────┘                      └─────────────────┘
+```
+
+In our case:
+
+- **GitHub Actions** = Client → needs **Private Key** (stored in GitHub Secrets)
+- **Your VPS** = Server → needs **Public Key** (stored in `~/.ssh/authorized_keys`)
+
+#### Generate Key on VPS
+
+```bash
+# SSH into your VPS
+ssh your-user@your-vps
+
+# Generate key pair
+ssh-keygen -t ed25519 -C "github-actions" -f ~/.ssh/github_actions
+
+# Add public key to authorized_keys
+cat ~/.ssh/github_actions.pub >> ~/.ssh/authorized_keys
+
+# Display private key (copy this to GitHub Secret VPS_SSH_KEY)
+cat ~/.ssh/github_actions
+# Copy the entire output (including -----BEGIN/END lines)
+```
+
+### Step 2: Fork or Clone
 
 ```bash
 git clone git@github.com:your-username/qbot.git
 cd qbot
 ```
 
-### Step 2: Create a Telegram Bot
+### Step 3: Create a Telegram Bot
 
 1. Open [@BotFather](https://t.me/botfather) in Telegram
 2. Send `/newbot` and follow the prompts
 3. Copy the Bot Token
 
-### Step 3: Get API Keys
+### Step 4: Get API Keys
 
 Get at least one API key:
 
@@ -34,7 +75,7 @@ Get at least one API key:
 - [OpenAI Platform](https://platform.openai.com/api-keys) - OpenAI
 - [Anthropic Console](https://console.anthropic.com/) - Claude
 
-### Step 4: Configure GitHub Secrets
+### Step 5: Configure GitHub Secrets
 
 Go to your GitHub repo → Settings → Secrets and variables → Actions.
 
@@ -44,7 +85,7 @@ Go to your GitHub repo → Settings → Secrets and variables → Actions.
 | ---------------- | ----------------------------------------------- |
 | `VPS_HOST`       | Your VPS IP address or hostname                 |
 | `VPS_USER`       | SSH username (e.g., `root` or `deploy`)         |
-| `VPS_SSH_KEY`    | Private SSH key (Ed25519 recommended)           |
+| `VPS_SSH_KEY`    | Private SSH key (from Step 1)                   |
 | `BOT_TOKEN`      | Telegram bot token from BotFather               |
 | `BOT_SECRET`     | Random string for webhook security              |
 | `WEBHOOK_URL`    | Public URL (e.g., `https://bot.yourdomain.com`) |
@@ -58,18 +99,18 @@ Go to your GitHub repo → Settings → Secrets and variables → Actions.
 | `CLAUDE_API_KEY` | Claude API key                    |
 | `ALLOWED_USERS`  | Comma-separated Telegram user IDs |
 
-### Step 5: Prepare Your VPS
+### Step 6: Prepare Your VPS
 
 The GitHub Actions workflow will **automatically install Docker** if it's not present. Just ensure:
 
-- SSH access is configured
+- SSH access is configured (Step 1)
 - Your user has `sudo` privileges
 
-### Step 6: Deploy
+### Step 7: Deploy
 
 Push to `main` branch or go to Actions → Deploy to VPS → Run workflow.
 
-### Step 7: Test
+### Step 8: Test
 
 Open your bot in Telegram and send `/start`!
 
