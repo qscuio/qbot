@@ -14,14 +14,20 @@ app.get('/health', (req, res) => {
 
 // Telegram webhook endpoint
 app.post('/webhook', async (req, res) => {
+  console.log('📨 Received webhook request');
+  
   // Verify webhook secret
   const secretHeader = req.headers['x-telegram-bot-api-secret-token'];
   if (secretHeader !== config.botSecret) {
+    console.log('❌ Unauthorized request - secret mismatch');
+    console.log('Expected:', config.botSecret);
+    console.log('Received:', secretHeader);
     return res.status(403).json({ error: 'Unauthorized' });
   }
   
   // Process update asynchronously
   const update = req.body;
+  console.log('✅ Processing update:', JSON.stringify(update).substring(0, 200));
   handleUpdate(update).catch(err => console.error('Error handling update:', err));
   
   res.json({ ok: true });

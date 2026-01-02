@@ -21,11 +21,17 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           script: |
+            # Use sudo only if not root
+            SUDO=""
+            if [ "$(id -u)" != "0" ]; then
+              SUDO="sudo"
+            fi
+            
             # Check if Docker is installed
             if ! command -v docker &> /dev/null; then
               echo "🐳 Docker not found. Installing..."
               curl -fsSL https://get.docker.com | sh
-              sudo usermod -aG docker $USER
+              $SUDO usermod -aG docker $USER || true
               echo "✅ Docker installed"
             else
               echo "✅ Docker is already installed: $(docker --version)"
@@ -34,27 +40,27 @@ jobs:
             # Check if Docker Compose plugin is installed
             if ! docker compose version &> /dev/null; then
               echo "📦 Docker Compose not found. Installing..."
-              sudo apt-get update
-              sudo apt-get install -y docker-compose-plugin
+              $SUDO apt-get update
+              $SUDO apt-get install -y docker-compose-plugin
               echo "✅ Docker Compose installed"
             else
               echo "✅ Docker Compose is already installed: $(docker compose version)"
             fi
             
             # Start Docker service if not running
-            if ! sudo systemctl is-active --quiet docker; then
-              sudo systemctl start docker
-              sudo systemctl enable docker
+            if ! $SUDO systemctl is-active --quiet docker 2>/dev/null; then
+              $SUDO systemctl start docker 2>/dev/null || true
+              $SUDO systemctl enable docker 2>/dev/null || true
             fi
             
             # Configure UFW firewall (if installed)
             if command -v ufw &> /dev/null; then
               echo "🔥 Configuring UFW firewall..."
-              sudo ufw allow ssh
-              sudo ufw allow 80/tcp
-              sudo ufw allow 443/tcp
-              sudo ufw --force enable || true
-              echo "✅ UFW configured (SSH, HTTP, HTTPS allowed)"
+              $SUDO ufw allow ssh
+              $SUDO ufw allow 80/tcp
+              $SUDO ufw allow 443/tcp
+              $SUDO ufw --force enable || true
+              echo "✅ UFW configured"
             fi
 
       - name: Setup Nginx reverse proxy
@@ -68,16 +74,23 @@ jobs:
           key: ${{ secrets.VPS_SSH_KEY }}
           envs: WEBHOOK_URL,BOT_PORT
           script: |
-            # Extract domain from WEBHOOK_URL (remove https:// prefix)
+            # Use sudo only if not root
+            SUDO=""
+            if [ "$(id -u)" != "0" ]; then
+              SUDO="sudo"
+            fi
+            
+            # Extract domain from WEBHOOK_URL
             DOMAIN=$(echo "$WEBHOOK_URL" | sed 's|https://||' | sed 's|/.*||')
-            echo "📡 Setting up Nginx for domain: $DOMAIN"
+            BOT_PORT=${BOT_PORT:-3000}
+            echo "📡 Setting up Nginx for domain: $DOMAIN -> port $BOT_PORT"
             
             # Install Nginx if not present
             if ! command -v nginx &> /dev/null; then
               echo "🌐 Nginx not found. Installing..."
-              sudo apt-get update
-              sudo apt-get install -y nginx
-              sudo systemctl enable nginx
+              $SUDO apt-get update
+              $SUDO apt-get install -y nginx
+              $SUDO systemctl enable nginx
               echo "✅ Nginx installed"
             else
               echo "✅ Nginx is already installed"
@@ -86,12 +99,12 @@ jobs:
             # Install certbot if not present
             if ! command -v certbot &> /dev/null; then
               echo "🔒 Certbot not found. Installing..."
-              sudo apt-get install -y certbot python3-certbot-nginx
+              $SUDO apt-get install -y certbot python3-certbot-nginx
               echo "✅ Certbot installed"
             fi
             
             # Create Nginx config for the bot
-            sudo tee /etc/nginx/sites-available/qbot > /dev/null << NGINXCONF
+            $SUDO tee /etc/nginx/sites-available/qbot > /dev/null << NGINXCONF
             server {
                 listen 80;
                 server_name $DOMAIN;
@@ -112,16 +125,16 @@ jobs:
             
             # Enable site if not already enabled
             if [ ! -L /etc/nginx/sites-enabled/qbot ]; then
-              sudo ln -sf /etc/nginx/sites-available/qbot /etc/nginx/sites-enabled/qbot
+              $SUDO ln -sf /etc/nginx/sites-available/qbot /etc/nginx/sites-enabled/qbot
             fi
             
             # Test and reload Nginx
-            sudo nginx -t && sudo systemctl reload nginx
+            $SUDO nginx -t && $SUDO systemctl reload nginx
             
             # Get SSL certificate if not exists
             if [ ! -d "/etc/letsencrypt/live/$DOMAIN" ]; then
               echo "🔒 Obtaining SSL certificate..."
-              sudo certbot --nginx -d $DOMAIN --non-interactive --agree-tos --email admin@$DOMAIN || echo "⚠️ SSL setup failed - you may need to run certbot manually"
+              $SUDO certbot --nginx -d $DOMAIN --non-interactive --agree-tos --email admin@$DOMAIN || echo "⚠️ SSL setup failed - run: certbot --nginx -d $DOMAIN"
             else
               echo "✅ SSL certificate already exists"
             fi
@@ -136,8 +149,7 @@ jobs:
             # Navigate to project directory
             cd /opt/qbot || {
               echo "Creating project directory..."
-              sudo mkdir -p /opt/qbot
-              sudo chown $USER:$USER /opt/qbot
+              mkdir -p /opt/qbot
               cd /opt/qbot
               git clone https://github.com/${{ github.repository }}.git .
             }
@@ -185,7 +197,7 @@ jobs:
               exit 1
             }
             
-            # Health check (use port from .env)
+            # Health check
             BOT_PORT=$(grep BOT_PORT .env | cut -d= -f2 | tr -d ' ')
             BOT_PORT=${BOT_PORT:-3000}
             echo "🏥 Health check on port $BOT_PORT..."
