@@ -46,16 +46,27 @@ jobs:
               sudo systemctl start docker
               sudo systemctl enable docker
             fi
+            
+            # Configure UFW firewall (if installed)
+            if command -v ufw &> /dev/null; then
+              echo "🔥 Configuring UFW firewall..."
+              sudo ufw allow ssh
+              sudo ufw allow 80/tcp
+              sudo ufw allow 443/tcp
+              sudo ufw --force enable || true
+              echo "✅ UFW configured (SSH, HTTP, HTTPS allowed)"
+            fi
 
       - name: Setup Nginx reverse proxy
         uses: appleboy/ssh-action@v1.0.3
         env:
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          BOT_PORT: ${{ secrets.BOT_PORT || '3000' }}
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
-          envs: WEBHOOK_URL
+          envs: WEBHOOK_URL,BOT_PORT
           script: |
             # Extract domain from WEBHOOK_URL (remove https:// prefix)
             DOMAIN=$(echo "$WEBHOOK_URL" | sed 's|https://||' | sed 's|/.*||')
@@ -86,7 +97,7 @@ jobs:
                 server_name $DOMAIN;
                 
                 location / {
-                    proxy_pass http://127.0.0.1:3000;
+                    proxy_pass http://127.0.0.1:$BOT_PORT;
                     proxy_http_version 1.1;
                     proxy_set_header Upgrade \$http_upgrade;
                     proxy_set_header Connection 'upgrade';
@@ -140,6 +151,7 @@ jobs:
             BOT_TOKEN=${{ secrets.BOT_TOKEN }}
             BOT_SECRET=${{ secrets.BOT_SECRET }}
             WEBHOOK_URL=${{ secrets.WEBHOOK_URL }}
+            BOT_PORT=${{ secrets.BOT_PORT || '3000' }}
             GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}
             OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
             CLAUDE_API_KEY=${{ secrets.CLAUDE_API_KEY }}
@@ -152,13 +164,38 @@ jobs:
             docker compose up -d
             
             # Wait for services to be ready
-            sleep 10
+            echo "⏳ Waiting for services to start..."
+            sleep 15
+            
+            # Show container status
+            docker compose ps
+            
+            # Check if bot is running
+            if ! docker compose ps bot | grep -q "Up"; then
+              echo "❌ Bot container failed to start. Showing logs:"
+              docker compose logs bot
+              exit 1
+            fi
             
             # Run database migrations
-            docker compose exec -T bot npm run db:push
+            echo "🗄️ Running database migrations..."
+            docker compose exec -T bot npm run db:push || {
+              echo "❌ Migration failed. Showing logs:"
+              docker compose logs bot
+              exit 1
+            }
             
-            # Health check
-            curl -f http://localhost:3000/health || echo "Health check failed"
+            # Health check (use port from .env)
+            BOT_PORT=$(grep BOT_PORT .env | cut -d= -f2 | tr -d ' ')
+            BOT_PORT=${BOT_PORT:-3000}
+            echo "🏥 Health check on port $BOT_PORT..."
+            curl -f http://localhost:$BOT_PORT/health || {
+              echo "❌ Health check failed. Showing logs:"
+              docker compose logs bot
+              exit 1
+            }
+            
+            echo "✅ Deployment successful!"
 
       - name: Register Webhook
         uses: appleboy/ssh-action@v1.0.3
@@ -168,4 +205,12 @@ jobs:
           key: ${{ secrets.VPS_SSH_KEY }}
           script: |
             cd /opt/qbot
-            docker compose exec -T bot npm run setup-webhook
+            
+            # Check if bot is running first
+            if docker compose ps bot | grep -q "Up"; then
+              docker compose exec -T bot npm run setup-webhook
+            else
+              echo "❌ Bot is not running, cannot register webhook"
+              docker compose logs bot
+              exit 1
+            fi

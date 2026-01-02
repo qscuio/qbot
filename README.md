@@ -98,6 +98,7 @@ Go to your GitHub repo → Settings → Secrets and variables → Actions.
 
 | Secret           | Description                       |
 | ---------------- | --------------------------------- |
+| `BOT_PORT`       | Port to run bot (default: `3000`) |
 | `OPENAI_API_KEY` | OpenAI API key                    |
 | `CLAUDE_API_KEY` | Claude API key                    |
 | `ALLOWED_USERS`  | Comma-separated Telegram user IDs |
