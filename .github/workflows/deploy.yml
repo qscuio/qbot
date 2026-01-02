@@ -47,6 +47,74 @@ jobs:
               sudo systemctl enable docker
             fi
 
+      - name: Setup Nginx reverse proxy
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          envs: WEBHOOK_URL
+          script: |
+            # Extract domain from WEBHOOK_URL (remove https:// prefix)
+            DOMAIN=$(echo "$WEBHOOK_URL" | sed 's|https://||' | sed 's|/.*||')
+            echo "📡 Setting up Nginx for domain: $DOMAIN"
+            
+            # Install Nginx if not present
+            if ! command -v nginx &> /dev/null; then
+              echo "🌐 Nginx not found. Installing..."
+              sudo apt-get update
+              sudo apt-get install -y nginx
+              sudo systemctl enable nginx
+              echo "✅ Nginx installed"
+            else
+              echo "✅ Nginx is already installed"
+            fi
+            
+            # Install certbot if not present
+            if ! command -v certbot &> /dev/null; then
+              echo "🔒 Certbot not found. Installing..."
+              sudo apt-get install -y certbot python3-certbot-nginx
+              echo "✅ Certbot installed"
+            fi
+            
+            # Create Nginx config for the bot
+            sudo tee /etc/nginx/sites-available/qbot > /dev/null << NGINXCONF
+            server {
+                listen 80;
+                server_name $DOMAIN;
+                
+                location / {
+                    proxy_pass http://127.0.0.1:3000;
+                    proxy_http_version 1.1;
+                    proxy_set_header Upgrade \$http_upgrade;
+                    proxy_set_header Connection 'upgrade';
+                    proxy_set_header Host \$host;
+                    proxy_set_header X-Real-IP \$remote_addr;
+                    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                    proxy_set_header X-Forwarded-Proto \$scheme;
+                    proxy_cache_bypass \$http_upgrade;
+                }
+            }
+            NGINXCONF
+            
+            # Enable site if not already enabled
+            if [ ! -L /etc/nginx/sites-enabled/qbot ]; then
+              sudo ln -sf /etc/nginx/sites-available/qbot /etc/nginx/sites-enabled/qbot
+            fi
+            
+            # Test and reload Nginx
+            sudo nginx -t && sudo systemctl reload nginx
+            
+            # Get SSL certificate if not exists
+            if [ ! -d "/etc/letsencrypt/live/$DOMAIN" ]; then
+              echo "🔒 Obtaining SSL certificate..."
+              sudo certbot --nginx -d $DOMAIN --non-interactive --agree-tos --email admin@$DOMAIN || echo "⚠️ SSL setup failed - you may need to run certbot manually"
+            else
+              echo "✅ SSL certificate already exists"
+            fi
+
       - name: Deploy to VPS via SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
