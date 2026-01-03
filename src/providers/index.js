@@ -102,7 +102,6 @@ async function fetchGroqModels() {
   return (data.data || [])
     .filter(m => m.id && !m.id.includes('whisper'))
     .sort((a, b) => a.id.localeCompare(b.id))
-    .slice(0, 10)
     .map(m => ({ id: m.id, name: m.id }));
 }
 
@@ -122,8 +121,7 @@ async function fetchGeminiModels() {
     .map(m => ({
       id: m.name.replace('models/', ''),
       name: m.displayName || m.name.replace('models/', ''),
-    }))
-    .slice(0, 10);
+    }));
 }
 
 // Fetch OpenAI models
@@ -141,7 +139,6 @@ async function fetchOpenAIModels() {
     .filter(m => m.id && (m.id.includes('gpt') || m.id.includes('o1') || m.id.includes('o3')))
     .filter(m => !m.id.includes('instruct') && !m.id.includes('realtime'))
     .sort((a, b) => b.id.localeCompare(a.id))
-    .slice(0, 10)
     .map(m => ({ id: m.id, name: m.id }));
 }
 
