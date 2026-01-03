@@ -2,10 +2,25 @@ import { config } from '../config.js';
 
 const TIMEOUT_MS = 55000;
 
-export async function callClaude(prompt, model) {
+export async function callClaude(prompt, model, history = [], contextPrefix = '') {
   if (!config.claudeApiKey) {
     throw new Error('CLAUDE_API_KEY is not set');
   }
+  
+  // Build messages array with history
+  const messages = [];
+  
+  // Add history messages
+  for (const msg of history) {
+    messages.push({
+      role: msg.role,
+      content: msg.content,
+    });
+  }
+  
+  // Add current prompt with context prefix
+  const fullPrompt = contextPrefix ? `${contextPrefix}${prompt}` : prompt;
+  messages.push({ role: 'user', content: fullPrompt });
   
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_MS);
@@ -21,7 +36,7 @@ export async function callClaude(prompt, model) {
       body: JSON.stringify({
         model,
         max_tokens: 4096,
-        messages: [{ role: 'user', content: prompt }],
+        messages,
       }),
       signal: controller.signal,
     });

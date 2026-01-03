@@ -4,6 +4,11 @@ import { registerWebhook, registerCommands } from '../src/telegram/api.js';
 const commands = [
   { command: 'start', description: 'Show help message' },
   { command: 'help', description: 'Show help message' },
+  { command: 'new', description: 'Start new chat' },
+  { command: 'chats', description: 'List/switch chats' },
+  { command: 'rename', description: 'Rename current chat' },
+  { command: 'clear', description: 'Clear current chat' },
+  { command: 'export', description: 'Export chat to notes' },
   { command: 'ai', description: 'Ask AI a question' },
   { command: 'providers', description: 'Select AI provider' },
   { command: 'models', description: 'Select AI model' },

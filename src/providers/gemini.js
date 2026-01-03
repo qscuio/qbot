@@ -2,10 +2,25 @@ import { config } from '../config.js';
 
 const TIMEOUT_MS = 55000;
 
-export async function callGemini(prompt, model) {
+export async function callGemini(prompt, model, history = [], contextPrefix = '') {
   if (!config.geminiApiKey) {
     throw new Error('GEMINI_API_KEY is not set');
   }
+  
+  // Build contents array with history
+  const contents = [];
+  
+  // Add history messages
+  for (const msg of history) {
+    contents.push({
+      role: msg.role === 'assistant' ? 'model' : 'user',
+      parts: [{ text: msg.content }],
+    });
+  }
+  
+  // Add current prompt with context prefix
+  const fullPrompt = contextPrefix ? `${contextPrefix}${prompt}` : prompt;
+  contents.push({ role: 'user', parts: [{ text: fullPrompt }] });
   
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${config.geminiApiKey}`;
   const controller = new AbortController();
@@ -16,7 +31,7 @@ export async function callGemini(prompt, model) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        contents,
         generationConfig: { thinkingConfig: { thinkingBudget: 1024 } },
       }),
       signal: controller.signal,

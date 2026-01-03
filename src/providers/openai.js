@@ -2,10 +2,29 @@ import { config } from '../config.js';
 
 const TIMEOUT_MS = 55000;
 
-export async function callOpenAI(prompt, model) {
+export async function callOpenAI(prompt, model, history = [], contextPrefix = '') {
   if (!config.openaiApiKey) {
     throw new Error('OPENAI_API_KEY is not set');
   }
+  
+  // Build messages array with history
+  const messages = [];
+  
+  // Add system message with context if available
+  if (contextPrefix) {
+    messages.push({ role: 'system', content: contextPrefix });
+  }
+  
+  // Add history messages
+  for (const msg of history) {
+    messages.push({
+      role: msg.role,
+      content: msg.content,
+    });
+  }
+  
+  // Add current prompt
+  messages.push({ role: 'user', content: prompt });
   
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_MS);
@@ -19,7 +38,7 @@ export async function callOpenAI(prompt, model) {
       },
       body: JSON.stringify({
         model,
-        messages: [{ role: 'user', content: prompt }],
+        messages,
         max_tokens: 4096,
       }),
       signal: controller.signal,

@@ -1,20 +1,41 @@
 import * as telegram from '../telegram/api.js';
+import { config } from '../config.js';
 import { PROVIDERS, DEFAULT_PROVIDER } from '../providers/index.js';
 import { callGemini } from '../providers/gemini.js';
 import { callOpenAI } from '../providers/openai.js';
 import { callClaude } from '../providers/claude.js';
-import { getUserSettings, setUserProvider, setUserModel } from '../db/index.js';
+import { 
+  getUserSettings, 
+  setUserProvider, 
+  setUserModel,
+  createChat,
+  getActiveChat,
+  getUserChats,
+  renameChat,
+  clearChatMessages,
+  saveMessage,
+  getChatMessages,
+  getMessageCount,
+  updateChatSummary,
+  getChat,
+} from '../db/index.js';
+import { exportChatToGit } from '../services/export.js';
 
 // Random reactions list
 const REACTIONS = ['👍', '👎', '❤', '🔥', '🥰', '👏', '😁', '🤔', '🤯', '😱', '🤬', '😢', '🎉', '🤩', '🤮', '💩', '🙏', '👌', '🕊', '🤡', '🥱', '🥴', '😍', '🐳', '❤‍🔥', '🌚', '🌭', '💯', '🤣', '⚡', '🍌', '🏆', '💔', '🤨', '😐', '🍓', '🍾', '💋', '🖕', '😈', '😴', '😭', '🤓', '👻', '👨‍💻', '👀', '🎃', '🙈', '😇', '😨', '🤝', '✍', '🤗', '🫡', '🎅', '🎄', '☃', '💅', '🤪', '🗿', '🆒', '💘', '🙉', '🦄', '😘', '💊', '🙊', '😎', '👾', '🤷‍♂', '🤷', '🤷‍♀', '😡'];
 
-// Command handlers registry - add new commands here
+// Command handlers registry
 const commands = {
   '/start': handleStart,
   '/help': handleStart,
   '/ai': handleAI,
   '/providers': handleProviders,
   '/models': handleModels,
+  '/new': handleNewChat,
+  '/chats': handleChats,
+  '/rename': handleRename,
+  '/clear': handleClear,
+  '/export': handleExport,
 };
 
 // Main message handler
@@ -37,15 +58,100 @@ export async function handleMessage(message) {
 // /start and /help command
 async function handleStart(message) {
   const chatId = message.chat.id;
-  const helpText = `<b>Functions:</b>
-<code>/help</code> - This message
-/ai &lt;text&gt; - Ask AI (uses your selected provider)
-/providers - List/select AI providers
-/models - List/select models for current provider
-Any other text will trigger a random reaction!`;
+  const helpText = `<b>🤖 AI Chat Bot</b>
 
-  const buttons = [[{ text: '🤖 Ask AI (Fun Fact)', callback_data: 'ask_ai' }]];
-  return telegram.sendInlineButtons(chatId, helpText, buttons);
+<b>Chat Commands:</b>
+/new - Start new chat
+/chats - List/switch chats
+/rename <title> - Rename current chat
+/clear - Clear current chat
+/export - Export chat to notes
+
+<b>AI Commands:</b>
+/ai <text> - Ask AI (or just type)
+/providers - Select AI provider
+/models - Select model
+
+<i>Just type any message to chat with AI!</i>`;
+
+  return telegram.sendMessage(chatId, helpText);
+}
+
+// /new - Create new chat
+async function handleNewChat(message) {
+  const chatId = message.chat.id;
+  const userId = message.from?.id;
+  
+  const chat = await createChat(userId);
+  return telegram.sendMessage(chatId, `✨ <b>New chat created!</b>\n\nSend me a message to start chatting.`);
+}
+
+// /chats - List user's chats
+async function handleChats(message) {
+  const chatId = message.chat.id;
+  const userId = message.from?.id;
+  
+  const settings = await getUserSettings(userId);
+  const chats = await getUserChats(userId, 10);
+  
+  if (chats.length === 0) {
+    return telegram.sendMessage(chatId, 'No chats yet. Send a message to start!');
+  }
+  
+  const buttons = chats.map(chat => [{
+    text: `${chat.id === settings.activeChatId ? '✅ ' : ''}${chat.title.substring(0, 30)}`,
+    callback_data: `switch_chat_${chat.id}`,
+  }]);
+  
+  const text = `<b>📂 Your Chats:</b>\n\n<i>Tap to switch</i>`;
+  return telegram.sendInlineButtons(chatId, text, buttons);
+}
+
+// /rename <title> - Rename current chat
+async function handleRename(message) {
+  const chatId = message.chat.id;
+  const userId = message.from?.id;
+  const newTitle = (message.text || '').replace('/rename', '').trim();
+  
+  if (!newTitle) {
+    return telegram.sendMessage(chatId, 'Usage: /rename <new title>');
+  }
+  
+  const activeChat = await getActiveChat(userId);
+  await renameChat(activeChat.id, newTitle);
+  
+  return telegram.sendMessage(chatId, `✅ Chat renamed to: <b>${telegram.escapeHtml(newTitle)}</b>`);
+}
+
+// /clear - Clear current chat
+async function handleClear(message) {
+  const chatId = message.chat.id;
+  const userId = message.from?.id;
+  
+  const activeChat = await getActiveChat(userId);
+  await clearChatMessages(activeChat.id);
+  await updateChatSummary(activeChat.id, null);
+  
+  return telegram.sendMessage(chatId, '🗑️ Chat history cleared!');
+}
+
+// /export - Export chat to git
+async function handleExport(message) {
+  const chatId = message.chat.id;
+  const userId = message.from?.id;
+  
+  if (!config.notesRepo) {
+    return telegram.sendMessage(chatId, '❌ Notes repo not configured. Set NOTES_REPO environment variable.');
+  }
+  
+  await telegram.sendMessage(chatId, '📝 Exporting chat...');
+  
+  try {
+    const result = await exportChatToGit(userId);
+    return telegram.sendMessage(chatId, `✅ Chat exported!\n\n📄 ${result.filename}`);
+  } catch (error) {
+    return telegram.sendMessage(chatId, `❌ Export failed: ${error.message}`);
+  }
 }
 
 // /providers command
@@ -97,7 +203,7 @@ async function handleAI(message) {
   return processAIRequest(chatId, userId, prompt);
 }
 
-// Process AI request (shared by command and callback)
+// Process AI request with chat history
 export async function processAIRequest(chatId, userId, prompt) {
   const settings = await getUserSettings(userId);
   const provider = PROVIDERS[settings.provider];
@@ -106,22 +212,58 @@ export async function processAIRequest(chatId, userId, prompt) {
     return telegram.sendMessage(chatId, 'Invalid provider selected.');
   }
   
+  // Get or create active chat
+  const activeChat = await getActiveChat(userId);
+  
+  // Save user message
+  await saveMessage(activeChat.id, 'user', prompt);
+  
+  // Auto-generate title from first message
+  const messageCount = await getMessageCount(activeChat.id);
+  if (messageCount === 1 && activeChat.title === 'New Chat') {
+    const shortTitle = prompt.substring(0, 50) + (prompt.length > 50 ? '...' : '');
+    await renameChat(activeChat.id, shortTitle);
+  }
+  
   await telegram.sendMessage(chatId, `🤔 Thinking... (${provider.name}: ${settings.model})`);
   
   try {
+    // Build context: summary + recent messages
+    const recentMessages = await getChatMessages(activeChat.id, 4);
+    const history = recentMessages.reverse().map(m => ({
+      role: m.role,
+      content: m.content,
+    }));
+    
+    // Add summary as system context if available
+    const contextPrefix = activeChat.summary 
+      ? `[Previous conversation summary: ${activeChat.summary}]\n\n` 
+      : '';
+    
     let response;
     switch (settings.provider) {
       case 'gemini':
-        response = await callGemini(prompt, settings.model);
+        response = await callGemini(prompt, settings.model, history, contextPrefix);
         break;
       case 'openai':
-        response = await callOpenAI(prompt, settings.model);
+        response = await callOpenAI(prompt, settings.model, history, contextPrefix);
         break;
       case 'claude':
-        response = await callClaude(prompt, settings.model);
+        response = await callClaude(prompt, settings.model, history, contextPrefix);
         break;
       default:
         return telegram.sendMessage(chatId, 'Unknown provider.');
+    }
+    
+    // Save assistant response
+    if (response.content) {
+      await saveMessage(activeChat.id, 'assistant', response.content);
+      
+      // Update summary every 6 messages
+      const newMessageCount = await getMessageCount(activeChat.id);
+      if (newMessageCount % 6 === 0) {
+        updateConversationSummary(activeChat.id, settings);
+      }
     }
     
     // Send thinking process if available
@@ -139,5 +281,39 @@ export async function processAIRequest(chatId, userId, prompt) {
     }
   } catch (error) {
     await telegram.sendMessage(chatId, `Error: ${error.message}`);
+  }
+}
+
+// Update conversation summary in background
+async function updateConversationSummary(chatId, settings) {
+  try {
+    const chat = await getChat(chatId);
+    if (!chat || chat.messages.length < 4) return;
+    
+    // Create prompt for summarization
+    const messagesText = chat.messages
+      .map(m => `${m.role}: ${m.content}`)
+      .join('\n');
+    
+    const summaryPrompt = `Summarize this conversation in 2-3 sentences, capturing the key topics and context:\n\n${messagesText}`;
+    
+    let response;
+    switch (settings.provider) {
+      case 'gemini':
+        response = await callGemini(summaryPrompt, settings.model);
+        break;
+      case 'openai':
+        response = await callOpenAI(summaryPrompt, settings.model);
+        break;
+      case 'claude':
+        response = await callClaude(summaryPrompt, settings.model);
+        break;
+    }
+    
+    if (response?.content) {
+      await updateChatSummary(chatId, response.content);
+    }
+  } catch (error) {
+    console.error('Failed to update summary:', error);
   }
 }

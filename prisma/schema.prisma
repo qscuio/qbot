@@ -7,30 +7,42 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// User settings and preferences
 model User {
   id            BigInt   @id // Telegram user ID
   provider      String   @default("gemini")
-  model         String   @default("gemini-2.5-flash")
+  model         String   @default("gemini-2.0-flash")
+  activeChatId  String?  // Current active chat ID
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
   
-  conversations Conversation[]
+  chats         Chat[]
   
   @@map("users")
 }
 
-// Conversation history for future features
-model Conversation {
+model Chat {
   id        String   @id @default(cuid())
   userId    BigInt
   user      User     @relation(fields: [userId], references: [id])
+  title     String   @default("New Chat")
+  summary   String?  // AI-generated summary for context
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  messages  Message[]
+  
+  @@index([userId, updatedAt])
+  @@map("chats")
+}
+
+model Message {
+  id        String   @id @default(cuid())
+  chatId    String
+  chat      Chat     @relation(fields: [chatId], references: [id], onDelete: Cascade)
   role      String   // "user" or "assistant"
   content   String
-  provider  String?
-  model     String?
   createdAt DateTime @default(now())
   
-  @@index([userId, createdAt])
-  @@map("conversations")
+  @@index([chatId, createdAt])
+  @@map("messages")
 }

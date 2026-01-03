@@ -30,6 +30,9 @@ export const config = {
     ? process.env.ALLOWED_USERS.split(",").map((id) => id.trim())
     : [],
 
+  // Notes Export
+  notesRepo: process.env.NOTES_REPO || "",
+
   // Database
   databaseUrl: process.env.DATABASE_URL,
   redisUrl: process.env.REDIS_URL || "redis://localhost:6379",

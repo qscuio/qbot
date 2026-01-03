@@ -12,7 +12,8 @@ export async function initDatabase() {
   }
 }
 
-// User settings helpers
+// ============ User Functions ============
+
 export async function getOrCreateUser(userId) {
   return prisma.user.upsert({
     where: { id: BigInt(userId) },
@@ -26,6 +27,7 @@ export async function getUserSettings(userId) {
   return {
     provider: user.provider,
     model: user.model,
+    activeChatId: user.activeChatId,
   };
 }
 
@@ -45,23 +47,111 @@ export async function setUserModel(userId, model) {
   });
 }
 
-// Conversation history (for future features)
-export async function saveMessage(userId, role, content, provider, model) {
-  return prisma.conversation.create({
+// ============ Chat Functions ============
+
+export async function createChat(userId, title = 'New Chat') {
+  const chat = await prisma.chat.create({
     data: {
       userId: BigInt(userId),
-      role,
-      content,
-      provider,
-      model,
+      title,
     },
+  });
+  
+  // Set as active chat
+  await prisma.user.update({
+    where: { id: BigInt(userId) },
+    data: { activeChatId: chat.id },
+  });
+  
+  return chat;
+}
+
+export async function getActiveChat(userId) {
+  const user = await getOrCreateUser(userId);
+  
+  if (user.activeChatId) {
+    const chat = await prisma.chat.findUnique({
+      where: { id: user.activeChatId },
+    });
+    if (chat) return chat;
+  }
+  
+  // No active chat - create one
+  return createChat(userId);
+}
+
+export async function setActiveChat(userId, chatId) {
+  return prisma.user.update({
+    where: { id: BigInt(userId) },
+    data: { activeChatId: chatId },
   });
 }
 
-export async function getConversationHistory(userId, limit = 10) {
-  return prisma.conversation.findMany({
+export async function getUserChats(userId, limit = 10) {
+  return prisma.chat.findMany({
     where: { userId: BigInt(userId) },
+    orderBy: { updatedAt: 'desc' },
+    take: limit,
+  });
+}
+
+export async function getChat(chatId) {
+  return prisma.chat.findUnique({
+    where: { id: chatId },
+    include: { messages: { orderBy: { createdAt: 'asc' } } },
+  });
+}
+
+export async function renameChat(chatId, title) {
+  return prisma.chat.update({
+    where: { id: chatId },
+    data: { title },
+  });
+}
+
+export async function updateChatSummary(chatId, summary) {
+  return prisma.chat.update({
+    where: { id: chatId },
+    data: { summary },
+  });
+}
+
+export async function deleteChat(chatId) {
+  return prisma.chat.delete({
+    where: { id: chatId },
+  });
+}
+
+export async function clearChatMessages(chatId) {
+  return prisma.message.deleteMany({
+    where: { chatId },
+  });
+}
+
+// ============ Message Functions ============
+
+export async function saveMessage(chatId, role, content) {
+  // Update chat's updatedAt
+  await prisma.chat.update({
+    where: { id: chatId },
+    data: { updatedAt: new Date() },
+  });
+  
+  return prisma.message.create({
+    data: { chatId, role, content },
+  });
+}
+
+export async function getChatMessages(chatId, limit = 10) {
+  return prisma.message.findMany({
+    where: { chatId },
     orderBy: { createdAt: 'desc' },
     take: limit,
+  });
+}
+
+export async function getMessageCount(chatId) {
+  return prisma.message.count({
+    where: { chatId },
   });
 }
