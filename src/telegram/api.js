@@ -20,11 +20,15 @@ export async function sendMessage(chatId, text) {
 
 // Send HTML formatted message
 export async function sendHtmlMessage(chatId, text) {
-  return callApi('sendMessage', {
+  const result = await callApi('sendMessage', {
     chat_id: chatId,
     text,
     parse_mode: 'HTML',
   });
+  if (!result.ok) {
+    console.error('sendHtmlMessage failed:', result.description, 'Text length:', text.length);
+  }
+  return result;
 }
 
 // Send message with inline keyboard

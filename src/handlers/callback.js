@@ -95,11 +95,14 @@ export async function handleCallbackQuery(callbackQuery) {
     
     try {
       const result = await exportChatToGit(userId);
-      const link = result.fileUrl 
-        ? `<a href="${result.fileUrl}">${result.filename}</a>`
-        : result.filename;
+      const rawLink = result.rawUrl 
+        ? `<a href="${result.rawUrl}">${result.rawFile}</a>`
+        : result.rawFile;
+      const notesLink = result.notesUrl 
+        ? `<a href="${result.notesUrl}">${result.notesFile}</a>`
+        : result.notesFile;
         
-      return telegram.sendHtmlMessage(chatId, `✅ Chat exported!\n\n📄 ${link}`);
+      return telegram.sendHtmlMessage(chatId, `✅ Chat exported!\n\n📄 Raw: ${rawLink}\n📝 Notes: ${notesLink}`);
     } catch (error) {
       return telegram.sendMessage(chatId, `❌ Export failed: ${error.message}`);
     }

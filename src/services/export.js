@@ -14,20 +14,16 @@ const MOUNTED_SSH_KEY = '/app/.qbot_ssh/deploy_key';
 
 // Configure SSH for git operations
 function setupSSH() {
-  // Check if mounted SSH key exists
   if (!existsSync(MOUNTED_SSH_KEY)) {
     throw new Error('SSH key not found. Please set VPS_SSH_KEY secret.');
   }
   
-  // Create temp SSH directory
   mkdirSync(SSH_DIR, { recursive: true });
   
-  // Copy the mounted key to temp location
   const keyContent = readFileSync(MOUNTED_SSH_KEY, 'utf8');
   const destKey = `${SSH_DIR}/id_rsa`;
   writeFileSync(destKey, keyContent, { mode: 0o600 });
   
-  // Create ssh config  
   const sshConfig = `Host github.com
   HostName github.com
   User git
@@ -38,9 +34,16 @@ function setupSSH() {
   writeFileSync(`${SSH_DIR}/config`, sshConfig, { mode: 0o600 });
 }
 
-// Get GIT_SSH_COMMAND for using our temp SSH config
 function getGitSSHCommand() {
   return `GIT_SSH_COMMAND="ssh -F ${SSH_DIR}/config"`;
+}
+
+// Generate short filename: MMDD-first-few-words.md
+function generateFilename(title, date) {
+  const mmdd = `${String(date.getMonth() + 1).padStart(2, '0')}${String(date.getDate()).padStart(2, '0')}`;
+  const words = title.split(/\s+/).slice(0, 3).join('-');
+  const safeWords = words.replace(/[^a-zA-Z0-9\u4e00-\u9fa5-]/g, '').substring(0, 30);
+  return `${mmdd}-${safeWords || 'chat'}.md`;
 }
 
 export async function exportChatToGit(userId) {
@@ -56,21 +59,36 @@ export async function exportChatToGit(userId) {
   }
   
   const settings = await getUserSettings(userId);
+  const date = new Date();
+  const filename = generateFilename(chat.title, date);
   
-  // Generate knowledge summary using AI
-  const messagesText = chat.messages
-    .map(m => `**${m.role === 'user' ? 'User' : 'Assistant'}:** ${m.content}`)
-    .join('\n\n');
+  // Build raw conversation text
+  const rawContent = chat.messages
+    .map(m => `**${m.role === 'user' ? 'User' : 'Assistant'}:**\n${m.content}`)
+    .join('\n\n---\n\n');
   
-  const summaryPrompt = `Convert this conversation into a well-organized knowledge document in Markdown format. 
-Extract key information, insights, and learnings. Use headers, bullet points, and code blocks where appropriate.
-Make it useful as a reference document.
+  // Create raw markdown file
+  const rawMarkdown = `# ${chat.title}
+
+> Exported: ${date.toLocaleString()} | ${chat.messages.length} messages
+
+${rawContent}
+
+---
+*Exported from QBot*
+`;
+
+  // Generate AI summary
+  let summaryMarkdown = '';
+  try {
+    const summaryPrompt = `Analyze this conversation and create a structured knowledge summary.
+Extract key points, insights, code examples, and actionable information.
+Use headers (##), bullet points, and code blocks.
+Be concise but comprehensive.
 
 Conversation:
-${messagesText}`;
+${rawContent.substring(0, 15000)}`;
 
-  let summary;
-  try {
     let response;
     switch (settings.provider) {
       case 'groq':
@@ -88,33 +106,35 @@ ${messagesText}`;
       default:
         response = await callGroq(summaryPrompt, 'llama-3.3-70b-versatile');
     }
-    summary = response.content || messagesText;
-  } catch (error) {
-    console.error('Failed to generate summary:', error);
-    summary = messagesText; // Fallback to raw messages
-  }
-  
-  // Create markdown content
-  const date = new Date().toISOString().split('T')[0];
-  const safeTitle = chat.title.replace(/[^a-zA-Z0-9\u4e00-\u9fa5]/g, '-').substring(0, 50);
-  const filename = `${date}-${safeTitle}.md`;
-  
-  const markdown = `# ${chat.title}
+    
+    const summary = response.content || 'Summary generation failed.';
+    
+    summaryMarkdown = `# ${chat.title} - Notes
 
-> Exported on ${new Date().toLocaleString()}
+> Summary of ${chat.messages.length} messages | ${date.toLocaleString()}
 
 ${summary}
 
 ---
+*AI-generated summary from QBot*
+`;
+  } catch (error) {
+    console.error('Failed to generate summary:', error);
+    summaryMarkdown = `# ${chat.title} - Notes
 
+> Summary generation failed
+
+See raw file for full conversation.
+
+---
 *Exported from QBot*
 `;
+  }
 
-  // Setup SSH for git
+  // Setup SSH and clone/pull repo
   setupSSH();
   const gitSSH = getGitSSHCommand();
 
-  // Clone/pull repo and push
   try {
     if (!existsSync(NOTES_DIR)) {
       mkdirSync(NOTES_DIR, { recursive: true });
@@ -123,41 +143,38 @@ ${summary}
       execSync(`cd ${NOTES_DIR} && ${gitSSH} git pull`, { stdio: 'pipe' });
     }
     
-    // Create chats directory if not exists
-    const chatsDir = join(NOTES_DIR, 'chats');
-    if (!existsSync(chatsDir)) {
-      mkdirSync(chatsDir, { recursive: true });
-    }
+    // Create directories
+    const rawDir = join(NOTES_DIR, 'raw');
+    const notesDir = join(NOTES_DIR, 'notes');
+    mkdirSync(rawDir, { recursive: true });
+    mkdirSync(notesDir, { recursive: true });
     
-    // Write file
-    const filePath = join(chatsDir, filename);
-    writeFileSync(filePath, markdown);
+    // Write files
+    writeFileSync(join(rawDir, filename), rawMarkdown);
+    writeFileSync(join(notesDir, filename), summaryMarkdown);
     
-    // Configure git user
+    // Git commit and push
     execSync(`cd ${NOTES_DIR} && git config user.email "qbot@telegram.bot" && git config user.name "QBot"`, { stdio: 'pipe' });
+    execSync(`cd ${NOTES_DIR} && git add . && git commit -m "Export: ${chat.title}" && ${gitSSH} git push`, { stdio: 'pipe' });
     
-    // Commit and push
-    execSync(`cd ${NOTES_DIR} && git add . && git commit -m "Add: ${chat.title}" && ${gitSSH} git push`, { 
-      stdio: 'pipe',
-    });
-    
-    // Construct GitHub URL
-    let fileUrl = null;
+    // Generate GitHub URLs
+    let rawUrl = null;
+    let notesUrl = null;
     if (config.notesRepo) {
-      // Convert git@github.com:user/repo.git to https://github.com/user/repo
       let repoUrl = config.notesRepo
         .replace('git@github.com:', 'https://github.com/')
         .replace('.git', '');
-        
-      // Handle https://github.com/user/repo.git format too
       if (repoUrl.endsWith('.git')) repoUrl = repoUrl.slice(0, -4);
       
-      fileUrl = `${repoUrl}/blob/main/chats/${filename}`;
+      rawUrl = `${repoUrl}/blob/main/raw/${filename}`;
+      notesUrl = `${repoUrl}/blob/main/notes/${filename}`;
     }
     
     return { 
-      filename: `chats/${filename}`,
-      fileUrl 
+      rawFile: `raw/${filename}`,
+      notesFile: `notes/${filename}`,
+      rawUrl,
+      notesUrl
     };
   } catch (error) {
     console.error('Git operation failed:', error);
