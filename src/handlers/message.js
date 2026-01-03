@@ -1,6 +1,6 @@
 import * as telegram from '../telegram/api.js';
 import { config } from '../config.js';
-import { PROVIDERS, DEFAULT_PROVIDER } from '../providers/index.js';
+import { PROVIDERS, DEFAULT_PROVIDER, fetchModels } from '../providers/index.js';
 import { callGemini } from '../providers/gemini.js';
 import { callOpenAI } from '../providers/openai.js';
 import { callClaude } from '../providers/claude.js';
@@ -61,21 +61,15 @@ async function handleStart(message) {
   const chatId = message.chat.id;
   const helpText = `<b>🤖 AI Chat Bot</b>
 
-<b>Chat Commands:</b>
-/new - Start new chat
-/chats - List/switch chats
-/rename <title> - Rename current chat
-/clear - Clear current chat
-/export - Export chat to notes
+Select a command below or just type a message to chat with AI!`;
 
-<b>AI Commands:</b>
-/ai <text> - Ask AI (or just type)
-/providers - Select AI provider
-/models - Select model
+  const buttons = [
+    [{ text: '✨ New Chat', callback_data: 'cmd_new' }, { text: '📂 Chats', callback_data: 'cmd_chats' }],
+    [{ text: '🔌 Providers', callback_data: 'cmd_providers' }, { text: '📋 Models', callback_data: 'cmd_models' }],
+    [{ text: '📝 Export', callback_data: 'cmd_export' }, { text: '🗑️ Clear', callback_data: 'cmd_clear' }],
+  ];
 
-<i>Just type any message to chat with AI!</i>`;
-
-  return telegram.sendMessage(chatId, helpText);
+  return telegram.sendInlineButtons(chatId, helpText, buttons);
 }
 
 // /new - Create new chat
@@ -182,9 +176,17 @@ async function handleModels(message) {
     return telegram.sendMessage(chatId, 'Invalid provider selected.');
   }
   
-  const modelButtons = Object.entries(provider.models).map(([shortName, fullName]) => [{
-    text: `${fullName === settings.model ? '✅ ' : ''}${shortName}`,
-    callback_data: `set_model_${shortName}`,
+  await telegram.sendMessage(chatId, `<i>Loading ${provider.name} models...</i>`);
+  
+  const models = await fetchModels(settings.provider);
+  
+  if (models.length === 0) {
+    return telegram.sendMessage(chatId, 'No models available for this provider.');
+  }
+  
+  const modelButtons = models.map(m => [{
+    text: `${m.id === settings.model ? '✅ ' : ''}${m.name}`,
+    callback_data: `set_model_full_${m.id}`,
   }]);
   
   const text = `<b>📋 ${provider.name} Models:</b>\n\n<i>Current: ${settings.model}</i>`;
