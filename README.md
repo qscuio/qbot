@@ -36,14 +36,21 @@ ssh your-user@your-vps
 # Generate key pair
 ssh-keygen -t ed25519 -C "github-actions" -f ~/.ssh/github_actions
 
-# Add public key to authorized_keys
+# Add public key to authorized_keys (for deployment SSH)
 cat ~/.ssh/github_actions.pub >> ~/.ssh/authorized_keys
 
 # Display private key (copy this to GitHub Secret VPS_SSH_KEY)
 cat ~/.ssh/github_actions
 ```
 
-> **Important**: Add the public key to your notes repo as a deploy key with write access for `/export` to work.
+**For `/export` feature** (push chats to notes repo):
+
+1. Show the public key on VPS:
+   ```bash
+   cat ~/.ssh/github_actions.pub
+   ```
+2. Go to GitHub → your notes repo (e.g., `qscuio/qnote`) → Settings → Deploy keys
+3. Click "Add deploy key", paste the public key, check **"Allow write access"**, save
 
 ### Step 2: Set Up DNS Record
 
