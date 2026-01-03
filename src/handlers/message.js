@@ -331,6 +331,13 @@ export async function processAIRequest(chatId, userId, prompt) {
     } else {
       await telegram.sendMessage(chatId, '⚠️ No response from AI. Try a different model or provider.');
     }
+    
+    // Show quick action buttons
+    const buttons = [
+      [{ text: '✨ New', callback_data: 'cmd_new' }, { text: '📂 Chats', callback_data: 'cmd_chats' }],
+      [{ text: '🔌 Provider', callback_data: 'cmd_providers' }, { text: '📋 Models', callback_data: 'cmd_models' }],
+    ];
+    await telegram.sendInlineButtons(chatId, '<i>Quick actions:</i>', buttons);
   } catch (error) {
     clearInterval(typingInterval);
     
