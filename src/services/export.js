@@ -141,7 +141,24 @@ ${summary}
       stdio: 'pipe',
     });
     
-    return { filename: `chats/${filename}` };
+    // Construct GitHub URL
+    let fileUrl = null;
+    if (config.notesRepo) {
+      // Convert git@github.com:user/repo.git to https://github.com/user/repo
+      let repoUrl = config.notesRepo
+        .replace('git@github.com:', 'https://github.com/')
+        .replace('.git', '');
+        
+      // Handle https://github.com/user/repo.git format too
+      if (repoUrl.endsWith('.git')) repoUrl = repoUrl.slice(0, -4);
+      
+      fileUrl = `${repoUrl}/blob/main/chats/${filename}`;
+    }
+    
+    return { 
+      filename: `chats/${filename}`,
+      fileUrl 
+    };
   } catch (error) {
     console.error('Git operation failed:', error);
     throw new Error(`Git push failed: ${error.message}`);
