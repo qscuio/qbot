@@ -218,6 +218,10 @@ jobs:
             echo "⏳ Waiting for services to start..."
             sleep 15
             
+            # Run database migrations
+            echo "📦 Running database migrations..."
+            docker compose exec -T bot npx prisma migrate deploy || echo "⚠️ Migration skipped or failed"
+            
             # Show container status
             docker compose ps
             
