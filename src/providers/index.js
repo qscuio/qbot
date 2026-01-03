@@ -157,17 +157,42 @@ async function fetchOpenAIModels() {
 async function fetchNvidiaModels() {
   if (!config.nvidiaApiKey) return getFallbackModels('nvidia');
   
-  const response = await fetch('https://integrate.api.nvidia.com/v1/models', {
-    headers: { 'Authorization': `Bearer ${config.nvidiaApiKey}` },
-  });
-  
-  if (!response.ok) return getFallbackModels('nvidia');
-  
-  const data = await response.json();
-  return (data.data || [])
-    .filter(m => m.id && !m.id.includes('embed') && !m.id.includes('rerank'))
-    .sort((a, b) => a.id.localeCompare(b.id))
-    .map(m => ({ id: m.id, name: m.id }));
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+    
+    const response = await fetch('https://integrate.api.nvidia.com/v1/models', {
+      headers: { 'Authorization': `Bearer ${config.nvidiaApiKey}` },
+      signal: controller.signal,
+    });
+    
+    clearTimeout(timeoutId);
+    
+    if (!response.ok) return getFallbackModels('nvidia');
+    
+    const data = await response.json();
+    
+    // Filter to only chat/instruct models from popular vendors
+    const popularVendors = ['meta/', 'mistralai/', 'google/', 'microsoft/', 'nvidia/', 'deepseek/'];
+    
+    return (data.data || [])
+      .filter(m => {
+        if (!m.id) return false;
+        // Must be from a popular vendor
+        const isPopularVendor = popularVendors.some(v => m.id.startsWith(v));
+        // Must be an instruct/chat model (not embedding, rerank, vision-only, etc.)
+        const isChat = m.id.includes('instruct') || m.id.includes('chat');
+        // Exclude embedding and reranking models
+        const isNotEmbed = !m.id.includes('embed') && !m.id.includes('rerank');
+        return isPopularVendor && isChat && isNotEmbed;
+      })
+      .sort((a, b) => a.id.localeCompare(b.id))
+      .slice(0, 20) // Limit to 20 models for Telegram button limit
+      .map(m => ({ id: m.id, name: m.id.split('/').pop() })); // Use short name for display
+  } catch (error) {
+    console.error('Error fetching NVIDIA models:', error.message);
+    return getFallbackModels('nvidia');
+  }
 }
 
 // Legacy function for backward compatibility
