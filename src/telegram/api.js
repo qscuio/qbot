@@ -18,17 +18,34 @@ export async function sendMessage(chatId, text) {
   return callApi('sendMessage', { chat_id: chatId, text });
 }
 
-// Send HTML formatted message
-export async function sendHtmlMessage(chatId, text) {
-  const result = await callApi('sendMessage', {
-    chat_id: chatId,
-    text,
-    parse_mode: 'HTML',
-  });
-  if (!result.ok) {
-    console.error('sendHtmlMessage failed:', result.description, 'Text length:', text.length);
+// Send HTML formatted message with retry
+export async function sendHtmlMessage(chatId, text, retries = 2) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const result = await callApi('sendMessage', {
+      chat_id: chatId,
+      text,
+      parse_mode: 'HTML',
+    });
+    
+    if (result.ok) {
+      return result;
+    }
+    
+    console.error(`sendHtmlMessage attempt ${attempt + 1} failed:`, result.description);
+    
+    // If HTML parsing error, try without HTML
+    if (result.description?.includes('parse')) {
+      console.error('HTML parse error, sending as plain text');
+      return sendMessage(chatId, text.replace(/<[^>]*>/g, ''));
+    }
+    
+    // Wait before retry
+    if (attempt < retries) {
+      await new Promise(r => setTimeout(r, 1000));
+    }
   }
-  return result;
+  
+  return { ok: false, description: 'All retries failed' };
 }
 
 // Send message with inline keyboard
@@ -84,35 +101,48 @@ export async function editMessageText(chatId, messageId, text, parseMode = 'HTML
   });
 }
 
-// Send long text (split into chunks if needed, at newline boundaries)
+// Send long text (split into chunks with retry)
 export async function sendLongHtmlMessage(chatId, text) {
-  const MAX_LENGTH = 4000; // Leave some room for safety
+  const MAX_LENGTH = 3500;
+  const chunks = [];
   
-  if (text.length <= MAX_LENGTH) {
-    return sendHtmlMessage(chatId, text);
-  }
-  
+  // Split into chunks at newlines
   let remaining = text;
   while (remaining.length > 0) {
     if (remaining.length <= MAX_LENGTH) {
-      await sendHtmlMessage(chatId, remaining);
+      chunks.push(remaining);
       break;
     }
     
-    // Find a good place to split (newline, then space)
     let splitAt = remaining.lastIndexOf('\n', MAX_LENGTH);
-    if (splitAt < MAX_LENGTH * 0.5) {
+    if (splitAt < MAX_LENGTH * 0.3) {
       splitAt = remaining.lastIndexOf(' ', MAX_LENGTH);
     }
-    if (splitAt < MAX_LENGTH * 0.5) {
+    if (splitAt < MAX_LENGTH * 0.3) {
       splitAt = MAX_LENGTH;
     }
     
-    await sendHtmlMessage(chatId, remaining.substring(0, splitAt));
+    chunks.push(remaining.substring(0, splitAt));
     remaining = remaining.substring(splitAt).trimStart();
+  }
+  
+  console.log(`Sending ${chunks.length} chunks to ${chatId}`);
+  
+  // Send each chunk with delay
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+    console.log(`Sending chunk ${i + 1}/${chunks.length}, length: ${chunk.length}`);
     
-    // Add small delay to ensure order and avoid rate limits
-    await new Promise(resolve => setTimeout(resolve, 500));
+    const result = await sendHtmlMessage(chatId, chunk);
+    
+    if (!result.ok) {
+      console.error(`Chunk ${i + 1} failed:`, result.description);
+    }
+    
+    // Delay between chunks (longer for rate limiting)
+    if (i < chunks.length - 1) {
+      await new Promise(r => setTimeout(r, 800));
+    }
   }
 }
 
