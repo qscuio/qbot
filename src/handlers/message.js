@@ -97,12 +97,16 @@ Step-by-step logic chain:
 4. [Political Outcome]
 
 ## 📈 Market Impact
-Step-by-step logic chain:
-1. [Event/Claim] → 
-2. [Sector/Industry Affected] → 
-3. [Market Mechanism] → 
-4. [Expected Price Movement]
-Specific tickers to watch: [if applicable]
+
+### 📈 利好 (Bullish)
+Industries: [affected sectors]
+Logic chain: [Event] → [Mechanism] → [Positive Effect]
+Tickers: [symbols]
+
+### 📉 利空 (Bearish)
+Industries: [affected sectors]
+Logic chain: [Event] → [Mechanism] → [Negative Effect]
+Tickers: [symbols]
 
 ## 🔗 Context
 Additional context, related events, or background.
