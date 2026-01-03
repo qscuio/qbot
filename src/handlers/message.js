@@ -51,9 +51,94 @@ export async function handleMessage(message) {
     }
   }
   
+  // Check if it's a forwarded message - analyze it
+  if (message.forward_from || message.forward_from_chat || message.forward_origin) {
+    return handleForwardedMessage(message);
+  }
+  
   // Default: random reaction
   const emoji = REACTIONS[Math.floor(Math.random() * REACTIONS.length)];
   return telegram.setMessageReaction(chatId, message.message_id, emoji, emoji === '🎉');
+}
+
+// Handle forwarded messages - analyze for truth, politics, market impact
+async function handleForwardedMessage(message) {
+  const chatId = message.chat.id;
+  const userId = message.from?.id;
+  const text = message.text || message.caption || '';
+  
+  if (!text) {
+    return telegram.sendMessage(chatId, '❌ No text content in forwarded message to analyze.');
+  }
+  
+  const settings = await getUserSettings(userId);
+  const provider = PROVIDERS[settings.provider];
+  
+  await telegram.sendChatAction(chatId, 'typing');
+  await telegram.sendHtmlMessage(chatId, `🔍 <i>Analyzing forwarded message...</i>`);
+  
+  const analysisPrompt = `You are a fact-checker and analyst. Analyze the following forwarded message.
+
+For each impact analysis, provide the LOGIC CHAIN showing step-by-step reasoning from event to result.
+
+Provide analysis in this format:
+## 📋 Summary
+Brief summary of the content.
+
+## ✅ Fact Check
+Verify claims. Rate accuracy (Verified/Partially True/Unverified/False/Opinion).
+Cite sources or reasoning for your verification.
+
+## 🏛️ Political Impact
+Step-by-step logic chain:
+1. [Event/Claim] → 
+2. [Immediate Effect] → 
+3. [Secondary Effect] → 
+4. [Political Outcome]
+
+## 📈 Market Impact
+Step-by-step logic chain:
+1. [Event/Claim] → 
+2. [Sector/Industry Affected] → 
+3. [Market Mechanism] → 
+4. [Expected Price Movement]
+Specific tickers to watch: [if applicable]
+
+## 🔗 Context
+Additional context, related events, or background.
+
+Message to analyze:
+"""
+${text}
+"""`;
+
+  try {
+    let response;
+    switch (settings.provider) {
+      case 'gemini':
+        response = await callGemini(analysisPrompt, settings.model);
+        break;
+      case 'openai':
+        response = await callOpenAI(analysisPrompt, settings.model);
+        break;
+      case 'claude':
+        response = await callClaude(analysisPrompt, settings.model);
+        break;
+      case 'groq':
+      default:
+        response = await callGroq(analysisPrompt, settings.model || 'llama-3.3-70b-versatile');
+    }
+    
+    if (response.content) {
+      const responseHtml = `<b>🔍 Analysis (${provider?.name || 'AI'}):</b>\n${telegram.markdownToHtml(response.content)}`;
+      await telegram.sendLongHtmlMessage(chatId, responseHtml);
+    } else {
+      await telegram.sendMessage(chatId, '⚠️ Could not analyze the message.');
+    }
+  } catch (error) {
+    console.error('Forward analysis error:', error);
+    await telegram.sendMessage(chatId, `❌ Analysis failed: ${error.message}`);
+  }
 }
 
 // /start and /help command
@@ -335,7 +420,7 @@ export async function processAIRequest(chatId, userId, prompt) {
     // Show quick action buttons
     const buttons = [
       [{ text: '✨ New', callback_data: 'cmd_new' }, { text: '📂 Chats', callback_data: 'cmd_chats' }],
-      [{ text: '🔌 Provider', callback_data: 'cmd_providers' }, { text: '📋 Models', callback_data: 'cmd_models' }],
+      [{ text: '🔌 Provider', callback_data: 'cmd_providers' }, { text: '📝 Export', callback_data: 'cmd_export' }],
     ];
     await telegram.sendInlineButtons(chatId, '<i>Quick actions:</i>', buttons);
   } catch (error) {
