@@ -55,6 +55,8 @@ Point a domain/subdomain to your VPS IP address:
 
 Your `WEBHOOK_URL` will be `https://bot.yourdomain.com`
 
+> ⚠️ **Cloudflare Users**: Use **gray cloud (DNS only)** mode, not orange cloud (proxied). This allows Let's Encrypt to issue certificates directly to your server.
+
 > The GitHub Actions workflow will **automatically configure Nginx and SSL** on first deployment.
 
 ### Step 3: Fork or Clone
