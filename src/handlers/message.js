@@ -78,7 +78,7 @@ async function handleNewChat(message) {
   const userId = message.from?.id;
   
   const chat = await createChat(userId);
-  return telegram.sendMessage(chatId, `✨ <b>New chat created!</b>\n\nSend me a message to start chatting.`);
+  return telegram.sendHtmlMessage(chatId, `✨ <b>New chat created!</b>\n\nSend me a message to start chatting.`);
 }
 
 // /chats - List user's chats

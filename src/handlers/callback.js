@@ -26,7 +26,7 @@ export async function handleCallbackQuery(callbackQuery) {
   if (data === 'cmd_new') {
     await telegram.answerCallbackQuery(callbackQuery.id, 'Creating new chat...');
     const chat = await createChat(userId);
-    return telegram.sendMessage(chatId, `✨ <b>New chat created!</b>\n\nSend me a message to start chatting.`);
+    return telegram.sendHtmlMessage(chatId, `✨ <b>New chat created!</b>\n\nSend me a message to start chatting.`);
   }
   
   if (data === 'cmd_chats') {
@@ -127,22 +127,22 @@ export async function handleCallbackQuery(callbackQuery) {
       
       // Show chat title
       let response = `✅ Switched to: <b>${telegram.escapeHtml(chat.title)}</b>\n`;
+      response += `<i>${chat.messages?.length || 0} messages</i>\n`;
       
-      // Show recent messages if any
+      // Show all messages
       if (chat.messages && chat.messages.length > 0) {
-        const recent = chat.messages.slice(-5); // Last 5 messages
-        response += `\n<i>Recent messages:</i>\n`;
-        for (const msg of recent) {
+        response += `\n<b>Chat History:</b>\n`;
+        for (const msg of chat.messages) {
           const icon = msg.role === 'user' ? '👤' : '🤖';
-          const content = msg.content.substring(0, 100) + (msg.content.length > 100 ? '...' : '');
-          response += `\n${icon} ${telegram.escapeHtml(content)}`;
+          const content = msg.content.substring(0, 200) + (msg.content.length > 200 ? '...' : '');
+          response += `\n${icon} ${telegram.escapeHtml(content)}\n`;
         }
-        response += `\n\n<i>Send a message to continue...</i>`;
+        response += `\n<i>Send a message to continue...</i>`;
       } else {
         response += `\n<i>This chat is empty. Send a message to start!</i>`;
       }
       
-      return telegram.sendMessage(chatId, response);
+      return telegram.sendLongHtmlMessage(chatId, response);
     }
     return telegram.answerCallbackQuery(callbackQuery.id, 'Chat not found.');
   }
@@ -155,7 +155,7 @@ export async function handleCallbackQuery(callbackQuery) {
     if (chat && chat.userId === BigInt(userId)) {
       await deleteChat(targetChatId);
       await telegram.answerCallbackQuery(callbackQuery.id, 'Chat deleted!');
-      return telegram.sendMessage(chatId, `🗑️ Deleted: <b>${telegram.escapeHtml(chat.title)}</b>`);
+      return telegram.sendHtmlMessage(chatId, `🗑️ Deleted: <b>${telegram.escapeHtml(chat.title)}</b>`);
     }
     return telegram.answerCallbackQuery(callbackQuery.id, 'Chat not found.');
   }
