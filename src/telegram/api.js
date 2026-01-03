@@ -62,6 +62,24 @@ export async function answerInlineQuery(inlineQueryId, results) {
   });
 }
 
+// Send chat action (typing, etc.)
+export async function sendChatAction(chatId, action = 'typing') {
+  return callApi('sendChatAction', {
+    chat_id: chatId,
+    action,
+  });
+}
+
+// Edit an existing message
+export async function editMessageText(chatId, messageId, text, parseMode = 'HTML') {
+  return callApi('editMessageText', {
+    chat_id: chatId,
+    message_id: messageId,
+    text,
+    parse_mode: parseMode,
+  });
+}
+
 // Send long text (split into chunks if needed)
 export async function sendLongHtmlMessage(chatId, text) {
   const MAX_LENGTH = 4096;

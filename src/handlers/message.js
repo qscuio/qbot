@@ -228,7 +228,17 @@ export async function processAIRequest(chatId, userId, prompt) {
     await renameChat(activeChat.id, shortTitle);
   }
   
-  await telegram.sendMessage(chatId, `🤔 Thinking... (${provider.name}: ${settings.model})`);
+  // Send typing indicator
+  await telegram.sendChatAction(chatId, 'typing');
+  
+  // Send status message that we'll update
+  const statusMsg = await telegram.sendHtmlMessage(chatId, `🤔 <i>Thinking...</i>\n\n<code>${provider.name}: ${settings.model}</code>`);
+  const statusMsgId = statusMsg?.result?.message_id;
+  
+  // Keep sending typing action while processing
+  const typingInterval = setInterval(() => {
+    telegram.sendChatAction(chatId, 'typing');
+  }, 4000);
   
   try {
     // Build context: summary + recent messages
@@ -243,22 +253,47 @@ export async function processAIRequest(chatId, userId, prompt) {
       ? `[Previous conversation summary: ${activeChat.summary}]\n\n` 
       : '';
     
+    // Update status
+    if (statusMsgId) {
+      await telegram.editMessageText(chatId, statusMsgId, `⏳ <i>Processing...</i>\n\n<code>${provider.name}: ${settings.model}</code>`);
+    }
+    
+    // Create timeout wrapper (60 seconds)
+    const timeoutMs = 60000;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    
     let response;
-    switch (settings.provider) {
-      case 'gemini':
-        response = await callGemini(prompt, settings.model, history, contextPrefix);
-        break;
-      case 'openai':
-        response = await callOpenAI(prompt, settings.model, history, contextPrefix);
-        break;
-      case 'claude':
-        response = await callClaude(prompt, settings.model, history, contextPrefix);
-        break;
-      case 'groq':
-        response = await callGroq(prompt, settings.model, history, contextPrefix);
-        break;
-      default:
-        return telegram.sendMessage(chatId, 'Unknown provider.');
+    try {
+      switch (settings.provider) {
+        case 'gemini':
+          response = await callGemini(prompt, settings.model, history, contextPrefix);
+          break;
+        case 'openai':
+          response = await callOpenAI(prompt, settings.model, history, contextPrefix);
+          break;
+        case 'claude':
+          response = await callClaude(prompt, settings.model, history, contextPrefix);
+          break;
+        case 'groq':
+          response = await callGroq(prompt, settings.model, history, contextPrefix);
+          break;
+        default:
+          clearInterval(typingInterval);
+          clearTimeout(timeoutId);
+          return telegram.sendMessage(chatId, 'Unknown provider.');
+      }
+    } finally {
+      clearTimeout(timeoutId);
+    }
+    
+    clearInterval(typingInterval);
+    
+    // Delete status message
+    if (statusMsgId) {
+      try {
+        await telegram.editMessageText(chatId, statusMsgId, `✅ <i>Done!</i>`, 'HTML');
+      } catch (e) { /* ignore */ }
     }
     
     // Save assistant response
@@ -283,10 +318,25 @@ export async function processAIRequest(chatId, userId, prompt) {
       const responseHtml = `<b>💬 ${provider.name}:</b>\n${telegram.markdownToHtml(response.content)}`;
       await telegram.sendLongHtmlMessage(chatId, responseHtml);
     } else {
-      await telegram.sendMessage(chatId, 'No response from AI.');
+      await telegram.sendMessage(chatId, '⚠️ No response from AI. Try a different model or provider.');
     }
   } catch (error) {
-    await telegram.sendMessage(chatId, `Error: ${error.message}`);
+    clearInterval(typingInterval);
+    
+    // Update status to show error
+    if (statusMsgId) {
+      try {
+        await telegram.editMessageText(chatId, statusMsgId, `❌ <i>Error occurred</i>`, 'HTML');
+      } catch (e) { /* ignore */ }
+    }
+    
+    // Detailed error message
+    const errorMessage = error.name === 'AbortError' 
+      ? '⏱️ Request timed out (60s). The model may be overloaded. Try again or switch to a faster model.'
+      : `❌ Error: ${error.message}\n\n<i>Try /models to switch models or /providers to change provider.</i>`;
+    
+    await telegram.sendHtmlMessage(chatId, errorMessage);
+    console.error('AI request error:', error);
   }
 }
 
