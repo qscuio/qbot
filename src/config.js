@@ -30,6 +30,7 @@ export const config = {
   allowedUsers: process.env.ALLOWED_USERS
     ? process.env.ALLOWED_USERS.split(",").map((id) => id.trim())
     : [],
+  ownerId: process.env.ALLOWED_USERS?.split(",")[0]?.trim() || null,
 
   // Notes Export
   notesRepo: process.env.NOTES_REPO || "",

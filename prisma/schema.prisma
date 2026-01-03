@@ -46,3 +46,11 @@ model Message {
   @@index([chatId, createdAt])
   @@map("messages")
 }
+
+model AllowedUser {
+  id        BigInt   @id // Telegram user ID
+  addedBy   BigInt   // Who added this user
+  createdAt DateTime @default(now())
+  
+  @@map("allowed_users")
+}

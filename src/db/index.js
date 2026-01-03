@@ -155,3 +155,36 @@ export async function getMessageCount(chatId) {
     where: { chatId },
   });
 }
+
+// ============ Allowed User Functions ============
+
+export async function getAllowedUsers() {
+  return prisma.allowedUser.findMany({
+    orderBy: { createdAt: 'asc' },
+  });
+}
+
+export async function addAllowedUser(userId, addedBy) {
+  return prisma.allowedUser.upsert({
+    where: { id: BigInt(userId) },
+    update: {},
+    create: { id: BigInt(userId), addedBy: BigInt(addedBy) },
+  });
+}
+
+export async function removeAllowedUser(userId) {
+  try {
+    return await prisma.allowedUser.delete({
+      where: { id: BigInt(userId) },
+    });
+  } catch (e) {
+    return null; // User not found in DB
+  }
+}
+
+export async function isUserInAllowedDb(userId) {
+  const user = await prisma.allowedUser.findUnique({
+    where: { id: BigInt(userId) },
+  });
+  return !!user;
+}

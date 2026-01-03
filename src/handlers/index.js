@@ -2,13 +2,19 @@ import { handleMessage } from './message.js';
 import { handleCallbackQuery } from './callback.js';
 import { handleInlineQuery } from './inline.js';
 import { config } from '../config.js';
+import { isUserInAllowedDb } from '../db/index.js';
 
 // Check if user is allowed (access control)
-function isUserAllowed(userId) {
+async function isUserAllowed(userId) {
   if (config.allowedUsers.length === 0) {
     return true; // No restriction if ALLOWED_USERS is not set
   }
-  return config.allowedUsers.includes(String(userId));
+  // Check env config first
+  if (config.allowedUsers.includes(String(userId))) {
+    return true;
+  }
+  // Check database
+  return await isUserInAllowedDb(userId);
 }
 
 // Main update handler (routes to appropriate handler)
@@ -16,7 +22,7 @@ export async function handleUpdate(update) {
   try {
     if ('message' in update) {
       const userId = update.message.from?.id;
-      if (!isUserAllowed(userId)) {
+      if (!await isUserAllowed(userId)) {
         const { sendMessage } = await import('../telegram/api.js');
         return sendMessage(update.message.chat.id, '🚫 Access denied. You are not authorized to use this bot.');
       }
@@ -25,7 +31,7 @@ export async function handleUpdate(update) {
     
     if ('callback_query' in update) {
       const userId = update.callback_query.from?.id;
-      if (!isUserAllowed(userId)) {
+      if (!await isUserAllowed(userId)) {
         const { answerCallbackQuery } = await import('../telegram/api.js');
         return answerCallbackQuery(update.callback_query.id, '🚫 Access denied.');
       }
