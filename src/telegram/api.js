@@ -80,11 +80,32 @@ export async function editMessageText(chatId, messageId, text, parseMode = 'HTML
   });
 }
 
-// Send long text (split into chunks if needed)
+// Send long text (split into chunks if needed, at newline boundaries)
 export async function sendLongHtmlMessage(chatId, text) {
-  const MAX_LENGTH = 4096;
-  for (let i = 0; i < text.length; i += MAX_LENGTH) {
-    await sendHtmlMessage(chatId, text.substring(i, i + MAX_LENGTH));
+  const MAX_LENGTH = 4000; // Leave some room for safety
+  
+  if (text.length <= MAX_LENGTH) {
+    return sendHtmlMessage(chatId, text);
+  }
+  
+  let remaining = text;
+  while (remaining.length > 0) {
+    if (remaining.length <= MAX_LENGTH) {
+      await sendHtmlMessage(chatId, remaining);
+      break;
+    }
+    
+    // Find a good place to split (newline, then space)
+    let splitAt = remaining.lastIndexOf('\n', MAX_LENGTH);
+    if (splitAt < MAX_LENGTH * 0.5) {
+      splitAt = remaining.lastIndexOf(' ', MAX_LENGTH);
+    }
+    if (splitAt < MAX_LENGTH * 0.5) {
+      splitAt = MAX_LENGTH;
+    }
+    
+    await sendHtmlMessage(chatId, remaining.substring(0, splitAt));
+    remaining = remaining.substring(splitAt).trimStart();
   }
 }
 
