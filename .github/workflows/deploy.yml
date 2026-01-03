@@ -200,6 +200,7 @@ jobs:
             GROQ_API_KEY=${{ secrets.GROQ_API_KEY }}
             ALLOWED_USERS=${{ secrets.ALLOWED_USERS }}
             NOTES_REPO=${{ secrets.NOTES_REPO }}
+            VPS_SSH_KEY=${{ secrets.VPS_SSH_KEY }}
             EOF
             
             # Build and deploy with Docker Compose

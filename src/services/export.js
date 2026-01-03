@@ -9,16 +9,36 @@ import { callClaude } from '../providers/claude.js';
 import { callGroq } from '../providers/groq.js';
 
 const NOTES_DIR = '/tmp/qbot-notes';
+const SSH_DIR = '/tmp/.ssh';
+const SSH_KEY_FILE = `${SSH_DIR}/id_rsa`;
 
-// Configure SSH to accept GitHub's host key
+// Configure SSH for git operations using key from environment
 function setupSSH() {
-  try {
-    mkdirSync('/root/.ssh', { recursive: true });
-    // Add GitHub to known hosts
-    execSync('ssh-keyscan github.com >> /root/.ssh/known_hosts 2>/dev/null', { stdio: 'pipe' });
-  } catch (e) {
-    // Ignore if already exists or not needed
+  const sshKey = process.env.VPS_SSH_KEY;
+  if (!sshKey) {
+    throw new Error('VPS_SSH_KEY environment variable not set');
   }
+  
+  // Create SSH directory
+  mkdirSync(SSH_DIR, { recursive: true });
+  
+  // Write SSH key from environment variable
+  writeFileSync(SSH_KEY_FILE, sshKey + '\n', { mode: 0o600 });
+  
+  // Create ssh config  
+  const sshConfig = `Host github.com
+  HostName github.com
+  User git
+  IdentityFile ${SSH_KEY_FILE}
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+`;
+  writeFileSync(`${SSH_DIR}/config`, sshConfig, { mode: 0o600 });
+}
+
+// Get GIT_SSH_COMMAND for using our temp SSH config
+function getGitSSHCommand() {
+  return `GIT_SSH_COMMAND="ssh -F ${SSH_DIR}/config"`;
 }
 
 export async function exportChatToGit(userId) {
@@ -90,14 +110,15 @@ ${summary}
 
   // Setup SSH for git
   setupSSH();
+  const gitSSH = getGitSSHCommand();
 
   // Clone/pull repo and push
   try {
     if (!existsSync(NOTES_DIR)) {
       mkdirSync(NOTES_DIR, { recursive: true });
-      execSync(`GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no" git clone ${config.notesRepo} ${NOTES_DIR}`, { stdio: 'pipe' });
+      execSync(`${gitSSH} git clone ${config.notesRepo} ${NOTES_DIR}`, { stdio: 'pipe' });
     } else {
-      execSync(`cd ${NOTES_DIR} && git pull`, { stdio: 'pipe' });
+      execSync(`cd ${NOTES_DIR} && ${gitSSH} git pull`, { stdio: 'pipe' });
     }
     
     // Create chats directory if not exists
@@ -114,7 +135,7 @@ ${summary}
     execSync(`cd ${NOTES_DIR} && git config user.email "qbot@telegram.bot" && git config user.name "QBot"`, { stdio: 'pipe' });
     
     // Commit and push
-    execSync(`cd ${NOTES_DIR} && git add . && git commit -m "Add: ${chat.title}" && git push`, { 
+    execSync(`cd ${NOTES_DIR} && git add . && git commit -m "Add: ${chat.title}" && ${gitSSH} git push`, { 
       stdio: 'pipe',
     });
     
@@ -124,4 +145,3 @@ ${summary}
     throw new Error(`Git push failed: ${error.message}`);
   }
 }
-

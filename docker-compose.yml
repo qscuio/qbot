@@ -11,8 +11,6 @@ services:
       - REDIS_URL=redis://redis:6379
     env_file:
       - .env
-    volumes:
-      - ~/.ssh:/root/.ssh:ro  # For git export
     depends_on:
       postgres:
         condition: service_healthy

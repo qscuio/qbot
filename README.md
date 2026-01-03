@@ -29,22 +29,6 @@ A feature-rich Telegram Bot with multi-provider AI support (Groq, Gemini, OpenAI
 
 ### Step 1: Set Up SSH Key (on your VPS)
 
-#### Why Private Key?
-
-```
-┌─────────────────┐                      ┌─────────────────┐
-│    Client       │  ──── connect ────→  │     Server      │
-│  holds PRIVATE  │  ← challenge ──────  │  holds PUBLIC   │
-│      KEY        │  ── sign challenge → │      KEY        │
-│                 │  ← ✅ success ─────  │                 │
-└─────────────────┘                      └─────────────────┘
-```
-
-- **GitHub Actions** = Client → needs **Private Key** (in GitHub Secrets)
-- **Your VPS** = Server → needs **Public Key** (in `~/.ssh/authorized_keys`)
-
-#### Generate Key on VPS
-
 ```bash
 # SSH into your VPS
 ssh your-user@your-vps
@@ -59,6 +43,8 @@ cat ~/.ssh/github_actions.pub >> ~/.ssh/authorized_keys
 cat ~/.ssh/github_actions
 ```
 
+> **Important**: Add the public key to your notes repo as a deploy key with write access for `/export` to work.
+
 ### Step 2: Set Up DNS Record
 
 Point a domain/subdomain to your VPS IP address:
@@ -69,34 +55,18 @@ Point a domain/subdomain to your VPS IP address:
 
 Your `WEBHOOK_URL` will be `https://bot.yourdomain.com`
 
-> ⚠️ **Cloudflare Users**: Use **gray cloud (DNS only)** mode, not orange cloud (proxied). This allows Let's Encrypt to issue certificates directly to your server.
+> ⚠️ **Cloudflare Users**: Use **gray cloud (DNS only)** mode for Let's Encrypt to work.
 
-> The GitHub Actions workflow will **automatically configure Nginx and SSL** on first deployment.
-
-### Step 3: Fork or Clone
-
-```bash
-git clone git@github.com:your-username/qbot.git
-cd qbot
-```
-
-### Step 4: Create a Telegram Bot
+### Step 3: Create a Telegram Bot
 
 1. Open [@BotFather](https://t.me/botfather) in Telegram
 2. Send `/newbot` and follow the prompts
 3. Copy the Bot Token
 
-### Step 5: Get API Keys
-
-Get at least one API key:
-
-- [Google AI Studio](https://aistudio.google.com/) - Gemini
-- [OpenAI Platform](https://platform.openai.com/api-keys) - OpenAI
-- [Anthropic Console](https://console.anthropic.com/) - Claude
-
-### Step 6: Configure GitHub Secrets
+### Step 4: Configure GitHub Secrets
 
 Go to your GitHub repo → Settings → Secrets and variables → Actions.
+
 **VPS & Deployment:**
 
 | Secret        | Description                     |
@@ -107,13 +77,13 @@ Go to your GitHub repo → Settings → Secrets and variables → Actions.
 
 **Bot Configuration:**
 
-| Secret          | Description                           |
-| --------------- | ------------------------------------- |
-| `BOT_TOKEN`     | Telegram bot token from BotFather     |
-| `BOT_SECRET`    | Random string for webhook security    |
-| `WEBHOOK_URL`   | `https://bot.yourdomain.com` (Step 2) |
-| `BOT_PORT`      | Port to run bot (default: `3000`)     |
-| `ALLOWED_USERS` | Comma-separated Telegram user IDs     |
+| Secret          | Description                        |
+| --------------- | ---------------------------------- |
+| `BOT_TOKEN`     | Telegram bot token from BotFather  |
+| `BOT_SECRET`    | Random string for webhook security |
+| `WEBHOOK_URL`   | `https://bot.yourdomain.com`       |
+| `BOT_PORT`      | Port to run bot (default: `3000`)  |
+| `ALLOWED_USERS` | Comma-separated Telegram user IDs  |
 
 **AI Provider API Keys:**
 
@@ -126,33 +96,25 @@ Go to your GitHub repo → Settings → Secrets and variables → Actions.
 
 **Features (Optional):**
 
-| Secret       | Description                                                  |
-| ------------ | ------------------------------------------------------------ |
-| `NOTES_REPO` | Git repo for /export (e.g., `git@github.com:user/notes.git`) |
+| Secret       | Description                                        |
+| ------------ | -------------------------------------------------- |
+| `NOTES_REPO` | Git repo for /export (uses `VPS_SSH_KEY` for auth) |
 
-### Step 7: Deploy
+### Step 5: Deploy
 
 Push to `main` branch or go to Actions → Deploy to VPS → Run workflow.
 
 The workflow automatically:
 
-- ✅ Installs Docker (if needed)
+- ✅ Installs Git and Docker (if needed)
 - ✅ Installs Nginx and obtains SSL certificate
 - ✅ Deploys the bot with Docker Compose
+- ✅ Runs database migrations
 - ✅ Registers the Telegram webhook
 
-### Step 8: Test
+### Step 6: Test
 
 Open your bot in Telegram and send `/start`!
-
-## Commands
-
-| Command      | Description        |
-| ------------ | ------------------ |
-| `/start`     | Show help message  |
-| `/ai <text>` | Ask AI a question  |
-| `/providers` | Select AI provider |
-| `/models`    | Select AI model    |
 
 ## Local Development
 
@@ -180,23 +142,11 @@ src/
 ├── config.js          # Environment configuration
 ├── telegram/          # Telegram API wrappers
 ├── handlers/          # Message/callback handlers
-├── providers/         # AI providers (Gemini, OpenAI, Claude)
+├── providers/         # AI providers (Groq, Gemini, OpenAI, Claude)
+├── services/          # Export service
 ├── cache/             # Redis cache adapter
 └── db/                # Prisma ORM for PostgreSQL
 ```
-
-### Adding New Features
-
-**Add a new command:**
-
-1. Edit `src/handlers/message.js`
-2. Add handler function and register in `commands` object
-
-**Add a new AI provider:**
-
-1. Create `src/providers/newprovider.js`
-2. Add to registry in `src/providers/index.js`
-3. Add case in `src/handlers/message.js` → `processAIRequest()`
 
 ## License
 
