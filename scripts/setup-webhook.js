@@ -12,6 +12,9 @@ const commands = [
   { command: 'ai', description: 'Ask AI a question' },
   { command: 'providers', description: 'Select AI provider' },
   { command: 'models', description: 'Select AI model' },
+  { command: 'users', description: 'List allowed users (owner)' },
+  { command: 'adduser', description: 'Add user (owner)' },
+  { command: 'deluser', description: 'Remove user (owner)' },
 ];
 
 async function setup() {
