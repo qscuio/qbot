@@ -101,6 +101,23 @@ export async function handleCallbackQuery(callbackQuery) {
     }
   }
   
+  if (data === 'cmd_usage') {
+    await telegram.answerCallbackQuery(callbackQuery.id);
+    // Trigger /usage command flow
+    const { handleMessage } = await import('./message.js');
+    // Mock message object to reuse handleUsage logic (which is internal to message.js but we can trigger it via handleMessage if we exported handleUsage, or just duplicate logic. 
+    // Actually, handleUsage is not exported. Let's just send the text directly here since it's simple.)
+    
+    let response = '<b>📊 API Usage & Billing</b>\n\n';
+    response += `<b>🔗 Dashboards:</b>\n`;
+    response += `• <a href="https://platform.openai.com/usage">OpenAI Usage</a>\n`;
+    response += `• <a href="https://console.groq.com/settings/billing">Groq Billing</a>\n`;
+    response += `• <a href="https://console.anthropic.com/settings/plans">Claude Billing</a>\n`;
+    response += `• <a href="https://aistudio.google.com/app/plan_information">Gemini Billing</a>\n`;
+    
+    return telegram.sendHtmlMessage(chatId, response);
+  }
+  
   if (data === 'cmd_clear') {
     await telegram.answerCallbackQuery(callbackQuery.id, 'Clearing...');
     const { getActiveChat } = await import('../db/index.js');
@@ -134,7 +151,11 @@ export async function handleCallbackQuery(callbackQuery) {
         response += `\n<b>Chat History:</b>\n`;
         for (const msg of chat.messages) {
           const icon = msg.role === 'user' ? '👤' : '🤖';
-          response += `\n${icon} ${telegram.escapeHtml(msg.content)}\n`;
+          // User messages: escape HTML, AI messages: convert markdown to HTML
+          const content = msg.role === 'user' 
+            ? telegram.escapeHtml(msg.content)
+            : telegram.markdownToHtml(msg.content);
+          response += `\n${icon} ${content}\n`;
         }
         response += `\n<i>Send a message to continue...</i>`;
       } else {

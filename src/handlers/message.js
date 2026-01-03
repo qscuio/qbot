@@ -66,7 +66,8 @@ Select a command below or just type a message to chat with AI!`;
   const buttons = [
     [{ text: '✨ New Chat', callback_data: 'cmd_new' }, { text: '📂 Chats', callback_data: 'cmd_chats' }],
     [{ text: '🔌 Providers', callback_data: 'cmd_providers' }, { text: '📋 Models', callback_data: 'cmd_models' }],
-    [{ text: '📝 Export', callback_data: 'cmd_export' }, { text: '🗑️ Clear', callback_data: 'cmd_clear' }],
+    [{ text: '📝 Export', callback_data: 'cmd_export' }, { text: '📊 Usage', callback_data: 'cmd_usage' }],
+    [{ text: '🗑️ Clear', callback_data: 'cmd_clear' }],
   ];
 
   return telegram.sendInlineButtons(chatId, helpText, buttons);
@@ -148,6 +149,8 @@ async function handleExport(message) {
     return telegram.sendMessage(chatId, `❌ Export failed: ${error.message}`);
   }
 }
+
+
 
 // /providers command
 async function handleProviders(message) {

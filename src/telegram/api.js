@@ -106,6 +106,9 @@ export async function sendLongHtmlMessage(chatId, text) {
     
     await sendHtmlMessage(chatId, remaining.substring(0, splitAt));
     remaining = remaining.substring(splitAt).trimStart();
+    
+    // Add small delay to ensure order and avoid rate limits
+    await new Promise(resolve => setTimeout(resolve, 500));
   }
 }
 
