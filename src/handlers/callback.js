@@ -134,8 +134,7 @@ export async function handleCallbackQuery(callbackQuery) {
         response += `\n<b>Chat History:</b>\n`;
         for (const msg of chat.messages) {
           const icon = msg.role === 'user' ? '👤' : '🤖';
-          const content = msg.content.substring(0, 200) + (msg.content.length > 200 ? '...' : '');
-          response += `\n${icon} ${telegram.escapeHtml(content)}\n`;
+          response += `\n${icon} ${telegram.escapeHtml(msg.content)}\n`;
         }
         response += `\n<i>Send a message to continue...</i>`;
       } else {
