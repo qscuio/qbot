@@ -1,5 +1,5 @@
 import { execSync } from 'child_process';
-import { writeFileSync, mkdirSync, existsSync } from 'fs';
+import { writeFileSync, mkdirSync, existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { config } from '../config.js';
 import { getActiveChat, getChat, getUserSettings } from '../db/index.js';
@@ -10,26 +10,28 @@ import { callGroq } from '../providers/groq.js';
 
 const NOTES_DIR = '/tmp/qbot-notes';
 const SSH_DIR = '/tmp/.ssh';
-const SSH_KEY_FILE = `${SSH_DIR}/id_rsa`;
+const MOUNTED_SSH_KEY = '/app/.qbot_ssh/deploy_key';
 
-// Configure SSH for git operations using key from environment
+// Configure SSH for git operations
 function setupSSH() {
-  const sshKey = process.env.VPS_SSH_KEY;
-  if (!sshKey) {
-    throw new Error('VPS_SSH_KEY environment variable not set');
+  // Check if mounted SSH key exists
+  if (!existsSync(MOUNTED_SSH_KEY)) {
+    throw new Error('SSH key not found. Please set VPS_SSH_KEY secret.');
   }
   
-  // Create SSH directory
+  // Create temp SSH directory
   mkdirSync(SSH_DIR, { recursive: true });
   
-  // Write SSH key from environment variable
-  writeFileSync(SSH_KEY_FILE, sshKey + '\n', { mode: 0o600 });
+  // Copy the mounted key to temp location
+  const keyContent = readFileSync(MOUNTED_SSH_KEY, 'utf8');
+  const destKey = `${SSH_DIR}/id_rsa`;
+  writeFileSync(destKey, keyContent, { mode: 0o600 });
   
   // Create ssh config  
   const sshConfig = `Host github.com
   HostName github.com
   User git
-  IdentityFile ${SSH_KEY_FILE}
+  IdentityFile ${destKey}
   StrictHostKeyChecking no
   UserKnownHostsFile /dev/null
 `;
