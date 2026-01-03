@@ -24,6 +24,7 @@ export const config = {
   geminiApiKey: process.env.GEMINI_API_KEY || "",
   openaiApiKey: process.env.OPENAI_API_KEY || "",
   claudeApiKey: process.env.CLAUDE_API_KEY || "",
+  groqApiKey: process.env.GROQ_API_KEY || "",
 
   // Access Control
   allowedUsers: process.env.ALLOWED_USERS

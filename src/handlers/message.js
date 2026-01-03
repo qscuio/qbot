@@ -4,6 +4,7 @@ import { PROVIDERS, DEFAULT_PROVIDER } from '../providers/index.js';
 import { callGemini } from '../providers/gemini.js';
 import { callOpenAI } from '../providers/openai.js';
 import { callClaude } from '../providers/claude.js';
+import { callGroq } from '../providers/groq.js';
 import { 
   getUserSettings, 
   setUserProvider, 
@@ -250,6 +251,9 @@ export async function processAIRequest(chatId, userId, prompt) {
         break;
       case 'claude':
         response = await callClaude(prompt, settings.model, history, contextPrefix);
+        break;
+      case 'groq':
+        response = await callGroq(prompt, settings.model, history, contextPrefix);
         break;
       default:
         return telegram.sendMessage(chatId, 'Unknown provider.');

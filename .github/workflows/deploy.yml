@@ -187,7 +187,9 @@ jobs:
             GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}
             OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
             CLAUDE_API_KEY=${{ secrets.CLAUDE_API_KEY }}
+            GROQ_API_KEY=${{ secrets.GROQ_API_KEY }}
             ALLOWED_USERS=${{ secrets.ALLOWED_USERS }}
+            NOTES_REPO=${{ secrets.NOTES_REPO }}
             EOF
             
             # Build and deploy with Docker Compose

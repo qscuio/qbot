@@ -3,11 +3,11 @@ export const PROVIDERS = {
   gemini: {
     name: 'Gemini',
     models: {
-      'flash': 'gemini-2.5-flash',
-      'flash-lite': 'gemini-2.5-flash-lite',
-      '3-flash': 'gemini-3-flash',
+      'flash': 'gemini-2.0-flash',
+      'flash-lite': 'gemini-2.0-flash-lite',
+      'pro': 'gemini-2.5-pro-preview-06-05',
     },
-    defaultModel: 'gemini-2.5-flash',
+    defaultModel: 'gemini-2.0-flash',
   },
   openai: {
     name: 'OpenAI',
@@ -26,6 +26,15 @@ export const PROVIDERS = {
       'opus': 'claude-3-opus-20240229',
     },
     defaultModel: 'claude-sonnet-4-20250514',
+  },
+  groq: {
+    name: 'Groq',
+    models: {
+      'llama-70b': 'llama-3.3-70b-versatile',
+      'llama-8b': 'llama-3.1-8b-instant',
+      'mixtral': 'mixtral-8x7b-32768',
+    },
+    defaultModel: 'llama-3.3-70b-versatile',
   },
 };
 
