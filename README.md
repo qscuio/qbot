@@ -1,10 +1,10 @@
 # QBot - Multi-Provider AI Telegram Bot
 
-A feature-rich Telegram Bot with multi-provider AI support (Groq, Gemini, OpenAI, Claude), chat history, and knowledge export.
+A feature-rich Telegram Bot with multi-provider AI support (Groq, Gemini, OpenAI, Claude, NVIDIA), chat history, and knowledge export.
 
 ## Features
 
-- 🤖 **Multi-Provider AI** - Groq (default), Gemini, OpenAI, Claude
+- 🤖 **Multi-Provider AI** - Groq (default), Gemini, OpenAI, Claude, NVIDIA
 - 💬 **Chat History** - Multiple conversations with context
 - 📝 **Knowledge Export** - Export chats to markdown, push to git
 - 🔄 **Model Selection** - Choose models per provider
@@ -100,6 +100,7 @@ Go to your GitHub repo → Settings → Secrets and variables → Actions.
 | `GEMINI_API_KEY` | Google Gemini API key           |
 | `OPENAI_API_KEY` | OpenAI API key                  |
 | `CLAUDE_API_KEY` | Anthropic Claude API key        |
+| `NVIDIA_API_KEY` | NVIDIA NIM API key              |
 
 **Features (Optional):**
 
@@ -149,7 +150,7 @@ src/
 ├── config.js          # Environment configuration
 ├── telegram/          # Telegram API wrappers
 ├── handlers/          # Message/callback handlers
-├── providers/         # AI providers (Groq, Gemini, OpenAI, Claude)
+├── providers/         # AI providers (Groq, Gemini, OpenAI, Claude, NVIDIA)
 ├── services/          # Export service
 ├── cache/             # Redis cache adapter
 └── db/                # Prisma ORM for PostgreSQL

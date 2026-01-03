@@ -38,6 +38,15 @@ export const PROVIDERS = {
     },
     defaultModel: 'claude-sonnet-4-20250514',
   },
+  nvidia: {
+    name: 'NVIDIA',
+    fallbackModels: {
+      'llama-70b': 'meta/llama-3.1-70b-instruct',
+      'llama-8b': 'meta/llama-3.1-8b-instruct',
+      'mistral-large': 'mistralai/mistral-large-2-instruct',
+    },
+    defaultModel: 'meta/llama-3.1-70b-instruct',
+  },
 };
 
 export const DEFAULT_PROVIDER = 'groq';
@@ -69,6 +78,8 @@ export async function fetchModels(providerKey) {
       case 'claude':
         // Claude doesn't have a public models API, use fallback
         return getFallbackModels('claude');
+      case 'nvidia':
+        return await fetchNvidiaModels();
       default:
         return [];
     }
@@ -139,6 +150,23 @@ async function fetchOpenAIModels() {
     .filter(m => m.id && (m.id.includes('gpt') || m.id.includes('o1') || m.id.includes('o3')))
     .filter(m => !m.id.includes('instruct') && !m.id.includes('realtime'))
     .sort((a, b) => b.id.localeCompare(a.id))
+    .map(m => ({ id: m.id, name: m.id }));
+}
+
+// Fetch NVIDIA NIM models
+async function fetchNvidiaModels() {
+  if (!config.nvidiaApiKey) return getFallbackModels('nvidia');
+  
+  const response = await fetch('https://integrate.api.nvidia.com/v1/models', {
+    headers: { 'Authorization': `Bearer ${config.nvidiaApiKey}` },
+  });
+  
+  if (!response.ok) return getFallbackModels('nvidia');
+  
+  const data = await response.json();
+  return (data.data || [])
+    .filter(m => m.id && !m.id.includes('embed') && !m.id.includes('rerank'))
+    .sort((a, b) => a.id.localeCompare(b.id))
     .map(m => ({ id: m.id, name: m.id }));
 }
 

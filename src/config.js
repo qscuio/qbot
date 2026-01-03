@@ -25,6 +25,7 @@ export const config = {
   openaiApiKey: process.env.OPENAI_API_KEY || "",
   claudeApiKey: process.env.CLAUDE_API_KEY || "",
   groqApiKey: process.env.GROQ_API_KEY || "",
+  nvidiaApiKey: process.env.NVIDIA_API_KEY || "",
 
   // Access Control
   allowedUsers: process.env.ALLOWED_USERS

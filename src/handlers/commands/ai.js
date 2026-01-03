@@ -4,6 +4,7 @@ import { callGemini } from '../../providers/gemini.js';
 import { callOpenAI } from '../../providers/openai.js';
 import { callClaude } from '../../providers/claude.js';
 import { callGroq } from '../../providers/groq.js';
+import { callNvidia } from '../../providers/nvidia.js';
 import { 
   getUserSettings,
   getActiveChat,
@@ -96,8 +97,11 @@ ${text}
         response = await callClaude(analysisPrompt, settings.model);
         break;
       case 'groq':
-      default:
         response = await callGroq(analysisPrompt, settings.model || 'llama-3.3-70b-versatile');
+        break;
+      case 'nvidia':
+      default:
+        response = await callNvidia(analysisPrompt, settings.model || 'meta/llama-3.1-70b-instruct');
     }
     
     if (response.content) {
@@ -183,6 +187,9 @@ export async function processAIRequest(chatId, userId, prompt) {
           break;
         case 'groq':
           response = await callGroq(prompt, settings.model, history, contextPrefix);
+          break;
+        case 'nvidia':
+          response = await callNvidia(prompt, settings.model, history, contextPrefix);
           break;
         default:
           clearInterval(typingInterval);
@@ -276,6 +283,9 @@ async function updateConversationSummary(chatId, settings) {
         break;
       case 'claude':
         response = await callClaude(summaryPrompt, settings.model);
+        break;
+      case 'nvidia':
+        response = await callNvidia(summaryPrompt, settings.model);
         break;
     }
     
