@@ -125,6 +125,34 @@ export async function handleCallbackQuery(callbackQuery) {
     return telegram.sendHtmlMessage(chatId, response);
   }
   
+  if (data === 'cmd_users') {
+    await telegram.answerCallbackQuery(callbackQuery.id);
+    
+    if (String(userId) !== config.ownerId) {
+      return telegram.sendMessage(chatId, '🚫 Only the owner can view users.');
+    }
+    
+    const { getAllowedUsers } = await import('../db/index.js');
+    const dbUsers = await getAllowedUsers();
+    
+    let response = '<b>👥 Allowed Users:</b>\n\n';
+    response += '<b>Environment:</b>\n';
+    config.allowedUsers.forEach((id, i) => {
+      const isOwner = i === 0 ? ' 👑' : '';
+      response += `• ${id}${isOwner}\n`;
+    });
+    
+    if (dbUsers.length > 0) {
+      response += '\n<b>Database:</b>\n';
+      dbUsers.forEach(u => {
+        response += `• ${u.id.toString()}\n`;
+      });
+    }
+    
+    response += '\n<i>Use /adduser and /deluser to manage.</i>';
+    return telegram.sendHtmlMessage(chatId, response);
+  }
+  
   if (data === 'cmd_clear') {
     await telegram.answerCallbackQuery(callbackQuery.id, 'Clearing...');
     const { getActiveChat } = await import('../db/index.js');
