@@ -41,11 +41,27 @@ export const PROVIDERS = {
   nvidia: {
     name: 'NVIDIA',
     fallbackModels: {
-      'llama-70b': 'meta/llama-3.1-70b-instruct',
-      'llama-8b': 'meta/llama-3.1-8b-instruct',
-      'mistral-large': 'mistralai/mistral-large-2-instruct',
+      'llama-405b': 'meta/llama-3.1-405b-instruct',
+      'mistral-675b': 'mistralai/mistral-large-3-675b-instruct-2512',
+      'nemotron-ultra': 'nvidia/llama-3.1-nemotron-ultra-253b-v1',
+      'nemotron-340b': 'nvidia/nemotron-4-340b-instruct',
+      'qwen3-coder': 'qwen/qwen3-coder-480b-a35b-instruct',
+      'qwen3-235b': 'qwen/qwen3-235b-a22b',
+      'deepseek-v3.2': 'deepseek-ai/deepseek-v3.2',
+      'deepseek-v3.1': 'deepseek-ai/deepseek-v3.1',
+      'deepseek-r1-0528': 'deepseek-ai/deepseek-r1-0528',
+      'deepseek-r1': 'deepseek-ai/deepseek-r1',
+      'devstral-123b': 'mistralai/devstral-2-123b-instruct-2512',
+      'palmyra-122b': 'writer/palmyra-creative-122b',
+      'gpt-oss-120b': 'openai/gpt-oss-120b',
+      'colosseum-355b': 'igenius/colosseum_355b_instruct_16k',
+      'stockmark-100b': 'stockmark/stockmark-2-100b-instruct',
+      'llama-3.3-70b': 'meta/llama-3.3-70b-instruct',
+      'nemotron-70b': 'nvidia/llama-3.1-nemotron-70b-instruct',
+      'llama-4-maverick': 'meta/llama-4-maverick-17b-128e-instruct',
+      'glm4.7': 'z-ai/glm4.7',
     },
-    defaultModel: 'meta/llama-3.1-70b-instruct',
+    defaultModel: 'deepseek-ai/deepseek-r1',
   },
 };
 
@@ -153,46 +169,10 @@ async function fetchOpenAIModels() {
     .map(m => ({ id: m.id, name: m.id }));
 }
 
-// Fetch NVIDIA NIM models
+// Fetch NVIDIA NIM models - use curated list
 async function fetchNvidiaModels() {
-  if (!config.nvidiaApiKey) return getFallbackModels('nvidia');
-  
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 10000);
-    
-    const response = await fetch('https://integrate.api.nvidia.com/v1/models', {
-      headers: { 'Authorization': `Bearer ${config.nvidiaApiKey}` },
-      signal: controller.signal,
-    });
-    
-    clearTimeout(timeoutId);
-    
-    if (!response.ok) return getFallbackModels('nvidia');
-    
-    const data = await response.json();
-    
-    // Filter to only chat/instruct models from popular vendors
-    const popularVendors = ['meta/', 'mistralai/', 'google/', 'microsoft/', 'nvidia/', 'deepseek/'];
-    
-    return (data.data || [])
-      .filter(m => {
-        if (!m.id) return false;
-        // Must be from a popular vendor
-        const isPopularVendor = popularVendors.some(v => m.id.startsWith(v));
-        // Must be an instruct/chat model (not embedding, rerank, vision-only, etc.)
-        const isChat = m.id.includes('instruct') || m.id.includes('chat');
-        // Exclude embedding and reranking models
-        const isNotEmbed = !m.id.includes('embed') && !m.id.includes('rerank');
-        return isPopularVendor && isChat && isNotEmbed;
-      })
-      .sort((a, b) => a.id.localeCompare(b.id))
-      .slice(0, 20) // Limit to 20 models for Telegram button limit
-      .map(m => ({ id: m.id, name: m.id.split('/').pop() })); // Use short name for display
-  } catch (error) {
-    console.error('Error fetching NVIDIA models:', error.message);
-    return getFallbackModels('nvidia');
-  }
+  // NVIDIA has too many models, use curated fallback list
+  return getFallbackModels('nvidia');
 }
 
 // Legacy function for backward compatibility
