@@ -6,8 +6,20 @@ import { getActiveChat, getChat, getUserSettings } from '../db/index.js';
 import { callGemini } from '../providers/gemini.js';
 import { callOpenAI } from '../providers/openai.js';
 import { callClaude } from '../providers/claude.js';
+import { callGroq } from '../providers/groq.js';
 
 const NOTES_DIR = '/tmp/qbot-notes';
+
+// Configure SSH to accept GitHub's host key
+function setupSSH() {
+  try {
+    mkdirSync('/root/.ssh', { recursive: true });
+    // Add GitHub to known hosts
+    execSync('ssh-keyscan github.com >> /root/.ssh/known_hosts 2>/dev/null', { stdio: 'pipe' });
+  } catch (e) {
+    // Ignore if already exists or not needed
+  }
+}
 
 export async function exportChatToGit(userId) {
   if (!config.notesRepo) {
@@ -39,6 +51,9 @@ ${messagesText}`;
   try {
     let response;
     switch (settings.provider) {
+      case 'groq':
+        response = await callGroq(summaryPrompt, settings.model);
+        break;
       case 'gemini':
         response = await callGemini(summaryPrompt, settings.model);
         break;
@@ -49,7 +64,7 @@ ${messagesText}`;
         response = await callClaude(summaryPrompt, settings.model);
         break;
       default:
-        response = await callGemini(summaryPrompt, 'gemini-2.0-flash');
+        response = await callGroq(summaryPrompt, 'llama-3.3-70b-versatile');
     }
     summary = response.content || messagesText;
   } catch (error) {
@@ -73,11 +88,14 @@ ${summary}
 *Exported from QBot*
 `;
 
+  // Setup SSH for git
+  setupSSH();
+
   // Clone/pull repo and push
   try {
     if (!existsSync(NOTES_DIR)) {
       mkdirSync(NOTES_DIR, { recursive: true });
-      execSync(`git clone ${config.notesRepo} ${NOTES_DIR}`, { stdio: 'pipe' });
+      execSync(`GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no" git clone ${config.notesRepo} ${NOTES_DIR}`, { stdio: 'pipe' });
     } else {
       execSync(`cd ${NOTES_DIR} && git pull`, { stdio: 'pipe' });
     }
@@ -92,6 +110,9 @@ ${summary}
     const filePath = join(chatsDir, filename);
     writeFileSync(filePath, markdown);
     
+    // Configure git user
+    execSync(`cd ${NOTES_DIR} && git config user.email "qbot@telegram.bot" && git config user.name "QBot"`, { stdio: 'pipe' });
+    
     // Commit and push
     execSync(`cd ${NOTES_DIR} && git add . && git commit -m "Add: ${chat.title}" && git push`, { 
       stdio: 'pipe',
@@ -103,3 +124,4 @@ ${summary}
     throw new Error(`Git push failed: ${error.message}`);
   }
 }
+

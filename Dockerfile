@@ -10,6 +10,9 @@ RUN npx prisma generate
 FROM node:20-alpine
 WORKDIR /app
 
+# Install git for /export command
+RUN apk add --no-cache git openssh-client
+
 # Install production dependencies only
 COPY package*.json ./
 RUN npm ci --omit=dev
