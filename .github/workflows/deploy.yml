@@ -103,11 +103,38 @@ jobs:
               echo "✅ Certbot installed"
             fi
             
-            # Create Nginx config for the bot
+            # Get SSL certificate first if not exists
+            if [ ! -d "/etc/letsencrypt/live/$DOMAIN" ]; then
+              echo "🔒 Obtaining SSL certificate..."
+              # Create temporary HTTP-only config for certbot
+              $SUDO tee /etc/nginx/sites-available/qbot > /dev/null << TMPCONF
+            server {
+                listen 80;
+                server_name $DOMAIN;
+                location / { return 200 'ok'; }
+            }
+            TMPCONF
+              $SUDO ln -sf /etc/nginx/sites-available/qbot /etc/nginx/sites-enabled/qbot
+              $SUDO nginx -t && $SUDO systemctl reload nginx
+              $SUDO certbot certonly --nginx -d $DOMAIN --non-interactive --agree-tos --email admin@$DOMAIN || echo "⚠️ SSL cert failed"
+            fi
+            
+            # Create full Nginx config with SSL
             $SUDO tee /etc/nginx/sites-available/qbot > /dev/null << NGINXCONF
             server {
                 listen 80;
                 server_name $DOMAIN;
+                return 301 https://\$host\$request_uri;
+            }
+            
+            server {
+                listen 443 ssl;
+                server_name $DOMAIN;
+                
+                ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
+                ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
+                include /etc/letsencrypt/options-ssl-nginx.conf;
+                ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
                 
                 location / {
                     proxy_pass http://127.0.0.1:$BOT_PORT;
@@ -130,14 +157,7 @@ jobs:
             
             # Test and reload Nginx
             $SUDO nginx -t && $SUDO systemctl reload nginx
-            
-            # Get SSL certificate if not exists
-            if [ ! -d "/etc/letsencrypt/live/$DOMAIN" ]; then
-              echo "🔒 Obtaining SSL certificate..."
-              $SUDO certbot --nginx -d $DOMAIN --non-interactive --agree-tos --email admin@$DOMAIN || echo "⚠️ SSL setup failed - run: certbot --nginx -d $DOMAIN"
-            else
-              echo "✅ SSL certificate already exists"
-            fi
+            echo "✅ Nginx configured with SSL"
 
       - name: Deploy to VPS via SSH
         uses: appleboy/ssh-action@v1.0.3
