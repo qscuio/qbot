@@ -12,7 +12,7 @@ for (const key of required) {
 
 export const config = {
   // Server
-  port: parseInt(process.env.PORT || "3000"),
+  port: parseInt(process.env.BOT_PORT || process.env.PORT || "3000"),
   nodeEnv: process.env.NODE_ENV || "development",
 
   // Telegram

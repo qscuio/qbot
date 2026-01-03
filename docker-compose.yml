@@ -3,10 +3,10 @@ services:
     build: .
     restart: unless-stopped
     ports:
-      - "${BOT_PORT:-3000}:3000"
+      - "${BOT_PORT:-3000}:${BOT_PORT:-3000}"
     environment:
       - NODE_ENV=production
-      - PORT=3000
+      - BOT_PORT=${BOT_PORT:-3000}
       - DATABASE_URL=postgresql://qbot:qbot@postgres:5432/qbot
       - REDIS_URL=redis://redis:6379
     env_file:
