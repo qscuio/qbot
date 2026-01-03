@@ -97,29 +97,38 @@ Get at least one API key:
 ### Step 6: Configure GitHub Secrets
 
 Go to your GitHub repo → Settings → Secrets and variables → Actions.
+**VPS & Deployment:**
 
-**Required Secrets:**
+| Secret        | Description                     |
+| ------------- | ------------------------------- |
+| `VPS_HOST`    | Your VPS IP address or hostname |
+| `VPS_USER`    | SSH username (e.g., `root`)     |
+| `VPS_SSH_KEY` | Private SSH key (from Step 1)   |
 
-| Secret         | Description                           |
-| -------------- | ------------------------------------- |
-| `VPS_HOST`     | Your VPS IP address or hostname       |
-| `VPS_USER`     | SSH username (e.g., `root`)           |
-| `VPS_SSH_KEY`  | Private SSH key (from Step 1)         |
-| `BOT_TOKEN`    | Telegram bot token from BotFather     |
-| `BOT_SECRET`   | Random string for webhook security    |
-| `WEBHOOK_URL`  | `https://bot.yourdomain.com` (Step 2) |
-| `GROQ_API_KEY` | Groq API key (default provider)       |
+**Bot Configuration:**
 
-**Optional Secrets:**
+| Secret          | Description                           |
+| --------------- | ------------------------------------- |
+| `BOT_TOKEN`     | Telegram bot token from BotFather     |
+| `BOT_SECRET`    | Random string for webhook security    |
+| `WEBHOOK_URL`   | `https://bot.yourdomain.com` (Step 2) |
+| `BOT_PORT`      | Port to run bot (default: `3000`)     |
+| `ALLOWED_USERS` | Comma-separated Telegram user IDs     |
 
-| Secret           | Description                                                  |
-| ---------------- | ------------------------------------------------------------ |
-| `BOT_PORT`       | Port to run bot (default: `3000`)                            |
-| `GEMINI_API_KEY` | Gemini API key                                               |
-| `OPENAI_API_KEY` | OpenAI API key                                               |
-| `CLAUDE_API_KEY` | Claude API key                                               |
-| `ALLOWED_USERS`  | Comma-separated Telegram user IDs                            |
-| `NOTES_REPO`     | Git repo for /export (e.g., `git@github.com:user/notes.git`) |
+**AI Provider API Keys:**
+
+| Secret           | Description                     |
+| ---------------- | ------------------------------- |
+| `GROQ_API_KEY`   | Groq API key (default provider) |
+| `GEMINI_API_KEY` | Google Gemini API key           |
+| `OPENAI_API_KEY` | OpenAI API key                  |
+| `CLAUDE_API_KEY` | Anthropic Claude API key        |
+
+**Features (Optional):**
+
+| Secret       | Description                                                  |
+| ------------ | ------------------------------------------------------------ |
+| `NOTES_REPO` | Git repo for /export (e.g., `git@github.com:user/notes.git`) |
 
 ### Step 7: Deploy
 

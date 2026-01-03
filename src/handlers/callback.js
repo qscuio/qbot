@@ -30,7 +30,25 @@ export async function handleCallbackQuery(callbackQuery) {
     if (chat && chat.userId === BigInt(userId)) {
       await setActiveChat(userId, targetChatId);
       await telegram.answerCallbackQuery(callbackQuery.id, 'Chat switched!');
-      return telegram.sendMessage(chatId, `✅ Switched to: <b>${telegram.escapeHtml(chat.title)}</b>`);
+      
+      // Show chat title
+      let response = `✅ Switched to: <b>${telegram.escapeHtml(chat.title)}</b>\n`;
+      
+      // Show recent messages if any
+      if (chat.messages && chat.messages.length > 0) {
+        const recent = chat.messages.slice(-5); // Last 5 messages
+        response += `\n<i>Recent messages:</i>\n`;
+        for (const msg of recent) {
+          const icon = msg.role === 'user' ? '👤' : '🤖';
+          const content = msg.content.substring(0, 100) + (msg.content.length > 100 ? '...' : '');
+          response += `\n${icon} ${telegram.escapeHtml(content)}`;
+        }
+        response += `\n\n<i>Send a message to continue...</i>`;
+      } else {
+        response += `\n<i>This chat is empty. Send a message to start!</i>`;
+      }
+      
+      return telegram.sendMessage(chatId, response);
     }
     return telegram.answerCallbackQuery(callbackQuery.id, 'Chat not found.');
   }
