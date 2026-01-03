@@ -1,15 +1,29 @@
 # QBot - Multi-Provider AI Telegram Bot
 
-A feature-rich Telegram Bot with multi-provider AI support (Gemini, OpenAI, Claude), deployed via Docker to your VPS.
+A feature-rich Telegram Bot with multi-provider AI support (Groq, Gemini, OpenAI, Claude), chat history, and knowledge export.
 
 ## Features
 
-- 🤖 **Multi-Provider AI** - Switch between Gemini, OpenAI, and Claude
+- 🤖 **Multi-Provider AI** - Groq (default), Gemini, OpenAI, Claude
+- 💬 **Chat History** - Multiple conversations with context
+- 📝 **Knowledge Export** - Export chats to markdown, push to git
 - 🔄 **Model Selection** - Choose models per provider
 - 💭 **Thinking Process** - See AI reasoning (where supported)
-- 💾 **Persistent Settings** - Provider and model preferences saved per user
+- 💾 **Persistent Settings** - Provider, model, chats saved per user
 - 🔒 **User Whitelist** - Restrict bot access to specific users
-- ⚡ **Inline Buttons** - Interactive provider/model selection
+
+## Commands
+
+| Command           | Description                |
+| ----------------- | -------------------------- |
+| `/new`            | Start a new chat           |
+| `/chats`          | List/switch between chats  |
+| `/rename <title>` | Rename current chat        |
+| `/clear`          | Clear current chat history |
+| `/export`         | Export chat to git repo    |
+| `/ai <text>`      | Ask AI a question          |
+| `/providers`      | Select AI provider         |
+| `/models`         | Select model               |
 
 ## Quick Deploy (GitHub Actions)
 
@@ -86,24 +100,26 @@ Go to your GitHub repo → Settings → Secrets and variables → Actions.
 
 **Required Secrets:**
 
-| Secret           | Description                           |
-| ---------------- | ------------------------------------- |
-| `VPS_HOST`       | Your VPS IP address or hostname       |
-| `VPS_USER`       | SSH username (e.g., `root`)           |
-| `VPS_SSH_KEY`    | Private SSH key (from Step 1)         |
-| `BOT_TOKEN`      | Telegram bot token from BotFather     |
-| `BOT_SECRET`     | Random string for webhook security    |
-| `WEBHOOK_URL`    | `https://bot.yourdomain.com` (Step 2) |
-| `GEMINI_API_KEY` | Gemini API key                        |
+| Secret         | Description                           |
+| -------------- | ------------------------------------- |
+| `VPS_HOST`     | Your VPS IP address or hostname       |
+| `VPS_USER`     | SSH username (e.g., `root`)           |
+| `VPS_SSH_KEY`  | Private SSH key (from Step 1)         |
+| `BOT_TOKEN`    | Telegram bot token from BotFather     |
+| `BOT_SECRET`   | Random string for webhook security    |
+| `WEBHOOK_URL`  | `https://bot.yourdomain.com` (Step 2) |
+| `GROQ_API_KEY` | Groq API key (default provider)       |
 
 **Optional Secrets:**
 
-| Secret           | Description                       |
-| ---------------- | --------------------------------- |
-| `BOT_PORT`       | Port to run bot (default: `3000`) |
-| `OPENAI_API_KEY` | OpenAI API key                    |
-| `CLAUDE_API_KEY` | Claude API key                    |
-| `ALLOWED_USERS`  | Comma-separated Telegram user IDs |
+| Secret           | Description                                                  |
+| ---------------- | ------------------------------------------------------------ |
+| `BOT_PORT`       | Port to run bot (default: `3000`)                            |
+| `GEMINI_API_KEY` | Gemini API key                                               |
+| `OPENAI_API_KEY` | OpenAI API key                                               |
+| `CLAUDE_API_KEY` | Claude API key                                               |
+| `ALLOWED_USERS`  | Comma-separated Telegram user IDs                            |
+| `NOTES_REPO`     | Git repo for /export (e.g., `git@github.com:user/notes.git`) |
 
 ### Step 7: Deploy
 

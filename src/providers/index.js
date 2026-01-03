@@ -38,7 +38,7 @@ export const PROVIDERS = {
   },
 };
 
-export const DEFAULT_PROVIDER = 'gemini';
+export const DEFAULT_PROVIDER = 'groq';
 
 // Get provider info
 export function getProvider(key) {

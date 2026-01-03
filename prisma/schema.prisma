@@ -9,8 +9,8 @@ datasource db {
 
 model User {
   id            BigInt   @id // Telegram user ID
-  provider      String   @default("gemini")
-  model         String   @default("gemini-2.0-flash")
+  provider      String   @default("groq")
+  model         String   @default("llama-3.3-70b-versatile")
   activeChatId  String?  // Current active chat ID
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
