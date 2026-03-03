@@ -102,14 +102,17 @@ mod tests {
 
     #[test]
     fn test_config_defaults() {
-        // Minimal config with only required fields
+        // Only TUSHARE_TOKEN and TELEGRAM_BOT_TOKEN are required
+        // DATABASE_URL and REDIS_URL have internal defaults
         std::env::set_var("TUSHARE_TOKEN", "test_token");
-        std::env::set_var("DATABASE_URL", "postgresql://localhost/test");
-        std::env::set_var("REDIS_URL", "redis://localhost:6379");
         std::env::set_var("TELEGRAM_BOT_TOKEN", "123:abc");
+        std::env::remove_var("DATABASE_URL");
+        std::env::remove_var("REDIS_URL");
 
         let cfg = Config::from_env().unwrap();
         assert_eq!(cfg.tushare_token, "test_token");
+        assert_eq!(cfg.database_url, "postgresql://qbot:qbot@127.0.0.1/qbot");
+        assert_eq!(cfg.redis_url, "redis://127.0.0.1:6379");
         assert_eq!(cfg.api_port, 8080); // default
     }
 }
@@ -172,7 +175,7 @@ impl Config {
             tushare_token: std::env::var("TUSHARE_TOKEN")
                 .context("TUSHARE_TOKEN is required")?,
             database_url: std::env::var("DATABASE_URL")
-                .context("DATABASE_URL is required")?,
+                .unwrap_or_else(|_| "postgresql://qbot:qbot@127.0.0.1/qbot".to_string()),
             redis_url: std::env::var("REDIS_URL")
                 .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string()),
             telegram_bot_token: std::env::var("TELEGRAM_BOT_TOKEN")
@@ -209,7 +212,8 @@ impl Config {
 # .env.example
 TUSHARE_TOKEN=your_tushare_token_here
 
-DATABASE_URL=postgresql://qbot:qbot@localhost/qbot
+# Internal services — pre-filled, no need to change (matches deploy/docker-compose.yml)
+DATABASE_URL=postgresql://qbot:qbot@127.0.0.1/qbot
 REDIS_URL=redis://127.0.0.1:6379
 
 TELEGRAM_BOT_TOKEN=your_bot_token_here
