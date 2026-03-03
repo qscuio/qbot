@@ -210,28 +210,31 @@ impl Config {
 
 ```bash
 # .env.example
+# ─────────────────────────────────────────────
+# SECRETS — fill these in locally for dev/test.
+# In production these are injected from GitHub
+# secrets by the deploy workflow. Never commit
+# a filled-in .env to the repo.
+# ─────────────────────────────────────────────
 TUSHARE_TOKEN=your_tushare_token_here
-
-# Internal services — pre-filled, no need to change (matches deploy/docker-compose.yml)
-DATABASE_URL=postgresql://qbot:qbot@127.0.0.1/qbot
-REDIS_URL=redis://127.0.0.1:6379
-
 TELEGRAM_BOT_TOKEN=your_bot_token_here
 STOCK_ALERT_CHANNEL=-1001234567890
 REPORT_CHANNEL=-1001234567890
 DABAN_CHANNEL=-1001234567890
-
-API_PORT=8080
 API_KEY=your_api_key_here
-
-# Optional AI analysis
-AI_PROVIDER=claude
 AI_API_KEY=your_ai_api_key
-
-# Optional proxy for data fetching
 DATA_PROXY=
 
-# Feature flags (true/false)
+# ─────────────────────────────────────────────
+# NON-SENSITIVE CONFIG — internal defaults,
+# no need to change for standard deployments.
+# ─────────────────────────────────────────────
+DATABASE_URL=postgresql://qbot:qbot@127.0.0.1/qbot
+REDIS_URL=redis://127.0.0.1:6379
+API_PORT=8080
+AI_PROVIDER=claude
+
+# Feature flags
 ENABLE_BURST_MONITOR=true
 ENABLE_TRADING_SIM=false
 ENABLE_DABAN_SIM=false
@@ -4358,10 +4361,12 @@ fi
 sudo mkdir -p /opt/qbot
 sudo chown ubuntu:ubuntu /opt/qbot
 
-# Copy .env (user must fill this in first)
+# .env is written by GitHub Actions deploy workflow from secrets.
+# For local/manual runs only, copy from example and fill in secrets:
 if [ ! -f /opt/qbot/.env ]; then
-    cp /opt/qbot/.env.example /opt/qbot/.env
-    echo "⚠️  Please fill in /opt/qbot/.env before continuing"
+    echo "⚠️  No .env found at /opt/qbot/.env"
+    echo "   For production: trigger a GitHub Actions deploy to write it from secrets."
+    echo "   For local test: cp .env.example /opt/qbot/.env and fill in secrets."
     exit 1
 fi
 
@@ -4475,6 +4480,42 @@ jobs:
             echo "skip=false" >> $GITHUB_OUTPUT
           fi
 
+      # Write all secrets to /opt/qbot/.env on the VPS.
+      # Sensitive values come exclusively from GitHub secrets — never from the repo.
+      # Non-sensitive values (internal URLs, feature flags) use hardcoded defaults.
+      - name: Write .env from GitHub secrets
+        if: steps.check.outputs.skip != 'true'
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            mkdir -p /opt/qbot
+            cat > /opt/qbot/.env << 'ENVEOF'
+            # === Secrets (injected from GitHub) ===
+            TUSHARE_TOKEN=${{ secrets.TUSHARE_TOKEN }}
+            TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
+            STOCK_ALERT_CHANNEL=${{ secrets.STOCK_ALERT_CHANNEL }}
+            REPORT_CHANNEL=${{ secrets.REPORT_CHANNEL }}
+            DABAN_CHANNEL=${{ secrets.DABAN_CHANNEL }}
+            API_KEY=${{ secrets.API_KEY }}
+            AI_API_KEY=${{ secrets.AI_API_KEY }}
+            DATA_PROXY=${{ secrets.DATA_PROXY }}
+
+            # === Non-sensitive config (internal defaults, no secrets needed) ===
+            DATABASE_URL=postgresql://qbot:qbot@127.0.0.1/qbot
+            REDIS_URL=redis://127.0.0.1:6379
+            API_PORT=8080
+            ENABLE_BURST_MONITOR=true
+            ENABLE_TRADING_SIM=false
+            ENABLE_DABAN_SIM=false
+            ENABLE_AI_ANALYSIS=false
+            ENABLE_CHIP_DIST=true
+            ENVEOF
+            chmod 600 /opt/qbot/.env
+            echo "✅ .env written"
+
       - name: Deploy to VPS
         if: steps.check.outputs.skip != 'true'
         uses: appleboy/ssh-action@v1.0.3
@@ -4503,24 +4544,43 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           script: |
-            curl -sf http://localhost:${{ secrets.API_PORT || 8080 }}/health || exit 1
+            curl -sf http://localhost:8080/health || exit 1
             echo "✅ Health check passed"
 ```
 
 **Step 3: Required GitHub Secrets**
 
 Configure these in GitHub → Settings → Environments → VPS:
-- `DEPLOY_ENABLED` = `true`
-- `VPS_HOST` = your VPS IP
-- `VPS_USER` = `ubuntu`
-- `VPS_SSH_KEY` = private SSH key
 
-**Step 4: Commit**
+| Secret | Required | Description |
+|--------|----------|-------------|
+| `DEPLOY_ENABLED` | yes | Set to `true` to enable deploys |
+| `VPS_HOST` | yes | VPS IP address |
+| `VPS_USER` | yes | SSH user (e.g. `ubuntu`) |
+| `VPS_SSH_KEY` | yes | Private SSH key |
+| `TUSHARE_TOKEN` | yes | Tushare API token |
+| `TELEGRAM_BOT_TOKEN` | yes | Telegram bot token |
+| `STOCK_ALERT_CHANNEL` | yes | Channel ID for signal/burst alerts |
+| `REPORT_CHANNEL` | yes | Channel ID for daily/weekly reports |
+| `DABAN_CHANNEL` | no | Channel ID for 打板 results |
+| `API_KEY` | no | REST API bearer key (leave empty = open) |
+| `AI_API_KEY` | no | LLM API key (Claude/OpenAI/Gemini) |
+| `DATA_PROXY` | no | HTTP/SOCKS5 proxy for Tushare/Sina |
+
+> **Security note:** The `.env` file on the VPS is written fresh on every deploy from GitHub secrets. It is owned by the deploy user with `chmod 600`. Never commit `.env` to the repo — it is in `.gitignore`.
+
+**Step 4: Add .gitignore and commit**
 
 ```bash
+cat > .gitignore << 'EOF'
+/target
+.env
+*.log
+EOF
+
 mkdir -p .github/workflows
-git add .github/
-git commit -m "feat: add GitHub Actions test and deploy workflows"
+git add .github/ .gitignore deploy/
+git commit -m "feat: add GitHub Actions workflows, deploy scripts, .gitignore"
 ```
 
 ---
