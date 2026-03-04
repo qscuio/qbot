@@ -2,6 +2,7 @@ mod config;
 mod data;
 mod error;
 mod state;
+mod storage;
 
 use anyhow::Result;
 use std::sync::Arc;
