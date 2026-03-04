@@ -1,6 +1,7 @@
 mod config;
 mod data;
 mod error;
+mod signals;
 mod state;
 mod storage;
 
