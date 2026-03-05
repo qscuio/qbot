@@ -1,11 +1,10 @@
 use axum::{
-    extract::{Query, State},
+    extract::State,
     http::{HeaderMap, StatusCode},
     response::Json,
     routing::{get, post},
     Router,
 };
-use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -38,6 +37,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/scan/trigger", post(trigger_scan))
         .route("/api/report/daily", get(get_daily_report))
         .route("/api/market/overview", get(market_overview_stub))
+        .route("/api/jobs/fetch", post(trigger_fetch))
+        .route("/api/jobs/scan", post(trigger_scan_job))
+        .route("/api/jobs/report/daily", post(trigger_daily_report))
+        .route("/api/jobs/report/weekly", post(trigger_weekly_report))
         .with_state(state)
 }
 
@@ -111,4 +114,65 @@ async fn get_daily_report(
 
 async fn market_overview_stub() -> Json<Value> {
     Json(json!({"status": "coming_soon"}))
+}
+
+async fn trigger_fetch(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> ApiResult {
+    if !check_auth(&headers, state.config.api_key.as_deref()) {
+        return Err((StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))));
+    }
+    let s = state.clone();
+    let p = state.provider.clone();
+    tokio::spawn(async move {
+        crate::scheduler::run_fetch_job(s, p).await;
+    });
+    Ok(Json(json!({"status": "started", "job": "fetch"})))
+}
+
+async fn trigger_scan_job(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> ApiResult {
+    if !check_auth(&headers, state.config.api_key.as_deref()) {
+        return Err((StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))));
+    }
+    let s = state.clone();
+    tokio::spawn(async move {
+        crate::scheduler::run_scan_job(s).await;
+    });
+    Ok(Json(json!({"status": "started", "job": "scan"})))
+}
+
+async fn trigger_daily_report(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> ApiResult {
+    if !check_auth(&headers, state.config.api_key.as_deref()) {
+        return Err((StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))));
+    }
+    let s = state.clone();
+    let p = state.provider.clone();
+    let push = state.pusher.clone();
+    tokio::spawn(async move {
+        crate::scheduler::run_daily_report_job(s, p, push).await;
+    });
+    Ok(Json(json!({"status": "started", "job": "report/daily"})))
+}
+
+async fn trigger_weekly_report(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> ApiResult {
+    if !check_auth(&headers, state.config.api_key.as_deref()) {
+        return Err((StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))));
+    }
+    let s = state.clone();
+    let p = state.provider.clone();
+    let push = state.pusher.clone();
+    tokio::spawn(async move {
+        crate::scheduler::run_weekly_report_job(s, p, push).await;
+    });
+    Ok(Json(json!({"status": "started", "job": "report/weekly"})))
 }
