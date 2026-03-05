@@ -1,0 +1,89 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: "Force cargo build --release"
+        type: boolean
+        default: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: VPS
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check if deployment enabled
+        id: check
+        run: |
+          if [ "${{ secrets.DEPLOY_ENABLED }}" != "true" ]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      # Write all secrets to /opt/qbot/.env on the VPS.
+      # Sensitive values come exclusively from GitHub secrets -- never from the repo.
+      # Non-sensitive values (internal URLs, feature flags) use hardcoded defaults.
+      - name: Write .env from GitHub secrets
+        if: steps.check.outputs.skip != 'true'
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            mkdir -p /opt/qbot
+            cat > /opt/qbot/.env << 'ENVEOF'
+            TUSHARE_TOKEN=${{ secrets.TUSHARE_TOKEN }}
+            TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
+            STOCK_ALERT_CHANNEL=${{ secrets.STOCK_ALERT_CHANNEL }}
+            REPORT_CHANNEL=${{ secrets.REPORT_CHANNEL }}
+            DABAN_CHANNEL=${{ secrets.DABAN_CHANNEL }}
+            API_KEY=${{ secrets.API_KEY }}
+            AI_API_KEY=${{ secrets.AI_API_KEY }}
+            DATA_PROXY=${{ secrets.DATA_PROXY }}
+            DATABASE_URL=postgresql://qbot:qbot@127.0.0.1/qbot
+            REDIS_URL=redis://127.0.0.1:6379
+            API_PORT=8080
+            ENABLE_BURST_MONITOR=true
+            ENABLE_TRADING_SIM=false
+            ENABLE_DABAN_SIM=false
+            ENABLE_AI_ANALYSIS=false
+            ENABLE_CHIP_DIST=true
+            ENVEOF
+            chmod 600 /opt/qbot/.env
+            echo ".env written"
+
+      - name: Deploy to VPS
+        if: steps.check.outputs.skip != 'true'
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            set -e
+            cd /opt/qbot
+            git pull origin main
+            cargo build --release
+            cp target/release/qbot /opt/qbot/qbot
+            sudo systemctl restart qbot
+            sleep 3
+            sudo systemctl is-active qbot && echo "qbot restarted successfully"
+
+      - name: Health check
+        if: steps.check.outputs.skip != 'true'
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            curl -sf http://localhost:8080/health || exit 1
+            echo "Health check passed"
