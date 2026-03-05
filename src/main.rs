@@ -1,9 +1,13 @@
+mod api;
 mod config;
 mod data;
 mod error;
+mod scheduler;
+mod services;
 mod signals;
 mod state;
 mod storage;
+mod telegram;
 
 use anyhow::Result;
 use std::sync::Arc;
@@ -11,41 +15,82 @@ use tracing::info;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "qbot=info,sqlx=warn".into()),
+                .unwrap_or_else(|_| "qbot=info,sqlx=warn,tokio_cron_scheduler=warn".into()),
         )
         .init();
 
     info!("qbot starting...");
 
     let config = config::Config::from_env()?;
-    info!("Config loaded");
+    let api_port = config.api_port;
+    info!("Config loaded (port: {})", api_port);
 
-    // Connect to PostgreSQL
+    // PostgreSQL
     let db = sqlx::postgres::PgPoolOptions::new()
         .max_connections(10)
         .connect(&config.database_url)
         .await?;
-    info!("PostgreSQL connected");
+    storage::postgres::run_migrations(&db).await?;
+    info!("PostgreSQL connected + migrations applied");
 
-    // Connect to Redis
+    // Redis
     let redis_client = redis::Client::open(config.redis_url.as_str())?;
     let redis = redis::aio::ConnectionManager::new(redis_client).await?;
     info!("Redis connected");
 
-    let _state = state::AppState {
-        config: Arc::new(config),
+    let state = Arc::new(state::AppState {
+        config: Arc::new(config.clone()),
         db,
         redis,
-    };
+    });
 
-    info!("qbot ready");
+    // Initialize signal registry
+    signals::registry::SignalRegistry::init();
 
-    // Keep alive until signal
-    tokio::signal::ctrl_c().await?;
-    info!("Shutting down...");
+    // Data provider and Telegram pusher
+    let provider = Arc::new(data::tushare::TushareClient::new(
+        config.tushare_token.clone(),
+        config.data_proxy.as_deref(),
+    ));
+    let pusher = Arc::new(telegram::TelegramPusher::new(config.telegram_bot_token.clone()));
+
+    // Check if first-run backfill needed
+    {
+        let history_svc = services::stock_history::StockHistoryService::new(
+            state.clone(), provider.clone()
+        );
+        if !history_svc.has_today_data().await {
+            info!("First run detected - starting 3-year backfill in background");
+            let state_clone = state.clone();
+            let provider_clone = provider.clone();
+            tokio::spawn(async move {
+                let svc = services::stock_history::StockHistoryService::new(state_clone, provider_clone);
+                if let Err(e) = svc.backfill(3).await {
+                    tracing::warn!("Backfill failed: {}", e);
+                }
+            });
+        }
+    }
+
+    // Start scheduler
+    let _sched = scheduler::start_scheduler(state.clone(), provider.clone(), pusher.clone()).await?;
+    info!("Scheduler started");
+
+    // Start Axum REST API
+    let router = api::build_router(state.clone());
+    let addr = format!("0.0.0.0:{}", api_port).parse::<std::net::SocketAddr>()?;
+    info!("API server listening on {}", addr);
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async {
+            tokio::signal::ctrl_c().await.ok();
+            info!("Shutting down...");
+        })
+        .await?;
+
     Ok(())
 }

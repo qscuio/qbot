@@ -1,0 +1,19 @@
+[Unit]
+Description=qbot A-Share Analysis Service
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/qbot
+ExecStart=/opt/qbot/qbot
+Restart=always
+RestartSec=10
+EnvironmentFile=/opt/qbot/.env
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=qbot
+
+[Install]
+WantedBy=multi-user.target

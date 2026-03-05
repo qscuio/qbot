@@ -24,9 +24,11 @@ anyhow = "1"
 thiserror = "1"
 chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "=1.11.0", features = ["v4", "serde"] }
 async-trait = "0.1"
+tempfile = "=3.10.1"
 
 [dev-dependencies]
 tokio-test = "0.4"
+
 
