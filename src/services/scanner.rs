@@ -14,6 +14,10 @@ const BATCH_SIZE: usize = 100;
 const MIN_BARS: usize = 60;
 const MULTI_SIGNAL_THRESHOLD: usize = 3;
 
+fn short_code(code: &str) -> String {
+    code.split('.').next().unwrap_or(code).to_ascii_uppercase()
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SignalHit {
     pub code: String,
@@ -53,12 +57,18 @@ impl ScannerService {
         }
         results.insert("multi_signal".to_string(), Vec::new());
 
-        // Load stock names
-        let names: HashMap<String, String> = {
+        // Load stock names (support both "600519" and "600519.SH" style keys)
+        let (names_exact, names_short): (HashMap<String, String>, HashMap<String, String>) = {
             let rows: Vec<(String, String)> = sqlx::query_as("SELECT code, name FROM stock_info")
                 .fetch_all(&self.state.db)
                 .await?;
-            rows.into_iter().collect()
+            let mut exact = HashMap::new();
+            let mut short = HashMap::new();
+            for (code, name) in rows {
+                exact.insert(code.clone(), name.clone());
+                short.entry(short_code(&code)).or_insert(name);
+            }
+            (exact, short)
         };
 
         let mut checked = 0usize;
@@ -74,7 +84,11 @@ impl ScannerService {
                     }
                 };
 
-                let name = names.get(code).cloned().unwrap_or_else(|| code.clone());
+                let name = names_exact
+                    .get(code)
+                    .cloned()
+                    .or_else(|| names_short.get(&short_code(code)).cloned())
+                    .unwrap_or_else(|| code.clone());
                 let ctx = StockContext {
                     code: code.clone(),
                     name: name.clone(),

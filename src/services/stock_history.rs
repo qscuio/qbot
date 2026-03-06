@@ -24,6 +24,14 @@ impl StockHistoryService {
         let start = end - Duration::days(years as i64 * 365);
         info!("Starting backfill {} to {}", start, end);
 
+        // Refresh stock universe/name mapping first, so scan/watch/chart can show names correctly.
+        let stocks = self.provider.get_stock_list().await?;
+        upsert_stock_info(&self.state.db, &stocks).await?;
+        info!(
+            "Stock info refreshed before backfill: {} stocks",
+            stocks.len()
+        );
+
         let dates = self.provider.get_trading_dates(start, end).await?;
         info!("{} trading days to backfill", dates.len());
 

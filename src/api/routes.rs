@@ -467,9 +467,30 @@ fn telegram_help_text() -> String {
         "<b>Charts</b>",
         "/history <code>&lt;code&gt;</code>",
         "/chart <code>&lt;code&gt;</code>",
-        "/dbcheck /dbsync",
+        "/dbcheck",
+        "/dbsync              自动修复数据库并同步",
+        "/dbsync full 10      回补10年历史",
     ]
     .join("\n")
+}
+
+fn parse_dbsync_backfill_years(args: &str) -> Option<u32> {
+    let raw = args.trim().to_ascii_lowercase();
+    if raw.is_empty() || raw == "today" || raw == "daily" {
+        return None;
+    }
+
+    if matches!(raw.as_str(), "full" | "all" | "history" | "backfill") {
+        return Some(10);
+    }
+
+    let token = raw.split_whitespace().last().unwrap_or_default();
+    let digits: String = token.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let years = digits.parse::<u32>().ok()?;
+    Some(years.clamp(1, 20))
 }
 
 async fn format_watchlist(state: Arc<AppState>, user_id: i64) -> crate::error::Result<String> {
@@ -886,8 +907,9 @@ fn scan_category_content(category: &str) -> Option<(String, Value)> {
             ]);
             rows.push(vec![
                 cb_button("📊 DB状态", "cmd:dbcheck"),
-                cb_button("🔄 DB同步", "cmd:dbsync"),
+                cb_button("🔄 DB修复", "cmd:dbsync"),
             ]);
+            rows.push(vec![cb_button("📚 回补10年", "cmd:dbsync_full10")]);
         }
         "hot" => {
             rows.push(vec![cb_button("⭐ 多信号共振", "scan:s:multi_signal")]);
@@ -1184,12 +1206,13 @@ fn tools_menu_markup() -> Value {
     inline_keyboard(vec![
         vec![
             cb_button("📊 DB状态", "cmd:dbcheck"),
-            cb_button("🔄 DB同步", "cmd:dbsync"),
+            cb_button("🔄 DB修复", "cmd:dbsync"),
         ],
         vec![
+            cb_button("📚 回补10年", "cmd:dbsync_full10"),
             cb_button("📜 历史查询", "prompt:history"),
-            cb_button("📈 K线图", "prompt:chart"),
         ],
+        vec![cb_button("📈 K线图", "prompt:chart")],
         vec![cb_button("◀️ 返回主菜单", "menu:main")],
     ])
 }
@@ -1533,6 +1556,16 @@ async fn handle_telegram_callback(
                 user_id,
                 "dbsync".to_string(),
                 "".to_string(),
+            )
+            .await?
+        }
+        "cmd:dbsync_full10" => {
+            handle_telegram_command(
+                state.clone(),
+                chat_id,
+                user_id,
+                "dbsync".to_string(),
+                "full 10".to_string(),
             )
             .await?
         }
@@ -1935,8 +1968,12 @@ async fn handle_telegram_command(
             } else {
                 format!("⚠️ {}天前", days_old)
             };
+            let history_days = match (min_date, max_date) {
+                (Some(min_d), Some(max_d)) => (max_d - min_d).num_days(),
+                _ => 0,
+            };
 
-            let msg = format!(
+            let mut msg = format!(
                 "📊 <b>stock_history 数据库状态</b>\n━━━━━━━━━━━━━━━━━━━━━\n📁 总记录数: <b>{}</b>\n📈 股票数量: <b>{}</b>\n📅 数据范围: {} ~ {}\n🕐 数据新鲜度: {}",
                 total_rows.unwrap_or(0),
                 stock_count.unwrap_or(0),
@@ -1944,16 +1981,74 @@ async fn handle_telegram_command(
                 max_date.map(|d| d.to_string()).unwrap_or_else(|| "N/A".to_string()),
                 freshness
             );
+            if history_days < 365 * 5 {
+                msg.push_str("\n\n⚠️ 历史区间偏短，建议执行：<code>/dbsync</code>");
+            }
             tg_send(&state, chat_id, &msg).await?;
         }
         "dbsync" => {
-            tg_send(&state, chat_id, "⏳ 正在同步今日行情数据...").await?;
+            let backfill_years = parse_dbsync_backfill_years(&args);
             let svc = crate::services::stock_history::StockHistoryService::new(
                 state.clone(),
                 state.provider.clone(),
             );
-            svc.update_today().await?;
-            tg_send(&state, chat_id, "✅ 数据同步完成").await?;
+            if let Some(years) = backfill_years {
+                tg_send(
+                    &state,
+                    chat_id,
+                    &format!(
+                        "⏳ 正在回补最近 <b>{}</b> 年历史数据（这一步可能较慢）...",
+                        years
+                    ),
+                )
+                .await?;
+                svc.backfill(years).await?;
+                tg_send(&state, chat_id, &format!("✅ 历史回补完成（{}年）", years)).await?;
+            } else {
+                tg_send(&state, chat_id, "🔧 正在执行数据库自检与自动修复...").await?;
+
+                let row: Option<(
+                    Option<i64>,
+                    Option<i64>,
+                    Option<chrono::NaiveDate>,
+                    Option<chrono::NaiveDate>,
+                )> = sqlx::query_as(
+                    r#"SELECT
+                             COUNT(*)::bigint,
+                             COUNT(DISTINCT code)::bigint,
+                             MIN(trade_date),
+                             MAX(trade_date)
+                           FROM stock_daily_bars"#,
+                )
+                .fetch_optional(&state.db)
+                .await?;
+                let (_total_rows, stock_count, min_date, max_date) =
+                    row.unwrap_or((Some(0), Some(0), None, None));
+                let history_days = match (min_date, max_date) {
+                    (Some(min_d), Some(max_d)) => (max_d - min_d).num_days(),
+                    _ => 0,
+                };
+                let today = crate::market_time::beijing_today();
+                let days_old = max_date.map(|d| (today - d).num_days()).unwrap_or(999);
+
+                let need_backfill =
+                    stock_count.unwrap_or(0) < 3000 || history_days < 365 * 8 || days_old > 10;
+
+                if need_backfill {
+                    tg_send(
+                        &state,
+                        chat_id,
+                        "⏳ 检测到数据库不完整，自动回补近10年历史数据（耗时较长）...",
+                    )
+                    .await?;
+                    svc.backfill(10).await?;
+                    tg_send(&state, chat_id, "✅ 历史回补完成（10年）").await?;
+                }
+
+                tg_send(&state, chat_id, "⏳ 正在同步最新交易日数据...").await?;
+                svc.update_today().await?;
+                tg_send(&state, chat_id, "✅ 数据库自动修复与同步完成").await?;
+            }
         }
         _ => {
             tracing::warn!(
