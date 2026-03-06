@@ -116,8 +116,31 @@ jobs:
             sudo systemctl daemon-reload
             sudo systemctl enable qbot
             sudo systemctl restart qbot
-            sleep 3
-            sudo systemctl is-active qbot && echo "qbot restarted successfully"
+
+            # Wait for service readiness (can be slower on first boot).
+            for i in $(seq 1 30); do
+              status="$(sudo systemctl is-active qbot || true)"
+              if [ "$status" = "active" ]; then
+                echo "qbot restarted successfully"
+                break
+              fi
+              if [ "$status" = "failed" ]; then
+                echo "qbot failed during startup"
+                sudo systemctl status qbot --no-pager || true
+                sudo journalctl -u qbot -n 120 --no-pager || true
+                exit 1
+              fi
+              echo "qbot status: $status (attempt $i/30), waiting..."
+              sleep 2
+            done
+
+            final_status="$(sudo systemctl is-active qbot || true)"
+            if [ "$final_status" != "active" ]; then
+              echo "qbot did not reach active state within timeout (final status: $final_status)"
+              sudo systemctl status qbot --no-pager || true
+              sudo journalctl -u qbot -n 120 --no-pager || true
+              exit 1
+            fi
 
       - name: Health check
         if: steps.check.outputs.skip != 'true'
@@ -127,5 +150,13 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           script: |
-            curl -sf http://localhost:8080/health || exit 1
-            echo "Health check passed"
+            for i in $(seq 1 30); do
+              if curl -fsS http://localhost:8080/health >/dev/null; then
+                echo "Health check passed"
+                exit 0
+              fi
+              echo "Health check not ready (attempt $i/30), waiting..."
+              sleep 2
+            done
+            echo "Health check failed after retries"
+            exit 1
