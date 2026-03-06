@@ -55,11 +55,9 @@ impl ScannerService {
 
         // Load stock names
         let names: HashMap<String, String> = {
-            let rows: Vec<(String, String)> =
-                sqlx::query_as("SELECT code, name FROM stock_info")
-                    .fetch_all(&self.state.db)
-                    .await
-                    .unwrap_or_default();
+            let rows: Vec<(String, String)> = sqlx::query_as("SELECT code, name FROM stock_info")
+                .fetch_all(&self.state.db)
+                .await?;
             rows.into_iter().collect()
         };
 
@@ -77,7 +75,10 @@ impl ScannerService {
                 };
 
                 let name = names.get(code).cloned().unwrap_or_else(|| code.clone());
-                let ctx = StockContext { code: code.clone(), name: name.clone() };
+                let ctx = StockContext {
+                    code: code.clone(),
+                    name: name.clone(),
+                };
                 let mut triggered_count = 0usize;
 
                 for signal in &signals {
@@ -129,24 +130,21 @@ impl ScannerService {
 
             tokio::task::yield_now().await;
 
-            if checked % 500 == 0 {
+            if checked.is_multiple_of(500) {
                 info!("Scan progress: {}/{}", checked, total);
             }
         }
 
-        // Save to DB in background
+        // Save to DB before exposing results to keep DB/cache consistent.
         if !db_inserts.is_empty() {
-            let db = self.state.db.clone();
-            let inserts = db_inserts.clone();
-            tokio::spawn(async move {
-                if let Err(e) = postgres::save_scan_results(&db, run_id, &inserts).await {
-                    warn!("Failed to save scan results: {}", e);
-                }
-            });
+            postgres::save_scan_results(&self.state.db, run_id, &db_inserts).await?;
         }
 
         let total_hits: usize = results.values().map(|v| v.len()).sum();
-        info!("Scan complete: {} stocks checked, {} signal hits", checked, total_hits);
+        info!(
+            "Scan complete: {} stocks checked, {} signal hits",
+            checked, total_hits
+        );
 
         // Cache results
         let json = serde_json::to_value(&results).unwrap_or_default();

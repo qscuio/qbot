@@ -1,26 +1,26 @@
-use chrono::{Duration, Local, NaiveDate};
+use chrono::Duration;
 use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::data::provider::DataProvider;
-use crate::data::tushare::TushareClient;
 use crate::error::Result;
+use crate::market_time::beijing_today;
 use crate::state::AppState;
 use crate::storage::{postgres, upsert_stock_info};
 
 pub struct StockHistoryService {
     state: Arc<AppState>,
-    provider: Arc<TushareClient>,
+    provider: Arc<dyn DataProvider>,
 }
 
 impl StockHistoryService {
-    pub fn new(state: Arc<AppState>, provider: Arc<TushareClient>) -> Self {
+    pub fn new(state: Arc<AppState>, provider: Arc<dyn DataProvider>) -> Self {
         StockHistoryService { state, provider }
     }
 
     /// Full backfill: fetch all trading dates in last N years, date-by-date
     pub async fn backfill(&self, years: u32) -> Result<()> {
-        let end = Local::now().naive_local().date();
+        let end = beijing_today();
         let start = end - Duration::days(years as i64 * 365);
         info!("Starting backfill {} to {}", start, end);
 
@@ -33,7 +33,13 @@ impl StockHistoryService {
                     let count = bars.len();
                     postgres::upsert_daily_bars(&self.state.db, &bars).await?;
                     if i % 50 == 0 {
-                        info!("Backfill progress: {}/{} ({}, {} bars)", i + 1, dates.len(), date, count);
+                        info!(
+                            "Backfill progress: {}/{} ({}, {} bars)",
+                            i + 1,
+                            dates.len(),
+                            date,
+                            count
+                        );
                     }
                 }
                 Err(e) => {
@@ -50,7 +56,7 @@ impl StockHistoryService {
 
     /// Daily incremental update: fetch today's bars for all known stocks
     pub async fn update_today(&self) -> Result<()> {
-        let today = Local::now().naive_local().date();
+        let today = beijing_today();
         info!("Daily update for {}", today);
 
         let bars = self.provider.get_daily_bars_by_date(today).await?;
@@ -66,17 +72,14 @@ impl StockHistoryService {
         Ok(())
     }
 
-    /// Check if today's data already exists (avoid duplicate fetches)
-    pub async fn has_today_data(&self) -> bool {
-        let today = Local::now().naive_local().date();
-        let result: Result<Option<(i64,)>> = sqlx::query_as(
-            "SELECT COUNT(*) FROM stock_daily_bars WHERE trade_date = $1",
-        )
-        .bind(today)
-        .fetch_optional(&self.state.db)
-        .await
-        .map_err(crate::error::AppError::Database);
+    /// Check if the history table already has any data.
+    pub async fn has_any_data(&self) -> bool {
+        let result: Result<(bool,)> =
+            sqlx::query_as("SELECT EXISTS (SELECT 1 FROM stock_daily_bars LIMIT 1)")
+                .fetch_one(&self.state.db)
+                .await
+                .map_err(crate::error::AppError::Database);
 
-        result.ok().flatten().map(|(cnt,)| cnt > 100).unwrap_or(false)
+        result.ok().map(|(exists,)| exists).unwrap_or(false)
     }
 }

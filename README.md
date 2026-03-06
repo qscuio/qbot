@@ -33,7 +33,7 @@ A-share stock analysis bot. Fetches daily market data from Tushare, runs 21 sign
              │
      ┌───────▼──────────────────────┐
      │  Telegram Pusher             │
-     │  report_channel / daban_ch   │
+     │  report_channel / alerts     │
      └──────────────────────────────┘
 ```
 
@@ -85,9 +85,7 @@ Copy `.env.example` to `.env` and fill in:
 | `TELEGRAM_BOT_TOKEN` | Yes | Telegram bot token |
 | `REPORT_CHANNEL` | Yes | Channel ID for daily/weekly reports (e.g. `-1001234567890`) |
 | `STOCK_ALERT_CHANNEL` | No | Channel ID for signal burst alerts |
-| `DABAN_CHANNEL` | No | Channel ID for daban results |
 | `API_KEY` | No | Bearer token for REST API (leave empty = open) |
-| `AI_API_KEY` | No | LLM key for AI analysis feature |
 | `DATA_PROXY` | No | HTTP/SOCKS5 proxy for Tushare/Sina (e.g. `socks5://127.0.0.1:1080`) |
 | `DATABASE_URL` | Yes | PostgreSQL URL (default: `postgresql://qbot:qbot@127.0.0.1/qbot`) |
 | `REDIS_URL` | Yes | Redis URL (default: `redis://127.0.0.1:6379`) |
@@ -131,6 +129,7 @@ If `API_KEY` is set, add `-H "Authorization: Bearer <key>"` to protected endpoin
 ## Scheduler
 
 Runs automatically when the binary starts (no `--run-now`):
+Jobs are scheduled with fixed `UTC+08:00` in code (`Job::new_async_tz`).
 
 | Time (Beijing) | Days | Job |
 |----------------|------|-----|
@@ -164,9 +163,7 @@ Push to `main` triggers `.github/workflows/deploy.yml`, which:
 | `TELEGRAM_BOT_TOKEN` | Telegram bot token |
 | `REPORT_CHANNEL` | Report channel ID |
 | `STOCK_ALERT_CHANNEL` | Alert channel ID |
-| `DABAN_CHANNEL` | Daban channel ID (optional) |
 | `API_KEY` | REST API bearer key (optional) |
-| `AI_API_KEY` | LLM API key (optional) |
 | `DATA_PROXY` | Proxy URL (optional) |
 
 ### VPS First-Run Setup

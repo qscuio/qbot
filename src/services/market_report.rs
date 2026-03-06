@@ -1,11 +1,11 @@
-use chrono::{Duration, Local, NaiveDate};
+use chrono::{Datelike, Duration, NaiveDate};
 use std::sync::Arc;
 use tracing::info;
 
 use crate::error::Result;
+use crate::market_time::beijing_today;
 use crate::services::limit_up::LimitUpService;
 use crate::services::market::MarketService;
-use crate::services::scanner::ScannerService;
 use crate::services::sector::SectorService;
 use crate::state::AppState;
 use crate::storage::{postgres, redis_cache::RedisCache};
@@ -16,7 +16,6 @@ pub struct MarketReportService {
     market: Arc<MarketService>,
     limit_up: Arc<LimitUpService>,
     sector: Arc<SectorService>,
-    scanner: Arc<ScannerService>,
 }
 
 impl MarketReportService {
@@ -25,9 +24,13 @@ impl MarketReportService {
         market: Arc<MarketService>,
         limit_up: Arc<LimitUpService>,
         sector: Arc<SectorService>,
-        scanner: Arc<ScannerService>,
     ) -> Self {
-        MarketReportService { state, market, limit_up, sector, scanner }
+        MarketReportService {
+            state,
+            market,
+            limit_up,
+            sector,
+        }
     }
 
     pub async fn generate_daily(&self, date: NaiveDate) -> Result<String> {
@@ -55,16 +58,28 @@ impl MarketReportService {
     }
 
     pub async fn generate_weekly(&self) -> Result<String> {
-        let date = Local::now().naive_local().date();
-        let start = date - Duration::days(7);
+        let date = beijing_today();
+        let start = date - Duration::days(date.weekday().num_days_from_monday() as i64);
 
         let rows: Vec<(String, Option<String>, Option<f64>)> = sqlx::query_as(
-            r#"SELECT code,
-               MAX(name) as name,
-               (MAX(close::float8) - MIN(close::float8)) / NULLIF(MIN(close::float8),0) * 100 as gain_pct
-               FROM stock_daily_bars b
-               LEFT JOIN stock_info i USING (code)
-               WHERE trade_date >= $1 AND trade_date <= $2
+            r#"WITH ranked AS (
+                 SELECT b.code,
+                        i.name,
+                        b.close::float8 AS close,
+                        b.trade_date,
+                        ROW_NUMBER() OVER (PARTITION BY b.code ORDER BY b.trade_date ASC) AS rn_first,
+                        ROW_NUMBER() OVER (PARTITION BY b.code ORDER BY b.trade_date DESC) AS rn_last
+                 FROM stock_daily_bars b
+                 LEFT JOIN stock_info i USING (code)
+                 WHERE b.trade_date >= $1 AND b.trade_date <= $2
+               )
+               SELECT code,
+                      MAX(name) AS name,
+                      (
+                          MAX(close) FILTER (WHERE rn_last = 1)
+                          - MAX(close) FILTER (WHERE rn_first = 1)
+                      ) / NULLIF(MAX(close) FILTER (WHERE rn_first = 1), 0) * 100 AS gain_pct
+               FROM ranked
                GROUP BY code
                ORDER BY gain_pct DESC NULLS LAST LIMIT 20"#,
         )
@@ -76,12 +91,14 @@ impl MarketReportService {
         let mut report = format!("📅 <b>周报 - {}</b>\n\n", date.format("%Y-%m-%d"));
         report.push_str("🏆 <b>本周涨幅榜 Top 20</b>\n");
         for (i, (code, name, gain_pct)) in rows.iter().enumerate() {
+            let gain = gain_pct.unwrap_or(0.0);
             report.push_str(&format!(
-                "{}. {} {} +{:.1}%\n",
+                "{}. {} {} {}{:.1}%\n",
                 i + 1,
                 code,
                 name.as_deref().unwrap_or(""),
-                gain_pct.unwrap_or(0.0),
+                if gain >= 0.0 { "+" } else { "" },
+                gain,
             ));
         }
 

@@ -2,6 +2,7 @@ mod api;
 mod config;
 mod data;
 mod error;
+mod market_time;
 mod scheduler;
 mod services;
 mod signals;
@@ -9,8 +10,10 @@ mod state;
 mod storage;
 mod telegram;
 
+use crate::data::provider::DataProvider;
 use anyhow::Result;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing::info;
 
 #[tokio::main]
@@ -45,11 +48,13 @@ async fn main() -> Result<()> {
     signals::registry::SignalRegistry::init();
 
     // Data provider and Telegram pusher
-    let provider = Arc::new(data::tushare::TushareClient::new(
+    let provider: Arc<dyn DataProvider> = Arc::new(data::tushare::TushareClient::new(
         config.tushare_token.clone(),
         config.data_proxy.as_deref(),
     ));
-    let pusher = Arc::new(telegram::TelegramPusher::new(config.telegram_bot_token.clone()));
+    let pusher = Arc::new(telegram::TelegramPusher::new(
+        config.telegram_bot_token.clone(),
+    ));
 
     let state = Arc::new(state::AppState {
         config: Arc::new(config.clone()),
@@ -57,19 +62,35 @@ async fn main() -> Result<()> {
         redis,
         provider: provider.clone(),
         pusher: pusher.clone(),
+        fetch_job_lock: Arc::new(Mutex::new(())),
+        scan_job_lock: Arc::new(Mutex::new(())),
+        daily_report_job_lock: Arc::new(Mutex::new(())),
+        weekly_report_job_lock: Arc::new(Mutex::new(())),
     });
+
+    if state.config.enable_burst_monitor && state.config.stock_alert_channel.is_some() {
+        let mut burst_monitor = services::burst_monitor::BurstMonitorService::new(
+            state.clone(),
+            Arc::new(data::sina::SinaClient::new()),
+            pusher.clone(),
+        );
+        tokio::spawn(async move {
+            burst_monitor.run_poll_loop().await;
+        });
+        info!("Burst monitor started");
+    }
 
     // Check if first-run backfill needed
     {
-        let history_svc = services::stock_history::StockHistoryService::new(
-            state.clone(), provider.clone()
-        );
-        if !history_svc.has_today_data().await {
+        let history_svc =
+            services::stock_history::StockHistoryService::new(state.clone(), provider.clone());
+        if !history_svc.has_any_data().await {
             info!("First run detected - starting 3-year backfill in background");
             let state_clone = state.clone();
             let provider_clone = provider.clone();
             tokio::spawn(async move {
-                let svc = services::stock_history::StockHistoryService::new(state_clone, provider_clone);
+                let svc =
+                    services::stock_history::StockHistoryService::new(state_clone, provider_clone);
                 if let Err(e) = svc.backfill(3).await {
                     tracing::warn!("Backfill failed: {}", e);
                 }
@@ -88,7 +109,8 @@ async fn main() -> Result<()> {
     }
 
     // Start scheduler
-    let _sched = scheduler::start_scheduler(state.clone(), provider.clone(), pusher.clone()).await?;
+    let _sched =
+        scheduler::start_scheduler(state.clone(), provider.clone(), pusher.clone()).await?;
     info!("Scheduler started");
 
     // Start Axum REST API

@@ -15,7 +15,10 @@ use crate::storage::postgres;
 type ApiResult = std::result::Result<Json<Value>, (StatusCode, Json<Value>)>;
 
 fn api_error(msg: &str) -> (StatusCode, Json<Value>) {
-    (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": msg})))
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": msg})),
+    )
 }
 
 fn check_auth(headers: &HeaderMap, api_key: Option<&str>) -> bool {
@@ -51,23 +54,25 @@ async fn health() -> Json<Value> {
 async fn list_signals() -> Json<Value> {
     let signals: Vec<Value> = SignalRegistry::get_enabled()
         .iter()
-        .map(|s| json!({
-            "id": s.signal_id(),
-            "name": s.display_name(),
-            "icon": s.icon(),
-            "group": s.group(),
-        }))
+        .map(|s| {
+            json!({
+                "id": s.signal_id(),
+                "name": s.display_name(),
+                "icon": s.icon(),
+                "group": s.group(),
+            })
+        })
         .collect();
     let count = signals.len();
     Json(json!({"signals": signals, "count": count}))
 }
 
-async fn get_scan_latest(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> ApiResult {
+async fn get_scan_latest(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult {
     if !check_auth(&headers, state.config.api_key.as_deref()) {
-        return Err((StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))));
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "unauthorized"})),
+        ));
     }
 
     let mut cache = crate::storage::redis_cache::RedisCache::new(state.redis.clone());
@@ -78,31 +83,28 @@ async fn get_scan_latest(
     }
 }
 
-async fn trigger_scan(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> ApiResult {
+async fn trigger_scan(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult {
     if !check_auth(&headers, state.config.api_key.as_deref()) {
-        return Err((StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))));
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "unauthorized"})),
+        ));
     }
 
     let state_clone = state.clone();
     tokio::spawn(async move {
-        let scanner = crate::services::scanner::ScannerService::new(state_clone);
-        if let Err(e) = scanner.run_full_scan().await {
-            tracing::warn!("Manual scan failed: {}", e);
-        }
+        crate::scheduler::run_scan_job(state_clone).await;
     });
 
     Ok(Json(json!({"status": "scan_started"})))
 }
 
-async fn get_daily_report(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> ApiResult {
+async fn get_daily_report(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult {
     if !check_auth(&headers, state.config.api_key.as_deref()) {
-        return Err((StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))));
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "unauthorized"})),
+        ));
     }
 
     match postgres::get_latest_report(&state.db, "daily").await {
@@ -116,12 +118,12 @@ async fn market_overview_stub() -> Json<Value> {
     Json(json!({"status": "coming_soon"}))
 }
 
-async fn trigger_fetch(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> ApiResult {
+async fn trigger_fetch(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult {
     if !check_auth(&headers, state.config.api_key.as_deref()) {
-        return Err((StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))));
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "unauthorized"})),
+        ));
     }
     let s = state.clone();
     let p = state.provider.clone();
@@ -131,12 +133,12 @@ async fn trigger_fetch(
     Ok(Json(json!({"status": "started", "job": "fetch"})))
 }
 
-async fn trigger_scan_job(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> ApiResult {
+async fn trigger_scan_job(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult {
     if !check_auth(&headers, state.config.api_key.as_deref()) {
-        return Err((StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))));
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "unauthorized"})),
+        ));
     }
     let s = state.clone();
     tokio::spawn(async move {
@@ -145,12 +147,12 @@ async fn trigger_scan_job(
     Ok(Json(json!({"status": "started", "job": "scan"})))
 }
 
-async fn trigger_daily_report(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> ApiResult {
+async fn trigger_daily_report(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult {
     if !check_auth(&headers, state.config.api_key.as_deref()) {
-        return Err((StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))));
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "unauthorized"})),
+        ));
     }
     let s = state.clone();
     let p = state.provider.clone();
@@ -166,7 +168,10 @@ async fn trigger_weekly_report(
     headers: HeaderMap,
 ) -> ApiResult {
     if !check_auth(&headers, state.config.api_key.as_deref()) {
-        return Err((StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))));
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "unauthorized"})),
+        ));
     }
     let s = state.clone();
     let p = state.provider.clone();

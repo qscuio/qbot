@@ -2,7 +2,6 @@ use chrono::NaiveDate;
 use std::sync::Arc;
 
 use crate::data::provider::DataProvider;
-use crate::data::tushare::TushareClient;
 use crate::data::types::IndexData;
 use crate::error::Result;
 use crate::state::AppState;
@@ -16,11 +15,11 @@ const INDICES: &[(&str, &str)] = &[
 
 pub struct MarketService {
     state: Arc<AppState>,
-    provider: Arc<TushareClient>,
+    provider: Arc<dyn DataProvider>,
 }
 
 impl MarketService {
-    pub fn new(state: Arc<AppState>, provider: Arc<TushareClient>) -> Self {
+    pub fn new(state: Arc<AppState>, provider: Arc<dyn DataProvider>) -> Self {
         MarketService { state, provider }
     }
 
@@ -38,17 +37,25 @@ impl MarketService {
                 r#"SELECT
                    COUNT(CASE WHEN close > open THEN 1 END),
                    COUNT(CASE WHEN close < open THEN 1 END),
-                   COUNT(CASE WHEN ABS(close - open) / NULLIF(open,0) * 100 >= 9.8 THEN 1 END),
-                   SUM(amount::float8)
-                   FROM stock_daily_bars WHERE trade_date = $1"#,
+                   COUNT(CASE WHEN prev_close > 0 AND (close - prev_close) / prev_close * 100 >= 9.8 THEN 1 END),
+                   SUM(amount)
+                   FROM (
+                     SELECT trade_date,
+                            open::float8 AS open,
+                            close::float8 AS close,
+                            amount::float8 AS amount,
+                            LAG(close::float8) OVER (PARTITION BY code ORDER BY trade_date) AS prev_close
+                     FROM stock_daily_bars
+                     WHERE trade_date <= $1
+                   ) bars
+                   WHERE trade_date = $1"#,
             )
             .bind(date)
             .fetch_optional(&self.state.db)
             .await?;
 
-        let (up_count, down_count, limit_up_count, total_amount) = row
-            .flatten_opt()
-            .unwrap_or((Some(0), Some(0), Some(0), Some(0.0)));
+        let (up_count, down_count, limit_up_count, total_amount) =
+            row.unwrap_or((Some(0), Some(0), Some(0), Some(0.0)));
 
         Ok(MarketOverview {
             date,
@@ -58,16 +65,6 @@ impl MarketService {
             limit_up_count: limit_up_count.unwrap_or(0) as usize,
             total_amount: total_amount.unwrap_or(0.0),
         })
-    }
-}
-
-// Helper trait to flatten Option<(...)>
-trait FlattenOpt {
-    fn flatten_opt(self) -> Self;
-}
-impl<A, B, C, D> FlattenOpt for Option<(Option<A>, Option<B>, Option<C>, Option<D>)> {
-    fn flatten_opt(self) -> Self {
-        self
     }
 }
 
