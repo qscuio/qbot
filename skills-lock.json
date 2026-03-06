@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "skills": {
+    "adversarial-review": {
+      "source": "poteto/noodle",
+      "sourceType": "github",
+      "computedHash": "fddcd0f2b627a81216e908dc6d1d597641b5e852d6cce7d66960fef5d50b0225"
+    }
+  }
+}
