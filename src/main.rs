@@ -70,6 +70,29 @@ async fn main() -> Result<()> {
     let pusher = Arc::new(telegram::TelegramPusher::new(
         config.telegram_bot_token.clone(),
     ));
+    let bot_commands = [
+        ("start", "显示帮助"),
+        ("help", "显示帮助"),
+        ("scan", "扫描信号"),
+        ("daban", "打板评分"),
+        ("watch", "添加/查看自选"),
+        ("unwatch", "删除自选"),
+        ("mywatch", "查看自选"),
+        ("port", "持仓管理"),
+        ("industry", "行业板块"),
+        ("concept", "概念板块"),
+        ("hot7", "7日热门板块"),
+        ("hot14", "14日热门板块"),
+        ("hot30", "30日热门板块"),
+        ("history", "查看历史K线"),
+        ("chart", "查看图表接口"),
+        ("dbcheck", "检查数据库"),
+        ("dbsync", "同步今日数据"),
+    ];
+    match pusher.set_my_commands(&bot_commands).await {
+        Ok(_) => info!("Telegram bot commands registered"),
+        Err(e) => warn!("Telegram setMyCommands failed: {}", e),
+    }
 
     let state = Arc::new(state::AppState {
         config: Arc::new(config.clone()),
@@ -92,6 +115,8 @@ async fn main() -> Result<()> {
             Ok(_) => info!("Telegram webhook registered: {}", endpoint),
             Err(e) => warn!("Telegram webhook registration failed: {}", e),
         }
+    } else {
+        warn!("WEBHOOK_URL is not set; Telegram inbound commands are disabled");
     }
 
     if state.config.enable_burst_monitor && state.config.stock_alert_channel.is_some() {

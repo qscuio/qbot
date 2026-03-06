@@ -234,6 +234,29 @@ Supported command set (webhook):
 - `/industry`, `/concept`, `/hot7`, `/hot14`, `/hot30`, `/sector_sync`
 - `/ai_analysis`
 - `/history`, `/chart`
+- `/dbcheck`, `/dbsync`
+
+Command menu:
+- qbot now auto-calls Telegram `setMyCommands` on startup.
+- If Telegram still does not show the slash menu, restart bot and reopen chat.
+
+Telegram debug checklist (VPS):
+
+```bash
+# 1) Live logs (webhook receive / command start / command done / secret mismatch)
+sudo journalctl -u qbot -f
+
+# 2) Service status
+sudo systemctl status qbot --no-pager
+
+# 3) Telegram-side webhook status
+curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getWebhookInfo" | jq
+```
+
+Expected:
+- `getWebhookInfo.url` = `${WEBHOOK_URL%/}/telegram/webhook`
+- `last_error_date` is empty or `0`
+- `pending_update_count` should not keep growing
 
 Nginx reverse proxy example (VPS):
 

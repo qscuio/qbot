@@ -67,6 +67,39 @@ impl TelegramPusher {
         Ok(())
     }
 
+    pub async fn set_my_commands(&self, commands: &[(&str, &str)]) -> Result<()> {
+        let url = format!("{}{}/setMyCommands", TG_API, self.token);
+        let command_list: Vec<_> = commands
+            .iter()
+            .map(|(command, description)| {
+                json!({
+                    "command": command,
+                    "description": description,
+                })
+            })
+            .collect();
+        let body = json!({ "commands": command_list });
+
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(AppError::Http)?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err_text = resp.text().await.unwrap_or_default();
+            return Err(AppError::Internal(format!(
+                "setMyCommands {}: {}",
+                status, err_text
+            )));
+        }
+
+        Ok(())
+    }
+
     async fn send_message(&self, chat_id: &str, text: &str) -> Result<()> {
         let url = format!("{}{}/sendMessage", TG_API, self.token);
         let body = json!({

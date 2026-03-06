@@ -752,6 +752,14 @@ async fn handle_telegram_command(
     command: String,
     args: String,
 ) -> crate::error::Result<()> {
+    tracing::info!(
+        "telegram command start: chat_id={}, user_id={}, command={}, args_len={}",
+        chat_id,
+        user_id,
+        command,
+        args.len()
+    );
+
     match command.as_str() {
         "start" | "help" => {
             tg_send(&state, chat_id, &telegram_help_text()).await?;
@@ -1102,8 +1110,27 @@ async fn handle_telegram_command(
             svc.update_today().await?;
             tg_send(&state, chat_id, "✅ 数据同步完成").await?;
         }
-        _ => {}
+        _ => {
+            tracing::warn!(
+                "telegram unknown command: chat_id={}, user_id={}, command={}",
+                chat_id,
+                user_id,
+                command
+            );
+            tg_send(
+                &state,
+                chat_id,
+                "❓ 未识别命令。发送 /help 查看当前支持的命令。",
+            )
+            .await?;
+        }
     }
+    tracing::info!(
+        "telegram command done: chat_id={}, user_id={}, command={}",
+        chat_id,
+        user_id,
+        command
+    );
     Ok(())
 }
 
@@ -1113,6 +1140,13 @@ async fn telegram_webhook(
     Json(update): Json<TelegramUpdate>,
 ) -> ApiResult {
     if !check_telegram_webhook_secret(&headers, state.config.telegram_webhook_secret.as_deref()) {
+        tracing::warn!(
+            "telegram webhook unauthorized: missing/invalid secret token, xff={:?}",
+            headers
+                .get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("-")
+        );
         return Err((
             StatusCode::UNAUTHORIZED,
             Json(json!({"error": "invalid telegram webhook secret"})),
@@ -1121,19 +1155,36 @@ async fn telegram_webhook(
 
     let msg = update.message.or(update.edited_message);
     let Some(message) = msg else {
+        tracing::debug!("telegram webhook ignored: no_message");
         return Ok(Json(json!({"ok": true, "ignored": "no_message"})));
     };
 
     let Some(text) = message.text else {
+        tracing::debug!(
+            "telegram webhook ignored: no_text, chat_id={}",
+            message.chat.id
+        );
         return Ok(Json(json!({"ok": true, "ignored": "no_text"})));
     };
 
     let Some((command, args)) = parse_telegram_command(&text) else {
+        tracing::debug!(
+            "telegram webhook ignored: non_command, chat_id={}, text_len={}",
+            message.chat.id,
+            text.len()
+        );
         return Ok(Json(json!({"ok": true, "ignored": "non_command"})));
     };
 
     let chat_id = message.chat.id;
     let user_id = message.from.map(|u| u.id).unwrap_or(chat_id);
+    tracing::info!(
+        "telegram webhook received command: chat_id={}, user_id={}, command={}, args_len={}",
+        chat_id,
+        user_id,
+        command,
+        args.len()
+    );
     let state_clone = state.clone();
 
     tokio::spawn(async move {
