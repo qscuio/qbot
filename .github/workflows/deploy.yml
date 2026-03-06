@@ -84,8 +84,37 @@ jobs:
             git -C "$REPO_DIR" checkout -B main FETCH_HEAD
 
             cd "$REPO_DIR"
+
+            # Ensure required native build deps exist for crates using native-tls/openssl.
+            if command -v dpkg >/dev/null 2>&1; then
+              if ! dpkg -s build-essential >/dev/null 2>&1 || ! dpkg -s pkg-config >/dev/null 2>&1 || ! dpkg -s libssl-dev >/dev/null 2>&1; then
+                sudo apt-get update
+                sudo apt-get install -y build-essential pkg-config libssl-dev curl
+              fi
+            fi
+
+            # Ensure cargo is available in this non-login shell.
+            if ! command -v cargo >/dev/null 2>&1; then
+              if [ -x "$HOME/.cargo/bin/cargo" ]; then
+                export PATH="$HOME/.cargo/bin:$PATH"
+              else
+                curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+                export PATH="$HOME/.cargo/bin:$PATH"
+              fi
+            fi
+
             cargo build --release
             cp target/release/qbot /opt/qbot/qbot
+
+            # Keep DB/cache containers up for local service dependencies.
+            if command -v docker >/dev/null 2>&1; then
+              docker compose -f deploy/docker-compose.yml up -d
+            fi
+
+            # Install/update service definition on every deploy.
+            sudo cp deploy/qbot.service /etc/systemd/system/qbot.service
+            sudo systemctl daemon-reload
+            sudo systemctl enable qbot
             sudo systemctl restart qbot
             sleep 3
             sudo systemctl is-active qbot && echo "qbot restarted successfully"
