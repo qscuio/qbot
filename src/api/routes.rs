@@ -17,6 +17,7 @@ use crate::services::chip_dist::ChipDistService;
 use crate::services::daban::DabanService;
 use crate::services::daban_sim::DabanSimService;
 use crate::services::portfolio::PortfolioService;
+use crate::services::scanner::{ScannerService, SignalHit};
 use crate::services::trading_sim::TradingSimService;
 use crate::services::watchlist::WatchlistService;
 use crate::signals::registry::SignalRegistry;
@@ -144,13 +145,23 @@ struct DateQuery {
 struct TelegramUpdate {
     message: Option<TelegramMessage>,
     edited_message: Option<TelegramMessage>,
+    callback_query: Option<TelegramCallbackQuery>,
 }
 
 #[derive(Debug, Deserialize)]
 struct TelegramMessage {
+    message_id: i64,
     from: Option<TelegramUser>,
     chat: TelegramChat,
     text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramCallbackQuery {
+    id: String,
+    from: TelegramUser,
+    data: Option<String>,
+    message: Option<TelegramMessage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -386,9 +397,23 @@ async fn tg_send(state: &Arc<AppState>, chat_id: i64, text: &str) -> crate::erro
     state.pusher.push(&chat_id.to_string(), text).await
 }
 
+async fn tg_send_with_markup(
+    state: &Arc<AppState>,
+    chat_id: i64,
+    text: &str,
+    reply_markup: Value,
+) -> crate::error::Result<()> {
+    state
+        .pusher
+        .push_with_markup(&chat_id.to_string(), text, reply_markup)
+        .await
+}
+
 fn telegram_help_text() -> String {
     [
         "🤖 <b>Qbot Commands</b>",
+        "",
+        "/menu          按钮导航菜单",
         "",
         "<b>Watchlist</b>",
         "/watch <code>&lt;code&gt;</code>  添加自选",
@@ -692,16 +717,7 @@ async fn send_hot_sectors(
     tg_send(&state, chat_id, &text).await
 }
 
-async fn format_scan_summary(state: Arc<AppState>) -> crate::error::Result<String> {
-    let results = crate::services::scanner::ScannerService::new(state.clone())
-        .run_full_scan()
-        .await?;
-
-    let total_hits: usize = results.values().map(|v| v.len()).sum();
-    if total_hits == 0 {
-        return Ok("🔍 扫描完成\n\n📭 暂无信号".to_string());
-    }
-
+fn scan_signal_meta() -> HashMap<String, (String, String)> {
     let mut meta: HashMap<String, (String, String)> = HashMap::new();
     for s in SignalRegistry::get_enabled() {
         meta.insert(
@@ -713,7 +729,10 @@ async fn format_scan_summary(state: Arc<AppState>) -> crate::error::Result<Strin
         "multi_signal".to_string(),
         ("多信号共振".to_string(), "⭐".to_string()),
     );
+    meta
+}
 
+fn scan_signal_rows(results: &HashMap<String, Vec<SignalHit>>) -> Vec<(String, usize)> {
     let mut rows: Vec<(String, usize)> = results
         .iter()
         .filter_map(|(k, v)| {
@@ -725,6 +744,29 @@ async fn format_scan_summary(state: Arc<AppState>) -> crate::error::Result<Strin
         })
         .collect();
     rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    rows
+}
+
+fn format_scan_summary(results: &HashMap<String, Vec<SignalHit>>, only_signal: Option<&str>) -> String {
+    let meta = scan_signal_meta();
+    let rows: Vec<(String, usize)> = scan_signal_rows(results)
+        .into_iter()
+        .filter(|(signal_id, _)| only_signal.map(|s| s == signal_id).unwrap_or(true))
+        .collect();
+
+    let total_hits: usize = rows.iter().map(|(_, c)| *c).sum();
+    if total_hits == 0 {
+        return match only_signal {
+            Some(sig) => {
+                let (name, icon) = meta
+                    .get(sig)
+                    .cloned()
+                    .unwrap_or_else(|| (sig.to_string(), "•".to_string()));
+                format!("{} <b>{}</b>\n\n📭 暂无命中", icon, escape_html(&name))
+            }
+            None => "🔍 扫描完成\n\n📭 暂无信号".to_string(),
+        };
+    }
 
     let mut text = format!(
         "🔍 <b>扫描完成</b>\n━━━━━━━━━━━━━━━━━━━━━\n共 <b>{}</b> 个信号\n\n",
@@ -742,7 +784,380 @@ async fn format_scan_summary(state: Arc<AppState>) -> crate::error::Result<Strin
             count
         ));
     }
-    Ok(text)
+    text.push_str("\n<i>下方将按信号发送可点击K线按钮</i>");
+    text
+}
+
+fn normalize_stock_code(raw: &str) -> String {
+    raw.split('.').next().unwrap_or(raw).trim().to_string()
+}
+
+fn chart_url_for_stock(code: &str) -> String {
+    let code = normalize_stock_code(code);
+    let market = if code.starts_with('6') { "1" } else { "0" };
+    format!("https://wap.eastmoney.com/quote/stock/{market}.{code}.html")
+}
+
+fn trim_chars(raw: &str, max_chars: usize) -> String {
+    if raw.chars().count() <= max_chars {
+        return raw.to_string();
+    }
+    let mut s: String = raw.chars().take(max_chars.saturating_sub(1)).collect();
+    s.push('…');
+    s
+}
+
+fn build_scan_hit_markup(hits: &[SignalHit]) -> Value {
+    let mut rows: Vec<Vec<Value>> = Vec::new();
+    let mut current_row: Vec<Value> = Vec::new();
+
+    for hit in hits {
+        let name = trim_chars(&hit.name, 8);
+        let code = normalize_stock_code(&hit.code);
+        let button = json!({
+            "text": format!("{name}({code})"),
+            "url": chart_url_for_stock(&hit.code),
+        });
+        current_row.push(button);
+        if current_row.len() == 2 {
+            rows.push(std::mem::take(&mut current_row));
+        }
+    }
+    if !current_row.is_empty() {
+        rows.push(current_row);
+    }
+
+    json!({ "inline_keyboard": rows })
+}
+
+async fn send_scan_signal_buttons(
+    state: &Arc<AppState>,
+    chat_id: i64,
+    signal_name: &str,
+    icon: &str,
+    hits: &[SignalHit],
+) -> crate::error::Result<()> {
+    const PAGE_SIZE: usize = 20;
+    let pages = hits.chunks(PAGE_SIZE).collect::<Vec<_>>();
+    let total_pages = pages.len();
+
+    for (idx, page_hits) in pages.iter().enumerate() {
+        let mut text = format!(
+            "{} <b>{}</b> ({})",
+            icon,
+            escape_html(signal_name),
+            hits.len()
+        );
+        if total_pages > 1 {
+            text.push_str(&format!("\n第 {}/{} 页", idx + 1, total_pages));
+        }
+        text.push_str("\n<i>点击按钮打开K线</i>");
+        let markup = build_scan_hit_markup(page_hits);
+        tg_send_with_markup(state, chat_id, &text, markup).await?;
+    }
+
+    Ok(())
+}
+
+fn cb_button(text: &str, data: &str) -> Value {
+    json!({"text": text, "callback_data": data})
+}
+
+fn inline_keyboard(rows: Vec<Vec<Value>>) -> Value {
+    json!({"inline_keyboard": rows})
+}
+
+fn main_menu_markup() -> Value {
+    inline_keyboard(vec![
+        vec![cb_button("🔍 信号扫描", "menu:scan"), cb_button("🧱 打板", "menu:daban")],
+        vec![cb_button("⭐ 自选", "menu:watch"), cb_button("💼 持仓", "menu:portfolio")],
+        vec![cb_button("🏭 板块/AI", "menu:sector"), cb_button("🛠 工具", "menu:tools")],
+        vec![cb_button("❓ 帮助", "cmd:help")],
+    ])
+}
+
+fn watch_menu_markup() -> Value {
+    inline_keyboard(vec![
+        vec![cb_button("📋 查看自选", "cmd:mywatch"), cb_button("📤 导出自选", "cmd:export")],
+        vec![cb_button("➕ 添加自选", "prompt:watch_add"), cb_button("➖ 删除自选", "prompt:watch_del")],
+        vec![cb_button("◀️ 返回主菜单", "menu:main")],
+    ])
+}
+
+fn portfolio_menu_markup() -> Value {
+    inline_keyboard(vec![
+        vec![cb_button("💼 查看持仓", "cmd:port")],
+        vec![cb_button("➕ 添加持仓", "prompt:port_add"), cb_button("➖ 删除持仓", "prompt:port_del")],
+        vec![cb_button("◀️ 返回主菜单", "menu:main")],
+    ])
+}
+
+fn sector_menu_markup() -> Value {
+    inline_keyboard(vec![
+        vec![cb_button("🏭 行业", "cmd:industry"), cb_button("💡 概念", "cmd:concept")],
+        vec![cb_button("🔥 Hot7", "cmd:hot7"), cb_button("🔥 Hot14", "cmd:hot14")],
+        vec![cb_button("🔥 Hot30", "cmd:hot30"), cb_button("🔄 同步板块", "cmd:sector_sync")],
+        vec![cb_button("🤖 AI 复盘", "cmd:ai_analysis")],
+        vec![cb_button("◀️ 返回主菜单", "menu:main")],
+    ])
+}
+
+fn tools_menu_markup() -> Value {
+    inline_keyboard(vec![
+        vec![cb_button("📊 DB状态", "cmd:dbcheck"), cb_button("🔄 DB同步", "cmd:dbsync")],
+        vec![cb_button("📜 历史查询", "prompt:history"), cb_button("📈 K线图", "prompt:chart")],
+        vec![cb_button("◀️ 返回主菜单", "menu:main")],
+    ])
+}
+
+fn daban_menu_markup() -> Value {
+    inline_keyboard(vec![
+        vec![cb_button("🧱 打板评分", "cmd:daban"), cb_button("💼 打板持仓", "cmd:daban_portfolio")],
+        vec![cb_button("📈 打板统计", "cmd:daban_stats"), cb_button("⚡ 打板扫描", "cmd:daban_scan")],
+        vec![cb_button("◀️ 返回主菜单", "menu:main")],
+    ])
+}
+
+fn scan_menu_markup() -> Value {
+    let mut rows: Vec<Vec<Value>> = vec![
+        vec![cb_button("🔍 全部扫描", "scan:all"), cb_button("⭐ 多信号共振", "scan:s:multi_signal")],
+    ];
+
+    let mut current: Vec<Value> = Vec::new();
+    for s in SignalRegistry::get_enabled() {
+        let label = format!("{} {}", s.icon(), s.display_name());
+        let cb = format!("scan:s:{}", s.signal_id());
+        current.push(cb_button(&label, &cb));
+        if current.len() == 2 {
+            rows.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        rows.push(current);
+    }
+    rows.push(vec![cb_button("◀️ 返回主菜单", "menu:main")]);
+    inline_keyboard(rows)
+}
+
+fn menu_content(menu: &str) -> (String, Value) {
+    match menu {
+        "watch" => (
+            "⭐ <b>自选菜单</b>\n选择一个操作".to_string(),
+            watch_menu_markup(),
+        ),
+        "portfolio" => (
+            "💼 <b>持仓菜单</b>\n选择一个操作".to_string(),
+            portfolio_menu_markup(),
+        ),
+        "sector" => (
+            "🏭 <b>板块 / AI 菜单</b>\n选择一个操作".to_string(),
+            sector_menu_markup(),
+        ),
+        "tools" => (
+            "🛠 <b>工具菜单</b>\n选择一个操作".to_string(),
+            tools_menu_markup(),
+        ),
+        "daban" => (
+            "🧱 <b>打板菜单</b>\n选择一个操作".to_string(),
+            daban_menu_markup(),
+        ),
+        "scan" => (
+            "🔍 <b>信号扫描菜单</b>\n可扫描全部或单个信号".to_string(),
+            scan_menu_markup(),
+        ),
+        _ => (
+            "🤖 <b>Qbot 导航菜单</b>\n所有命令与子命令可通过按钮进入".to_string(),
+            main_menu_markup(),
+        ),
+    }
+}
+
+async fn show_menu(
+    state: &Arc<AppState>,
+    chat_id: i64,
+    message_id: Option<i64>,
+    menu: &str,
+) -> crate::error::Result<()> {
+    let (text, markup) = menu_content(menu);
+
+    if let Some(mid) = message_id {
+        if state
+            .pusher
+            .edit_message_with_markup(chat_id, mid, &text, markup.clone())
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+    }
+
+    tg_send_with_markup(state, chat_id, &text, markup).await
+}
+
+async fn send_help_with_menu(state: &Arc<AppState>, chat_id: i64) -> crate::error::Result<()> {
+    let mut text = telegram_help_text();
+    text.push_str("\n\n<i>也可使用下方按钮导航</i>");
+    tg_send_with_markup(state, chat_id, &text, main_menu_markup()).await
+}
+
+async fn run_scan_command(
+    state: Arc<AppState>,
+    chat_id: i64,
+    only_signal: Option<&str>,
+) -> crate::error::Result<()> {
+    let meta = scan_signal_meta();
+    let tip = match only_signal {
+        Some(sig) => {
+            let (name, _) = meta
+                .get(sig)
+                .cloned()
+                .unwrap_or_else(|| (sig.to_string(), "•".to_string()));
+            format!("⏳ 正在扫描信号：{}，请稍候...", escape_html(&name))
+        }
+        None => "⏳ 正在扫描全部信号，请稍候...".to_string(),
+    };
+    tg_send(&state, chat_id, &tip).await?;
+
+    let results = ScannerService::new(state.clone()).run_full_scan().await?;
+    let summary = format_scan_summary(&results, only_signal);
+    tg_send(&state, chat_id, &summary).await?;
+
+    for (signal_id, _count) in scan_signal_rows(&results)
+        .into_iter()
+        .filter(|(signal_id, _)| only_signal.map(|s| s == signal_id).unwrap_or(true))
+    {
+        let hits = match results.get(&signal_id) {
+            Some(v) if !v.is_empty() => v,
+            _ => continue,
+        };
+        let (name, icon) = meta
+            .get(&signal_id)
+            .cloned()
+            .unwrap_or_else(|| (signal_id.clone(), "•".to_string()));
+        send_scan_signal_buttons(&state, chat_id, &name, &icon, hits).await?;
+    }
+    Ok(())
+}
+
+async fn handle_telegram_callback(
+    state: Arc<AppState>,
+    chat_id: i64,
+    user_id: i64,
+    message_id: i64,
+    data: String,
+) -> crate::error::Result<()> {
+    tracing::info!(
+        "telegram callback: chat_id={}, user_id={}, message_id={}, data={}",
+        chat_id,
+        user_id,
+        message_id,
+        data
+    );
+
+    match data.as_str() {
+        "menu:main" => show_menu(&state, chat_id, Some(message_id), "main").await?,
+        "menu:scan" => show_menu(&state, chat_id, Some(message_id), "scan").await?,
+        "menu:watch" => show_menu(&state, chat_id, Some(message_id), "watch").await?,
+        "menu:portfolio" => show_menu(&state, chat_id, Some(message_id), "portfolio").await?,
+        "menu:sector" => show_menu(&state, chat_id, Some(message_id), "sector").await?,
+        "menu:tools" => show_menu(&state, chat_id, Some(message_id), "tools").await?,
+        "menu:daban" => show_menu(&state, chat_id, Some(message_id), "daban").await?,
+        "cmd:help" => send_help_with_menu(&state, chat_id).await?,
+        "cmd:mywatch" => {
+            handle_telegram_command(state.clone(), chat_id, user_id, "mywatch".to_string(), "".to_string()).await?
+        }
+        "cmd:export" => {
+            handle_telegram_command(state.clone(), chat_id, user_id, "export".to_string(), "".to_string()).await?
+        }
+        "cmd:port" => {
+            handle_telegram_command(state.clone(), chat_id, user_id, "port".to_string(), "".to_string()).await?
+        }
+        "cmd:daban" => {
+            handle_telegram_command(state.clone(), chat_id, user_id, "daban".to_string(), "".to_string()).await?
+        }
+        "cmd:daban_portfolio" => {
+            handle_telegram_command(
+                state.clone(),
+                chat_id,
+                user_id,
+                "daban".to_string(),
+                "portfolio".to_string(),
+            )
+            .await?
+        }
+        "cmd:daban_stats" => {
+            handle_telegram_command(
+                state.clone(),
+                chat_id,
+                user_id,
+                "daban".to_string(),
+                "stats".to_string(),
+            )
+            .await?
+        }
+        "cmd:daban_scan" => {
+            handle_telegram_command(
+                state.clone(),
+                chat_id,
+                user_id,
+                "daban".to_string(),
+                "scan".to_string(),
+            )
+            .await?
+        }
+        "cmd:industry" => {
+            handle_telegram_command(state.clone(), chat_id, user_id, "industry".to_string(), "".to_string()).await?
+        }
+        "cmd:concept" => {
+            handle_telegram_command(state.clone(), chat_id, user_id, "concept".to_string(), "".to_string()).await?
+        }
+        "cmd:hot7" => {
+            handle_telegram_command(state.clone(), chat_id, user_id, "hot7".to_string(), "".to_string()).await?
+        }
+        "cmd:hot14" => {
+            handle_telegram_command(state.clone(), chat_id, user_id, "hot14".to_string(), "".to_string()).await?
+        }
+        "cmd:hot30" => {
+            handle_telegram_command(state.clone(), chat_id, user_id, "hot30".to_string(), "".to_string()).await?
+        }
+        "cmd:sector_sync" => {
+            handle_telegram_command(state.clone(), chat_id, user_id, "sector_sync".to_string(), "".to_string()).await?
+        }
+        "cmd:ai_analysis" => {
+            handle_telegram_command(state.clone(), chat_id, user_id, "ai_analysis".to_string(), "".to_string()).await?
+        }
+        "cmd:dbcheck" => {
+            handle_telegram_command(state.clone(), chat_id, user_id, "dbcheck".to_string(), "".to_string()).await?
+        }
+        "cmd:dbsync" => {
+            handle_telegram_command(state.clone(), chat_id, user_id, "dbsync".to_string(), "".to_string()).await?
+        }
+        "scan:all" => run_scan_command(state.clone(), chat_id, None).await?,
+        "prompt:watch_add" => tg_send(&state, chat_id, "用法: <code>/watch 600519</code>").await?,
+        "prompt:watch_del" => tg_send(&state, chat_id, "用法: <code>/unwatch 600519</code>").await?,
+        "prompt:port_add" => {
+            tg_send(
+                &state,
+                chat_id,
+                "用法: <code>/port add &lt;代码&gt; &lt;成本价&gt; &lt;股数&gt;</code>",
+            )
+            .await?
+        }
+        "prompt:port_del" => {
+            tg_send(&state, chat_id, "用法: <code>/port del &lt;代码&gt;</code>").await?
+        }
+        "prompt:history" => tg_send(&state, chat_id, "用法: <code>/history 600519</code>").await?,
+        "prompt:chart" => tg_send(&state, chat_id, "用法: <code>/chart 600519</code>").await?,
+        _ => {
+            if let Some(signal_id) = data.strip_prefix("scan:s:") {
+                run_scan_command(state.clone(), chat_id, Some(signal_id)).await?;
+            } else {
+                tg_send(&state, chat_id, "❓ 未识别按钮动作，请重试。").await?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 async fn handle_telegram_command(
@@ -761,8 +1176,11 @@ async fn handle_telegram_command(
     );
 
     match command.as_str() {
+        "menu" => {
+            show_menu(&state, chat_id, None, "main").await?;
+        }
         "start" | "help" => {
-            tg_send(&state, chat_id, &telegram_help_text()).await?;
+            send_help_with_menu(&state, chat_id).await?;
         }
         "watch" => {
             let code = args.split_whitespace().next().unwrap_or_default();
@@ -948,9 +1366,7 @@ async fn handle_telegram_command(
             }
         }
         "scan" => {
-            tg_send(&state, chat_id, "⏳ 正在扫描信号，请稍候...").await?;
-            let summary = format_scan_summary(state.clone()).await?;
-            tg_send(&state, chat_id, &summary).await?;
+            run_scan_command(state.clone(), chat_id, None).await?;
         }
         "industry" => send_sector_snapshot(state.clone(), chat_id, "industry").await?,
         "concept" => send_sector_snapshot(state.clone(), chat_id, "concept").await?,
@@ -1151,6 +1567,47 @@ async fn telegram_webhook(
             StatusCode::UNAUTHORIZED,
             Json(json!({"error": "invalid telegram webhook secret"})),
         ));
+    }
+
+    if let Some(callback) = update.callback_query {
+        let Some(message) = callback.message else {
+            tracing::debug!("telegram callback ignored: no_message");
+            return Ok(Json(json!({"ok": true, "ignored": "callback_no_message"})));
+        };
+        let Some(data) = callback.data else {
+            tracing::debug!("telegram callback ignored: no_data");
+            return Ok(Json(json!({"ok": true, "ignored": "callback_no_data"})));
+        };
+
+        if let Err(e) = state
+            .pusher
+            .answer_callback_query(&callback.id, None)
+            .await
+        {
+            tracing::warn!("telegram answerCallbackQuery failed: {}", e);
+        }
+
+        let chat_id = message.chat.id;
+        let user_id = callback.from.id;
+        let message_id = message.message_id;
+        let state_clone = state.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) = handle_telegram_callback(
+                state_clone.clone(),
+                chat_id,
+                user_id,
+                message_id,
+                data,
+            )
+            .await
+            {
+                tracing::warn!("telegram callback handling failed: {}", e);
+                let _ = tg_send(&state_clone, chat_id, "❌ 按钮操作失败，请稍后重试。").await;
+            }
+        });
+
+        return Ok(Json(json!({"ok": true})));
     }
 
     let msg = update.message.or(update.edited_message);

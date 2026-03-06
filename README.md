@@ -227,6 +227,7 @@ sudo journalctl -u qbot -f
 
 Supported command set (webhook):
 - `/start`, `/help`
+- `/menu` (打开按钮导航)
 - `/watch`, `/unwatch`, `/mywatch`, `/export`
 - `/port`, `/port add`, `/port del`
 - `/scan`
@@ -235,6 +236,16 @@ Supported command set (webhook):
 - `/ai_analysis`
 - `/history`, `/chart`
 - `/dbcheck`, `/dbsync`
+
+`/scan` behavior:
+- Runs full signal scan (all enabled signals).
+- Sends summary + per-signal button lists.
+- Buttons open stock K-line pages directly.
+- Supports signal-specific scan via button menu (`/menu` → `信号扫描`).
+
+Telegram button navigation:
+- Main menu + submenus for Watchlist / Portfolio / Daban / Sector+AI / Tools.
+- All commands and subcommands have corresponding buttons.
 
 Command menu:
 - qbot now auto-calls Telegram `setMyCommands` on startup.

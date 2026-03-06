@@ -27,12 +27,21 @@ impl TelegramPusher {
 
     pub async fn push(&self, channel: &str, text: &str) -> Result<()> {
         for chunk in Self::split_message(text) {
-            self.send_message(channel, &chunk).await?;
+            self.send_message(channel, &chunk, None).await?;
             if chunk.len() > 100 {
                 sleep(Duration::from_millis(500)).await;
             }
         }
         Ok(())
+    }
+
+    pub async fn push_with_markup(
+        &self,
+        channel: &str,
+        text: &str,
+        reply_markup: serde_json::Value,
+    ) -> Result<()> {
+        self.send_message(channel, text, Some(&reply_markup)).await
     }
 
     pub async fn set_webhook(&self, webhook_url: &str, secret_token: Option<&str>) -> Result<()> {
@@ -100,14 +109,92 @@ impl TelegramPusher {
         Ok(())
     }
 
-    async fn send_message(&self, chat_id: &str, text: &str) -> Result<()> {
-        let url = format!("{}{}/sendMessage", TG_API, self.token);
+    pub async fn answer_callback_query(
+        &self,
+        callback_query_id: &str,
+        text: Option<&str>,
+    ) -> Result<()> {
+        let url = format!("{}{}/answerCallbackQuery", TG_API, self.token);
+        let mut body = json!({
+            "callback_query_id": callback_query_id,
+        });
+        if let Some(t) = text.filter(|v| !v.trim().is_empty()) {
+            body["text"] = json!(t);
+        }
+
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(AppError::Http)?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err_text = resp.text().await.unwrap_or_default();
+            return Err(AppError::Internal(format!(
+                "answerCallbackQuery {}: {}",
+                status, err_text
+            )));
+        }
+
+        Ok(())
+    }
+
+    pub async fn edit_message_with_markup(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: &str,
+        reply_markup: serde_json::Value,
+    ) -> Result<()> {
+        let url = format!("{}{}/editMessageText", TG_API, self.token);
         let body = json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": true,
+            "reply_markup": reply_markup,
+        });
+
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(AppError::Http)?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err_text = resp.text().await.unwrap_or_default();
+            return Err(AppError::Internal(format!(
+                "editMessageText {}: {}",
+                status, err_text
+            )));
+        }
+
+        Ok(())
+    }
+
+    async fn send_message(
+        &self,
+        chat_id: &str,
+        text: &str,
+        reply_markup: Option<&serde_json::Value>,
+    ) -> Result<()> {
+        let url = format!("{}{}/sendMessage", TG_API, self.token);
+        let mut body = json!({
             "chat_id": chat_id,
             "text": text,
             "parse_mode": "HTML",
             "disable_web_page_preview": true,
         });
+        if let Some(markup) = reply_markup {
+            body["reply_markup"] = markup.clone();
+        }
 
         let resp = self
             .client

@@ -73,6 +73,7 @@ async fn main() -> Result<()> {
     let bot_commands = [
         ("start", "显示帮助"),
         ("help", "显示帮助"),
+        ("menu", "打开按钮菜单"),
         ("scan", "扫描信号"),
         ("daban", "打板评分"),
         ("watch", "添加/查看自选"),
