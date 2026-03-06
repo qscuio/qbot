@@ -69,8 +69,21 @@ jobs:
           key: ${{ secrets.VPS_SSH_KEY }}
           script: |
             set -e
-            cd /opt/qbot
-            git pull origin main
+            REPO_DIR="/opt/qbot"
+            REPO_URL="https://github.com/${{ github.repository }}.git"
+
+            mkdir -p "$REPO_DIR"
+
+            if [ ! -d "$REPO_DIR/.git" ]; then
+              echo "No git repository found in $REPO_DIR. Initializing..."
+              git -C "$REPO_DIR" init
+              git -C "$REPO_DIR" remote add origin "$REPO_URL"
+            fi
+
+            git -C "$REPO_DIR" fetch --depth 1 origin main
+            git -C "$REPO_DIR" checkout -B main FETCH_HEAD
+
+            cd "$REPO_DIR"
             cargo build --release
             cp target/release/qbot /opt/qbot/qbot
             sudo systemctl restart qbot

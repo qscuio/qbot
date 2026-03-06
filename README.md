@@ -151,20 +151,22 @@ Push to `main` triggers `.github/workflows/deploy.yml`, which:
 3. Restarts `qbot.service` via systemd
 4. Hits `/health` to confirm
 
-**Required GitHub secrets** (Settings → Environments → VPS):
+**GitHub secrets used by deploy workflow** (Settings → Environments → `VPS`):
 
-| Secret | Description |
-|--------|-------------|
-| `DEPLOY_ENABLED` | Set to `true` to enable deploys |
-| `VPS_HOST` | VPS IP address |
-| `VPS_USER` | SSH user (e.g. `ubuntu`) |
-| `VPS_SSH_KEY` | Private SSH key |
-| `TUSHARE_TOKEN` | Tushare API token |
-| `TELEGRAM_BOT_TOKEN` | Telegram bot token |
-| `REPORT_CHANNEL` | Report channel ID |
-| `STOCK_ALERT_CHANNEL` | Alert channel ID |
-| `API_KEY` | REST API bearer key (optional) |
-| `DATA_PROXY` | Proxy URL (optional) |
+| Secret | Required | Description |
+|--------|----------|-------------|
+| `DEPLOY_ENABLED` | Yes | Must be `true` or deploy steps are skipped |
+| `VPS_HOST` | Yes | VPS IP or hostname |
+| `VPS_USER` | Yes | SSH user (for example `ubuntu`) |
+| `VPS_SSH_KEY` | Yes | Private SSH key content (full PEM block) |
+| `TUSHARE_TOKEN` | Yes | Tushare API token |
+| `TELEGRAM_BOT_TOKEN` | Yes | Telegram bot token |
+| `REPORT_CHANNEL` | Yes | Telegram channel ID for reports |
+| `STOCK_ALERT_CHANNEL` | No | Telegram channel ID for burst alerts |
+| `DABAN_CHANNEL` | No | Telegram channel ID for daban notifications |
+| `API_KEY` | No | REST API bearer token |
+| `AI_API_KEY` | No | Optional key for AI analysis features |
+| `DATA_PROXY` | No | Optional HTTP/SOCKS proxy URL |
 
 ### VPS First-Run Setup
 
