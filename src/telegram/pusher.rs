@@ -49,7 +49,7 @@ impl TelegramPusher {
         let mut body = json!({
             "url": webhook_url,
             "drop_pending_updates": false,
-            "allowed_updates": ["message", "edited_message"],
+            "allowed_updates": ["message", "edited_message", "callback_query"],
         });
 
         if let Some(secret) = secret_token.filter(|s| !s.trim().is_empty()) {

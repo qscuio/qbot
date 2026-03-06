@@ -1,0 +1,270 @@
+/* --- Header --- */
+.header {
+    padding-top: 8px;
+    padding-bottom: 8px;
+    padding-left: 12px;
+    padding-right: 12px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border-color);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    flex-shrink: 0;
+    position: relative;
+    z-index: 20;
+}
+
+/* Mobile: Add padding for system status bar */
+@media (max-width: 768px) {
+    .header {
+        padding-top: calc(env(safe-area-inset-top) + 8px);
+        padding-left: 16px;
+        padding-right: 16px;
+    }
+}
+
+/* Row 1: Stock Name & Code (Centered) */
+.header-row-title {
+    display: flex;
+    align-items: baseline;
+    justify-content: center;
+    gap: 8px;
+    width: 100%;
+    min-height: 28px;
+}
+
+.stock-name {
+    font-size: 20px;
+    font-weight: 700;
+    color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    line-height: 1.2;
+}
+
+.stock-code {
+    font-size: 14px;
+    color: var(--text-secondary);
+    font-family: monospace;
+    flex-shrink: 0;
+}
+
+/* Row 2: Price & Change (Centered) */
+.header-row-price {
+    display: flex;
+    align-items: baseline;
+    justify-content: center;
+    gap: 8px;
+    width: 100%;
+}
+
+.price-curr {
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--text-primary);
+    font-family: monospace;
+}
+
+/* Row 3: Actions */
+.header-row-actions {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    width: 100%;
+    overflow: visible;
+    padding-bottom: 2px;
+}
+
+/* Row 4: Stats */
+.header-row-stats {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    gap: 8px;
+}
+
+.stat-grid {
+    display: flex;
+    gap: 12px;
+    font-size: 11px;
+    flex-wrap: wrap;
+    justify-content: center;
+}
+
+.stat-item {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+    white-space: nowrap;
+}
+
+.stat-label {
+    color: var(--text-muted);
+}
+
+.stat-val {
+    font-weight: 500;
+    font-family: monospace;
+}
+
+/* --- Toolbar --- */
+.toolbar {
+    height: 48px;
+    display: flex;
+    align-items: center;
+    background: var(--bg-primary);
+    border-bottom: 1px solid var(--border-color);
+    padding: 0 8px;
+    gap: 4px;
+    overflow-x: auto;
+    flex-shrink: 0;
+}
+
+.toolbar::-webkit-scrollbar {
+    display: none;
+}
+
+.group {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    padding: 0 4px;
+    border-right: 1px solid var(--border-color);
+    height: 24px;
+}
+
+.group:last-child {
+    border-right: none;
+}
+
+.spacer {
+    flex: 1;
+}
+
+/* --- Main Layout --- */
+.content-area {
+    flex: 1;
+    display: flex;
+    overflow: hidden;
+    position: relative;
+}
+
+/* Chart Section */
+.chart-section {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    position: relative;
+}
+
+#main-chart {
+    flex: 3;
+    min-height: 200px;
+    position: relative;
+}
+
+#sub-chart {
+    flex: 1.2;
+    min-height: 80px;
+    border-top: 1px solid var(--border-color);
+    position: relative;
+}
+
+/* --- Chip Panel --- */
+.side-panel {
+    width: 0;
+    /* Hidden by default on desktop */
+    border-left: 0;
+    background: var(--bg-secondary);
+    display: flex;
+    flex-direction: column;
+    transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    z-index: 30;
+    position: relative;
+    overflow: hidden;
+}
+
+.side-panel.open {
+    width: 240px;
+    border-left: 1px solid var(--border-color);
+}
+
+.panel-header {
+    padding: 12px;
+    font-weight: 600;
+    font-size: 13px;
+    border-bottom: 1px solid var(--border-color);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    position: relative;
+    z-index: 2;
+    background: var(--bg-secondary);
+}
+
+.close-btn {
+    display: none;
+    background: none;
+    border: none;
+    font-size: 18px;
+    color: var(--text-secondary);
+    cursor: pointer;
+}
+
+#chip-chart-area {
+    flex: 1;
+    padding: 8px;
+    overflow: hidden;
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: var(--chip-height, 100%);
+    z-index: 1;
+}
+
+.chip-stats {
+    padding: 12px;
+    border-top: 1px solid var(--border-color);
+    font-size: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    position: relative;
+    z-index: 2;
+    background: var(--bg-secondary);
+    margin-top: auto;
+}
+
+/* Mobile Overlay Backdrop */
+.backdrop {
+    display: none;
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    z-index: 25;
+    opacity: 0;
+    transition: opacity 0.3s;
+}
+
+.backdrop.open {
+    display: block;
+    opacity: 1;
+}
+
+/* Floating Navigation */
+.floating-nav {
+    position: fixed;
+    bottom: calc(40px + env(safe-area-inset-bottom));
+    left: 0;
+    width: 100%;
+    display: flex;
+    justify-content: space-between;
+    padding: 0 24px;
+    pointer-events: none;
+    z-index: 90;
+}

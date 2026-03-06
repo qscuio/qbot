@@ -1,0 +1,94 @@
+/* --- Responsive: Desktop --- */
+@media(min-width: 600px) {
+    .stat-grid {
+        display: flex;
+    }
+}
+
+/* --- Responsive: Mobile --- */
+@media (max-width: 768px) {
+    .side-panel {
+        position: absolute;
+        right: 0;
+        top: 0;
+        bottom: 0;
+        transform: translateX(100%);
+        box-shadow: -4px 0 16px rgba(0, 0, 0, 0.2);
+    }
+
+    .side-panel.open {
+        transform: translateX(0);
+    }
+
+    .close-btn {
+        display: block;
+    }
+}
+
+/* --- Landscape Mode --- */
+.force-landscape {
+    transform: rotate(90deg);
+    transform-origin: top left;
+    width: 100vh !important;
+    height: 100vw !important;
+    /* Fallback for browsers supporting dvh/dvw */
+    width: 100dvh !important;
+    height: 100dvw !important;
+    position: fixed;
+    top: 0;
+    left: 100%;
+    z-index: 9999;
+    background: var(--bg-primary);
+    overflow: hidden;
+}
+
+/* Compact Header for Landscape */
+.force-landscape .header {
+    padding-top: env(safe-area-inset-top);
+    padding-left: 60px !important;
+    padding-right: 60px !important;
+    min-height: 40px;
+    gap: 4px;
+    justify-content: center;
+    align-items: center;
+}
+
+/* Compact rows in landscape */
+.force-landscape .header-row-title {
+    justify-content: center;
+    min-height: auto;
+}
+
+.force-landscape .header-row-price {
+    gap: 6px;
+}
+
+.force-landscape .header-row-actions {
+    justify-content: center;
+    padding-bottom: 0;
+}
+
+.force-landscape .header-row-stats {
+    justify-content: center;
+    gap: 12px;
+}
+
+.force-landscape .stat-grid {
+    display: flex !important;
+    font-size: 10px;
+    gap: 8px;
+}
+
+/* Adjust individual text sizes for compact line */
+.force-landscape .stock-name {
+    font-size: 14px;
+}
+
+.force-landscape .price-curr {
+    font-size: 14px;
+}
+
+.force-landscape .price-change {
+    padding: 1px 4px;
+    font-size: 11px;
+}

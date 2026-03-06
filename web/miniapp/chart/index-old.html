@@ -1,0 +1,2950 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport"
+        content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>Pro Stock Chart</title>
+    <script src="https://unpkg.com/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"></script>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <style>
+        :root {
+            --bg-primary: #ffffff;
+            --bg-secondary: #f8fafc;
+            --bg-tertiary: #f1f5f9;
+            --text-primary: #0f172a;
+            --text-secondary: #64748b;
+            --text-muted: #94a3b8;
+            --border-color: #e2e8f0;
+            --grid-color: #f1f5f9;
+            --up-color: #ef4444;
+            /* Rise = Red */
+            --down-color: #22c55e;
+            /* Fall = Green */
+            --accent-color: #2962ff;
+            --btn-active-bg: #eff6ff;
+            --btn-active-text: #2962ff;
+            --hover-bg: #f1f5f9;
+        }
+
+        [data-theme="dark"] {
+            --bg-primary: #101014;
+            --bg-secondary: #161a25;
+            --bg-tertiary: #1e222d;
+            --text-primary: #d1d4dc;
+            --text-secondary: #868993;
+            --text-muted: #50535e;
+            --border-color: #2a2e39;
+            --grid-color: #1e222d;
+            --up-color: #f23645;
+            --down-color: #089981;
+            --accent-color: #2962ff;
+            --btn-active-bg: #1e222d;
+            --btn-active-text: #2962ff;
+            --hover-bg: #2a2e39;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        body {
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Roboto, sans-serif;
+            overflow: hidden;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* --- Header --- */
+        .header {
+            /* Minimal top padding + safe area */
+            padding-top: calc(4px + env(safe-area-inset-top));
+            padding-bottom: 8px;
+            padding-left: 12px;
+            padding-right: 12px;
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            justify-content: center;
+            /* Center content in Portrait */
+            align-items: center;
+            height: auto;
+            min-height: 50px;
+            flex-shrink: 0;
+            position: relative;
+        }
+
+        /* Stock Info (First Child) - Centered in Portrait */
+        .header>div:first-child {
+            margin-left: 0;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            /* Center text */
+            z-index: 10;
+        }
+
+        .stock-main {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            align-items: center;
+            /* Center items */
+        }
+
+        .stock-title-row {
+            display: flex;
+            align-items: baseline;
+            gap: 8px;
+            justify-content: center;
+        }
+
+        .stock-name {
+            font-size: 16px;
+            font-weight: 700;
+            color: var(--text-primary);
+        }
+
+        .stock-code {
+            font-size: 12px;
+            color: var(--text-secondary);
+            font-family: monospace;
+        }
+
+        .stock-price-row {
+            display: flex;
+            align-items: baseline;
+            gap: 12px;
+        }
+
+        .price-curr {
+            font-size: 20px;
+            font-weight: 700;
+            color: var(--text-primary);
+        }
+
+        .price-change {
+            font-size: 13px;
+            font-weight: 600;
+            padding: 2px 6px;
+            border-radius: 4px;
+        }
+
+        .price-change.up {
+            color: var(--up-color);
+            background: rgba(242, 54, 69, 0.1);
+        }
+
+        .price-change.down {
+            color: var(--down-color);
+            background: rgba(8, 153, 129, 0.1);
+        }
+
+        .price-change.flat {
+            color: var(--text-secondary);
+            background: var(--bg-tertiary);
+        }
+
+        .stat-grid {
+            display: flex;
+            gap: 16px;
+            font-size: 11px;
+            display: none;
+        }
+
+        .stat-item {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-end;
+        }
+
+        .stat-label {
+            color: var(--text-muted);
+        }
+
+        .stat-val {
+            font-weight: 500;
+            font-family: monospace;
+        }
+
+        @media(min-width: 600px) {
+            .stat-grid {
+                display: flex;
+            }
+        }
+
+        /* --- Toolbar --- */
+        .toolbar {
+            height: 48px;
+            display: flex;
+            align-items: center;
+            background: var(--bg-primary);
+            border-bottom: 1px solid var(--border-color);
+            padding: 0 8px;
+            gap: 4px;
+            overflow-x: auto;
+            flex-shrink: 0;
+        }
+
+        .toolbar::-webkit-scrollbar {
+            display: none;
+        }
+
+        .group {
+            display: flex;
+            align-items: center;
+            gap: 2px;
+            padding: 0 4px;
+            border-right: 1px solid var(--border-color);
+            height: 24px;
+        }
+
+        .group:last-child {
+            border-right: none;
+        }
+
+        .t-btn {
+            background: transparent;
+            border: none;
+            color: var(--text-secondary);
+            padding: 6px 10px;
+            font-size: 13px;
+            font-weight: 500;
+            border-radius: 6px;
+            cursor: pointer;
+            white-space: nowrap;
+            transition: all 0.2s;
+        }
+
+        .t-btn:hover {
+            background: var(--hover-bg);
+            color: var(--text-primary);
+        }
+
+        .t-btn.active {
+            color: var(--btn-active-text);
+            background: var(--btn-active-bg);
+            font-weight: 600;
+        }
+
+        .t-btn.xs {
+            font-size: 11px;
+            padding: 4px 6px;
+        }
+
+        .spacer {
+            flex: 1;
+        }
+
+        .theme-toggle {
+            padding: 6px;
+            font-size: 16px;
+            background: transparent;
+            border: none;
+            cursor: pointer;
+        }
+
+        /* --- Main Layout --- */
+        .content-area {
+            flex: 1;
+            display: flex;
+            overflow: hidden;
+            position: relative;
+        }
+
+        /* Chart Section */
+        .chart-section {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+            position: relative;
+        }
+
+        #main-chart {
+            flex: 3;
+            min-height: 200px;
+            position: relative;
+        }
+
+        #sub-chart {
+            flex: 1.2;
+            min-height: 80px;
+            border-top: 1px solid var(--border-color);
+            position: relative;
+        }
+
+        .legend-floating {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            z-index: 20;
+            font-size: 11px;
+            font-family: monospace;
+            pointer-events: none;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .leg-row {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            background: rgba(0, 0, 0, 0.0);
+            border-radius: 4px;
+            padding: 2px;
+        }
+
+        .leg-item {
+            display: flex;
+            gap: 4px;
+        }
+
+        .leg-lbl {
+            color: var(--text-muted);
+        }
+
+        .leg-val {
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        /* Indicators Colors */
+        .c-ma5 {
+            color: #f59e0b;
+        }
+
+        .c-ma10 {
+            color: #3b82f6;
+        }
+
+        .c-ma20 {
+            color: #a855f7;
+        }
+
+        .c-ma60 {
+            color: #22c55e;
+        }
+
+        .c-macd-diff {
+            color: #f23645;
+        }
+
+        .c-macd-dea {
+            color: #3b82f6;
+        }
+
+        .c-k {
+            color: #f59e0b;
+        }
+
+        .c-d {
+            color: #3b82f6;
+        }
+
+        .c-j {
+            color: #a855f7;
+        }
+
+        .c-rsi {
+            color: #a855f7;
+        }
+
+        /* --- Chip Panel --- */
+        .side-panel {
+            width: 0;
+            /* Hidden by default on desktop */
+            border-left: 0;
+            background: var(--bg-secondary);
+            display: flex;
+            flex-direction: column;
+            transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            z-index: 30;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .side-panel.open {
+            width: 240px;
+            border-left: 1px solid var(--border-color);
+        }
+
+        @media (max-width: 768px) {
+            .side-panel {
+                position: absolute;
+                right: 0;
+                top: 0;
+                bottom: 0;
+                transform: translateX(100%);
+                box-shadow: -4px 0 16px rgba(0, 0, 0, 0.2);
+            }
+
+            .side-panel.open {
+                transform: translateX(0);
+            }
+        }
+
+        .panel-header {
+            padding: 12px;
+            font-weight: 600;
+            font-size: 13px;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            position: relative;
+            z-index: 2;
+            background: var(--bg-secondary);
+        }
+
+        .close-btn {
+            display: none;
+            background: none;
+            border: none;
+            font-size: 18px;
+            color: var(--text-secondary);
+            cursor: pointer;
+        }
+
+        @media (max-width: 768px) {
+            .close-btn {
+                display: block;
+            }
+        }
+
+        #chip-chart-area {
+            flex: 1;
+            padding: 8px;
+            overflow: hidden;
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: var(--chip-height, 100%);
+            z-index: 1;
+        }
+
+        .chip-stats {
+            padding: 12px;
+            border-top: 1px solid var(--border-color);
+            font-size: 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            position: relative;
+            z-index: 2;
+            background: var(--bg-secondary);
+            margin-top: auto;
+        }
+
+        .chip-row {
+            display: flex;
+            justify-content: space-between;
+        }
+
+        .chip-val {
+            font-weight: 600;
+            font-family: monospace;
+        }
+
+        .chip-bar-row {
+            display: flex;
+            align-items: center;
+            height: 12px;
+            margin-bottom: 1px;
+        }
+
+        .chip-price {
+            width: 45px;
+            font-size: 9px;
+            color: var(--text-muted);
+            text-align: right;
+            padding-right: 4px;
+        }
+
+        .chip-track {
+            flex: 1;
+            background: var(--bg-tertiary);
+            height: 8px;
+            border-radius: 2px;
+            overflow: hidden;
+        }
+
+        .chip-fill {
+            height: 100%;
+            transition: width 0.3s;
+        }
+
+        .chip-fill.p {
+            background: var(--up-color);
+            opacity: 0.8;
+        }
+
+        .chip-fill.l {
+            background: var(--down-color);
+            opacity: 0.8;
+        }
+
+        .peak-marker {
+            position: absolute;
+            left: 0;
+            color: #f59e0b;
+            font-size: 8px;
+            line-height: 1;
+        }
+
+        /* Action Banner */
+        .action-banner {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 8px 16px;
+            background: linear-gradient(90deg, var(--bg-secondary) 0%, var(--bg-primary) 100%);
+            border-bottom: 1px solid var(--border-color);
+            gap: 12px;
+        }
+
+        .action-signal {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .action-badge {
+            padding: 4px 12px;
+            border-radius: 4px;
+            font-weight: bold;
+            font-size: 12px;
+            text-transform: uppercase;
+        }
+
+        .action-badge.buy {
+            background: rgba(34, 197, 94, 0.2);
+            color: #22c55e;
+            border: 1px solid #22c55e;
+        }
+
+        .action-badge.sell {
+            background: rgba(239, 68, 68, 0.2);
+            color: #ef4444;
+            border: 1px solid #ef4444;
+        }
+
+        .action-badge.hold {
+            background: rgba(251, 191, 36, 0.2);
+            color: #fbbf24;
+            border: 1px solid #fbbf24;
+        }
+
+        .action-text {
+            font-size: 11px;
+            color: var(--text-secondary);
+        }
+
+        .action-text strong {
+            color: var(--text-primary);
+        }
+
+        .action-time {
+            font-size: 10px;
+            color: var(--text-muted);
+        }
+
+        .curr-marker {
+            color: var(--text-primary);
+            font-size: 10px;
+            margin-left: 2px;
+        }
+
+        .chip-track {
+            position: relative;
+        }
+
+        /* Loading & Error */
+        .overlay {
+            position: absolute;
+            inset: 0;
+            background: var(--bg-primary);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 50;
+        }
+
+        .spinner {
+            width: 30px;
+            height: 30px;
+            border: 3px solid var(--border-color);
+            border-top-color: var(--accent-color);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            100% {
+                transform: rotate(360deg);
+            }
+        }
+
+        .error {
+            color: var(--up-color);
+            font-size: 14px;
+            text-align: center;
+            padding: 20px;
+        }
+
+        /* Mobile Overlay Backdrop */
+        .backdrop {
+            display: none;
+            position: absolute;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.5);
+            z-index: 25;
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+
+        .backdrop.open {
+            display: block;
+            opacity: 1;
+        }
+
+        /* Landscape Mode */
+        .force-landscape {
+            transform: rotate(90deg);
+            transform-origin: top left;
+            width: 100vh !important;
+            height: 100vw !important;
+            /* Fallback for browsers supporting dvh/dvw */
+            width: 100dvh !important;
+            height: 100dvw !important;
+            position: fixed;
+            top: 0;
+            left: 100%;
+            z-index: 9999;
+            background: var(--bg-primary);
+            overflow: hidden;
+        }
+
+        /* Compact Header for Landscape */
+        .force-landscape .header {
+            padding-top: env(safe-area-inset-top);
+            padding-left: 60px !important;
+            /* Buffer for side buttons */
+            padding-right: 60px !important;
+            /* Buffer for side buttons */
+            min-height: 40px;
+            gap: 12px;
+            justify-content: center;
+            /* Landscape: Center align to avoid corners */
+            align-items: center;
+        }
+
+        /* Single line layout for Stock Info in Landscape */
+        .force-landscape .header>div:first-child {
+            margin-left: 0;
+            /* Reset portrait shift */
+            display: flex;
+            flex-direction: row;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .force-landscape .stock-title-row {
+            margin-bottom: 0;
+        }
+
+        .force-landscape .stock-price-row {
+            margin-top: 0 !important;
+        }
+
+        .force-landscape .stat-grid {
+            display: flex !important;
+            font-size: 10px;
+            /* Smaller font to fit */
+            gap: 8px;
+        }
+
+        /* Adjust individual text sizes for compact line */
+        .force-landscape .stock-name {
+            font-size: 14px;
+        }
+
+        .force-landscape .price-curr {
+            font-size: 14px;
+        }
+
+        .force-landscape .price-change {
+            padding: 1px 4px;
+            font-size: 11px;
+        }
+
+        /* Force show stats in landscape regardless of screen width check */
+        .force-landscape .stat-grid {
+            display: flex !important;
+        }
+
+        /* Floating Navigation */
+        .floating-nav {
+            position: fixed;
+            bottom: calc(40px + env(safe-area-inset-bottom));
+            left: 0;
+            width: 100%;
+            display: flex;
+            justify-content: space-between;
+            padding: 0 24px;
+            pointer-events: none;
+            z-index: 90;
+        }
+
+        .nav-btn {
+            pointer-events: auto;
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            border: 1px solid var(--grid-color);
+            border-radius: 50%;
+            width: 48px;
+            height: 48px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+            transition: transform 0.1s, background 0.2s;
+            opacity: 0.9;
+        }
+
+        .nav-btn:active {
+            transform: scale(0.95);
+            opacity: 1;
+        }
+
+        [data-theme="dark"] .nav-btn {
+            background: rgba(30, 30, 30, 0.8);
+            backdrop-filter: blur(8px);
+        }
+    </style>
+</head>
+
+<body>
+    <!-- Header -->
+    <div class="header">
+        <div>
+            <div class="stock-title-row">
+                <span class="stock-name" id="name">--</span>
+                <span class="stock-code" id="code">--</span>
+            </div>
+            <div class="stock-price-row" style="margin-top: 4px;">
+                <span class="price-curr" id="price">--</span>
+                <div class="price-change flat" id="change">--%</div>
+                <button class="t-btn xs" id="btn-watchlist" onclick="toggleWatchlist()"
+                    style="margin-left: 8px; font-size: 16px; padding: 2px 6px;">☆</button>
+            </div>
+        </div>
+
+        <div class="stat-grid">
+            <div class="stat-item">
+                <span class="stat-label">Amplitude</span>
+                <span class="stat-val" id="amplitude">--%</span>
+            </div>
+            <div class="stat-item">
+                <span class="stat-label">Turnover</span>
+                <span class="stat-val" id="turnover">--%</span>
+            </div>
+            <div class="stat-item">
+                <span class="stat-label">Vol Ratio</span>
+                <span class="stat-val" id="vol-ratio">--</span>
+            </div>
+            <div class="stat-item">
+                <span class="stat-label">Volume</span>
+                <span class="stat-val" id="vol-stat">--</span>
+            </div>
+        </div>
+
+        <button class="t-btn" id="chips-toggle" onclick="toggleChipsPanel()" style="display: none;">Chips</button>
+    </div>
+
+    <!-- Action Banner -->
+    <div class="action-banner" id="action-banner">
+        <div class="action-signal">
+            <span class="action-badge hold" id="action-badge">HOLD</span>
+            <div>
+                <div class="action-text" id="action-text">Analyzing...</div>
+                <div class="action-time" id="action-time">--</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toolbar -->
+    <div class="toolbar">
+        <div class="group">
+            <button class="t-btn active" onclick="setPeriod('daily', this)">Day</button>
+            <button class="t-btn" onclick="setPeriod('weekly', this)">Week</button>
+            <button class="t-btn" onclick="setPeriod('monthly', this)">Month</button>
+        </div>
+
+        <div class="group">
+            <button class="t-btn active" id="btn-ma" onclick="toggleOverlays('MA')">MA</button>
+            <button class="t-btn" id="btn-boll" onclick="toggleOverlays('BOLL')">BOLL</button>
+        </div>
+
+        <div class="group">
+            <button class="t-btn" id="btn-log" onclick="toggleLogScale()">Log</button>
+        </div>
+
+        <div class="group">
+            <button class="t-btn active" onclick="setSubChart('VOL', this)">VOL</button>
+            <button class="t-btn" onclick="setSubChart('MACD', this)">MACD</button>
+            <button class="t-btn" onclick="setSubChart('KDJ', this)">KDJ</button>
+            <button class="t-btn" onclick="setSubChart('RSI', this)">RSI</button>
+        </div>
+
+        <button class="t-btn xs active" onclick="toggleSignals()" id="btn-signals">Signals</button>
+        <button class="t-btn xs active" onclick="togglePriceLines()" id="btn-lines" data-action="lines">Lines</button>
+        <button class="t-btn xs active" onclick="toggleChipsPanel()" id="btn-chips">Chips</button>
+
+        <div class="spacer"></div>
+        <button class="t-btn xs" onclick="toggleLandscape()" id="btn-landscape" style="font-size: 16px;">⟲</button>
+        <button class="theme-toggle" id="theme-btn" onclick="toggleTheme()">🌙</button>
+    </div>
+
+    <!-- Floating Navigation -->
+    <div id="floating-nav" class="floating-nav" style="display: none;">
+        <button class="nav-btn prev" onclick="navigateTo('prev')" id="float-btn-prev">
+            <svg viewBox="0 0 24 24" width="24" height="24" stroke="currentColor" stroke-width="2" fill="none"
+                stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="15 18 9 12 15 6"></polyline>
+            </svg>
+        </button>
+        <button class="nav-btn next" onclick="navigateTo('next')" id="float-btn-next">
+            <svg viewBox="0 0 24 24" width="24" height="24" stroke="currentColor" stroke-width="2" fill="none"
+                stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="9 18 15 12 9 6"></polyline>
+            </svg>
+        </button>
+    </div>
+
+    <!-- Main Content -->
+    <div class="content-area">
+        <div class="chart-section">
+            <div id="loading" class="overlay">
+                <div class="spinner"></div>
+            </div>
+
+            <div id="main-chart">
+                <div class="legend-floating" id="main-legend">
+                    <div class="leg-row">
+                        <span class="leg-item"><span class="leg-lbl">O</span><span class="leg-val"
+                                id="l-o">--</span></span>
+                        <span class="leg-item"><span class="leg-lbl">H</span><span class="leg-val"
+                                id="l-h">--</span></span>
+                        <span class="leg-item"><span class="leg-lbl">L</span><span class="leg-val"
+                                id="l-l">--</span></span>
+                        <span class="leg-item"><span class="leg-lbl">C</span><span class="leg-val"
+                                id="l-c">--</span></span>
+                    </div>
+                    <!-- MA Legend -->
+                    <div class="leg-row" id="ma-legend">
+                        <span class="leg-item c-ma5">MA5:<span class="leg-val c-ma5" id="l-ma5">--</span></span>
+                        <span class="leg-item c-ma10">MA10:<span class="leg-val c-ma10" id="l-ma10">--</span></span>
+                        <span class="leg-item c-ma20">MA20:<span class="leg-val c-ma20" id="l-ma20">--</span></span>
+                    </div>
+                </div>
+
+            </div>
+
+            <div id="sub-chart">
+                <div class="legend-floating">
+                    <div class="leg-row" id="sub-legend">
+                        <!-- Dynamic Subchart Legend -->
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="backdrop" id="backdrop" onclick="toggleChipsPanel()"></div>
+
+        <div class="side-panel" id="side-panel">
+            <div class="panel-header">
+                <span>Chip Distribution</span>
+                <span id="chip-date" style="font-weight: 400; color: var(--text-muted);">--</span>
+                <button class="close-btn" onclick="toggleChipsPanel()">×</button>
+            </div>
+            <div id="chip-chart-area" style="flex: 1; position: relative; overflow: hidden;">
+                <canvas id="chip-canvas"
+                    style="position: absolute; top: 0; left: 0; width: 100%; height: 100%;"></canvas>
+            </div>
+            <div class="chip-stats">
+                <div class="chip-row">
+                    <span style="color:var(--text-muted)">Profit Ratio</span>
+                    <span class="chip-val" id="p-ratio" style="color:var(--up-color)">--%</span>
+                </div>
+                <div class="chip-row">
+                    <span style="color:var(--text-muted)">Avg Cost</span>
+                    <span class="chip-val" id="avg-cost">--</span>
+                </div>
+                <div class="chip-row">
+                    <span style="color:var(--text-muted)">Concentration</span>
+                    <span class="chip-val" id="conc">--%</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // --- State ---
+        const params = new URLSearchParams(window.location.search);
+        // Check for Telegram Mini App startapp parameter in multiple places:
+        // 1. Telegram WebApp SDK (initDataUnsafe.start_param)
+        // 2. URL query param (tgWebAppStartParam/startapp - set by Telegram or manual)
+        // 3. Direct URL query param (code - for direct web access)
+        const tgStartParam = window.Telegram?.WebApp?.initDataUnsafe?.start_param
+            || params.get('tgWebAppStartParam')
+            || params.get('startapp');
+
+        function parseStartParam(startParam) {
+            if (!startParam) {
+                return { code: null, context: null };
+            }
+            const idx = startParam.indexOf('_');
+            if (idx === -1) {
+                return { code: startParam, context: null };
+            }
+            const codePart = startParam.substring(0, idx);
+            const contextPart = startParam.substring(idx + 1);
+            return {
+                code: codePart || null,
+                context: contextPart || null
+            };
+        }
+
+        const parsedStart = parseStartParam(tgStartParam);
+        const parsedCodeParam = parseStartParam(params.get('code'));
+        let navContext = params.get('context') || parsedCodeParam.context || parsedStart.context;
+        let code = parsedCodeParam.code || parsedStart.code || '600519';
+        const API_BASE = window.location.origin;
+
+        // User ID for watchlist
+        const debugUserIdParam = params.get('debug_user_id');
+        let userId = null;
+
+        function resolveUserId() {
+            let resolved = window.Telegram?.WebApp?.initDataUnsafe?.user?.id;
+            if (!resolved && debugUserIdParam && /^\d+$/.test(debugUserIdParam)) {
+                resolved = Number(debugUserIdParam);
+            }
+            if (!resolved) {
+                console.warn("No Telegram User ID found; watchlist disabled.");
+            }
+            userId = resolved || null;
+            return userId;
+        }
+
+        resolveUserId();
+
+        let chartData = [];
+        let timeFrame = 'daily';
+
+        // Chart Instances
+        let chartMain, chartSub;
+        let sCandle, sMa5, sMa10, sMa20, sBollUp, sBollMid, sBollLow;
+        let sVol, sMacdHist, sMacdSig, sMacdLine, sK, sD, sJ, sRsi;
+
+        // Display Options
+        let activeOverlay = 'MA'; // 'MA', 'BOLL', 'NONE'
+        let activeSub = 'VOL';    // 'VOL', 'MACD', 'KDJ', 'RSI'
+        let showSignals = true;  // Enabled by default
+        let showPriceLines = true; // Support/Resistance/Trend lines
+        let showChipOverlay = true; // Chip distribution overlay on K-line
+
+        // Price lines (support, resistance, trend)
+        let priceLines = [];  // Store created price lines for cleanup
+
+        let chipDebounceTimer = null;
+        let lastChipIdx = -1;
+        function debouncedRenderChips(idx) {
+            if (idx === lastChipIdx && idx !== -1) return;
+            lastChipIdx = idx;
+            if (chipDebounceTimer) clearTimeout(chipDebounceTimer);
+            chipDebounceTimer = setTimeout(() => {
+                renderSidePanelChips(idx);
+            }, 20);
+        }
+
+        // --- Dynamic Lines (S/R & Trend) ---
+        let dynamicLineTimeout = null;
+        let trendChannelLines = []; // Store trend channel lines
+
+        // Re-bindable main function
+        function updateDynamicAnalysis() {
+            if (dynamicLineTimeout) clearTimeout(dynamicLineTimeout);
+            dynamicLineTimeout = setTimeout(() => {
+                const range = chartMain.timeScale().getVisibleLogicalRange();
+                if (!range) return;
+
+                // Convert logical range to data indices
+                // Handle out of bounds
+                const first = Math.max(0, Math.floor(range.from));
+                const last = Math.min(rawData.length - 1, Math.ceil(range.to));
+
+                if (first >= last) return;
+
+                const visibleData = rawData.slice(first, last + 1);
+
+                // 1. Calculate & Draw Support/Resistance
+                drawSupportResistance(visibleData);
+
+                // 2. Calculate & Draw Trend Channel
+                drawTrendChannel(visibleData);
+
+            }, 50); // Debounce 50ms
+        }
+
+        // --- Support & Resistance ---
+        function drawSupportResistance(data) {
+            clearPriceLines(); // Clear old S/R lines
+            if (!showPriceLines || data.length < 5) return;
+
+            // Simple Pivot Concept: Lowest Low / Highest High in visible
+            // Advanced: Clustering? Let's stick to key levels for now to avoid clutter
+
+            // Find Lowest Low and Highest High in visible range
+            let lowVal = Infinity, highVal = -Infinity;
+            data.forEach(d => {
+                if (d.low < lowVal) lowVal = d.low;
+                if (d.high > highVal) highVal = d.high;
+            });
+
+            const currentPrice = data[data.length - 1].close;
+
+            // Draw Support (Lowest)
+            // Only if below current price
+            if (lowVal < currentPrice) {
+                priceLines.push(sCandle.createPriceLine({
+                    price: lowVal,
+                    color: '#22c55e', // Green
+                    lineWidth: 1,
+                    lineStyle: LightweightCharts.LineStyle.Solid,
+                    axisLabelVisible: true,
+                    title: '支撑 S1',
+                }));
+            }
+
+            // Draw Resistance (Highest)
+            if (highVal > currentPrice) {
+                priceLines.push(sCandle.createPriceLine({
+                    price: highVal,
+                    color: '#ef4444', // Red
+                    lineWidth: 1,
+                    lineStyle: LightweightCharts.LineStyle.Solid,
+                    axisLabelVisible: true,
+                    title: '压力 R1',
+                }));
+            }
+        }
+
+        // =====================================================
+        // TREND ANALYSIS SYSTEM
+        // Philosophy: 趋势线不是信号源，是结构过滤器；真正的信号来自"趋势线附近的资金反应"
+        // =====================================================
+
+        // --- Tips Library ---
+        const TIPS_LIBRARY = {
+            TOUCH_TL: "📍 线是区，不是点：用 ATR 给线留呼吸空间。",
+            BREAK_TL: "⚡ 突破 ≠ 延续；接受（回踩不破）才算数。",
+            BREAKOUT_ACCEPTED: "✅ 回踩确认！突破已被市场接受。",
+            FAILED_BREAKDOWN: "🔥 失败跌破！假突破=最集中的错误仓位。",
+            FAILED_BREAKOUT: "⚠️ 上破失败！假突破=最集中的错误仓位。",
+            RISKY_NTH_TOUCH: "⚠️ 第 N 次触碰同一条线，风险显著上升。",
+            TIMEFRAME_CHANGE: "🔄 周期不是让你看得更清楚，而是让错误更少地发生。",
+            VOLUME_PULLBACK: "📉 回踩缩量是健康，回踩放量是危险。",
+            NO_VOLUME_BREAKOUT: "⚠️ 缩量突破，谨慎对待。",
+            STRUCTURE_BREAK: "🚨 结构破坏！止损基于结构失效，不是基于线。"
+        };
+        const PERMANENT_TIP = "趋势线不是进场按钮，反应才是信号。";
+
+        // --- Tips Engine ---
+        class TipsEngine {
+            constructor() {
+                this.lastTipTime = {};
+                this.cooldownMs = 60000;
+                this.tipContainer = null;
+                this.permanentTipEl = null;
+            }
+
+            init() {
+                // Create tip container
+                this.tipContainer = document.createElement('div');
+                this.tipContainer.id = 'tips-container';
+                this.tipContainer.style.cssText = `
+                    position: absolute; top: 40px; right: 10px; z-index: 30;
+                    max-width: 280px; font-size: 11px; pointer-events: none;
+                `;
+                document.getElementById('main-chart').appendChild(this.tipContainer);
+
+                // Create permanent tip
+                this.permanentTipEl = document.createElement('div');
+                this.permanentTipEl.style.cssText = `
+                    background: rgba(236, 72, 153, 0.15); color: #ec4899;
+                    padding: 6px 10px; border-radius: 6px; margin-bottom: 6px;
+                    border-left: 3px solid #ec4899;
+                `;
+                this.permanentTipEl.textContent = PERMANENT_TIP;
+                this.tipContainer.appendChild(this.permanentTipEl);
+            }
+
+            shouldShowTip(tipKey) {
+                const now = Date.now();
+                const lastTime = this.lastTipTime[tipKey] || 0;
+                if (now - lastTime > this.cooldownMs) {
+                    this.lastTipTime[tipKey] = now;
+                    return true;
+                }
+                return false;
+            }
+
+            showTip(eventType) {
+                if (!this.tipContainer) return;
+                if (!this.shouldShowTip(eventType)) return;
+                const text = TIPS_LIBRARY[eventType];
+                if (!text) return;
+
+                const tipEl = document.createElement('div');
+                tipEl.style.cssText = `
+                    background: rgba(41, 98, 255, 0.2); color: #60a5fa;
+                    padding: 8px 12px; border-radius: 6px; margin-bottom: 6px;
+                    animation: tipFadeIn 0.3s ease-out;
+                    border-left: 3px solid #2962ff;
+                `;
+                tipEl.textContent = text;
+                this.tipContainer.appendChild(tipEl);
+
+                // Auto remove after 8 seconds
+                setTimeout(() => {
+                    tipEl.style.opacity = '0';
+                    tipEl.style.transition = 'opacity 0.5s';
+                    setTimeout(() => tipEl.remove(), 500);
+                }, 8000);
+            }
+        }
+        const tipsEngine = new TipsEngine();
+
+        // --- Pivot Detection ---
+        function detectPivots(data, leftBars = 3, rightBars = 3) {
+            const pivotHighs = [];
+            const pivotLows = [];
+
+            for (let i = leftBars; i < data.length - rightBars; i++) {
+                // Pivot High
+                let isHigh = true;
+                for (let j = -leftBars; j <= rightBars; j++) {
+                    if (j !== 0 && data[i + j].high > data[i].high) {
+                        isHigh = false;
+                        break;
+                    }
+                }
+                if (isHigh) {
+                    pivotHighs.push({
+                        index: i,
+                        time: data[i].time,
+                        price: data[i].high,
+                        confirmedAt: i + rightBars
+                    });
+                }
+
+                // Pivot Low
+                let isLow = true;
+                for (let j = -leftBars; j <= rightBars; j++) {
+                    if (j !== 0 && data[i + j].low < data[i].low) {
+                        isLow = false;
+                        break;
+                    }
+                }
+                if (isLow) {
+                    pivotLows.push({
+                        index: i,
+                        time: data[i].time,
+                        price: data[i].low,
+                        confirmedAt: i + rightBars
+                    });
+                }
+            }
+
+            return { pivotHighs, pivotLows };
+        }
+
+        // --- ATR Calculation ---
+        function calculateATR(data, period = 14) {
+            if (data.length < 2) return 0;
+            const trs = [];
+            for (let i = 1; i < data.length; i++) {
+                const tr = Math.max(
+                    data[i].high - data[i].low,
+                    Math.abs(data[i].high - data[i - 1].close),
+                    Math.abs(data[i].low - data[i - 1].close)
+                );
+                trs.push(tr);
+            }
+            const slice = trs.slice(-period);
+            return slice.reduce((a, b) => a + b, 0) / slice.length;
+        }
+
+        // --- Trend Line Creation & Scoring ---
+        function createTrendLine(p1, p2, type, data) {
+            const slope = (p2.price - p1.price) / (p2.index - p1.index);
+            return {
+                type, // 'UP' or 'DOWN'
+                p1, p2,
+                slope,
+                startIdx: p1.index,
+                endIdx: p2.index,
+                getValue: (idx) => p1.price + slope * (idx - p1.index)
+            };
+        }
+
+        function scoreTrendLine(line, data, epsilon) {
+            let touches = 0;
+            let breaches = 0;
+
+            for (let i = line.startIdx; i < data.length; i++) {
+                const lineValue = line.getValue(i);
+                const d = data[i];
+
+                if (line.type === 'UP') {
+                    if (Math.abs(d.low - lineValue) <= epsilon) touches++;
+                    if (d.close < lineValue - epsilon) breaches++;
+                } else {
+                    if (Math.abs(d.high - lineValue) <= epsilon) touches++;
+                    if (d.close > lineValue + epsilon) breaches++;
+                }
+            }
+
+            const age = data.length - 1 - line.startIdx;
+            const slopePenalty = Math.abs(line.slope) > 0.1 ? 0.8 : 1.0;
+
+            return (touches * 10 - breaches * 15 + Math.min(age, 30)) * slopePenalty;
+        }
+
+        function generateTrendLines(data, pivots, atr, epsilonFactor = 0.7) {
+            const epsilon = atr * epsilonFactor;
+            const upTrendLines = [];
+            const downTrendLines = [];
+
+            // Up trend lines from pivot lows
+            const lows = pivots.pivotLows.slice(-4);
+            for (let i = 0; i < lows.length - 1; i++) {
+                for (let j = i + 1; j < lows.length; j++) {
+                    if (lows[j].price > lows[i].price) { // Ascending
+                        const line = createTrendLine(lows[i], lows[j], 'UP', data);
+                        line.score = scoreTrendLine(line, data, epsilon);
+                        upTrendLines.push(line);
+                    }
+                }
+            }
+
+            // Down trend lines from pivot highs
+            const highs = pivots.pivotHighs.slice(-4);
+            for (let i = 0; i < highs.length - 1; i++) {
+                for (let j = i + 1; j < highs.length; j++) {
+                    if (highs[j].price < highs[i].price) { // Descending
+                        const line = createTrendLine(highs[i], highs[j], 'DOWN', data);
+                        line.score = scoreTrendLine(line, data, epsilon);
+                        downTrendLines.push(line);
+                    }
+                }
+            }
+
+            return {
+                upTrendLines: upTrendLines.sort((a, b) => b.score - a.score),
+                downTrendLines: downTrendLines.sort((a, b) => b.score - a.score),
+                epsilon
+            };
+        }
+
+        // --- Volume Ratio ---
+        function calculateVolRatio(data, lookback = 20) {
+            if (data.length < 2) return 1;
+            const currentVol = data[data.length - 1].volume;
+            const avgVol = data.slice(-lookback - 1, -1).reduce((a, b) => a + b.volume, 0) / lookback;
+            return avgVol > 0 ? currentVol / avgVol : 1;
+        }
+
+        // --- State Machine ---
+        const EVENT_TYPES = {
+            TOUCH_TL: 'TOUCH_TL',
+            BREAK_TL: 'BREAK_TL',
+            FAILED_BREAKDOWN: 'FAILED_BREAKDOWN',
+            FAILED_BREAKOUT: 'FAILED_BREAKOUT',
+            BREAKOUT_ACCEPTED: 'BREAKOUT_ACCEPTED',
+            RISKY_NTH_TOUCH: 'RISKY_NTH_TOUCH'
+        };
+
+        class TrendStateMachine {
+            constructor() {
+                this.state = 'IDLE';
+                this.breakoutBar = null;
+                this.breakoutLevel = null;
+                this.pullbackWindow = 10;
+                this.touchCount = 0;
+            }
+
+            reset() {
+                this.state = 'IDLE';
+                this.breakoutBar = null;
+                this.breakoutLevel = null;
+                this.touchCount = 0;
+            }
+
+            processBar(bar, idx, trendLine, volRatio, epsilon) {
+                if (!trendLine) return [];
+                const lineValue = trendLine.getValue(idx);
+                const events = [];
+
+                const inZone = Math.abs(bar.close - lineValue) <= epsilon || Math.abs(bar.low - lineValue) <= epsilon;
+                const breakUp = bar.close > lineValue + epsilon;
+                const breakDn = bar.close < lineValue - epsilon;
+                const failedBreakdown = bar.low < lineValue - epsilon && bar.close > lineValue;
+                const failedBreakout = bar.high > lineValue + epsilon && bar.close < lineValue;
+
+                switch (this.state) {
+                    case 'IDLE':
+                        if (inZone) {
+                            this.touchCount++;
+                            events.push({ type: EVENT_TYPES.TOUCH_TL, idx, lineValue });
+                            if (this.touchCount >= 3) {
+                                events.push({ type: EVENT_TYPES.RISKY_NTH_TOUCH, idx, count: this.touchCount });
+                            }
+                        }
+                        if (trendLine.type === 'UP' && breakUp) {
+                            this.state = 'BREAKOUT_DETECTED';
+                            this.breakoutBar = idx;
+                            this.breakoutLevel = lineValue;
+                            events.push({ type: EVENT_TYPES.BREAK_TL, idx, lineValue, volRatio });
+                        }
+                        if (trendLine.type === 'UP' && failedBreakdown) {
+                            events.push({ type: EVENT_TYPES.FAILED_BREAKDOWN, idx, lineValue, volRatio });
+                        }
+                        if (trendLine.type === 'DOWN' && failedBreakout) {
+                            events.push({ type: EVENT_TYPES.FAILED_BREAKOUT, idx, lineValue, volRatio });
+                        }
+                        break;
+
+                    case 'BREAKOUT_DETECTED':
+                        if (idx - this.breakoutBar > this.pullbackWindow) {
+                            this.state = 'IDLE';
+                        } else if (inZone && volRatio < 1.0) {
+                            this.state = 'WAITING_PULLBACK';
+                        } else if (bar.close < this.breakoutLevel - epsilon) {
+                            this.state = 'IDLE';
+                        }
+                        break;
+
+                    case 'WAITING_PULLBACK':
+                        if (bar.close > lineValue) {
+                            events.push({ type: EVENT_TYPES.BREAKOUT_ACCEPTED, idx, lineValue, volRatio });
+                            this.state = 'IDLE';
+                        } else if (bar.close < this.breakoutLevel - epsilon) {
+                            this.state = 'IDLE';
+                        }
+                        break;
+                }
+
+                return events;
+            }
+        }
+        const trendStateMachine = new TrendStateMachine();
+
+        // --- Trend Line Series ---
+        let sTrendLine = null;
+        let sTrendUpper = null;
+        let sTrendLower = null;
+        let sEpsilonZone = null;  // For epsilon area
+
+        function initTrendSeries() {
+            if (!chartMain) return;
+            if (!sTrendLine) sTrendLine = chartMain.addLineSeries({ color: '#ec4899', lineWidth: 2, lineStyle: 0, lastValueVisible: false, priceLineVisible: false, crosshairMarkerVisible: false });
+            if (!sTrendUpper) sTrendUpper = chartMain.addLineSeries({ color: '#ec4899', lineWidth: 1, lineStyle: 2, lastValueVisible: false, priceLineVisible: false, crosshairMarkerVisible: false });
+            if (!sTrendLower) sTrendLower = chartMain.addLineSeries({ color: '#ec4899', lineWidth: 1, lineStyle: 2, lastValueVisible: false, priceLineVisible: false, crosshairMarkerVisible: false });
+        }
+
+        // --- Main Draw Function ---
+        function drawTrendChannel(data) {
+            initTrendSeries();
+            if (!showPriceLines || data.length < 15) {
+                sTrendLine.setData([]);
+                sTrendUpper.setData([]);
+                sTrendLower.setData([]);
+                return;
+            }
+
+            // 1. Detect pivots
+            const pivots = detectPivots(data, 3, 3);
+
+            // 2. Calculate ATR
+            const atr = calculateATR(data, 14);
+            const epsilon = atr * 0.7;
+
+            // 3. Generate trend lines
+            const { upTrendLines, downTrendLines } = generateTrendLines(data, pivots, atr);
+
+            // 4. Pick best trend line (prefer up if both exist; or pick by score)
+            let bestLine = null;
+            if (upTrendLines.length > 0 && downTrendLines.length > 0) {
+                bestLine = upTrendLines[0].score >= downTrendLines[0].score ? upTrendLines[0] : downTrendLines[0];
+            } else if (upTrendLines.length > 0) {
+                bestLine = upTrendLines[0];
+            } else if (downTrendLines.length > 0) {
+                bestLine = downTrendLines[0];
+            }
+
+            if (!bestLine || bestLine.score < 5) {
+                // Fall back to linear regression
+                drawLinearRegressionChannel(data);
+                return;
+            }
+
+            // 5. Draw the best trend line with epsilon zone
+            const trendData = [];
+            const upperData = [];
+            const lowerData = [];
+
+            // Extend line to current bar
+            const startIdx = Math.max(0, bestLine.startIdx - 5);
+            const endIdx = data.length - 1;
+
+            for (let i = startIdx; i <= endIdx; i++) {
+                const y = bestLine.getValue(i);
+                if (y > 0) {
+                    trendData.push({ time: data[i].time, value: y });
+                    upperData.push({ time: data[i].time, value: y + epsilon });
+                    lowerData.push({ time: data[i].time, value: y - epsilon });
+                }
+            }
+
+            sTrendLine.setData(trendData);
+            sTrendUpper.setData(upperData);
+            sTrendLower.setData(lowerData);
+
+            // 6. Process state machine for events on current bar
+            const currentIdx = data.length - 1;
+            const volRatio = calculateVolRatio(data, 20);
+            const events = trendStateMachine.processBar(
+                data[currentIdx], currentIdx, bestLine, volRatio, epsilon
+            );
+
+            // 7. Show tips for events
+            events.forEach(ev => {
+                tipsEngine.showTip(ev.type);
+            });
+
+            // 8. Update trend markers
+            updateTrendMarkers(data, bestLine, epsilon, events);
+        }
+
+        // Fallback linear regression
+        function drawLinearRegressionChannel(data) {
+            let n = data.length;
+            let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
+            data.forEach((d, i) => {
+                sumX += i;
+                sumY += d.close;
+                sumXY += i * d.close;
+                sumX2 += i * i;
+            });
+
+            const slope = (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX);
+            const intercept = (sumY - slope * sumX) / n;
+
+            let sumSqDiff = 0;
+            data.forEach((d, i) => {
+                const yPred = slope * i + intercept;
+                sumSqDiff += Math.pow(d.close - yPred, 2);
+            });
+            const stdDev = Math.sqrt(sumSqDiff / n);
+
+            const trendData = [], upperData = [], lowerData = [];
+            data.forEach((d, i) => {
+                const y = slope * i + intercept;
+                trendData.push({ time: d.time, value: y });
+                upperData.push({ time: d.time, value: y + 2 * stdDev });
+                lowerData.push({ time: d.time, value: y - 2 * stdDev });
+            });
+
+            sTrendLine.setData(trendData);
+            sTrendUpper.setData(upperData);
+            sTrendLower.setData(lowerData);
+        }
+
+        // --- Trend Signal Markers ---
+        let trendMarkers = [];
+        function updateTrendMarkers(data, trendLine, epsilon, currentEvents) {
+            // Add markers for significant events
+            const markers = [...(sCandle.markers() || [])];
+
+            currentEvents.forEach(ev => {
+                const bar = data[ev.idx];
+                let marker = null;
+
+                if (ev.type === EVENT_TYPES.FAILED_BREAKDOWN) {
+                    marker = {
+                        time: bar.time,
+                        position: 'belowBar',
+                        color: '#22c55e',
+                        shape: 'arrowUp',
+                        text: 'FBD'
+                    };
+                } else if (ev.type === EVENT_TYPES.FAILED_BREAKOUT) {
+                    marker = {
+                        time: bar.time,
+                        position: 'aboveBar',
+                        color: '#ef4444',
+                        shape: 'arrowDown',
+                        text: 'FBO'
+                    };
+                } else if (ev.type === EVENT_TYPES.BREAKOUT_ACCEPTED) {
+                    marker = {
+                        time: bar.time,
+                        position: 'belowBar',
+                        color: '#3b82f6',
+                        shape: 'circle',
+                        text: 'ACC'
+                    };
+                } else if (ev.type === EVENT_TYPES.RISKY_NTH_TOUCH) {
+                    marker = {
+                        time: bar.time,
+                        position: 'aboveBar',
+                        color: '#f59e0b',
+                        shape: 'square',
+                        text: `⚠${ev.count}`
+                    };
+                }
+
+                if (marker && !markers.some(m => m.time === marker.time && m.text === marker.text)) {
+                    markers.push(marker);
+                }
+            });
+
+            trendMarkers = markers;
+        }
+
+        // Helper to clear existing
+        function clearPriceLines() {
+            priceLines.forEach(l => {
+                try { sCandle.removePriceLine(l); } catch (e) { }
+            });
+            priceLines = [];
+        }
+
+        function togglePriceLines() {
+            showPriceLines = !showPriceLines;
+            updateDynamicAnalysis(); // Trigger update
+            const btn = document.querySelector('[data-action="lines"]');
+            if (btn) btn.classList.toggle('active', showPriceLines);
+        }
+
+
+
+        // --- Initialization ---
+        document.addEventListener('DOMContentLoaded', () => {
+            // Telegram Mini App Setup
+            if (window.Telegram?.WebApp) {
+                Telegram.WebApp.ready();
+                try {
+                    const platform = Telegram.WebApp.platform || 'unknown';
+                    // Only request fullscreen on mobile devices (Android/iOS) to hide status bar
+                    if (['android', 'ios'].includes(platform)) {
+                        if (Telegram.WebApp.requestFullscreen) {
+                            Telegram.WebApp.requestFullscreen();
+                        }
+                    }
+
+                    // Expand to full height (matches Telegram window size on desktop)
+                    Telegram.WebApp.expand();
+                } catch (e) {
+                    console.warn("Telegram WebApp setup failed:", e);
+                }
+            }
+
+            initTheme();
+            initCharts();
+            tipsEngine.init();  // Initialize tips engine after charts
+            loadData();
+
+            // Start auto-refresh (only active during trading hours)
+            startAutoRefresh();
+
+            // Mobile check for Chips button
+            if (window.innerWidth < 768) {
+                document.getElementById('chips-toggle').style.display = 'block';
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            if (chartMain) chartMain.resize(0, 0); // Auto-resize check
+            if (chartSub) chartSub.resize(0, 0);
+            // Redraw chip overlay on resize
+            setTimeout(() => renderSidePanelChips(lastChipIdx), 100);
+        });
+
+        // --- Theme Logic ---
+        function initTheme() {
+            const theme = localStorage.getItem('pro-chart-theme') || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+            document.documentElement.setAttribute('data-theme', theme);
+            updateThemeIcon(theme);
+            syncTelegramTheme();
+        }
+
+        function toggleTheme() {
+            const cur = document.documentElement.getAttribute('data-theme');
+            const next = cur === 'dark' ? 'light' : 'dark';
+            document.documentElement.setAttribute('data-theme', next);
+            localStorage.setItem('pro-chart-theme', next);
+            updateThemeIcon(next);
+            if (chartMain) applyChartTheme();
+            syncTelegramTheme();
+        }
+
+        function syncTelegramTheme() {
+            if (window.Telegram?.WebApp) {
+                // Wait for style update
+                requestAnimationFrame(() => {
+                    const style = getComputedStyle(document.documentElement);
+                    const headerColor = style.getPropertyValue('--bg-secondary').trim();
+                    const bgColor = style.getPropertyValue('--bg-primary').trim();
+
+                    try {
+                        Telegram.WebApp.setHeaderColor(headerColor);
+                        Telegram.WebApp.setBackgroundColor(bgColor);
+                    } catch (e) {
+                        console.warn("Failed to set Telegram colors", e);
+                    }
+                });
+            }
+        }
+
+        function updateThemeIcon(t) {
+            document.getElementById('theme-btn').textContent = t === 'dark' ? '☀️' : '🌙';
+        }
+
+        function getColors() {
+            const style = getComputedStyle(document.body);
+            const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+            return {
+                bg: style.getPropertyValue('--bg-primary').trim(),
+                grid: style.getPropertyValue('--grid-color').trim(),
+                text: style.getPropertyValue('--text-secondary').trim(),
+                up: style.getPropertyValue('--up-color').trim(),
+                down: style.getPropertyValue('--down-color').trim(),
+            };
+        }
+
+        // --- Chart Setup ---
+        function initCharts() {
+            const mainCont = document.getElementById('main-chart');
+            const subCont = document.getElementById('sub-chart');
+            const c = getColors();
+
+            const chartOpts = {
+                layout: { background: { type: 'solid', color: 'transparent' }, textColor: c.text, fontFamily: "'Inter', sans-serif" },
+                grid: { vertLines: { color: c.grid }, horzLines: { color: c.grid } },
+                crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+                localization: {
+                    locale: 'zh-CN',
+                    dateFormat: 'yyyy-MM-dd',
+                },
+                timeScale: {
+                    borderColor: c.grid,
+                    timeVisible: false,
+                    rightOffset: 5,  // Small right margin
+                    barSpacing: 8,
+                    minBarSpacing: 3,
+                    fixLeftEdge: false,
+                    fixRightEdge: true,
+                    shiftVisibleRangeOnNewBar: true
+                },
+                rightPriceScale: { borderColor: c.grid, minimumWidth: 80, autoScale: true },
+                autoSize: true
+            };
+
+            chartMain = LightweightCharts.createChart(mainCont, chartOpts);
+            chartSub = LightweightCharts.createChart(subCont, chartOpts);
+
+            // -- Main Series --
+            sCandle = chartMain.addCandlestickSeries({
+                upColor: c.up, downColor: c.down, borderUpColor: c.up, borderDownColor: c.down, wickUpColor: c.up, wickDownColor: c.down
+            });
+
+            sMa5 = chartMain.addLineSeries({ color: '#f59e0b', lineWidth: 1, visible: false });
+            sMa10 = chartMain.addLineSeries({ color: '#3b82f6', lineWidth: 1, visible: false });
+            sMa20 = chartMain.addLineSeries({ color: '#a855f7', lineWidth: 1, visible: false });
+
+            sBollUp = chartMain.addLineSeries({ color: '#f97316', lineWidth: 1, lineStyle: 2, visible: false });
+            sBollMid = chartMain.addLineSeries({ color: '#3b82f6', lineWidth: 1, visible: false });
+            sBollLow = chartMain.addLineSeries({ color: '#22c55e', lineWidth: 1, lineStyle: 2, visible: false });
+
+            // -- Sub Series (Lazy init others, start with Vol) --
+            // We use different series types on the same chart, managing visibility
+            sVol = chartSub.addHistogramSeries({ priceFormat: { type: 'volume' } });
+
+            // Sync
+            chartMain.timeScale().subscribeVisibleLogicalRangeChange(r => {
+                chartSub.timeScale().setVisibleLogicalRange(r);
+                // Sync side panel chips on scroll/zoom
+                requestAnimationFrame(() => renderSidePanelChips(lastChipIdx));
+                // Update Dynamic Lines (S/R & Trend)
+                updateDynamicAnalysis();
+            });
+            chartSub.timeScale().subscribeVisibleLogicalRangeChange(r => {
+                chartMain.timeScale().setVisibleLogicalRange(r);
+                requestAnimationFrame(() => renderSidePanelChips(lastChipIdx));
+            });
+
+            // Legend Sync + Chip Distribution on Hover
+            chartMain.subscribeCrosshairMove(param => {
+                updateMainLegend(param);
+                // Use current active sub-chart series for crosshair sync
+                const subSeries = sVol || sMacdHist || sK || sRsi;
+                if (param.time && subSeries) chartSub.setCrosshairPosition(0, param.time, subSeries);
+
+                // Update chip distribution on hover (like 通达信)
+                if (param.time && rawData.length > 0) {
+                    const idx = rawData.findIndex(d => d.time === param.time);
+                    if (idx !== -1) {
+                        debouncedRenderChips(idx);
+
+                        // Interactive Header Update
+                        const d = rawData[idx];
+                        const prev = idx > 0 ? rawData[idx - 1] : d; // fallback to self if first
+                        updateHeaderValues(d, prev);
+                    }
+                } else {
+                    // Restore latest
+                    restoreHeaderValues();
+                }
+            });
+
+            chartSub.subscribeCrosshairMove(param => {
+                updateSubLegend(param);
+                if (param.time && sCandle) chartMain.setCrosshairPosition(0, param.time, sCandle);
+
+                // Also update chips when hovering on sub-chart
+                if (param.time && rawData.length > 0) {
+                    const idx = rawData.findIndex(d => d.time === param.time);
+                    if (idx !== -1) {
+                        debouncedRenderChips(idx);
+                    }
+                }
+            });
+
+            chartMain.subscribeClick(param => {
+                if (param.time) {
+                    const idx = rawData.findIndex(d => d.time === param.time);
+                    if (idx !== -1) {
+                        lastChipIdx = idx;
+                        renderSidePanelChips(idx);
+                    }
+                }
+            });
+
+            applyChartTheme();
+        }
+
+        function applyChartTheme() {
+            const c = getColors();
+            const opts = {
+                layout: { textColor: c.text },
+                grid: { vertLines: { color: c.grid }, horzLines: { color: c.grid } },
+                timeScale: { borderColor: c.grid },
+                rightPriceScale: { borderColor: c.grid }
+            };
+            chartMain.applyOptions(opts);
+            chartSub.applyOptions(opts);
+
+            sCandle.applyOptions({ upColor: c.up, downColor: c.down, borderUpColor: c.up, borderDownColor: c.down, wickUpColor: c.up, wickDownColor: c.down });
+        }
+
+        // --- Authentication ---
+        async function authenticatedFetch(url, options = {}) {
+            const headers = options.headers || {};
+            // Add Telegram initData if available
+            if (window.Telegram && Telegram.WebApp && Telegram.WebApp.initData) {
+                headers['X-Telegram-Init-Data'] = Telegram.WebApp.initData;
+            }
+
+            const res = await fetch(url, { ...options, headers });
+
+            if (res.status === 401 || res.status === 403) {
+                document.body.innerHTML = `
+                    <div style="display:flex;justify-content:center;align-items:center;height:100vh;background:#000;color:#fff;flex-direction:column;text-align:center;padding:20px;">
+                        <h2 style="color: #ef4444; margin-bottom: 10px;">Access Denied</h2>
+                        <p style="color: #9ca3af;">You are not authorized to view this chart.</p>
+                        <p style="font-size: 12px; color: #525252; margin-top: 20px;">ID: ${Telegram.WebApp.initDataUnsafe?.user?.id || 'Unknown'}</p>
+                    </div>
+                `;
+                throw new Error('Access Denied');
+            }
+            return res;
+        }
+
+        // --- Data Loading ---
+        let rawData = [];
+        let refreshTimer = null;
+
+        async function loadData(isUpdate = false) {
+            try {
+                const days = 250;
+                // Use authenticatedFetch
+                const res = await authenticatedFetch(`${API_BASE}/api/chart/data/${code}?days=${days}&period=${timeFrame}`);
+                if (!res.ok) throw new Error('Network error');
+                const json = await res.json();
+
+                if (!json.data || !json.data.length) throw new Error('No Data');
+
+                // Filter out invalid data entries (missing OHLCV values)
+                rawData = json.data.filter(d =>
+                    d &&
+                    d.close !== undefined && d.close !== null && !isNaN(d.close) &&
+                    d.open !== undefined && d.open !== null &&
+                    d.high !== undefined && d.high !== null &&
+                    d.low !== undefined && d.low !== null
+                );
+
+                if (rawData.length === 0) throw new Error('No valid data');
+
+                updateStockHeader(json);
+                processData();
+
+                // Only reset zoom on first load
+                if (!isUpdate && chartMain) {
+                    // Default Zoom: Show last 60 bars
+                    const totalBars = rawData.length;
+                    const visibleBars = 60;
+                    if (totalBars > visibleBars) {
+                        chartMain.timeScale().setVisibleLogicalRange({
+                            from: totalBars - visibleBars,
+                            to: totalBars + 2 // Small buffer for latest candle
+                        });
+                    } else {
+                        chartMain.timeScale().fitContent();
+                    }
+                    // Force scroll to the latest data
+                    chartMain.timeScale().scrollToPosition(-2, false);
+
+                    chartMain.priceScale('right').applyOptions({
+                        autoScale: true,
+                        scaleMargins: { top: 0.1, bottom: 0.1 }
+                    });
+                }
+
+                document.getElementById('loading').style.display = 'none';
+
+                // Reset chip cache only on full reload, or maybe update latest?
+                // For now, let's keep cache unless it's a major change
+                if (!isUpdate) {
+                    resetChipCache();
+                    renderSidePanelChips(-1);
+                }
+
+            } catch (e) {
+                if (!isUpdate) {
+                    document.getElementById('loading').innerHTML = `<div class="error">${e.message}</div>`;
+                } else {
+                    console.warn("Background update failed:", e);
+                }
+            }
+        }
+
+        function isTradingTime() {
+            const now = new Date();
+            // Convert to China time (UTC+8) roughly
+            // Since this runs in client, we assume client time or just check hours if user is in China
+            // Better: use UTC
+            const utc = now.getTime() + now.getTimezoneOffset() * 60000;
+            const chinaTime = new Date(utc + (3600000 * 8));
+
+            const day = chinaTime.getDay();
+            if (day === 0 || day === 6) return false; // Weekend
+
+            const h = chinaTime.getHours();
+            const m = chinaTime.getMinutes();
+            const t = h * 60 + m;
+
+            // 9:15 - 11:30 (555 - 690)
+            // 13:00 - 15:00 (780 - 900)
+            return (t >= 555 && t <= 690) || (t >= 780 && t <= 900);
+        }
+
+        function startAutoRefresh() {
+            if (refreshTimer) clearInterval(refreshTimer);
+
+            // Check every 5 seconds
+            refreshTimer = setInterval(() => {
+                if (document.hidden) return; // Don't refresh if tab hidden
+                if (timeFrame !== 'daily') return; // Only refresh daily chart (which has realtime logic)
+
+                if (isTradingTime()) {
+                    loadData(true);
+                }
+            }, 5000);
+        }
+
+
+
+        // Reset chip cache when loading new data
+        function resetChipCache() {
+            lastChipIdx = -1;
+        }
+
+        // --- Header Updates ---
+        let latestStockData = null;
+        let latestPrevData = null;
+
+        function updateStockHeader(data) {
+            document.getElementById('name').textContent = data.name || code;
+            document.getElementById('code').textContent = code;
+
+            // Filter valid data with close values
+            const validData = rawData.filter(d => d && d.close !== undefined && d.close !== null);
+            if (validData.length === 0) {
+                document.getElementById('price').textContent = '--';
+                return;
+            }
+
+            const last = validData[validData.length - 1];
+            const prev = validData[validData.length > 1 ? validData.length - 2 : 0];
+
+            // Save for restoration
+            latestStockData = last;
+            latestPrevData = prev;
+
+            updateHeaderValues(last, prev);
+        }
+
+        function restoreHeaderValues() {
+            if (latestStockData && latestPrevData) {
+                updateHeaderValues(latestStockData, latestPrevData);
+            }
+        }
+
+        function updateHeaderValues(current, prev) {
+            if (!current) return;
+
+            // Price
+            document.getElementById('price').textContent = current.close.toFixed(2);
+
+            // Change
+            // If this is the very first bar and no prev, change is 0
+            let pct = 0;
+            if (prev && prev.close > 0) {
+                pct = ((current.close - prev.close) / prev.close) * 100;
+            }
+
+            const chgEl = document.getElementById('change');
+            chgEl.textContent = (pct > 0 ? '+' : '') + pct.toFixed(2) + '%';
+            chgEl.className = `price-change ${pct > 0 ? 'up' : pct < 0 ? 'down' : 'flat'}`;
+
+            // Stats
+            // Amplitude: Use backend value if available, else calculate
+            let amp = current.amplitude;
+            if (amp === undefined || amp === null) {
+                if (prev && prev.close > 0) {
+                    amp = ((current.high - current.low) / prev.close) * 100;
+                } else {
+                    amp = 0;
+                }
+            }
+            document.getElementById('amplitude').textContent = amp.toFixed(2) + '%';
+
+            // Turnover Rate
+            let turnover = current.turnover_rate || 0;
+            document.getElementById('turnover').textContent = turnover.toFixed(2) + '%';
+
+            // Volume Ratio
+            let vr = current.volume_ratio;
+            const vrEl = document.getElementById('vol-ratio');
+            if (vr !== undefined && vr !== null) {
+                vrEl.textContent = vr.toFixed(2);
+                // Highlight if high volume ratio?
+                vrEl.style.color = vr > 2 ? 'var(--up-color)' : 'var(--text-primary)';
+            } else {
+                vrEl.textContent = '--';
+                vrEl.style.color = 'var(--text-primary)';
+            }
+
+            // Volume
+            // Format volume (e.g. 10000 -> 1.0万)
+            let vol = current.volume;
+            let volStr = '';
+            if (vol > 100000000) {
+                volStr = (vol / 100000000).toFixed(2) + '亿';
+            } else if (vol > 10000) {
+                volStr = (vol / 10000).toFixed(1) + '万';
+            } else {
+                volStr = vol.toString();
+            }
+            document.getElementById('vol-stat').textContent = volStr;
+        }
+
+        // --- Indicator Calculations ---
+        function calculateMA(n) {
+            // rawData is already filtered for valid entries on load
+            return rawData.map((d, i, arr) => {
+                if (i < n - 1) return { time: d.time, value: NaN };
+                const sum = arr.slice(i - n + 1, i + 1).reduce((a, b) => a + b.close, 0);
+                return { time: d.time, value: sum / n };
+            }).filter(d => !isNaN(d.value));
+        }
+
+        function calculateBOLL(n = 20, k = 2) {
+            // Need Standard Deviation
+            return rawData.map((d, i, arr) => {
+                if (i < n - 1) return null;
+                const slice = arr.slice(i - n + 1, i + 1);
+                const avg = slice.reduce((a, b) => a + b.close, 0) / n;
+                const variance = slice.reduce((a, b) => a + Math.pow(b.close - avg, 2), 0) / n;
+                const std = Math.sqrt(variance);
+                return {
+                    time: d.time,
+                    mid: avg,
+                    upper: avg + k * std,
+                    lower: avg - k * std
+                };
+            }).filter(Boolean);
+        }
+
+        function calculateMACD(short = 12, long = 26, sig = 9) {
+            let emaShort = 0, emaLong = 0, emaSig = 0;
+            const res = [];
+            rawData.forEach((d, i) => {
+                if (i === 0) { emaShort = d.close; emaLong = d.close; }
+                else {
+                    emaShort = (2 * d.close + (short - 1) * emaShort) / (short + 1);
+                    emaLong = (2 * d.close + (long - 1) * emaLong) / (long + 1);
+                }
+                const diff = emaShort - emaLong;
+                if (i === 0) emaSig = diff;
+                else emaSig = (2 * diff + (sig - 1) * emaSig) / (sig + 1);
+
+                res.push({ time: d.time, diff, dea: emaSig, hist: 2 * (diff - emaSig) });
+            });
+            return res;
+        }
+
+        function calculateKDJ(n = 9, m1 = 3, m2 = 3) {
+            let k = 50, d = 50;
+            return rawData.map((item, i) => {
+                let low = item.low, high = item.high;
+                for (let j = 0; j < n; j++) {
+                    if (i - j >= 0) {
+                        low = Math.min(low, rawData[i - j].low);
+                        high = Math.max(high, rawData[i - j].high);
+                    }
+                }
+                const rsv = (high === low) ? 50 : (item.close - low) / (high - low) * 100;
+                k = (1 * rsv + (m1 - 1) * k) / m1;
+                d = (1 * k + (m2 - 1) * d) / m2;
+                const jVal = 3 * k - 2 * d;
+                return { time: item.time, k, d, j: jVal };
+            });
+        }
+
+        function calculateRSI(n = 14) {
+            let up = 0, down = 0;
+            const res = [];
+            for (let i = 1; i < rawData.length; i++) {
+                const diff = rawData[i].close - rawData[i - 1].close;
+                const u = diff > 0 ? diff : 0;
+                const d = diff < 0 ? -diff : 0;
+                if (i <= n) {
+                    up += u; down += d;
+                    if (i === n) {
+                        up /= n; down /= n;
+                    }
+                } else {
+                    up = (up * (n - 1) + u) / n;
+                    down = (down * (n - 1) + d) / n;
+                }
+                if (i >= n) {
+                    const rs = down === 0 ? 100 : up / down;
+                    res.push({ time: rawData[i].time, value: 100 - (100 / (1 + rs)) });
+                }
+            }
+            return res;
+        }
+
+        // --- Data Processing & Rendering ---
+        function processData() {
+            // Main Chart: Candle
+            sCandle.setData(rawData.map(d => ({ time: d.time, open: d.open, high: d.high, low: d.low, close: d.close })));
+
+            // Update TimeScale (Daily vs Intraday)
+            const isIntraday = !['daily', 'weekly', 'monthly'].includes(timeFrame);
+            const tsOpts = { timeScale: { timeVisible: isIntraday } };
+            chartMain.applyOptions(tsOpts);
+            chartSub.applyOptions(tsOpts);
+
+            // Overlays
+            updateOverlays();
+            updateSubChart();
+
+            // Markers
+            if (showSignals) {
+                // Determine signals (re-use older logic if needed or reimplement)
+                // For now, let's keep it simple or implement the previous logic
+                const signals = [];
+                const ma5 = calculateMA(5);
+                const ma10 = calculateMA(10);
+
+                for (let i = 1; i < rawData.length; i++) {
+                    const t = rawData[i].time;
+                    const tp = rawData[i - 1].time;
+                    const c5 = ma5.find(m => m.time === t)?.value;
+                    const c10 = ma10.find(m => m.time === t)?.value;
+                    const p5 = ma5.find(m => m.time === tp)?.value;
+                    const p10 = ma10.find(m => m.time === tp)?.value;
+                    if (c5 && c10 && p5 && p10) {
+                        if (p5 <= p10 && c5 > c10) signals.push({ time: t, position: 'belowBar', color: '#ef4444', shape: 'arrowUp', text: 'B' });
+                        if (p5 >= p10 && c5 < c10) signals.push({ time: t, position: 'aboveBar', color: '#22c55e', shape: 'arrowDown', text: 'S' });
+                    }
+                }
+                sCandle.setMarkers(signals);
+
+                // Update action banner with current/next actionable signal
+                updateActionBanner(ma5, ma10);
+            } else {
+                sCandle.setMarkers([]);
+            }
+
+            // Draw support/resistance/trend lines
+            // calculateAndDrawPriceLines(); // Replaced by updateDynamicAnalysis
+
+
+            // Draw chip distribution overlay (synced with K-line Y-axis)
+            // drawChipOverlay(); // Removed
+
+            // Initial Analysis
+            updateDynamicAnalysis();
+        }
+
+        function updateActionBanner(ma5, ma10) {
+            // Get current (latest) and previous data points
+            if (rawData.length < 2 || ma5.length < 2 || ma10.length < 2) return;
+
+            const lastIdx = rawData.length - 1;
+            const lastTime = rawData[lastIdx].time;
+            const prevTime = rawData[lastIdx - 1].time;
+
+            const curr5 = ma5.find(m => m.time === lastTime)?.value;
+            const curr10 = ma10.find(m => m.time === lastTime)?.value;
+            const prev5 = ma5.find(m => m.time === prevTime)?.value;
+            const prev10 = ma10.find(m => m.time === prevTime)?.value;
+
+            if (!curr5 || !curr10) return;
+
+            const badge = document.getElementById('action-badge');
+            const text = document.getElementById('action-text');
+            const timeEl = document.getElementById('action-time');
+
+            // Determine market state (China market hours)
+            const now = new Date();
+            const chinaTime = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Shanghai' }));
+            const hour = chinaTime.getHours();
+            const mins = chinaTime.getMinutes();
+            const dayOfWeek = chinaTime.getDay();
+            const timeMins = hour * 60 + mins;
+            const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
+            const isMarketOpen = !isWeekend && ((timeMins >= 570 && timeMins <= 690) || (timeMins >= 780 && timeMins <= 900));
+
+            // Calculate trend direction
+            const maDiff = curr5 - curr10;
+            const maDiffPrev = prev5 && prev10 ? prev5 - prev10 : 0;
+            const trendDir = maDiff > 0 ? 'bullish' : 'bearish';
+            const crossingUp = maDiffPrev <= 0 && maDiff > 0;
+            const crossingDown = maDiffPrev >= 0 && maDiff < 0;
+
+            // Determine action
+            let action = 'hold';
+            let actionText = '';
+            let timeLabel = '';
+
+            if (crossingUp) {
+                action = 'buy';
+                actionText = isMarketOpen
+                    ? '<strong>BUY Signal</strong> - MA5 crossed above MA10. Consider entry now.'
+                    : '<strong>BUY on Open</strong> - MA5 crossed above MA10. Watch at market open.';
+            } else if (crossingDown) {
+                action = 'sell';
+                actionText = isMarketOpen
+                    ? '<strong>SELL Signal</strong> - MA5 crossed below MA10. Consider exit now.'
+                    : '<strong>SELL on Open</strong> - MA5 crossed below MA10. Watch at market open.';
+            } else if (trendDir === 'bullish') {
+                action = 'hold';
+                actionText = '<strong>HOLD Long</strong> - MA5 > MA10, uptrend intact. Hold or add on dips.';
+            } else {
+                action = 'hold';
+                actionText = '<strong>HOLD/Wait</strong> - MA5 < MA10, downtrend. Wait for buy signal.';
+            }
+
+            // Time label
+            if (isMarketOpen) {
+                timeLabel = `Market Open • ${chinaTime.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`;
+            } else if (isWeekend) {
+                timeLabel = 'Market Closed (Weekend) • Action applies to next open';
+            } else if (timeMins < 570) {
+                timeLabel = 'Pre-Market • Action applies to today\'s open';
+            } else {
+                timeLabel = 'After Hours • Action applies to next trading day';
+            }
+
+            // Update UI
+            badge.className = 'action-badge ' + action;
+            badge.textContent = action.toUpperCase();
+            text.innerHTML = actionText;
+            timeEl.textContent = timeLabel;
+        }
+
+        function updateOverlays() {
+            // Toggle visibility
+            const isMa = activeOverlay === 'MA';
+            const isBoll = activeOverlay === 'BOLL';
+
+            sMa5.applyOptions({ visible: isMa });
+            sMa10.applyOptions({ visible: isMa });
+            sMa20.applyOptions({ visible: isMa });
+
+            sBollUp.applyOptions({ visible: isBoll });
+            sBollMid.applyOptions({ visible: isBoll });
+            sBollLow.applyOptions({ visible: isBoll });
+
+            document.getElementById('ma-legend').innerHTML = ''; // Clear
+
+            if (isMa) {
+                sMa5.setData(calculateMA(5));
+                sMa10.setData(calculateMA(10));
+                sMa20.setData(calculateMA(20));
+                document.getElementById('ma-legend').innerHTML = `
+                   <span class="leg-item c-ma5">MA5:<span class="leg-val" id="l-ma5">--</span></span>
+                   <span class="leg-item c-ma10">MA10:<span class="leg-val" id="l-ma10">--</span></span>
+                   <span class="leg-item c-ma20">MA20:<span class="leg-val" id="l-ma20">--</span></span>
+                `;
+            } else if (isBoll) {
+                const boll = calculateBOLL();
+                sBollUp.setData(boll.map(b => ({ time: b.time, value: b.upper })));
+                sBollMid.setData(boll.map(b => ({ time: b.time, value: b.mid })));
+                sBollLow.setData(boll.map(b => ({ time: b.time, value: b.lower })));
+                document.getElementById('ma-legend').innerHTML = `
+                   <span class="leg-item" style="color:#f97316">UP:<span class="leg-val" id="l-b1">--</span></span>
+                   <span class="leg-item" style="color:#3b82f6">MID:<span class="leg-val" id="l-b2">--</span></span>
+                   <span class="leg-item" style="color:#22c55e">LOW:<span class="leg-val" id="l-b3">--</span></span>
+                `;
+            }
+        }
+
+        function updateSubChart() {
+            // Clear previous sub-series with error handling
+            // Note: removeSeries can throw if series was already removed or chart is in invalid state
+            const removeSafely = (series) => {
+                if (series) {
+                    try { chartSub.removeSeries(series); } catch (e) { /* ignore */ }
+                }
+            };
+
+            removeSafely(sVol);
+            removeSafely(sMacdHist);
+            removeSafely(sMacdLine);
+            removeSafely(sMacdSig);
+            removeSafely(sK);
+            removeSafely(sD);
+            removeSafely(sJ);
+            removeSafely(sRsi);
+
+            sVol = null; sMacdHist = null; sMacdLine = null; sMacdSig = null; sK = null; sD = null; sJ = null; sRsi = null;
+
+            const subLeg = document.getElementById('sub-legend');
+            subLeg.innerHTML = '';
+
+            if (activeSub === 'VOL') {
+                sVol = chartSub.addHistogramSeries({ priceFormat: { type: 'volume' } });
+                // Filter out entries with undefined/null/0 volume and ensure valid data
+                const volData = rawData
+                    .filter(d => d.volume !== undefined && d.volume !== null && d.volume > 0)
+                    .map(d => ({
+                        time: d.time,
+                        value: d.volume,
+                        color: d.close >= d.open ? getColors().up : getColors().down
+                    }));
+                if (volData.length > 0) {
+                    sVol.setData(volData);
+                }
+                subLeg.innerHTML = `<span class="leg-item">Vol:<span class="leg-val" id="l-vol">--</span></span>`;
+            }
+            else if (activeSub === 'MACD') {
+                const macd = calculateMACD();
+                // Histogram needs 'volume' type logic for zero-based, but we want price scale. 
+                // Lightweight chart histogram is fine with negative if valid.
+                sMacdHist = chartSub.addHistogramSeries({
+                    color: '#2962ff',
+                    lineWidth: 2,
+                    priceFormat: {
+                        type: 'price',
+                    },
+                });
+                sMacdLine = chartSub.addLineSeries({ color: '#f59e0b', lineWidth: 1 }); // DIFF
+                sMacdSig = chartSub.addLineSeries({ color: '#3b82f6', lineWidth: 1 });  // DEA
+
+                sMacdLine.setData(macd.map(m => ({ time: m.time, value: m.diff })));
+                sMacdSig.setData(macd.map(m => ({ time: m.time, value: m.dea })));
+                sMacdHist.setData(macd.map(m => ({
+                    time: m.time, value: m.hist,
+                    color: m.hist > 0 ? getColors().up : getColors().down
+                })));
+
+                subLeg.innerHTML = `
+                    <span class="leg-item" style="color:#f59e0b">DIF:<span class="leg-val" id="l-dif">--</span></span>
+                    <span class="leg-item" style="color:#3b82f6">DEA:<span class="leg-val" id="l-dea">--</span></span>
+                    <span class="leg-item">MACD:<span class="leg-val" id="l-macd">--</span></span>
+                 `;
+            }
+            else if (activeSub === 'KDJ') {
+                const kdj = calculateKDJ();
+                sK = chartSub.addLineSeries({ color: '#f59e0b', lineWidth: 1 });
+                sD = chartSub.addLineSeries({ color: '#3b82f6', lineWidth: 1 });
+                sJ = chartSub.addLineSeries({ color: '#a855f7', lineWidth: 1 });
+
+                sK.setData(kdj.map(x => ({ time: x.time, value: x.k })));
+                sD.setData(kdj.map(x => ({ time: x.time, value: x.d })));
+                sJ.setData(kdj.map(x => ({ time: x.time, value: x.j })));
+
+                subLeg.innerHTML = `
+                    <span class="leg-item" style="color:#f59e0b">K:<span class="leg-val" id="l-k">--</span></span>
+                    <span class="leg-item" style="color:#3b82f6">D:<span class="leg-val" id="l-d">--</span></span>
+                    <span class="leg-item" style="color:#a855f7">J:<span class="leg-val" id="l-j">--</span></span>
+                 `;
+            }
+            else if (activeSub === 'RSI') {
+                const rsi = calculateRSI();
+                sRsi = chartSub.addLineSeries({ color: '#a855f7', lineWidth: 1 });
+                sRsi.setData(rsi);
+                // Add 80/20 lines?
+                subLeg.innerHTML = `<span class="leg-item" style="color:#a855f7">RSI(14):<span class="leg-val" id="l-rsi">--</span></span>`;
+            }
+
+            // chartSub.timeScale().fitContent(); // Maybe don't force fit, stick to sync
+        }
+
+
+        // --- Interaction ---
+        function setPeriod(p, btn) {
+            if (timeFrame === p) return;
+            timeFrame = p;
+            btn.parentNode.querySelectorAll('.t-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            trendStateMachine.reset();  // Reset state machine on period change
+            tipsEngine.showTip('TIMEFRAME_CHANGE');  // Show tip on period change
+            loadData();
+        }
+
+        function toggleOverlays(type) {
+            if (activeOverlay === type) activeOverlay = 'NONE';
+            else activeOverlay = type;
+
+            document.getElementById('btn-ma').classList.toggle('active', activeOverlay === 'MA');
+            document.getElementById('btn-boll').classList.toggle('active', activeOverlay === 'BOLL');
+            updateOverlays();
+        }
+
+        function setSubChart(type, btn) {
+            if (activeSub === type) return;
+            activeSub = type;
+            btn.parentNode.querySelectorAll('.t-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            updateSubChart();
+        }
+
+        function toggleSignals() {
+            showSignals = !showSignals;
+            document.getElementById('btn-signals').classList.toggle('active', showSignals);
+            if (rawData.length) processData(); // Re-run markers
+        }
+
+        // --- Log Scale ---
+        let isLogScale = false;
+        function toggleLogScale() {
+            isLogScale = !isLogScale;
+            document.getElementById('btn-log').classList.toggle('active', isLogScale);
+
+            // Mode 0 = Normal, 1 = Logarithmic, 2 = Percentage, 3 = IndexedTo100
+            const mode = isLogScale ? 1 : 0;
+
+            if (chartMain) {
+                chartMain.priceScale('right').applyOptions({
+                    mode: mode
+                });
+            }
+        }
+
+        // --- Legends ---
+        function updateMainLegend(param) {
+            if (!param.time || !param.seriesData) return;
+            const c = param.seriesData.get(sCandle);
+            if (c) {
+                document.getElementById('l-o').textContent = c.open.toFixed(2);
+                document.getElementById('l-h').textContent = c.high.toFixed(2);
+                document.getElementById('l-l').textContent = c.low.toFixed(2);
+                document.getElementById('l-c').textContent = c.close.toFixed(2);
+            }
+            if (activeOverlay === 'MA') {
+                const v5 = param.seriesData.get(sMa5);
+                const v10 = param.seriesData.get(sMa10);
+                const v20 = param.seriesData.get(sMa20);
+                const el5 = document.getElementById('l-ma5');
+                const el10 = document.getElementById('l-ma10');
+                const el20 = document.getElementById('l-ma20');
+                if (v5 && el5) el5.textContent = v5.value.toFixed(2);
+                if (v10 && el10) el10.textContent = v10.value.toFixed(2);
+                if (v20 && el20) el20.textContent = v20.value.toFixed(2);
+            }
+            if (activeOverlay === 'BOLL') {
+                const u = param.seriesData.get(sBollUp);
+                const m = param.seriesData.get(sBollMid);
+                const l = param.seriesData.get(sBollLow);
+                const el1 = document.getElementById('l-b1');
+                const el2 = document.getElementById('l-b2');
+                const el3 = document.getElementById('l-b3');
+                if (u && el1) el1.textContent = u.value.toFixed(2);
+                if (m && el2) el2.textContent = m.value.toFixed(2);
+                if (l && el3) el3.textContent = l.value.toFixed(2);
+            }
+        }
+
+        function updateSubLegend(param) {
+            if (!param.time || !param.seriesData) return;
+
+            if (activeSub === 'VOL') {
+                const v = param.seriesData.get(sVol);
+                const el = document.getElementById('l-vol');
+                if (v && el) el.textContent = (v.value / 10000).toFixed(1) + '万';
+            } else if (activeSub === 'MACD') {
+                const diff = param.seriesData.get(sMacdLine);
+                const dea = param.seriesData.get(sMacdSig);
+                const hist = param.seriesData.get(sMacdHist);
+                const elDif = document.getElementById('l-dif');
+                const elDea = document.getElementById('l-dea');
+                const elMacd = document.getElementById('l-macd');
+                if (diff && elDif) elDif.textContent = diff.value.toFixed(3);
+                if (dea && elDea) elDea.textContent = dea.value.toFixed(3);
+                if (hist && elMacd) elMacd.textContent = hist.value.toFixed(3);
+            } else if (activeSub === 'KDJ') {
+                const k = param.seriesData.get(sK);
+                const d = param.seriesData.get(sD);
+                const j = param.seriesData.get(sJ);
+                const elK = document.getElementById('l-k');
+                const elD = document.getElementById('l-d');
+                const elJ = document.getElementById('l-j');
+                if (k && elK) elK.textContent = k.value.toFixed(2);
+                if (d && elD) elD.textContent = d.value.toFixed(2);
+                if (j && elJ) elJ.textContent = j.value.toFixed(2);
+            } else if (activeSub === 'RSI') {
+                const r = param.seriesData.get(sRsi);
+                const el = document.getElementById('l-rsi');
+                if (r && el) el.textContent = r.value.toFixed(2);
+            }
+        }
+
+        // --- Chip Distribution (Preserved Logic) ---
+        function toggleChipsPanel() {
+            const p = document.getElementById('side-panel');
+            const bg = document.getElementById('backdrop');
+            p.classList.toggle('open');
+
+            // Mobile only backdrop
+            if (window.innerWidth < 768) {
+                bg.classList.toggle('open');
+            } else {
+                // Desktop: Trigger resize to adjust chart width
+                // Wait for transition (300ms) and intermediate steps
+                setTimeout(() => {
+                    if (chartMain) chartMain.resize(0, 0);
+                    if (chartSub) chartSub.resize(0, 0);
+                }, 300); // Match CSS transition time
+
+                // Also trigger immediate/intermediate to smooth it out?
+                // LW Charts handles resize efficiently, maybe just final is enough for interaction fix.
+            }
+        }
+
+        // Adapted from original code
+        // priceRange: optional {min, max} to sync with K-line chart Y-axis
+        function calculateChipDistribution(data, upToIndex, priceRange = null) {
+            if (!data || data.length === 0) return { distribution: [], avgCost: 0, profitRatio: 0, concentration: 0, priceRange: null };
+            // Use same logic as before but concise
+            const endIndex = upToIndex >= 0 ? upToIndex : data.length - 1;
+            const currentPrice = data[endIndex].close;
+            const lookback = Math.min(60, endIndex + 1);
+            const startIndex = endIndex - lookback + 1;
+
+            // Calculate chip distribution data
+            let chipMinPrice = Infinity, chipMaxPrice = -Infinity, totalVol = 0;
+            for (let i = startIndex; i <= endIndex; i++) {
+                if (data[i].low < chipMinPrice) chipMinPrice = data[i].low;
+                if (data[i].high > chipMaxPrice) chipMaxPrice = data[i].high;
+                totalVol += data[i].volume;
+            }
+
+            // Use K-line price range if provided, otherwise use chip data range
+            let minPrice, maxPrice;
+            if (priceRange && priceRange.min !== undefined && priceRange.max !== undefined) {
+                minPrice = priceRange.min;
+                maxPrice = priceRange.max;
+            } else {
+                const padding = (chipMaxPrice - chipMinPrice) * 0.1;
+                minPrice = Math.max(0, chipMinPrice - padding);
+                maxPrice = chipMaxPrice + padding;
+            }
+
+            const numBuckets = 120; // Higher resolution for Tongdaxin style
+            const bucketSize = (maxPrice - minPrice) / numBuckets;
+            const buckets = new Array(numBuckets).fill(0);
+
+            for (let i = startIndex; i <= endIndex; i++) {
+                const d = data[i];
+                const decay = 1 - (endIndex - i) * 0.02; // Faster decay
+                const vol = d.volume * Math.max(0.1, decay);
+                const lowB = Math.floor((d.low - minPrice) / bucketSize);
+                const highB = Math.floor((d.high - minPrice) / bucketSize);
+                for (let b = Math.max(0, lowB); b <= Math.min(numBuckets - 1, highB); b++) {
+                    buckets[b] += vol / (highB - lowB + 1);
+                }
+            }
+
+            const maxB = Math.max(...buckets);
+            const dist = [];
+            let profitV = 0, lossV = 0, wSum = 0, tVol = 0;
+
+            for (let i = 0; i < numBuckets; i++) {
+                const price = minPrice + (i + 0.5) * bucketSize;
+                const pct = maxB > 0 ? (buckets[i] / maxB) * 100 : 0;
+                const isP = price <= currentPrice;
+                dist.push({ price, percentage: pct, isProfit: isP });
+
+                if (buckets[i] > 0) {
+                    if (isP) profitV += buckets[i]; else lossV += buckets[i];
+                    wSum += price * buckets[i]; tVol += buckets[i];
+                }
+            }
+            const avgCost = tVol > 0 ? wSum / tVol : currentPrice;
+            const profitRatio = (profitV + lossV) > 0 ? (profitV / (profitV + lossV)) * 100 : 0;
+
+            const sorted = [...buckets].sort((a, b) => b - a).slice(0, Math.floor(numBuckets * 0.2));
+            const topSum = sorted.reduce((a, b) => a + b, 0);
+            const conc = tVol > 0 ? (topSum / tVol) * 100 : 0;
+
+            return {
+                distribution: dist.reverse(),
+                avgCost,
+                profitRatio,
+                concentration: conc,
+                currentPrice,
+                priceRange: { min: minPrice, max: maxPrice }
+            };
+        }
+
+
+
+        async function renderSidePanelChips(dayIndex) {
+            const idx = dayIndex >= 0 ? dayIndex : rawData.length - 1;
+            const target = rawData[idx];
+            if (!target) return;
+
+            document.getElementById('chip-date').textContent = target.time;
+
+            const canvas = document.getElementById('chip-canvas');
+            const container = document.getElementById('chip-chart-area');
+            if (!canvas || !container) return;
+
+            // Resize canvas to match container (which should match chart height)
+            const rect = container.getBoundingClientRect();
+            // Ensure canvas resolution matches display size
+            const dpr = window.devicePixelRatio || 1;
+
+            // Align chip Y coordinates with main chart price scale.
+            // We need the offset between main chart top and chip panel top.
+            const mainChartEl = document.getElementById('main-chart');
+            const mainRect = mainChartEl.getBoundingClientRect();
+            const mainHeight = mainRect.height;
+
+            const sidePanel = document.getElementById('side-panel');
+            if (sidePanel) {
+                sidePanel.style.setProperty('--chip-height', `${mainHeight}px`);
+            }
+
+            const chipRect = container.getBoundingClientRect();
+            const yOffset = mainRect.top - chipRect.top;
+
+            canvas.width = rect.width * dpr;
+            canvas.height = rect.height * dpr;
+            canvas.style.width = rect.width + 'px';
+            canvas.style.height = rect.height + 'px';
+
+            const ctx = canvas.getContext('2d');
+            ctx.scale(dpr, dpr);
+            ctx.clearRect(0, 0, rect.width, rect.height);
+
+            // Calculate chip distribution
+            // We need to calculate based on the visible range or the whole data?
+            // Usually chip distribution is calculated for the specific day (idx).
+            // But the DISPLAY is mapped to the current Y-axis.
+
+            const chips = calculateChipDistribution(rawData, idx); // Use internal range logic
+
+            // Drawing
+            // We need to map price to Y coordinate using sCandle.priceToCoordinate(price)
+            // But sCandle.priceToCoordinate returns coordinate relative to the chart container.
+            // We need to map that to the side panel canvas.
+            // Since side panel is top-aligned with chart section, the Y should match exactly for the main chart part.
+
+            if (!sCandle) return;
+
+            const maxPct = Math.max(...chips.distribution.map(d => d.percentage));
+            const currentPrice = chips.currentPrice;
+
+            // Draw bars
+            // We'll iterate through buckets (or distribution items)
+            // Since we want a "histogram" look, we can draw rects for each bucket.
+            // But our calculateChipDistribution returns discrete points.
+            // Let's use the buckets directly if possible, or just draw rects centered on price.
+
+            // To make it look like Tongdaxin, we want thin horizontal lines or blocks.
+            // Let's use the distribution data.
+
+            // Optimization: Only draw what's visible? 
+            // Canvas is fast enough for this.
+
+            chips.distribution.forEach(d => {
+                const yMain = sCandle.priceToCoordinate(d.price);
+
+                if (yMain === null) return;
+
+                // Check if y is within the main chart area
+                if (yMain < 0 || yMain > mainHeight) return;
+
+                const y = yMain + yOffset;
+                if (y < 0 || y > rect.height) return;
+
+                const barWidth = (d.percentage / maxPct) * (rect.width - 40); // Leave space for text
+                const barHeight = 2; // Thin lines for high res look
+
+                // Color
+                // Profit (price < current) = Red
+                // Loss (price > current) = Green/Blue
+                // Tongdaxin: Profit=Red, Loss=Blue/Green. 
+                // Let's use variables.
+                const isProfit = d.price <= currentPrice;
+                // Using app colors
+                ctx.fillStyle = isProfit ? '#ef4444' : '#3b82f6'; // Red / Blue
+                ctx.globalAlpha = 0.6;
+
+                // Draw bar from LEFT
+                ctx.fillRect(0, y - barHeight / 2, barWidth, barHeight);
+
+                // Draw Peak Line?
+                if (d.percentage === maxPct) {
+                    ctx.fillStyle = '#f59e0b'; // Orange for peak
+                    ctx.fillRect(0, y - barHeight / 2, barWidth + 2, barHeight);
+                }
+            });
+            ctx.globalAlpha = 1.0;
+
+            // Draw Current Price Line
+            const currYMain = sCandle.priceToCoordinate(currentPrice);
+            const currY = currYMain !== null ? currYMain + yOffset : null;
+            if (currYMain !== null && currYMain >= 0 && currYMain <= mainHeight && currY !== null && currY >= 0 && currY <= rect.height) {
+                ctx.strokeStyle = '#fbbf24'; // Yellow
+                ctx.lineWidth = 1;
+                ctx.setLineDash([4, 2]);
+                ctx.beginPath();
+                ctx.moveTo(0, currY);
+                ctx.lineTo(rect.width, currY);
+                ctx.stroke();
+                ctx.setLineDash([]);
+
+                // Label
+                ctx.fillStyle = '#fbbf24';
+                ctx.font = '10px monospace';
+                ctx.fillText(currentPrice.toFixed(2), rect.width - 35, currY - 2);
+            }
+
+            // Update stats text
+            const pRatioEl = document.getElementById('p-ratio');
+            pRatioEl.textContent = chips.profitRatio.toFixed(1) + '%';
+            pRatioEl.style.color = chips.profitRatio >= 50 ? 'var(--up-color)' : 'var(--down-color)';
+            document.getElementById('avg-cost').textContent = chips.avgCost.toFixed(2);
+            document.getElementById('conc').textContent = chips.concentration.toFixed(1) + '%';
+        }
+
+        // --- Telegram Integration ---
+        if (window.Telegram?.WebApp) {
+            Telegram.WebApp.ready();
+
+            // Only use FullScreen on Mobile (v8.0+)
+            const p = Telegram.WebApp.platform;
+            if (['ios', 'android'].includes(p) && Telegram.WebApp.requestFullscreen) {
+                Telegram.WebApp.requestFullscreen();
+            }
+            // Always expand to maximize available space (Desktop/Web/Mobile)
+            Telegram.WebApp.expand();
+
+            // Color scheme sync
+            Telegram.WebApp.onEvent('themeChanged', initTheme);
+        }
+
+        // --- Watchlist Functions ---
+        async function checkWatchlistStatus() {
+            const btn = document.getElementById('btn-watchlist');
+            if (!resolveUserId()) {
+                btn.disabled = true;
+                btn.style.opacity = '0.5';
+                btn.title = "Open in Telegram to use watchlist";
+                return;
+            }
+            btn.disabled = false;
+            btn.style.opacity = '1';
+            btn.title = "";
+            try {
+                // Use authenticatedFetch
+                const res = await authenticatedFetch(`${API_BASE}/api/chart/watchlist/status?user_id=${userId}&code=${code}`);
+                const data = await res.json();
+                updateWatchlistBtn(data.in_watchlist);
+            } catch (e) {
+                console.error("Failed to check watchlist:", e);
+                // Don't disable button on first error, maybe just network glitch
+            }
+        }
+
+        function updateWatchlistBtn(isIn) {
+            const btn = document.getElementById('btn-watchlist');
+            if (isIn) {
+                btn.textContent = "★";
+                btn.style.color = "#f59e0b"; // Gold/Orange
+                btn.classList.add('active');
+            } else {
+                btn.textContent = "☆";
+                btn.style.color = "var(--text-secondary)";
+                btn.classList.remove('active');
+            }
+        }
+
+        // --- Landscape Mode ---
+        let isLandscape = false;
+
+        function toggleLandscape() {
+            isLandscape = !isLandscape;
+            const body = document.body;
+            const btn = document.getElementById('btn-landscape');
+
+            if (isLandscape) {
+                body.classList.add('force-landscape');
+                btn.classList.add('active');
+            } else {
+                body.classList.remove('force-landscape');
+                btn.classList.remove('active');
+            }
+
+            // Trigger resize after transition
+            setTimeout(() => {
+                if (chartMain) chartMain.resize(0, 0);
+                if (chartSub) chartSub.resize(0, 0);
+                renderSidePanelChips(lastChipIdx);
+            }, 100);
+        }
+
+        // Auto-detect orientation change
+        window.addEventListener('orientationchange', () => {
+            // If physically rotated to landscape, remove forced landscape
+            if (window.orientation === 90 || window.orientation === -90) {
+                if (isLandscape) toggleLandscape(); // Turn off forced mode
+            }
+        });
+
+        // Also listen to resize to detect orientation change on some devices
+        window.addEventListener('resize', () => {
+            if (window.innerWidth > window.innerHeight && isLandscape) {
+                toggleLandscape();
+            }
+        });
+
+        async function toggleWatchlist() {
+            const btn = document.getElementById('btn-watchlist');
+            if (!resolveUserId()) {
+                showToast("Open in Telegram to use watchlist");
+                return;
+            }
+            const isAdding = btn.textContent === "☆";
+
+            // Optimistic update
+            updateWatchlistBtn(isAdding);
+
+            try {
+                const endpoint = isAdding ? '/api/chart/watchlist/add' : '/api/chart/watchlist/remove';
+                // Use authenticatedFetch
+                const res = await authenticatedFetch(`${API_BASE}${endpoint}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        user_id: userId,
+                        code: code,
+                        name: document.getElementById('name').textContent
+                    })
+                });
+
+                const data = await res.json();
+                if (isAdding && !data.success && !data.code) { // Check for failure
+                    updateWatchlistBtn(false); // Revert
+                    showToast("Failed to add");
+                } else if (!isAdding && !data.success) {
+                    updateWatchlistBtn(true); // Revert
+                    showToast("Failed to remove");
+                } else {
+                    showToast(isAdding ? "Added to Watchlist" : "Removed from Watchlist");
+                }
+
+            } catch (e) {
+                console.error("Watchlist toggle error:", e);
+                updateWatchlistBtn(!isAdding); // Revert
+                showToast("Error updating watchlist");
+            }
+        }
+
+        function showToast(msg) {
+            // Simple toast implementation
+            const toast = document.createElement('div');
+            toast.textContent = msg;
+            toast.style.position = 'fixed';
+            toast.style.bottom = '80px';
+            toast.style.left = '50%';
+            toast.style.transform = 'translateX(-50%)';
+            toast.style.background = 'rgba(0,0,0,0.7)';
+            toast.style.color = 'white';
+            toast.style.padding = '8px 16px';
+            toast.style.borderRadius = '20px';
+            toast.style.fontSize = '12px';
+            toast.style.zIndex = '100';
+            toast.style.opacity = '0';
+            toast.style.transition = 'opacity 0.3s';
+
+            document.body.appendChild(toast);
+
+            // Trigger reflow
+            toast.offsetHeight;
+            toast.style.opacity = '1';
+
+            setTimeout(() => {
+                toast.style.opacity = '0';
+                setTimeout(() => toast.remove(), 300);
+            }, 2000);
+        }
+
+        // --- Navigation ---
+        let prevCode = null;
+        let nextCode = null;
+
+        function initNavigation() {
+            if (navContext) {
+                checkNavigation();
+            }
+        }
+
+        async function checkNavigation() {
+            if (!navContext) return;
+            try {
+                let url = `${API_BASE}/api/chart/navigation?code=${code}&context=${navContext}`;
+                if (resolveUserId()) url += `&user_id=${userId}`;
+
+                // Use authenticatedFetch
+                const res = await authenticatedFetch(url);
+                const data = await res.json();
+
+                prevCode = data.prev;
+                nextCode = data.next;
+
+                const btnPrev = document.getElementById('float-btn-prev');
+                const btnNext = document.getElementById('float-btn-next');
+                const navContainer = document.getElementById('floating-nav');
+
+                if (prevCode || nextCode) {
+                    navContainer.style.display = 'flex';
+                } else {
+                    navContainer.style.display = 'none';
+                }
+
+                if (prevCode) {
+                    btnPrev.style.visibility = 'visible';
+                    btnPrev.title = prevCode;
+                } else {
+                    btnPrev.style.visibility = 'hidden';
+                }
+
+                if (nextCode) {
+                    btnNext.style.visibility = 'visible';
+                    btnNext.title = nextCode;
+                } else {
+                    btnNext.style.visibility = 'hidden';
+                }
+
+            } catch (e) {
+                console.error("Nav check failed", e);
+            }
+        }
+
+        function navigateTo(dir) {
+            const target = dir === 'prev' ? prevCode : nextCode;
+            if (target) {
+                // Reload page with new code
+                // We need to keep the context!
+                // Construct new URL
+                const url = new URL(window.location.href);
+                url.searchParams.set('code', target);
+                // If using startapp, we might need to update it too, but for web reload 'code' param is key if we support it
+                // Actually, our init logic parses 'code' from URL param 'code' OR 'tgWebAppStartParam'
+
+                // Let's just reload with code param, keeping context param if exists
+                if (navContext) {
+                    url.searchParams.set('context', navContext);
+                }
+
+                // Also update startapp if present to avoid confusion? 
+                // Telegram WebApp might not like full reload.
+                // Better to just update state and re-render?
+
+                code = target;
+                // Update URL without reload if possible
+                window.history.pushState({}, '', url);
+
+                // Reset data
+                rawData = [];
+                document.getElementById('loading').style.display = 'flex';
+
+                // Re-init
+                loadData();
+                checkWatchlistStatus();
+                checkNavigation(); // Update buttons for new code
+            }
+        }
+
+        // Initialize
+        checkWatchlistStatus();
+        initNavigation();
+
+    </script>
+</body>
+
+</html>

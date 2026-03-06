@@ -1,0 +1,35 @@
+:root {
+    --bg-primary: #ffffff;
+    --bg-secondary: #f8fafc;
+    --bg-tertiary: #f1f5f9;
+    --text-primary: #0f172a;
+    --text-secondary: #64748b;
+    --text-muted: #94a3b8;
+    --border-color: #e2e8f0;
+    --grid-color: #f1f5f9;
+    --up-color: #ef4444;
+    /* Rise = Red */
+    --down-color: #22c55e;
+    /* Fall = Green */
+    --accent-color: #2962ff;
+    --btn-active-bg: #eff6ff;
+    --btn-active-text: #2962ff;
+    --hover-bg: #f1f5f9;
+}
+
+[data-theme="dark"] {
+    --bg-primary: #101014;
+    --bg-secondary: #161a25;
+    --bg-tertiary: #1e222d;
+    --text-primary: #d1d4dc;
+    --text-secondary: #868993;
+    --text-muted: #50535e;
+    --border-color: #2a2e39;
+    --grid-color: #1e222d;
+    --up-color: #f23645;
+    --down-color: #089981;
+    --accent-color: #2962ff;
+    --btn-active-bg: #1e222d;
+    --btn-active-text: #2962ff;
+    --hover-bg: #2a2e39;
+}

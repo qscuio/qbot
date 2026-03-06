@@ -218,6 +218,7 @@ sudo journalctl -u qbot -f
   - `TELEGRAM_WEBHOOK_SECRET` (shared secret header token)
 - If `WEBHOOK_URL` is set, qbot auto-registers Telegram webhook to:
   - `${WEBHOOK_URL}/telegram/webhook`
+- Webhook subscription includes `message`, `edited_message`, and `callback_query` (button navigation).
 - If `TELEGRAM_WEBHOOK_SECRET` is set, webhook requests must include:
   - `X-Telegram-Bot-Api-Secret-Token: <TELEGRAM_WEBHOOK_SECRET>`
 - If `WEBHOOK_URL` is `https://...`, deploy auto-attempts Let's Encrypt issuance.
@@ -240,12 +241,17 @@ Supported command set (webhook):
 `/scan` behavior:
 - Runs full signal scan (all enabled signals).
 - Sends summary + per-signal button lists.
-- Buttons open stock K-line pages directly.
+- Buttons open self-hosted K-line miniapp (`/miniapp/chart`) when `WEBHOOK_URL` is set.
 - Supports signal-specific scan via button menu (`/menu` → `信号扫描`).
 
 Telegram button navigation:
 - Main menu + submenus for Watchlist / Portfolio / Daban / Sector+AI / Tools.
 - All commands and subcommands have corresponding buttons.
+
+Self-hosted chart miniapp:
+- Ported from `../qubot` and served by Rust service at:
+  - `${WEBHOOK_URL}/miniapp/chart/?code=600519`
+- Scan result buttons and `/chart` use this miniapp URL.
 
 Command menu:
 - qbot now auto-calls Telegram `setMyCommands` on startup.

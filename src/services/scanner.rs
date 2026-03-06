@@ -14,7 +14,7 @@ const BATCH_SIZE: usize = 100;
 const MIN_BARS: usize = 60;
 const MULTI_SIGNAL_THRESHOLD: usize = 3;
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SignalHit {
     pub code: String,
     pub name: String,
