@@ -33,19 +33,6 @@ impl TushareClient {
         }
     }
 
-    /// Convert Tushare code (000001.SZ) to Sina code (sz000001)
-    pub fn to_sina_code(&self, tushare_code: &str) -> String {
-        if let Some((num, market)) = tushare_code.split_once('.') {
-            match market {
-                "SH" => format!("sh{}", num),
-                "SZ" => format!("sz{}", num),
-                _ => tushare_code.to_lowercase().replace('.', ""),
-            }
-        } else {
-            tushare_code.to_string()
-        }
-    }
-
     async fn call(&self, api_name: &str, params: Value, fields: &str) -> Result<Value> {
         let body = json!({
             "api_name": api_name,
@@ -120,6 +107,19 @@ impl TushareClient {
             Value::Number(n) => n.as_i64().unwrap_or(0),
             Value::String(s) => s.parse().unwrap_or(0),
             _ => 0,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn to_sina_code(&self, tushare_code: &str) -> String {
+        if let Some((num, market)) = tushare_code.split_once('.') {
+            match market {
+                "SH" => format!("sh{}", num),
+                "SZ" => format!("sz{}", num),
+                _ => tushare_code.to_lowercase().replace('.', ""),
+            }
+        } else {
+            tushare_code.to_string()
         }
     }
 }

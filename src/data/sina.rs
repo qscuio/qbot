@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use crate::data::types::Quote;
 use crate::error::{AppError, Result};
+use crate::market_time::beijing_now;
 
 const SINA_URL: &str = "http://hq.sinajs.cn/list=";
 
@@ -85,7 +86,7 @@ impl SinaClient {
 
         let date_str = format!("{} {}", parts[30], parts[31]);
         let timestamp = NaiveDateTime::parse_from_str(&date_str, "%Y-%m-%d %H:%M:%S")
-            .unwrap_or_else(|_| chrono::Local::now().naive_local());
+            .unwrap_or_else(|_| beijing_now().naive_local());
 
         Some(Quote {
             code: tushare_code.to_string(),

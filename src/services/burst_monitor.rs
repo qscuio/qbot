@@ -51,7 +51,11 @@ impl BurstMonitorService {
             let mut cache = RedisCache::new(self.state.redis.clone());
 
             for (code, quote) in &quotes {
-                let prev_price = self.price_state.get(code).copied().unwrap_or(quote.prev_close);
+                let prev_price = self
+                    .price_state
+                    .get(code)
+                    .copied()
+                    .unwrap_or(quote.prev_close);
                 if prev_price == 0.0 {
                     continue;
                 }

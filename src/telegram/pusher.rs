@@ -35,6 +35,38 @@ impl TelegramPusher {
         Ok(())
     }
 
+    pub async fn set_webhook(&self, webhook_url: &str, secret_token: Option<&str>) -> Result<()> {
+        let url = format!("{}{}/setWebhook", TG_API, self.token);
+        let mut body = json!({
+            "url": webhook_url,
+            "drop_pending_updates": false,
+            "allowed_updates": ["message", "edited_message"],
+        });
+
+        if let Some(secret) = secret_token.filter(|s| !s.trim().is_empty()) {
+            body["secret_token"] = json!(secret);
+        }
+
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(AppError::Http)?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err_text = resp.text().await.unwrap_or_default();
+            return Err(AppError::Internal(format!(
+                "setWebhook {}: {}",
+                status, err_text
+            )));
+        }
+
+        Ok(())
+    }
+
     async fn send_message(&self, chat_id: &str, text: &str) -> Result<()> {
         let url = format!("{}{}/sendMessage", TG_API, self.token);
         let body = json!({
@@ -44,7 +76,12 @@ impl TelegramPusher {
             "disable_web_page_preview": true,
         });
 
-        let resp = self.client.post(&url).json(&body).send().await
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
             .map_err(AppError::Http)?;
 
         if !resp.status().is_success() {
@@ -53,13 +90,24 @@ impl TelegramPusher {
             if status.as_u16() == 429 {
                 warn!("Telegram rate limit hit, waiting 5s...");
                 sleep(Duration::from_secs(5)).await;
-                let retry = self.client.post(&url).json(&body).send().await
+                let retry = self
+                    .client
+                    .post(&url)
+                    .json(&body)
+                    .send()
+                    .await
                     .map_err(AppError::Http)?;
                 if !retry.status().is_success() {
-                    return Err(AppError::Internal(format!("Telegram error: {}", retry.status())));
+                    return Err(AppError::Internal(format!(
+                        "Telegram error: {}",
+                        retry.status()
+                    )));
                 }
             } else {
-                return Err(AppError::Internal(format!("Telegram {}: {}", status, err_text)));
+                return Err(AppError::Internal(format!(
+                    "Telegram {}: {}",
+                    status, err_text
+                )));
             }
         }
 

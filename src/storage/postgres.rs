@@ -55,34 +55,46 @@ pub async fn upsert_daily_bars(pool: &PgPool, bars: &[(String, Candle)]) -> Resu
 
 /// Fetch OHLCV history for a stock (sorted ascending)
 pub async fn get_stock_history(pool: &PgPool, code: &str, days: usize) -> Result<Vec<Candle>> {
-    let rows: Vec<(NaiveDate, Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<i64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>)> =
-        sqlx::query_as(
-            r#"SELECT trade_date, open::float8, high::float8, low::float8, close::float8,
+    let rows: Vec<(
+        NaiveDate,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<i64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+    )> = sqlx::query_as(
+        r#"SELECT trade_date, open::float8, high::float8, low::float8, close::float8,
                       volume, amount::float8, turnover::float8, pe::float8, pb::float8
                FROM stock_daily_bars
                WHERE code = $1
                ORDER BY trade_date DESC
                LIMIT $2"#,
-        )
-        .bind(code)
-        .bind(days as i64)
-        .fetch_all(pool)
-        .await?;
+    )
+    .bind(code)
+    .bind(days as i64)
+    .fetch_all(pool)
+    .await?;
 
     let mut bars: Vec<Candle> = rows
         .into_iter()
-        .map(|(trade_date, open, high, low, close, volume, amount, turnover, pe, pb)| Candle {
-            trade_date,
-            open: open.unwrap_or(0.0),
-            high: high.unwrap_or(0.0),
-            low: low.unwrap_or(0.0),
-            close: close.unwrap_or(0.0),
-            volume: volume.unwrap_or(0),
-            amount: amount.unwrap_or(0.0),
-            turnover,
-            pe,
-            pb,
-        })
+        .map(
+            |(trade_date, open, high, low, close, volume, amount, turnover, pe, pb)| Candle {
+                trade_date,
+                open: open.unwrap_or(0.0),
+                high: high.unwrap_or(0.0),
+                low: low.unwrap_or(0.0),
+                close: close.unwrap_or(0.0),
+                volume: volume.unwrap_or(0),
+                amount: amount.unwrap_or(0.0),
+                turnover,
+                pe,
+                pb,
+            },
+        )
         .collect();
 
     bars.sort_by_key(|b| b.trade_date);
@@ -215,10 +227,139 @@ pub async fn save_report(pool: &PgPool, report_type: &str, content: &str) -> Res
 
 /// Get stock name by code
 pub async fn get_stock_name(pool: &PgPool, code: &str) -> Result<Option<String>> {
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT name FROM stock_info WHERE code = $1")
-            .bind(code)
-            .fetch_optional(pool)
-            .await?;
+    let row: Option<(String,)> = sqlx::query_as("SELECT name FROM stock_info WHERE code = $1")
+        .bind(code)
+        .fetch_optional(pool)
+        .await?;
     Ok(row.map(|r| r.0))
+}
+
+/// Resolve a flexible stock code into canonical Tushare code (e.g. 600519 -> 600519.SH)
+pub async fn resolve_stock_code(pool: &PgPool, raw_code: &str) -> Result<Option<String>> {
+    let code = raw_code.trim().to_uppercase();
+    if code.is_empty() {
+        return Ok(None);
+    }
+
+    if code.contains('.') {
+        let row: Option<(String,)> = sqlx::query_as(
+            r#"SELECT code
+               FROM stock_info
+               WHERE UPPER(code) = $1
+               LIMIT 1"#,
+        )
+        .bind(code)
+        .fetch_optional(pool)
+        .await?;
+        return Ok(row.map(|r| r.0));
+    }
+
+    let pattern = format!("{}.%", code);
+    let rows: Vec<(String,)> = sqlx::query_as(
+        r#"SELECT code
+           FROM stock_info
+           WHERE code ILIKE $1
+           ORDER BY
+             CASE
+               WHEN $2 LIKE '6%' AND code LIKE '%.SH' THEN 0
+               WHEN $2 NOT LIKE '6%' AND code LIKE '%.SZ' THEN 0
+               ELSE 1
+             END,
+             code
+           LIMIT 1"#,
+    )
+    .bind(pattern)
+    .bind(code)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().next().map(|r| r.0))
+}
+
+/// Search stocks by code or name.
+pub async fn search_stocks(pool: &PgPool, q: &str, limit: i64) -> Result<Vec<StockInfo>> {
+    let keyword = q.trim();
+    if keyword.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let lim = limit.clamp(1, 50);
+    let pattern = format!("%{}%", keyword);
+    let rows: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+        r#"SELECT code, name, market, industry
+           FROM stock_info
+           WHERE code ILIKE $1 OR name ILIKE $1
+           ORDER BY code
+           LIMIT $2"#,
+    )
+    .bind(pattern)
+    .bind(lim)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(code, name, market, industry)| StockInfo {
+            code,
+            name,
+            market: market.unwrap_or_default(),
+            industry,
+        })
+        .collect())
+}
+
+/// Add stock to a user's watchlist.
+pub async fn add_watchlist_stock(pool: &PgPool, user_id: i64, code: &str) -> Result<()> {
+    sqlx::query(
+        r#"INSERT INTO user_watchlist (user_id, code)
+           VALUES ($1, $2)
+           ON CONFLICT (user_id, code) DO NOTHING"#,
+    )
+    .bind(user_id)
+    .bind(code)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Remove stock from a user's watchlist. Returns true if a row was removed.
+pub async fn remove_watchlist_stock(pool: &PgPool, user_id: i64, code: &str) -> Result<bool> {
+    let res = sqlx::query(
+        r#"DELETE FROM user_watchlist
+           WHERE user_id = $1 AND code = $2"#,
+    )
+    .bind(user_id)
+    .bind(code)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Check if stock is in a user's watchlist.
+pub async fn is_watchlist_stock(pool: &PgPool, user_id: i64, code: &str) -> Result<bool> {
+    let row: Option<(bool,)> = sqlx::query_as(
+        r#"SELECT EXISTS(
+             SELECT 1 FROM user_watchlist WHERE user_id = $1 AND code = $2
+           )"#,
+    )
+    .bind(user_id)
+    .bind(code)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| r.0).unwrap_or(false))
+}
+
+/// List a user's watchlist with stock names.
+pub async fn list_watchlist_stocks(pool: &PgPool, user_id: i64) -> Result<Vec<(String, String)>> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        r#"SELECT w.code, COALESCE(i.name, w.code) AS name
+           FROM user_watchlist w
+           LEFT JOIN stock_info i ON i.code = w.code
+           WHERE w.user_id = $1
+           ORDER BY w.added_at DESC"#,
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
 }

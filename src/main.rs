@@ -14,7 +14,7 @@ use crate::data::provider::DataProvider;
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{info, warn};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -47,11 +47,26 @@ async fn main() -> Result<()> {
     // Initialize signal registry
     signals::registry::SignalRegistry::init();
 
-    // Data provider and Telegram pusher
-    let provider: Arc<dyn DataProvider> = Arc::new(data::tushare::TushareClient::new(
+    // Data providers (tushare primary, eastmoney + tencent secondary, db fallback) and Telegram pusher
+    let tushare_provider: Arc<dyn DataProvider> = Arc::new(data::tushare::TushareClient::new(
         config.tushare_token.clone(),
         config.data_proxy.as_deref(),
     ));
+    let eastmoney_provider: Arc<dyn DataProvider> = Arc::new(
+        data::eastmoney::EastmoneyProvider::new(config.data_proxy.as_deref()),
+    );
+    let tencent_provider: Arc<dyn DataProvider> = Arc::new(data::tencent::TencentProvider::new(
+        config.data_proxy.as_deref(),
+    ));
+    let db_provider: Arc<dyn DataProvider> = Arc::new(data::db::DbDataProvider::new(db.clone()));
+    let provider: Arc<dyn DataProvider> =
+        Arc::new(data::fallback::FallbackDataProvider::new(vec![
+            tushare_provider,
+            eastmoney_provider,
+            tencent_provider,
+            db_provider,
+        ]));
+    info!("Data providers configured: tushare -> eastmoney -> tencent -> db fallback");
     let pusher = Arc::new(telegram::TelegramPusher::new(
         config.telegram_bot_token.clone(),
     ));
@@ -68,6 +83,17 @@ async fn main() -> Result<()> {
         weekly_report_job_lock: Arc::new(Mutex::new(())),
     });
 
+    if let Some(base_url) = state.config.webhook_url.as_deref() {
+        let endpoint = format!("{}/telegram/webhook", base_url.trim_end_matches('/'));
+        match pusher
+            .set_webhook(&endpoint, state.config.telegram_webhook_secret.as_deref())
+            .await
+        {
+            Ok(_) => info!("Telegram webhook registered: {}", endpoint),
+            Err(e) => warn!("Telegram webhook registration failed: {}", e),
+        }
+    }
+
     if state.config.enable_burst_monitor && state.config.stock_alert_channel.is_some() {
         let mut burst_monitor = services::burst_monitor::BurstMonitorService::new(
             state.clone(),
@@ -78,6 +104,37 @@ async fn main() -> Result<()> {
             burst_monitor.run_poll_loop().await;
         });
         info!("Burst monitor started");
+    }
+
+    if state.config.enable_daban_live && state.config.daban_channel.is_some() {
+        let daban = services::daban::DabanService::new(state.clone());
+        let provider_clone = provider.clone();
+        let pusher_clone = pusher.clone();
+        let channel = state.config.daban_channel.clone().unwrap_or_default();
+        tokio::spawn(async move {
+            daban
+                .run_live_loop(provider_clone, pusher_clone, channel)
+                .await;
+        });
+        info!("Daban live loop started");
+    }
+
+    if state.config.enable_chip_dist {
+        let chip_dist = services::chip_dist::ChipDistService::new(state.clone());
+        tokio::spawn(async move {
+            chip_dist.run_daily_update_loop().await;
+        });
+        info!("Chip distribution loop started");
+    }
+
+    if state.config.enable_ai_analysis && state.config.report_channel.is_some() {
+        let ai = services::ai_analysis::AiAnalysisService::new(state.clone());
+        let channel = state.config.report_channel.clone().unwrap_or_default();
+        let pusher_clone = pusher.clone();
+        tokio::spawn(async move {
+            ai.run_daily_loop(pusher_clone, channel).await;
+        });
+        info!("AI analysis loop started");
     }
 
     // Check if first-run backfill needed

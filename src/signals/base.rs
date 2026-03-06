@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use crate::data::types::Candle;
+use std::collections::HashMap;
 
 /// Result of a signal detection
 #[derive(Debug, Clone)]
@@ -10,11 +10,17 @@ pub struct SignalResult {
 
 impl SignalResult {
     pub fn yes() -> Self {
-        SignalResult { triggered: true, metadata: HashMap::new() }
+        SignalResult {
+            triggered: true,
+            metadata: HashMap::new(),
+        }
     }
 
     pub fn no() -> Self {
-        SignalResult { triggered: false, metadata: HashMap::new() }
+        SignalResult {
+            triggered: false,
+            metadata: HashMap::new(),
+        }
     }
 
     pub fn with_meta(mut self, key: &str, value: serde_json::Value) -> Self {
@@ -36,32 +42,46 @@ pub trait SignalDetector: Send + Sync {
     fn display_name(&self) -> &'static str;
     fn icon(&self) -> &'static str;
     fn group(&self) -> &'static str;
-    fn min_bars(&self) -> usize { 21 }
-    fn priority(&self) -> i32 { 100 }
-    fn enabled(&self) -> bool { true }
-    fn count_in_multi(&self) -> bool { true }
+    fn min_bars(&self) -> usize {
+        21
+    }
+    fn priority(&self) -> i32 {
+        100
+    }
+    fn enabled(&self) -> bool {
+        true
+    }
+    fn count_in_multi(&self) -> bool {
+        true
+    }
 
     fn detect(&self, bars: &[Candle], ctx: &StockContext) -> SignalResult;
 }
 
 /// Helper: compute simple moving average
 pub fn sma(values: &[f64], period: usize) -> Option<f64> {
-    if values.len() < period { return None; }
-    let sum: f64 = values[values.len()-period..].iter().sum();
+    if values.len() < period {
+        return None;
+    }
+    let sum: f64 = values[values.len() - period..].iter().sum();
     Some(sum / period as f64)
 }
 
 /// Helper: compute EMA (simplified)
 pub fn ema(values: &[f64], period: usize) -> Option<f64> {
-    if values.len() < period { return None; }
+    if values.len() < period {
+        return None;
+    }
     let ema_val = values[values.len() - period..].iter().sum::<f64>() / period as f64;
     Some(ema_val)
 }
 
 /// Helper: average volume over last N bars
 pub fn avg_volume(bars: &[Candle], n: usize) -> f64 {
-    if bars.len() < n { return 0.0; }
-    let sum: f64 = bars[bars.len()-n..].iter().map(|b| b.volume as f64).sum();
+    if bars.len() < n {
+        return 0.0;
+    }
+    let sum: f64 = bars[bars.len() - n..].iter().map(|b| b.volume as f64).sum();
     sum / n as f64
 }
 

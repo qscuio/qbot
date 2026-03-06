@@ -58,7 +58,8 @@ impl RedisCache {
 
     /// Cache scan results until next trading day (TTL: 24h)
     pub async fn cache_scan_results(&mut self, results: &serde_json::Value) -> Result<()> {
-        self.set_json("scan:latest", results, Duration::from_secs(86400)).await
+        self.set_json("scan:latest", results, Duration::from_secs(86400))
+            .await
     }
 
     pub async fn get_scan_results(&mut self) -> Result<Option<serde_json::Value>> {
@@ -67,7 +68,8 @@ impl RedisCache {
 
     /// Cache stock universe (TTL: 24h)
     pub async fn cache_stock_universe(&mut self, stocks: &serde_json::Value) -> Result<()> {
-        self.set_json("stocks:universe", stocks, Duration::from_secs(86400)).await
+        self.set_json("stocks:universe", stocks, Duration::from_secs(86400))
+            .await
     }
 
     pub async fn get_stock_universe(&mut self) -> Result<Option<serde_json::Value>> {
@@ -76,7 +78,8 @@ impl RedisCache {
 
     /// Burst monitor cooldown (TTL: 5min)
     pub async fn set_burst_alerted(&mut self, code: &str) -> Result<()> {
-        self.set_flag(&format!("burst:alerted:{}", code), Duration::from_secs(300)).await
+        self.set_flag(&format!("burst:alerted:{}", code), Duration::from_secs(300))
+            .await
     }
 
     pub async fn is_burst_alerted(&mut self, code: &str) -> Result<bool> {

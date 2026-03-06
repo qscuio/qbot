@@ -42,11 +42,16 @@ jobs:
             cat > /opt/qbot/.env << 'ENVEOF'
             TUSHARE_TOKEN=${{ secrets.TUSHARE_TOKEN }}
             TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
+            TELEGRAM_WEBHOOK_SECRET=${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
+            WEBHOOK_URL=${{ secrets.WEBHOOK_URL }}
+            LETSENCRYPT_EMAIL=${{ secrets.LETSENCRYPT_EMAIL }}
             STOCK_ALERT_CHANNEL=${{ secrets.STOCK_ALERT_CHANNEL }}
             REPORT_CHANNEL=${{ secrets.REPORT_CHANNEL }}
             DABAN_CHANNEL=${{ secrets.DABAN_CHANNEL }}
             API_KEY=${{ secrets.API_KEY }}
             AI_API_KEY=${{ secrets.AI_API_KEY }}
+            AI_BASE_URL=${{ secrets.AI_BASE_URL || 'https://api.openai.com/v1' }}
+            AI_MODEL=${{ secrets.AI_MODEL || 'gpt-4o-mini' }}
             DATA_PROXY=${{ secrets.DATA_PROXY }}
             DATABASE_URL=postgresql://qbot:qbot@127.0.0.1/qbot
             REDIS_URL=redis://127.0.0.1:6379
@@ -54,8 +59,9 @@ jobs:
             ENABLE_BURST_MONITOR=true
             ENABLE_TRADING_SIM=false
             ENABLE_DABAN_SIM=false
-            ENABLE_AI_ANALYSIS=false
-            ENABLE_CHIP_DIST=true
+            ENABLE_DABAN_LIVE=${{ secrets.ENABLE_DABAN_LIVE || 'false' }}
+            ENABLE_AI_ANALYSIS=${{ secrets.ENABLE_AI_ANALYSIS || 'false' }}
+            ENABLE_CHIP_DIST=${{ secrets.ENABLE_CHIP_DIST || 'true' }}
             ENVEOF
             chmod 600 /opt/qbot/.env
             echo ".env written"
@@ -85,6 +91,18 @@ jobs:
 
             cd "$REPO_DIR"
 
+            # Load specific runtime values from .env without sourcing it.
+            read_env_value() {
+              key="$1"
+              if [ ! -f "$REPO_DIR/.env" ]; then
+                return 0
+              fi
+              grep -E "^${key}=" "$REPO_DIR/.env" | tail -n1 | cut -d= -f2- | tr -d '\r'
+            }
+            WEBHOOK_URL="$(read_env_value WEBHOOK_URL)"
+            API_PORT="$(read_env_value API_PORT)"
+            LETSENCRYPT_EMAIL="${{ secrets.LETSENCRYPT_EMAIL }}"
+
             # Ensure required native build deps exist for crates using native-tls/openssl.
             if command -v dpkg >/dev/null 2>&1; then
               if ! dpkg -s build-essential >/dev/null 2>&1 || ! dpkg -s pkg-config >/dev/null 2>&1 || ! dpkg -s libssl-dev >/dev/null 2>&1; then
@@ -110,6 +128,154 @@ jobs:
             if command -v docker >/dev/null 2>&1; then
               docker compose -f deploy/docker-compose.yml up -d
             fi
+
+            # Auto-configure Nginx reverse proxy for webhook/API if WEBHOOK_URL is provided.
+            configure_nginx_proxy() {
+              webhook_url="${WEBHOOK_URL:-}"
+              api_port="${API_PORT:-8080}"
+
+              if [ -z "$webhook_url" ]; then
+                echo "WEBHOOK_URL is empty; skipping Nginx reverse-proxy setup"
+                return 0
+              fi
+
+              webhook_url="${webhook_url%/}"
+              case "$webhook_url" in
+                http://*|https://*) ;;
+                *)
+                  echo "WEBHOOK_URL is invalid (must start with http:// or https://): $webhook_url"
+                  return 0
+                  ;;
+              esac
+
+              scheme="${webhook_url%%://*}"
+              rest="${webhook_url#*://}"
+              hostport="${rest%%/*}"
+              host="${hostport%%:*}"
+              if [ -z "$host" ]; then
+                echo "Could not parse host from WEBHOOK_URL: $webhook_url"
+                return 0
+              fi
+
+              if ! command -v nginx >/dev/null 2>&1; then
+                sudo apt-get update
+                sudo apt-get install -y nginx
+              fi
+
+              cert_path="/etc/letsencrypt/live/${host}/fullchain.pem"
+              key_path="/etc/letsencrypt/live/${host}/privkey.pem"
+
+              cert_email="${LETSENCRYPT_EMAIL:-admin@${host}}"
+
+              # Auto-TLS when https is requested (Cloudflare gray-cloud / DNS-only required).
+              if [ "$scheme" = "https" ] && { [ ! -f "$cert_path" ] || [ ! -f "$key_path" ]; }; then
+                if ! command -v certbot >/dev/null 2>&1; then
+                  sudo apt-get update
+                  sudo apt-get install -y certbot python3-certbot-nginx
+                fi
+                sudo systemctl enable nginx || true
+                sudo systemctl start nginx || true
+                if ! sudo certbot certonly --nginx \
+                  -d "$host" \
+                  --non-interactive \
+                  --agree-tos \
+                  --email "$cert_email"; then
+                  echo "ERROR: certbot failed for ${host}"
+                  echo "Hint: if domain is on Cloudflare, set DNS record to gray cloud (DNS only)."
+                  exit 1
+                fi
+              fi
+
+              if [ "$scheme" = "https" ]; then
+                if [ ! -f "$cert_path" ] || [ ! -f "$key_path" ]; then
+                  echo "ERROR: HTTPS requested but certificate files are missing:"
+                  echo "  $cert_path"
+                  echo "  $key_path"
+                  echo "Fix DNS/ACME and redeploy."
+                  exit 1
+                fi
+                cat <<EOF | sudo tee /etc/nginx/sites-available/qbot.conf >/dev/null
+server {
+    listen 80;
+    server_name ${host};
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    server_name ${host};
+
+    ssl_certificate ${cert_path};
+    ssl_certificate_key ${key_path};
+
+    client_max_body_size 2m;
+
+    location /telegram/webhook {
+        proxy_pass http://127.0.0.1:${api_port}/telegram/webhook;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_connect_timeout 10s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:${api_port};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+EOF
+              else
+                cat <<EOF | sudo tee /etc/nginx/sites-available/qbot.conf >/dev/null
+server {
+    listen 80;
+    server_name ${host};
+
+    client_max_body_size 2m;
+
+    location /telegram/webhook {
+        proxy_pass http://127.0.0.1:${api_port}/telegram/webhook;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_connect_timeout 10s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:${api_port};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+EOF
+              fi
+
+              sudo ln -sfn /etc/nginx/sites-available/qbot.conf /etc/nginx/sites-enabled/qbot.conf
+              sudo rm -f /etc/nginx/sites-enabled/default
+              sudo nginx -t
+              sudo systemctl enable nginx
+              sudo systemctl restart nginx
+              echo "Nginx reverse proxy configured for host: ${host}"
+            }
+
+            configure_nginx_proxy
 
             # Install/update service definition on every deploy.
             SERVICE_USER="$(id -un)"

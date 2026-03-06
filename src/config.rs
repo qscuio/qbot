@@ -11,18 +11,27 @@ pub struct Config {
 
     // Telegram
     pub telegram_bot_token: String,
+    pub telegram_webhook_secret: Option<String>,
+    pub webhook_url: Option<String>,
     pub stock_alert_channel: Option<String>,
     pub report_channel: Option<String>,
+    pub daban_channel: Option<String>,
 
     // API
     pub api_port: u16,
     pub api_key: Option<String>,
+    pub ai_api_key: Option<String>,
+    pub ai_base_url: String,
+    pub ai_model: String,
 
     // Data proxy (optional)
     pub data_proxy: Option<String>,
 
     // Feature flags
     pub enable_burst_monitor: bool,
+    pub enable_daban_live: bool,
+    pub enable_ai_analysis: bool,
+    pub enable_chip_dist: bool,
 }
 
 impl Config {
@@ -37,15 +46,31 @@ impl Config {
                 .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string()),
             telegram_bot_token: std::env::var("TELEGRAM_BOT_TOKEN")
                 .context("TELEGRAM_BOT_TOKEN is required")?,
+            telegram_webhook_secret: std::env::var("TELEGRAM_WEBHOOK_SECRET").ok(),
+            webhook_url: std::env::var("WEBHOOK_URL").ok(),
             stock_alert_channel: std::env::var("STOCK_ALERT_CHANNEL").ok(),
             report_channel: std::env::var("REPORT_CHANNEL").ok(),
+            daban_channel: std::env::var("DABAN_CHANNEL").ok(),
             api_port: std::env::var("API_PORT")
                 .unwrap_or_else(|_| "8080".to_string())
                 .parse()
                 .unwrap_or(8080),
             api_key: std::env::var("API_KEY").ok(),
+            ai_api_key: std::env::var("AI_API_KEY").ok(),
+            ai_base_url: std::env::var("AI_BASE_URL")
+                .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
+            ai_model: std::env::var("AI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string()),
             data_proxy: std::env::var("DATA_PROXY").ok(),
             enable_burst_monitor: std::env::var("ENABLE_BURST_MONITOR")
+                .unwrap_or_else(|_| "true".to_string())
+                == "true",
+            enable_daban_live: std::env::var("ENABLE_DABAN_LIVE")
+                .unwrap_or_else(|_| "false".to_string())
+                == "true",
+            enable_ai_analysis: std::env::var("ENABLE_AI_ANALYSIS")
+                .unwrap_or_else(|_| "false".to_string())
+                == "true",
+            enable_chip_dist: std::env::var("ENABLE_CHIP_DIST")
                 .unwrap_or_else(|_| "true".to_string())
                 == "true",
         })

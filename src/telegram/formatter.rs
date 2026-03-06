@@ -1,3 +1,4 @@
+use crate::market_time::beijing_now;
 use crate::services::limit_up::LimitUpSummary;
 use crate::services::market::MarketOverview;
 use crate::services::sector::SectorRank;
@@ -19,10 +20,17 @@ pub fn format_daily_report(
     // Indices
     msg.push_str("📈 <b>指数表现</b>\n");
     for idx in &overview.indices {
-        let arrow = if idx.change_pct >= 0.0 { "🔺" } else { "🔻" };
+        let arrow = if idx.change_pct >= 0.0 {
+            "🔺"
+        } else {
+            "🔻"
+        };
         msg.push_str(&format!(
             "{} {} {}{:.2}%\n",
-            arrow, idx.name, if idx.change_pct >= 0.0 { "+" } else { "" }, idx.change_pct
+            arrow,
+            idx.name,
+            if idx.change_pct >= 0.0 { "+" } else { "" },
+            idx.change_pct
         ));
     }
 
@@ -72,7 +80,7 @@ pub fn format_daily_report(
         }
     }
 
-    msg.push_str(&format!("\n🕐 {}", chrono::Local::now().format("%H:%M")));
+    msg.push_str(&format!("\n🕐 {}", beijing_now().format("%H:%M")));
     msg
 }
 
@@ -89,11 +97,19 @@ pub fn format_scan_alert(signal_name: &str, icon: &str, hits: &[serde_json::Valu
     msg
 }
 
-pub fn format_limit_up_report(date: chrono::NaiveDate, stocks: &[crate::data::types::LimitUpStock]) -> String {
-    let mut msg = format!("🎯 <b>涨停板 {}</b> — {} 只\n\n", date.format("%m-%d"), stocks.len());
+pub fn format_limit_up_report(
+    date: chrono::NaiveDate,
+    stocks: &[crate::data::types::LimitUpStock],
+) -> String {
+    let mut msg = format!(
+        "🎯 <b>涨停板 {}</b> — {} 只\n\n",
+        date.format("%m-%d"),
+        stocks.len()
+    );
 
     // Group by streak
-    let mut by_streak: std::collections::HashMap<i32, Vec<&crate::data::types::LimitUpStock>> = std::collections::HashMap::new();
+    let mut by_streak: std::collections::HashMap<i32, Vec<&crate::data::types::LimitUpStock>> =
+        std::collections::HashMap::new();
     for s in stocks {
         by_streak.entry(s.open_times).or_default().push(s);
     }

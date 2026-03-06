@@ -1,7 +1,7 @@
+use super::types::*;
+use crate::error::Result;
 use async_trait::async_trait;
 use chrono::NaiveDate;
-use crate::error::Result;
-use super::types::*;
 
 #[async_trait]
 pub trait DataProvider: Send + Sync {
@@ -28,7 +28,8 @@ pub trait DataProvider: Send + Sync {
     async fn get_limit_up_stocks(&self, trade_date: NaiveDate) -> Result<Vec<LimitUpStock>>;
 
     /// Fetch index daily bars
-    async fn get_index_daily(&self, code: &str, trade_date: NaiveDate) -> Result<Option<IndexData>>;
+    async fn get_index_daily(&self, code: &str, trade_date: NaiveDate)
+        -> Result<Option<IndexData>>;
 
     /// Fetch sector performance for a date
     async fn get_sector_data(&self, trade_date: NaiveDate) -> Result<Vec<SectorData>>;

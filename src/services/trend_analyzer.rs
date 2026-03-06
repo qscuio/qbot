@@ -22,7 +22,7 @@ pub enum BuySignal {
     StrongSell, // 强烈卖出
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct TrendAnalysis {
     pub code: String,
     pub trend_status: TrendStatus,
@@ -52,7 +52,11 @@ impl TrendAnalyzer {
 
         let trend_status = if ma5 > ma10 && ma10 > ma20 && ma20 > ma60 {
             let spread = (ma5 - ma60) / ma60 * 100.0;
-            if spread > 5.0 { TrendStatus::StrongBull } else { TrendStatus::Bull }
+            if spread > 5.0 {
+                TrendStatus::StrongBull
+            } else {
+                TrendStatus::Bull
+            }
         } else if ma5 > ma10 {
             TrendStatus::WeakBull
         } else if (ma5 - ma10).abs() / ma10 * 100.0 < 1.0 {
@@ -69,21 +73,40 @@ impl TrendAnalyzer {
 
         let score = {
             let mut s = 50.0f64;
-            if ma5 > ma10 { s += 10.0; }
-            if ma10 > ma20 { s += 10.0; }
-            if ma20 > ma60 { s += 10.0; }
-            if price > ma5 { s += 5.0; }
-            if bias_ma20 > 0.0 && bias_ma20 < 10.0 { s += 5.0; }
-            if bias_ma20 < 0.0 { s -= 10.0; }
+            if ma5 > ma10 {
+                s += 10.0;
+            }
+            if ma10 > ma20 {
+                s += 10.0;
+            }
+            if ma20 > ma60 {
+                s += 10.0;
+            }
+            if price > ma5 {
+                s += 5.0;
+            }
+            if bias_ma20 > 0.0 && bias_ma20 < 10.0 {
+                s += 5.0;
+            }
+            if bias_ma20 < 0.0 {
+                s -= 10.0;
+            }
             s.clamp(0.0, 100.0)
         };
 
-        let buy_signal = if score >= 85.0 { BuySignal::StrongBuy }
-            else if score >= 70.0 { BuySignal::Buy }
-            else if score >= 55.0 { BuySignal::Hold }
-            else if score >= 40.0 { BuySignal::Wait }
-            else if score >= 25.0 { BuySignal::Sell }
-            else { BuySignal::StrongSell };
+        let buy_signal = if score >= 85.0 {
+            BuySignal::StrongBuy
+        } else if score >= 70.0 {
+            BuySignal::Buy
+        } else if score >= 55.0 {
+            BuySignal::Hold
+        } else if score >= 40.0 {
+            BuySignal::Wait
+        } else if score >= 25.0 {
+            BuySignal::Sell
+        } else {
+            BuySignal::StrongSell
+        };
 
         Some(TrendAnalysis {
             code: code.to_string(),

@@ -1,5 +1,5 @@
-use std::sync::OnceLock;
 use super::base::SignalDetector;
+use std::sync::OnceLock;
 
 static REGISTRY: OnceLock<Vec<Box<dyn SignalDetector>>> = OnceLock::new();
 
@@ -9,12 +9,12 @@ impl SignalRegistry {
     /// Initialize registry with all signals
     pub fn init() -> &'static Vec<Box<dyn SignalDetector>> {
         REGISTRY.get_or_init(|| {
-            use super::volume::*;
-            use super::trend::*;
-            use super::pattern::*;
             use super::board::*;
-            use super::momentum::*;
             use super::comprehensive::*;
+            use super::momentum::*;
+            use super::pattern::*;
+            use super::trend::*;
+            use super::volume::*;
 
             let signals: Vec<Box<dyn SignalDetector>> = vec![
                 // Volume
