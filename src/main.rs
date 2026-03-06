@@ -168,13 +168,13 @@ async fn main() -> Result<()> {
         let history_svc =
             services::stock_history::StockHistoryService::new(state.clone(), provider.clone());
         if !history_svc.has_any_data().await {
-            info!("First run detected - starting 3-year backfill in background");
+            info!("First run detected - starting full-history backfill in background");
             let state_clone = state.clone();
             let provider_clone = provider.clone();
             tokio::spawn(async move {
                 let svc =
                     services::stock_history::StockHistoryService::new(state_clone, provider_clone);
-                if let Err(e) = svc.backfill(3).await {
+                if let Err(e) = svc.backfill_full().await {
                     tracing::warn!("Backfill failed: {}", e);
                 }
             });

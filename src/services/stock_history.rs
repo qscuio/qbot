@@ -1,4 +1,4 @@
-use chrono::Duration;
+use chrono::{Duration, NaiveDate};
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -22,6 +22,17 @@ impl StockHistoryService {
     pub async fn backfill(&self, years: u32) -> Result<()> {
         let end = beijing_today();
         let start = end - Duration::days(years as i64 * 365);
+        self.backfill_range(start, end).await
+    }
+
+    /// Full history backfill from A-share market inception.
+    pub async fn backfill_full(&self) -> Result<()> {
+        let end = beijing_today();
+        let start = NaiveDate::from_ymd_opt(1990, 1, 1).expect("valid full history start date");
+        self.backfill_range(start, end).await
+    }
+
+    async fn backfill_range(&self, start: NaiveDate, end: NaiveDate) -> Result<()> {
         info!("Starting backfill {} to {}", start, end);
 
         // Refresh stock universe/name mapping first, so scan/watch/chart can show names correctly.
