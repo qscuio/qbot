@@ -3,6 +3,8 @@
 set -e
 
 echo "qbot VPS Setup"
+DEPLOY_USER="$(id -un)"
+DEPLOY_GROUP="$(id -gn)"
 
 # Install Rust if not present
 if ! command -v cargo &>/dev/null; then
@@ -19,7 +21,7 @@ fi
 
 # Create deployment directory
 sudo mkdir -p /opt/qbot
-sudo chown ubuntu:ubuntu /opt/qbot
+sudo chown "$DEPLOY_USER:$DEPLOY_GROUP" /opt/qbot
 
 # .env is written by GitHub Actions deploy workflow from secrets.
 # For local/manual runs only, copy from example and fill in secrets:
@@ -41,7 +43,7 @@ cargo build --release
 cp target/release/qbot /opt/qbot/qbot
 
 # Install systemd service
-sudo cp deploy/qbot.service /etc/systemd/system/qbot.service
+sed "s/^User=.*/User=$DEPLOY_USER/" deploy/qbot.service | sudo tee /etc/systemd/system/qbot.service >/dev/null
 sudo systemctl daemon-reload
 sudo systemctl enable qbot
 sudo systemctl start qbot

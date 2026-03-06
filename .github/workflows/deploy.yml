@@ -112,7 +112,9 @@ jobs:
             fi
 
             # Install/update service definition on every deploy.
+            SERVICE_USER="$(id -un)"
             sudo cp deploy/qbot.service /etc/systemd/system/qbot.service
+            sudo sed -i "s/^User=.*/User=${SERVICE_USER}/" /etc/systemd/system/qbot.service
             sudo systemctl daemon-reload
             sudo systemctl enable qbot
             sudo systemctl restart qbot
