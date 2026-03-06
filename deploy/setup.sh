@@ -167,6 +167,12 @@ configure_nginx_proxy
 
 # Build and install binary
 cargo build --release
+if [ -f /etc/systemd/system/qbot.service ] || [ -f /lib/systemd/system/qbot.service ]; then
+    if sudo systemctl is-active --quiet qbot; then
+        echo "Stopping qbot before binary update..."
+        sudo systemctl stop qbot
+    fi
+fi
 cp target/release/qbot /opt/qbot/qbot
 
 # Install systemd service
