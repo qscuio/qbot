@@ -99,6 +99,7 @@ Copy `.env.example` to `.env` and fill in:
 | `ENABLE_DABAN_LIVE` | No | Enable intraday daban live loop (`true`/`false`, default `false`) |
 | `ENABLE_AI_ANALYSIS` | No | Enable scheduled AI market analysis push (`true`/`false`, default `false`) |
 | `ENABLE_CHIP_DIST` | No | Enable scheduled chip-distribution refresh (`true`/`false`, default `true`) |
+| `ENABLE_SIGNAL_AUTO_TRADING` | No | Enable signal-based auto paper trading loop with Telegram action pushes (`true`/`false`, default `false`) |
 
 ---
 
@@ -128,6 +129,8 @@ curl -X POST http://localhost:8080/api/jobs/report/weekly  # generate + push wee
 
 # Read results
 curl http://localhost:8080/api/scan/latest
+curl http://localhost:8080/api/scan/prestart
+curl http://localhost:8080/api/scan/stats
 curl http://localhost:8080/api/report/daily
 ```
 
@@ -232,6 +235,9 @@ Supported command set (webhook):
 - `/watch`, `/unwatch`, `/mywatch`, `/export`
 - `/port`, `/port add`, `/port del`
 - `/scan`
+- `/prestart`
+- `/scan_stats`
+- `/autosim`, `/autosim_report`
 - `/daban`, `/daban portfolio`, `/daban stats`
 - `/industry`, `/concept`, `/hot7`, `/hot14`, `/hot30`, `/sector_sync`
 - `/ai_analysis`
@@ -329,9 +335,13 @@ curl -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
 | POST | `/telegram/webhook` | No* | Telegram inbound command webhook (`*` validated by `TELEGRAM_WEBHOOK_SECRET` if configured) |
 | GET | `/api/signals` | No | List all 21 signals |
 | GET | `/api/scan/latest` | Yes | Latest scan results from Redis |
+| GET | `/api/scan/prestart` | Yes | Pre-start candidate pool with A-tier `3/5` resonance and B-tier `core + auxiliary` setup from `ma_bullish/volume_price/slow_bull/small_bullish/triple_bullish` |
+| GET | `/api/scan/stats` | Yes | Forward-return stats by signal (`days`, optional `signal_id`, optional `limit`) |
 | GET | `/api/report/daily` | Yes | Latest daily report from DB |
+| GET | `/api/report/signal_auto` | Yes | Latest signal auto-trading daily report from DB |
 | GET | `/api/report/limitup` | Yes | Latest standalone limit-up report from DB |
 | GET | `/api/report/strong` | Yes | Latest standalone strong-stock report from DB |
+| GET | `/api/signal-auto/accounts` | Yes | Per-signal strategy account snapshots |
 | GET | `/api/market/overview` | Yes | Market overview with sector breadth, top stock trend, and report text |
 | GET | `/api/chart/data/{code}` | Yes | OHLCV chart data (`days`, `period=daily|weekly|monthly`) |
 | GET | `/api/chart/chips/{code}` | Yes | Chip distribution data (`date=YYYY-MM-DD` optional) |
@@ -365,7 +375,7 @@ curl -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
 
 ## Database
 
-10 migrations applied automatically on startup via SQLx:
+11 migrations applied automatically on startup via SQLx:
 
 | Table | Contents |
 |-------|----------|
@@ -377,6 +387,7 @@ curl -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
 | `user_portfolio` | Portfolio positions |
 | `user_watchlist` | Watchlist stocks |
 | `trading_sim_positions` / `daban_sim_positions` / `sim_capital` | Trading simulation records |
+| `signal_strategy_accounts` / `signal_strategy_candidates` / `signal_strategy_positions` / `signal_strategy_events` | Auto paper-trading accounts, candidates, trades, and event logs. Includes pre-start signal accounts plus synthetic `auto_daban` and `auto_strong` accounts. Pre-start signals only buy `A`-tier setups and log `B`-tier setups as watch-only observations |
 | `startup_watchlist` | One-limit-up-in-30-days startup tracking |
 | `reports` | Generated daily/weekly/limitup/strong report content |
 

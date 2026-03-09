@@ -32,6 +32,7 @@ pub struct Config {
     pub enable_daban_live: bool,
     pub enable_ai_analysis: bool,
     pub enable_chip_dist: bool,
+    pub enable_signal_auto_trading: bool,
 }
 
 impl Config {
@@ -72,6 +73,9 @@ impl Config {
                 == "true",
             enable_chip_dist: std::env::var("ENABLE_CHIP_DIST")
                 .unwrap_or_else(|_| "true".to_string())
+                == "true",
+            enable_signal_auto_trading: std::env::var("ENABLE_SIGNAL_AUTO_TRADING")
+                .unwrap_or_else(|_| "false".to_string())
                 == "true",
         })
     }

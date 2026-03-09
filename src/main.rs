@@ -70,11 +70,16 @@ async fn main() -> Result<()> {
     let pusher = Arc::new(telegram::TelegramPusher::new(
         config.telegram_bot_token.clone(),
     ));
+    let sina_client = Arc::new(data::sina::SinaClient::new());
     let bot_commands = [
         ("start", "显示帮助"),
         ("help", "显示帮助"),
         ("menu", "打开按钮菜单"),
         ("scan", "扫描信号"),
+        ("prestart", "预启动候选"),
+        ("scan_stats", "信号统计"),
+        ("autosim", "自动交易状态"),
+        ("autosim_report", "自动交易日报"),
         ("daban", "打板评分"),
         ("limitup", "涨停追踪概览"),
         ("strong", "近期强势股"),
@@ -129,13 +134,24 @@ async fn main() -> Result<()> {
     if state.config.enable_burst_monitor && state.config.stock_alert_channel.is_some() {
         let mut burst_monitor = services::burst_monitor::BurstMonitorService::new(
             state.clone(),
-            Arc::new(data::sina::SinaClient::new()),
+            sina_client.clone(),
             pusher.clone(),
         );
         tokio::spawn(async move {
             burst_monitor.run_poll_loop().await;
         });
         info!("Burst monitor started");
+    }
+
+    if state.config.enable_signal_auto_trading {
+        let auto_trading = services::signal_auto_trading::SignalAutoTradingService::new(
+            state.clone(),
+            sina_client,
+        );
+        tokio::spawn(async move {
+            auto_trading.run_poll_loop().await;
+        });
+        info!("Signal auto trading loop started");
     }
 
     if state.config.enable_daban_live && state.config.daban_channel.is_some() {

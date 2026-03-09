@@ -6,7 +6,8 @@ use crate::data::provider::DataProvider;
 use crate::market_time::{beijing_today, beijing_tz};
 use crate::services::{
     limit_up::LimitUpService, market::MarketService, market_report::MarketReportService,
-    scanner::ScannerService, sector::SectorService, stock_history::StockHistoryService,
+    scanner::ScannerService, sector::SectorService, signal_auto_trading::SignalAutoTradingService,
+    stock_history::StockHistoryService,
 };
 use crate::state::AppState;
 use crate::telegram::pusher::TelegramPusher;
@@ -39,8 +40,21 @@ pub async fn run_scan_job(state: Arc<AppState>) {
     let _guard = state.scan_job_lock.lock().await;
     info!("Scan job: running full signal scan");
     let scanner = ScannerService::new(state.clone());
-    if let Err(e) = scanner.run_full_scan().await {
-        warn!("Scan failed: {}", e);
+    match scanner.run_full_scan().await {
+        Ok(results) => {
+            if state.config.enable_signal_auto_trading {
+                let auto_svc = SignalAutoTradingService::new(
+                    state.clone(),
+                    Arc::new(crate::data::sina::SinaClient::new()),
+                );
+                if let Err(e) = auto_svc.prepare_candidates_from_scan(&results).await {
+                    warn!("Signal auto candidate prep failed: {}", e);
+                }
+            }
+        }
+        Err(e) => {
+            warn!("Scan failed: {}", e);
+        }
     }
 }
 
@@ -96,6 +110,23 @@ pub async fn run_daily_report_job(
             }
         }
         Err(e) => warn!("Strong-stock standalone report failed: {}", e),
+    }
+
+    if state.config.enable_signal_auto_trading {
+        let auto_svc = SignalAutoTradingService::new(
+            state.clone(),
+            Arc::new(crate::data::sina::SinaClient::new()),
+        );
+        match auto_svc.generate_daily_report(today).await {
+            Ok(report) => {
+                if let Some(channel) = alert_channel {
+                    if let Err(e) = pusher.push(channel, &report).await {
+                        warn!("Signal-auto report push failed: {}", e);
+                    }
+                }
+            }
+            Err(e) => warn!("Signal-auto daily report failed: {}", e),
+        }
     }
 }
 

@@ -19,7 +19,12 @@ use crate::services::daban::DabanService;
 use crate::services::daban_sim::DabanSimService;
 use crate::services::limit_up::LimitUpService;
 use crate::services::portfolio::PortfolioService;
+use crate::services::prestart::{PrestartCandidate, PrestartService};
 use crate::services::scanner::{ScannerService, SignalHit};
+use crate::services::scanner_stats::{
+    HorizonPerformance, ScannerStatsService, SignalPerformanceSummary,
+};
+use crate::services::signal_auto_trading::{SignalAutoTradingService, StrategyAccountSnapshot};
 use crate::services::trading_sim::TradingSimService;
 use crate::services::watchlist::WatchlistService;
 use crate::signals::registry::SignalRegistry;
@@ -149,6 +154,18 @@ struct DabanSimSellRequest {
 #[derive(Debug, Deserialize)]
 struct DateQuery {
     date: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScanStatsQuery {
+    days: Option<i64>,
+    signal_id: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PrestartQuery {
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -317,10 +334,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/telegram/webhook", post(telegram_webhook))
         .route("/api/signals", get(list_signals))
         .route("/api/scan/latest", get(get_scan_latest))
+        .route("/api/scan/prestart", get(get_prestart_candidates))
+        .route("/api/scan/stats", get(get_scan_stats))
         .route("/api/scan/trigger", post(trigger_scan))
         .route("/api/report/daily", get(get_daily_report))
+        .route("/api/report/signal_auto", get(get_signal_auto_report))
         .route("/api/report/limitup", get(get_limitup_report))
         .route("/api/report/strong", get(get_strong_report))
+        .route("/api/signal-auto/accounts", get(get_signal_auto_accounts))
         .route("/api/market/overview", get(market_overview))
         .route("/api/chart/data/:code", get(chart_data))
         .route("/api/chart/chips/:code", get(chart_chips))
@@ -457,6 +478,10 @@ fn telegram_help_text() -> String {
         "",
         "<b>Signals / Daban</b>",
         "/scan           扫描信号",
+        "/prestart       预启动候选池",
+        "/scan_stats     信号前瞻收益统计",
+        "/autosim        自动交易账户快照",
+        "/autosim_report 自动交易最新日报",
         "/daban          打板评分",
         "/daban portfolio 打板持仓",
         "/daban stats    打板统计",
@@ -511,6 +536,246 @@ fn parse_dbsync_mode(args: &str) -> DbSyncMode {
         return DbSyncMode::Years(years.clamp(1, 80));
     }
     DbSyncMode::AutoFix
+}
+
+fn normalize_scan_stats_days(days: Option<i64>) -> i64 {
+    days.unwrap_or(180).clamp(5, 3650)
+}
+
+fn parse_scan_stats_args(args: &str) -> (Option<String>, i64) {
+    let mut signal_id = None;
+    let mut days = None;
+
+    for token in args.split_whitespace() {
+        if let Ok(value) = token.parse::<i64>() {
+            days = Some(value);
+        } else if !token.trim().is_empty() {
+            signal_id = Some(token.trim().to_ascii_lowercase());
+        }
+    }
+
+    (signal_id, normalize_scan_stats_days(days))
+}
+
+fn format_horizon_metric(horizon: &HorizonPerformance) -> String {
+    if horizon.samples == 0 {
+        return format!("{}d n=0", horizon.days);
+    }
+
+    format!(
+        "{}d {:+.2}% / {:.1}% (n={})",
+        horizon.days, horizon.avg_return_pct, horizon.win_rate_pct, horizon.samples
+    )
+}
+
+fn format_scan_stats_text(
+    summaries: &[SignalPerformanceSummary],
+    lookback_days: i64,
+    only_signal: Option<&str>,
+) -> String {
+    let meta = scan_signal_meta();
+    if summaries.is_empty() {
+        return match only_signal {
+            Some(signal_id) => format!(
+                "📊 <b>信号统计</b>\n\n📭 近{}日暂无 <code>{}</code> 的有效样本",
+                lookback_days,
+                escape_html(signal_id)
+            ),
+            None => format!("📊 <b>信号统计</b>\n\n📭 近{}日暂无有效样本", lookback_days),
+        };
+    }
+
+    let mut lines = vec![
+        format!("📊 <b>信号统计</b> (近{}日)", lookback_days),
+        "━━━━━━━━━━━━━━━━━━━━━".to_string(),
+    ];
+
+    for (idx, summary) in summaries.iter().enumerate() {
+        let (name, icon) = meta
+            .get(&summary.signal_id)
+            .cloned()
+            .unwrap_or_else(|| (summary.signal_id.clone(), "•".to_string()));
+        let horizon_1 = summary
+            .horizons
+            .iter()
+            .find(|h| h.days == 1)
+            .map(format_horizon_metric)
+            .unwrap_or_else(|| "1d n=0".to_string());
+        let horizon_3 = summary
+            .horizons
+            .iter()
+            .find(|h| h.days == 3)
+            .map(format_horizon_metric)
+            .unwrap_or_else(|| "3d n=0".to_string());
+        let horizon_5 = summary
+            .horizons
+            .iter()
+            .find(|h| h.days == 5)
+            .map(format_horizon_metric)
+            .unwrap_or_else(|| "5d n=0".to_string());
+        let horizon_10 = summary
+            .horizons
+            .iter()
+            .find(|h| h.days == 10)
+            .map(format_horizon_metric)
+            .unwrap_or_else(|| "10d n=0".to_string());
+
+        lines.push(format!(
+            "{}. {} <b>{}</b> <code>{}</code> 样本{}",
+            idx + 1,
+            icon,
+            escape_html(&name),
+            escape_html(&summary.signal_id),
+            summary.total_samples
+        ));
+        lines.push(format!("   {} | {}", horizon_1, horizon_3));
+        lines.push(format!("   {} | {}", horizon_5, horizon_10));
+    }
+
+    lines.join("\n")
+}
+
+fn format_signal_auto_status(accounts: &[StrategyAccountSnapshot]) -> String {
+    if accounts.is_empty() {
+        return "🤖 <b>自动交易状态</b>\n\n📭 暂无策略账户".to_string();
+    }
+
+    let mut prestart_accounts: Vec<&StrategyAccountSnapshot> = accounts
+        .iter()
+        .filter(|account| account.signal_id != "auto_daban" && account.signal_id != "auto_strong")
+        .collect();
+    let mut daban_accounts: Vec<&StrategyAccountSnapshot> = accounts
+        .iter()
+        .filter(|account| account.signal_id == "auto_daban")
+        .collect();
+    let mut strong_accounts: Vec<&StrategyAccountSnapshot> = accounts
+        .iter()
+        .filter(|account| account.signal_id == "auto_strong")
+        .collect();
+
+    let sort_group = |items: &mut Vec<&StrategyAccountSnapshot>| {
+        items.sort_by(|a, b| {
+            b.pnl_pct
+                .partial_cmp(&a.pnl_pct)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.signal_id.cmp(&b.signal_id))
+        });
+    };
+    sort_group(&mut prestart_accounts);
+    sort_group(&mut daban_accounts);
+    sort_group(&mut strong_accounts);
+
+    let mut lines = vec![
+        "🤖 <b>自动交易状态</b>".to_string(),
+        "━━━━━━━━━━━━━━━━━━━━━".to_string(),
+    ];
+
+    append_signal_auto_group(&mut lines, "🌱 预启动", &prestart_accounts);
+    append_signal_auto_group(&mut lines, "🧱 自动打板", &daban_accounts);
+    append_signal_auto_group(&mut lines, "💪 自动强势股", &strong_accounts);
+
+    lines.join("\n")
+}
+
+fn append_signal_auto_group(
+    lines: &mut Vec<String>,
+    title: &str,
+    accounts: &[&StrategyAccountSnapshot],
+) {
+    if accounts.is_empty() {
+        return;
+    }
+
+    lines.push(format!("\n<b>{}</b>", title));
+    let active_accounts = accounts
+        .iter()
+        .filter(|account| account.open_positions > 0 || account.pending_candidates > 0)
+        .count();
+    let total_equity: f64 = accounts.iter().map(|account| account.equity).sum();
+    let total_realized: f64 = accounts.iter().map(|account| account.realized_pnl).sum();
+    let total_unrealized: f64 = accounts.iter().map(|account| account.unrealized_pnl).sum();
+    let total_weekly_pnl: f64 = accounts.iter().map(|account| account.weekly_pnl).sum();
+    let avg_pnl_pct = if accounts.is_empty() {
+        0.0
+    } else {
+        accounts.iter().map(|account| account.pnl_pct).sum::<f64>() / accounts.len() as f64
+    };
+    let total_closed_trades: i64 = accounts.iter().map(|account| account.closed_trades).sum();
+    let total_winning_trades: i64 = accounts.iter().map(|account| account.winning_trades).sum();
+    let win_rate = if total_closed_trades > 0 {
+        total_winning_trades as f64 / total_closed_trades as f64 * 100.0
+    } else {
+        0.0
+    };
+    lines.push(format!(
+        "  账户 {} | 活跃 {} | 总权益 {:.0} | 平均收益 {:+.2}%",
+        accounts.len(),
+        active_accounts,
+        total_equity,
+        avg_pnl_pct
+    ));
+    lines.push(format!(
+        "  已实现 {:+.0} | 未实现 {:+.0} | 胜率 {:.1}% ({}/{})",
+        total_realized, total_unrealized, win_rate, total_winning_trades, total_closed_trades
+    ));
+    lines.push(format!("  本周收益 {:+.0}", total_weekly_pnl));
+    for account in accounts.iter().take(12) {
+        lines.push(format!(
+            "• <b>{}</b> ({})\n   资金: {:.0}  权益: {:.0}\n   持仓: {}  待买: {}  收益: {:+.2}%\n   周收益: {:+.0}  回撤: {:.2}%  连胜: {}  连亏: {}",
+            escape_html(&account.signal_name),
+            escape_html(&account.signal_id),
+            account.cash_balance,
+            account.equity,
+            account.open_positions,
+            account.pending_candidates,
+            account.pnl_pct,
+            account.weekly_pnl,
+            account.max_drawdown_pct,
+            account.win_streak,
+            account.loss_streak
+        ));
+    }
+}
+
+fn format_prestart_text(candidates: &[PrestartCandidate], limit: usize) -> String {
+    if candidates.is_empty() {
+        return "🌱 <b>预启动候选</b>\n\n📭 暂无符合条件的股票".to_string();
+    }
+
+    let a_count = candidates
+        .iter()
+        .filter(|item| item.tier == crate::services::prestart::PrestartTier::A)
+        .count();
+    let b_count = candidates.len().saturating_sub(a_count);
+    let mut lines = vec![
+        format!("🌱 <b>预启动候选</b> (Top {})", limit.min(candidates.len())),
+        "━━━━━━━━━━━━━━━━━━━━━".to_string(),
+        format!(
+            "<i>A档: 至少3/5共振 | B档: 核心(ma_bullish/slow_bull)+辅助共振 | A {} / B {}</i>",
+            a_count, b_count
+        ),
+    ];
+
+    for (idx, item) in candidates.iter().enumerate() {
+        lines.push(format!(
+            "{}. [{}档] <b>{}</b> ({}) {:.1}分",
+            idx + 1,
+            item.tier,
+            escape_html(&item.name),
+            escape_html(&item.code),
+            item.score
+        ));
+        lines.push(format!(
+            "   共振: {}",
+            escape_html(&item.matched_signal_names.join(" / "))
+        ));
+        lines.push(format!(
+            "   涨幅 {:+.1}% | 成交额 {:.1}亿 | 15日振幅 {:.1}% | 距前高 {:.1}%",
+            item.gain_pct, item.amount_yi, item.range_15_pct, item.gap_to_high_pct
+        ));
+    }
+
+    lines.join("\n")
 }
 
 async fn format_watchlist(state: Arc<AppState>, user_id: i64) -> crate::error::Result<String> {
@@ -1396,6 +1661,7 @@ fn scan_menu_markup() -> Value {
             cb_button("🗓 周/月周期", "scan:menu:period"),
             cb_button("⚙️ 工具/控制", "scan:menu:tools"),
         ],
+        vec![cb_button("🌱 预启动池", "cmd:prestart")],
         vec![cb_button("◀️ 返回主菜单", "menu:main")],
     ];
     inline_keyboard(rows)
@@ -1428,7 +1694,7 @@ fn menu_content(menu: &str) -> (String, Value) {
             daban_menu_markup(),
         ),
         "scan" => (
-            "🔍 <b>信号扫描 - 分类菜单</b>\n━━━━━━━━━━━━━━━━━━━━━\n<i>先选分类，再选具体信号</i>"
+            "🔍 <b>信号扫描 - 分类菜单</b>\n━━━━━━━━━━━━━━━━━━━━━\n<i>先选分类，再选具体信号；也可直接查看预启动池</i>"
                 .to_string(),
             scan_menu_markup(),
         ),
@@ -1591,6 +1857,16 @@ async fn handle_telegram_callback(
                 chat_id,
                 user_id,
                 "daban".to_string(),
+                "".to_string(),
+            )
+            .await?
+        }
+        "cmd:prestart" => {
+            handle_telegram_command(
+                state.clone(),
+                chat_id,
+                user_id,
+                "prestart".to_string(),
                 "".to_string(),
             )
             .await?
@@ -2011,6 +2287,54 @@ async fn handle_telegram_command(
                     let svc = DabanService::new(state.clone());
                     let report = svc.build_report(None, 20).await?;
                     tg_send(&state, chat_id, &DabanService::format_report_text(&report)).await?;
+                }
+            }
+        }
+        "scan_stats" => {
+            let (signal_id, lookback_days) = parse_scan_stats_args(&args);
+            let mut summaries = ScannerStatsService::new(state.clone())
+                .summarize(lookback_days, signal_id.as_deref())
+                .await?;
+            summaries.truncate(if signal_id.is_some() { 1 } else { 8 });
+            tg_send(
+                &state,
+                chat_id,
+                &format_scan_stats_text(&summaries, lookback_days, signal_id.as_deref()),
+            )
+            .await?;
+        }
+        "prestart" => {
+            let limit = args.trim().parse::<usize>().unwrap_or(20).clamp(1, 50);
+            let candidates = PrestartService::new(state.clone())
+                .list_candidates(limit)
+                .await?;
+            tg_send(&state, chat_id, &format_prestart_text(&candidates, limit)).await?;
+        }
+        "autosim" => {
+            let accounts = SignalAutoTradingService::new(
+                state.clone(),
+                Arc::new(crate::data::sina::SinaClient::new()),
+            )
+            .list_account_snapshots()
+            .await?;
+            tg_send(&state, chat_id, &format_signal_auto_status(&accounts)).await?;
+        }
+        "autosim_report" => {
+            match SignalAutoTradingService::new(
+                state.clone(),
+                Arc::new(crate::data::sina::SinaClient::new()),
+            )
+            .latest_report()
+            .await?
+            {
+                Some(report) => tg_send(&state, chat_id, &report).await?,
+                None => {
+                    tg_send(
+                        &state,
+                        chat_id,
+                        "📭 暂无自动交易日报\n开启自动交易后，收盘会自动生成并推送",
+                    )
+                    .await?
                 }
             }
         }
@@ -2488,6 +2812,31 @@ async fn get_scan_latest(State(state): State<Arc<AppState>>, headers: HeaderMap)
     }
 }
 
+async fn get_prestart_candidates(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<PrestartQuery>,
+) -> ApiResult {
+    if !check_auth(&headers, state.config.api_key.as_deref()) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "unauthorized"})),
+        ));
+    }
+
+    let limit = query.limit.unwrap_or(20).clamp(1, 50);
+    let candidates = PrestartService::new(state)
+        .list_candidates(limit)
+        .await
+        .map_err(|e| api_error(&e.to_string()))?;
+
+    Ok(Json(json!({
+        "count": candidates.len(),
+        "limit": limit,
+        "candidates": candidates,
+    })))
+}
+
 async fn trigger_scan(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult {
     if !check_auth(&headers, state.config.api_key.as_deref()) {
         return Err((
@@ -2504,6 +2853,36 @@ async fn trigger_scan(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
     Ok(Json(json!({"status": "scan_started"})))
 }
 
+async fn get_scan_stats(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<ScanStatsQuery>,
+) -> ApiResult {
+    if !check_auth(&headers, state.config.api_key.as_deref()) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "unauthorized"})),
+        ));
+    }
+
+    let lookback_days = normalize_scan_stats_days(query.days);
+    let signal_id = query.signal_id.as_deref();
+    let limit = query.limit.unwrap_or(10).clamp(1, 50);
+
+    let mut summaries = ScannerStatsService::new(state)
+        .summarize(lookback_days, signal_id)
+        .await
+        .map_err(|e| api_error(&e.to_string()))?;
+    summaries.truncate(limit);
+
+    Ok(Json(json!({
+        "lookback_days": lookback_days,
+        "signal_id": signal_id,
+        "count": summaries.len(),
+        "signals": summaries,
+    })))
+}
+
 async fn get_daily_report(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult {
     if !check_auth(&headers, state.config.api_key.as_deref()) {
         return Err((
@@ -2513,6 +2892,27 @@ async fn get_daily_report(State(state): State<Arc<AppState>>, headers: HeaderMap
     }
 
     match postgres::get_latest_report(&state.db, "daily").await {
+        Ok(Some(content)) => Ok(Json(json!({"content": content}))),
+        Ok(None) => Ok(Json(json!({"status": "no_report_yet"}))),
+        Err(e) => Err(api_error(&e.to_string())),
+    }
+}
+
+async fn get_signal_auto_report(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> ApiResult {
+    if !check_auth(&headers, state.config.api_key.as_deref()) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "unauthorized"})),
+        ));
+    }
+
+    match SignalAutoTradingService::new(state, Arc::new(crate::data::sina::SinaClient::new()))
+        .latest_report()
+        .await
+    {
         Ok(Some(content)) => Ok(Json(json!({"content": content}))),
         Ok(None) => Ok(Json(json!({"status": "no_report_yet"}))),
         Err(e) => Err(api_error(&e.to_string())),
@@ -2550,6 +2950,25 @@ async fn get_strong_report(State(state): State<Arc<AppState>>, headers: HeaderMa
     }
 
     get_report_by_type(state, "strong").await
+}
+
+async fn get_signal_auto_accounts(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> ApiResult {
+    if !check_auth(&headers, state.config.api_key.as_deref()) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "unauthorized"})),
+        ));
+    }
+
+    let accounts =
+        SignalAutoTradingService::new(state, Arc::new(crate::data::sina::SinaClient::new()))
+            .list_account_snapshots()
+            .await
+            .map_err(|e| api_error(&e.to_string()))?;
+    Ok(Json(json!({"accounts": accounts, "count": accounts.len()})))
 }
 
 async fn market_overview(
@@ -3302,12 +3721,114 @@ mod tests {
     }
 
     #[test]
+    fn telegram_help_text_mentions_scan_stats_command() {
+        let text = telegram_help_text();
+        assert!(text.contains("/scan_stats"));
+    }
+
+    #[test]
+    fn telegram_help_text_mentions_prestart_command() {
+        let text = telegram_help_text();
+        assert!(text.contains("/prestart"));
+    }
+
+    #[test]
+    fn telegram_help_text_mentions_autosim_commands() {
+        let text = telegram_help_text();
+        assert!(text.contains("/autosim"));
+        assert!(text.contains("/autosim_report"));
+    }
+
+    #[test]
+    fn parse_scan_stats_args_supports_signal_and_days() {
+        let (signal_id, days) = parse_scan_stats_args("startup 120");
+        assert_eq!(signal_id.as_deref(), Some("startup"));
+        assert_eq!(days, 120);
+
+        let (signal_id, days) = parse_scan_stats_args("90");
+        assert_eq!(signal_id, None);
+        assert_eq!(days, 90);
+    }
+
+    #[test]
     fn menu_content_exposes_limit_up_entry() {
         let (main_text, main_markup) = menu_content("main");
         let (limit_text, _) = menu_content("limitup");
+        let (scan_text, scan_markup) = menu_content("scan");
 
         assert!(main_text.contains("Qbot"));
         assert!(main_markup.to_string().contains("menu:limitup"));
         assert!(limit_text.contains("涨停"));
+        assert!(scan_text.contains("预启动池"));
+        assert!(scan_markup.to_string().contains("cmd:prestart"));
+    }
+
+    #[test]
+    fn signal_auto_status_groups_prestart_daban_and_strong_accounts() {
+        let text = format_signal_auto_status(&[
+            StrategyAccountSnapshot {
+                signal_id: "ma_bullish".to_string(),
+                signal_name: "均线多头".to_string(),
+                cash_balance: 100_000.0,
+                initial_capital: 100_000.0,
+                open_positions: 0,
+                pending_candidates: 1,
+                equity: 101_200.0,
+                pnl_pct: 1.2,
+                realized_pnl: 1200.0,
+                unrealized_pnl: 0.0,
+                closed_trades: 2,
+                winning_trades: 1,
+                weekly_pnl: 500.0,
+                max_drawdown_pct: 3.2,
+                win_streak: 1,
+                loss_streak: 0,
+            },
+            StrategyAccountSnapshot {
+                signal_id: "auto_daban".to_string(),
+                signal_name: "自动打板".to_string(),
+                cash_balance: 98_000.0,
+                initial_capital: 100_000.0,
+                open_positions: 1,
+                pending_candidates: 0,
+                equity: 102_500.0,
+                pnl_pct: 2.5,
+                realized_pnl: 1500.0,
+                unrealized_pnl: 1000.0,
+                closed_trades: 3,
+                winning_trades: 2,
+                weekly_pnl: 900.0,
+                max_drawdown_pct: 4.5,
+                win_streak: 2,
+                loss_streak: 0,
+            },
+            StrategyAccountSnapshot {
+                signal_id: "auto_strong".to_string(),
+                signal_name: "自动强势股".to_string(),
+                cash_balance: 100_000.0,
+                initial_capital: 100_000.0,
+                open_positions: 0,
+                pending_candidates: 1,
+                equity: 99_100.0,
+                pnl_pct: -0.9,
+                realized_pnl: -900.0,
+                unrealized_pnl: 0.0,
+                closed_trades: 1,
+                winning_trades: 0,
+                weekly_pnl: -400.0,
+                max_drawdown_pct: 6.8,
+                win_streak: 0,
+                loss_streak: 1,
+            },
+        ]);
+
+        assert!(text.contains("🌱 预启动"));
+        assert!(text.contains("🧱 自动打板"));
+        assert!(text.contains("💪 自动强势股"));
+        assert!(text.contains("账户 1 | 活跃 1"));
+        assert!(text.contains("总权益 102500"));
+        assert!(text.contains("已实现 +1500 | 未实现 +1000 | 胜率 66.7% (2/3)"));
+        assert!(text.contains("本周收益 +900"));
+        assert!(text.contains("回撤: 4.50%  连胜: 2  连亏: 0"));
     }
 }

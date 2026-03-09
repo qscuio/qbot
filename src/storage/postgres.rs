@@ -21,6 +21,16 @@ pub struct StartupWatchStock {
     pub first_limit_close: f64,
 }
 
+#[derive(Debug, Clone)]
+pub struct SignalOutcomeRow {
+    pub signal_id: String,
+    pub entry_close: f64,
+    pub close_1d: Option<f64>,
+    pub close_3d: Option<f64>,
+    pub close_5d: Option<f64>,
+    pub close_10d: Option<f64>,
+}
+
 /// Run sqlx migrations
 pub async fn run_migrations(pool: &PgPool) -> Result<()> {
     sqlx::migrate!("./migrations")
@@ -167,6 +177,106 @@ pub async fn save_scan_results(
     }
     tx.commit().await?;
     Ok(())
+}
+
+pub async fn list_signal_outcome_samples(
+    pool: &PgPool,
+    lookback_days: i64,
+    signal_id: Option<&str>,
+) -> Result<Vec<SignalOutcomeRow>> {
+    let days = lookback_days.clamp(1, 3650) as i32;
+
+    let rows: Vec<(
+        String,
+        f64,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+    )> = sqlx::query_as(
+        r#"WITH deduped AS (
+                   SELECT DISTINCT ON (
+                       sr.signal_id,
+                       sr.code,
+                       ((sr.scanned_at AT TIME ZONE 'Asia/Shanghai')::date)
+                   )
+                          sr.signal_id,
+                          sr.code,
+                          (sr.scanned_at AT TIME ZONE 'Asia/Shanghai')::date AS signal_date
+                   FROM scan_results sr
+                   WHERE sr.scanned_at >= NOW() - ($1::int * INTERVAL '1 day')
+                     AND ($2::text IS NULL OR sr.signal_id = $2)
+                   ORDER BY sr.signal_id,
+                            sr.code,
+                            ((sr.scanned_at AT TIME ZONE 'Asia/Shanghai')::date),
+                            sr.scanned_at DESC
+               )
+               SELECT d.signal_id,
+                      entry.close::float8 AS entry_close,
+                      h1.close::float8 AS close_1d,
+                      h3.close::float8 AS close_3d,
+                      h5.close::float8 AS close_5d,
+                      h10.close::float8 AS close_10d
+               FROM deduped d
+               JOIN stock_daily_bars entry
+                 ON entry.code = d.code
+                AND entry.trade_date = d.signal_date
+               LEFT JOIN LATERAL (
+                   SELECT b.close
+                   FROM stock_daily_bars b
+                   WHERE b.code = d.code
+                     AND b.trade_date > d.signal_date
+                   ORDER BY b.trade_date ASC
+                   OFFSET 0
+                   LIMIT 1
+               ) h1 ON TRUE
+               LEFT JOIN LATERAL (
+                   SELECT b.close
+                   FROM stock_daily_bars b
+                   WHERE b.code = d.code
+                     AND b.trade_date > d.signal_date
+                   ORDER BY b.trade_date ASC
+                   OFFSET 2
+                   LIMIT 1
+               ) h3 ON TRUE
+               LEFT JOIN LATERAL (
+                   SELECT b.close
+                   FROM stock_daily_bars b
+                   WHERE b.code = d.code
+                     AND b.trade_date > d.signal_date
+                   ORDER BY b.trade_date ASC
+                   OFFSET 4
+                   LIMIT 1
+               ) h5 ON TRUE
+               LEFT JOIN LATERAL (
+                   SELECT b.close
+                   FROM stock_daily_bars b
+                   WHERE b.code = d.code
+                     AND b.trade_date > d.signal_date
+                   ORDER BY b.trade_date ASC
+                   OFFSET 9
+                   LIMIT 1
+               ) h10 ON TRUE
+               ORDER BY d.signal_id, d.signal_date DESC, d.code"#,
+    )
+    .bind(days)
+    .bind(signal_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(signal_id, entry_close, close_1d, close_3d, close_5d, close_10d)| SignalOutcomeRow {
+                signal_id,
+                entry_close,
+                close_1d,
+                close_3d,
+                close_5d,
+                close_10d,
+            },
+        )
+        .collect())
 }
 
 /// Save limit-up stocks
