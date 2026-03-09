@@ -5,6 +5,22 @@ use uuid::Uuid;
 use crate::data::types::{Candle, LimitUpStock, SectorData, StockInfo};
 use crate::error::{AppError, Result};
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StrongLimitUpStock {
+    pub code: String,
+    pub name: String,
+    pub limit_count: i64,
+    pub latest_trade_date: NaiveDate,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StartupWatchStock {
+    pub code: String,
+    pub name: String,
+    pub first_limit_date: NaiveDate,
+    pub first_limit_close: f64,
+}
+
 /// Run sqlx migrations
 pub async fn run_migrations(pool: &PgPool) -> Result<()> {
     sqlx::migrate!("./migrations")
@@ -179,6 +195,183 @@ pub async fn save_limit_up_stocks(pool: &PgPool, stocks: &[LimitUpStock]) -> Res
     }
     tx.commit().await?;
     Ok(())
+}
+
+pub async fn latest_limit_up_trade_date(pool: &PgPool) -> Result<Option<NaiveDate>> {
+    let row: (Option<NaiveDate>,) = sqlx::query_as("SELECT MAX(trade_date) FROM limit_up_stocks")
+        .fetch_one(pool)
+        .await?;
+    Ok(row.0)
+}
+
+pub async fn list_strong_limit_up_stocks(
+    pool: &PgPool,
+    days: i64,
+    min_limit_count: i64,
+) -> Result<Vec<StrongLimitUpStock>> {
+    let lookback_days = days.max(1) - 1;
+    let min_hits = min_limit_count.max(1);
+
+    let rows: Vec<(String, String, i64, NaiveDate)> = sqlx::query_as(
+        r#"WITH anchor AS (
+               SELECT MAX(trade_date) AS trade_date
+               FROM limit_up_stocks
+           )
+           SELECT s.code,
+                  COALESCE(MAX(s.name), s.code) AS name,
+                  COUNT(*)::bigint AS limit_count,
+                  MAX(s.trade_date) AS latest_trade_date
+           FROM limit_up_stocks s
+           CROSS JOIN anchor a
+           WHERE a.trade_date IS NOT NULL
+             AND s.trade_date BETWEEN a.trade_date - $1::int AND a.trade_date
+           GROUP BY s.code
+           HAVING COUNT(*) >= $2
+           ORDER BY limit_count DESC, latest_trade_date DESC, s.code"#,
+    )
+    .bind(lookback_days as i32)
+    .bind(min_hits)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(code, name, limit_count, latest_trade_date)| StrongLimitUpStock {
+                code,
+                name,
+                limit_count,
+                latest_trade_date,
+            },
+        )
+        .collect())
+}
+
+pub async fn rebuild_startup_watchlist(pool: &PgPool, anchor_date: NaiveDate) -> Result<()> {
+    let mut tx = pool.begin().await?;
+
+    sqlx::query("DELETE FROM startup_watchlist")
+        .execute(&mut *tx)
+        .await?;
+
+    sqlx::query(
+        r#"INSERT INTO startup_watchlist (code, name, first_limit_date, first_limit_close)
+           WITH candidates AS (
+               SELECT code,
+                      COALESCE(MAX(name), code) AS name,
+                      MIN(trade_date) AS first_limit_date,
+                      COUNT(*)::bigint AS limit_count
+               FROM limit_up_stocks
+               WHERE trade_date BETWEEN $1::date - 29 AND $1
+               GROUP BY code
+               HAVING COUNT(*) = 1
+           )
+           SELECT c.code,
+                  c.name,
+                  c.first_limit_date,
+                  COALESCE(l.close::float8, 0)
+           FROM candidates c
+           JOIN limit_up_stocks l
+             ON l.code = c.code
+            AND l.trade_date = c.first_limit_date
+           ORDER BY c.first_limit_date DESC, c.code"#,
+    )
+    .bind(anchor_date)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn list_startup_watchlist(pool: &PgPool) -> Result<Vec<StartupWatchStock>> {
+    let rows: Vec<(String, String, NaiveDate, f64)> = sqlx::query_as(
+        r#"SELECT code,
+                  COALESCE(name, code) AS name,
+                  first_limit_date,
+                  COALESCE(first_limit_close::float8, 0)
+           FROM startup_watchlist
+           ORDER BY first_limit_date DESC, code"#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(code, name, first_limit_date, first_limit_close)| StartupWatchStock {
+                code,
+                name,
+                first_limit_date,
+                first_limit_close,
+            },
+        )
+        .collect())
+}
+
+pub async fn list_limit_up_stocks_by_date(
+    pool: &PgPool,
+    trade_date: NaiveDate,
+) -> Result<Vec<LimitUpStock>> {
+    let rows: Vec<(
+        String,
+        Option<String>,
+        NaiveDate,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<String>,
+        Option<String>,
+        Option<i32>,
+        Option<f64>,
+    )> = sqlx::query_as(
+        r#"SELECT code,
+                  name,
+                  trade_date,
+                  close::float8,
+                  pct_chg::float8,
+                  seal_amount::float8,
+                  limit_time,
+                  limit_time,
+                  burst_count,
+                  strth::float8
+           FROM limit_up_stocks
+           WHERE trade_date = $1
+           ORDER BY seal_amount DESC NULLS LAST, code"#,
+    )
+    .bind(trade_date)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(
+                code,
+                name,
+                trade_date,
+                close,
+                pct_chg,
+                seal_amount,
+                first_time,
+                last_time,
+                open_times,
+                strth,
+            )| LimitUpStock {
+                code,
+                name: name.unwrap_or_default(),
+                trade_date,
+                close: close.unwrap_or(0.0),
+                pct_chg: pct_chg.unwrap_or(0.0),
+                fd_amount: seal_amount.unwrap_or(0.0),
+                first_time,
+                last_time,
+                open_times: open_times.unwrap_or(0),
+                strth: strth.unwrap_or(0.0),
+                limit: "U".to_string(),
+            },
+        )
+        .collect())
 }
 
 /// Save sector data
@@ -362,4 +555,84 @@ pub async fn list_watchlist_stocks(pool: &PgPool, user_id: i64) -> Result<Vec<(S
     .fetch_all(pool)
     .await?;
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::NaiveDate;
+
+    fn d(value: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(value, "%Y-%m-%d").unwrap()
+    }
+
+    async fn seed_limit_up(
+        pool: &PgPool,
+        code: &str,
+        name: &str,
+        trade_date: NaiveDate,
+        close: f64,
+    ) -> sqlx::Result<()> {
+        sqlx::query(
+            r#"INSERT INTO limit_up_stocks
+               (code, trade_date, name, close)
+               VALUES ($1, $2, $3, $4)"#,
+        )
+        .bind(code)
+        .bind(trade_date)
+        .bind(name)
+        .bind(close)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn strong_limit_up_query_ranks_recent_stocks(pool: PgPool) -> sqlx::Result<()> {
+        seed_limit_up(&pool, "600001.SH", "Alpha", d("2026-03-03"), 10.1).await?;
+        seed_limit_up(&pool, "600001.SH", "Alpha", d("2026-03-05"), 10.8).await?;
+        seed_limit_up(&pool, "600001.SH", "Alpha", d("2026-03-08"), 11.3).await?;
+
+        seed_limit_up(&pool, "600002.SH", "Beta", d("2026-03-03"), 12.0).await?;
+        seed_limit_up(&pool, "600002.SH", "Beta", d("2026-03-04"), 12.6).await?;
+        seed_limit_up(&pool, "600002.SH", "Beta", d("2026-03-06"), 13.4).await?;
+        seed_limit_up(&pool, "600002.SH", "Beta", d("2026-03-09"), 14.1).await?;
+
+        seed_limit_up(&pool, "600003.SH", "Gamma", d("2026-03-04"), 8.9).await?;
+        seed_limit_up(&pool, "600003.SH", "Gamma", d("2026-03-09"), 9.3).await?;
+
+        let strong = list_strong_limit_up_stocks(&pool, 7, 3).await.unwrap();
+
+        assert_eq!(strong.len(), 2);
+        assert_eq!(strong[0].code, "600002.SH");
+        assert_eq!(strong[0].name, "Beta");
+        assert_eq!(strong[0].limit_count, 4);
+        assert_eq!(strong[1].code, "600001.SH");
+        assert_eq!(strong[1].limit_count, 3);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn startup_watchlist_rebuild_keeps_only_single_recent_limit_up(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        seed_limit_up(&pool, "600010.SH", "Solo", d("2026-03-08"), 9.8).await?;
+
+        seed_limit_up(&pool, "600011.SH", "Repeat", d("2026-02-20"), 6.2).await?;
+        seed_limit_up(&pool, "600011.SH", "Repeat", d("2026-03-09"), 6.9).await?;
+
+        seed_limit_up(&pool, "600012.SH", "Old", d("2026-01-10"), 5.5).await?;
+
+        rebuild_startup_watchlist(&pool, d("2026-03-09"))
+            .await
+            .unwrap();
+        let items = list_startup_watchlist(&pool).await.unwrap();
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].code, "600010.SH");
+        assert_eq!(items[0].name, "Solo");
+        assert_eq!(items[0].first_limit_date, d("2026-03-08"));
+        assert!((items[0].first_limit_close - 9.8).abs() < f64::EPSILON);
+        Ok(())
+    }
 }

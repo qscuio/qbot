@@ -330,6 +330,8 @@ curl -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
 | GET | `/api/signals` | No | List all 21 signals |
 | GET | `/api/scan/latest` | Yes | Latest scan results from Redis |
 | GET | `/api/report/daily` | Yes | Latest daily report from DB |
+| GET | `/api/report/limitup` | Yes | Latest standalone limit-up report from DB |
+| GET | `/api/report/strong` | Yes | Latest standalone strong-stock report from DB |
 | GET | `/api/market/overview` | Yes | Market overview with sector breadth, top stock trend, and report text |
 | GET | `/api/chart/data/{code}` | Yes | OHLCV chart data (`days`, `period=daily|weekly|monthly`) |
 | GET | `/api/chart/chips/{code}` | Yes | Chip distribution data (`date=YYYY-MM-DD` optional) |
@@ -363,7 +365,7 @@ curl -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
 
 ## Database
 
-9 migrations applied automatically on startup via SQLx:
+10 migrations applied automatically on startup via SQLx:
 
 | Table | Contents |
 |-------|----------|
@@ -375,7 +377,8 @@ curl -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
 | `user_portfolio` | Portfolio positions |
 | `user_watchlist` | Watchlist stocks |
 | `trading_sim_positions` / `daban_sim_positions` / `sim_capital` | Trading simulation records |
-| `reports` | Generated report content |
+| `startup_watchlist` | One-limit-up-in-30-days startup tracking |
+| `reports` | Generated daily/weekly/limitup/strong report content |
 
 ---
 

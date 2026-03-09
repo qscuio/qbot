@@ -69,6 +69,34 @@ pub async fn run_daily_report_job(
         }
         Err(e) => warn!("Daily report failed: {}", e),
     }
+
+    let alert_channel = state
+        .config
+        .stock_alert_channel
+        .as_ref()
+        .or(state.config.report_channel.as_ref());
+
+    match report_svc.generate_limitup_report(today).await {
+        Ok(report) => {
+            if let Some(channel) = alert_channel {
+                if let Err(e) = pusher.push(channel, &report).await {
+                    warn!("Limit-up report push failed: {}", e);
+                }
+            }
+        }
+        Err(e) => warn!("Limit-up standalone report failed: {}", e),
+    }
+
+    match report_svc.generate_strong_report(today, 7).await {
+        Ok(report) => {
+            if let Some(channel) = alert_channel {
+                if let Err(e) = pusher.push(channel, &report).await {
+                    warn!("Strong-stock report push failed: {}", e);
+                }
+            }
+        }
+        Err(e) => warn!("Strong-stock standalone report failed: {}", e),
+    }
 }
 
 /// Generate weekly market report and push to Telegram (Friday 20:00 job).

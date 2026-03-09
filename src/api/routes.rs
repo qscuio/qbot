@@ -17,6 +17,7 @@ use crate::services::ai_analysis::AiAnalysisService;
 use crate::services::chip_dist::ChipDistService;
 use crate::services::daban::DabanService;
 use crate::services::daban_sim::DabanSimService;
+use crate::services::limit_up::LimitUpService;
 use crate::services::portfolio::PortfolioService;
 use crate::services::scanner::{ScannerService, SignalHit};
 use crate::services::trading_sim::TradingSimService;
@@ -318,6 +319,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/scan/latest", get(get_scan_latest))
         .route("/api/scan/trigger", post(trigger_scan))
         .route("/api/report/daily", get(get_daily_report))
+        .route("/api/report/limitup", get(get_limitup_report))
+        .route("/api/report/strong", get(get_strong_report))
         .route("/api/market/overview", get(market_overview))
         .route("/api/chart/data/:code", get(chart_data))
         .route("/api/chart/chips/:code", get(chart_chips))
@@ -458,6 +461,14 @@ fn telegram_help_text() -> String {
         "/daban portfolio 打板持仓",
         "/daban stats    打板统计",
         "",
+        "<b>Limit-Up</b>",
+        "/limitup        涨停追踪概览",
+        "/strong         近期强势股",
+        "/startup        启动追踪",
+        "/limitup_sync   手动同步涨停数据",
+        "/limitup_report 最新涨停股报告",
+        "/strong_report  最新强势股报告",
+        "",
         "<b>Sectors / AI</b>",
         "/industry /concept",
         "/hot7 /hot14 /hot30",
@@ -523,6 +534,92 @@ async fn format_watchlist(state: Arc<AppState>, user_id: i64) -> crate::error::R
             idx + 1,
             escape_html(&item.name),
             escape_html(&item.code)
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
+async fn format_limit_up_overview(state: Arc<AppState>) -> crate::error::Result<String> {
+    let svc = LimitUpService::new(state.clone(), state.provider.clone());
+    let Some(trade_date) = svc.latest_trade_date().await? else {
+        return Ok(
+            "📈 <b>涨停追踪</b>\n\n📭 暂无数据\n使用 <code>/limitup_sync</code> 先同步当日涨停"
+                .to_string(),
+        );
+    };
+
+    let summary = svc.get_summary(trade_date).await?;
+    let strong = svc.get_strong_stocks(7, 3).await?;
+    let startup = svc.get_startup_watchlist().await?;
+
+    Ok(format!(
+        "📈 <b>涨停追踪</b>\n━━━━━━━━━━━━━━━━━━━━━\n📅 日期: {}\n📌 涨停总数: {}\n✅ 封板: {}\n💥 炸板: {}\n📉 炸板率: {:.1}%\n💪 强势股: {}\n👀 启动追踪: {}",
+        trade_date,
+        summary.total,
+        summary.sealed,
+        summary.burst,
+        summary.burst_rate,
+        strong.len(),
+        startup.len()
+    ))
+}
+
+async fn format_strong_limit_up(state: Arc<AppState>, days: i64) -> crate::error::Result<String> {
+    let svc = LimitUpService::new(state.clone(), state.provider.clone());
+    let items = svc.get_strong_stocks(days, 3).await?;
+
+    if items.is_empty() {
+        return Ok(format!(
+            "💪 <b>强势股</b> ({}日)\n\n📭 暂无符合条件的强势股",
+            days
+        ));
+    }
+
+    let miniapp_base = state.config.webhook_url.as_deref();
+    let mut lines = vec![
+        format!("💪 <b>强势股</b> ({}日, {})", days, items.len()),
+        "━━━━━━━━━━━━━━━━━━━━━".to_string(),
+    ];
+    for (idx, item) in items.iter().take(30).enumerate() {
+        let url = chart_url_for_stock(&item.code, miniapp_base, Some("limit_up_strong"));
+        lines.push(format!(
+            "{}. <a href=\"{}\">{}</a> ({}) - {}次涨停",
+            idx + 1,
+            url,
+            escape_html(&item.name),
+            escape_html(&item.code),
+            item.limit_count
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
+async fn format_startup_watchlist(state: Arc<AppState>) -> crate::error::Result<String> {
+    let svc = LimitUpService::new(state.clone(), state.provider.clone());
+    let items = svc.get_startup_watchlist().await?;
+
+    if items.is_empty() {
+        return Ok(
+            "👀 <b>启动追踪</b>\n\n📭 暂无观察股\n<i>近30日只涨停过一次的股票会进入这里</i>"
+                .to_string(),
+        );
+    }
+
+    let miniapp_base = state.config.webhook_url.as_deref();
+    let mut lines = vec![
+        format!("👀 <b>启动追踪</b> ({})", items.len()),
+        "━━━━━━━━━━━━━━━━━━━━━".to_string(),
+        "<i>近30日仅涨停一次，再次涨停将自动移除</i>".to_string(),
+    ];
+    for (idx, item) in items.iter().take(30).enumerate() {
+        let url = chart_url_for_stock(&item.code, miniapp_base, Some("limit_up_startup"));
+        lines.push(format!(
+            "{}. <a href=\"{}\">{}</a> ({}) {}",
+            idx + 1,
+            url,
+            escape_html(&item.name),
+            escape_html(&item.code),
+            item.first_limit_date.format("%m/%d")
         ));
     }
     Ok(lines.join("\n"))
@@ -1160,10 +1257,13 @@ fn main_menu_markup() -> Value {
             cb_button("💼 持仓", "menu:portfolio"),
         ],
         vec![
+            cb_button("📈 涨停追踪", "menu:limitup"),
             cb_button("🏭 板块/AI", "menu:sector"),
-            cb_button("🛠 工具", "menu:tools"),
         ],
-        vec![cb_button("❓ 帮助", "cmd:help")],
+        vec![
+            cb_button("🛠 工具", "menu:tools"),
+            cb_button("❓ 帮助", "cmd:help"),
+        ],
     ])
 }
 
@@ -1240,6 +1340,20 @@ fn daban_menu_markup() -> Value {
     ])
 }
 
+fn limitup_menu_markup() -> Value {
+    inline_keyboard(vec![
+        vec![
+            cb_button("📊 概览", "cmd:limitup"),
+            cb_button("💪 强势股", "cmd:strong"),
+        ],
+        vec![
+            cb_button("👀 启动追踪", "cmd:startup"),
+            cb_button("🔄 同步涨停", "cmd:limitup_sync"),
+        ],
+        vec![cb_button("◀️ 返回主菜单", "menu:main")],
+    ])
+}
+
 fn scan_menu_markup() -> Value {
     let rows: Vec<Vec<Value>> = vec![
         vec![
@@ -1272,6 +1386,10 @@ fn menu_content(menu: &str) -> (String, Value) {
         "sector" => (
             "🏭 <b>板块 / AI 菜单</b>\n选择一个操作".to_string(),
             sector_menu_markup(),
+        ),
+        "limitup" => (
+            "📈 <b>涨停追踪菜单</b>\n选择一个操作".to_string(),
+            limitup_menu_markup(),
         ),
         "tools" => (
             "🛠 <b>工具菜单</b>\n选择一个操作".to_string(),
@@ -1404,6 +1522,7 @@ async fn handle_telegram_callback(
         "menu:scan" => show_menu(&state, chat_id, Some(message_id), "scan").await?,
         "menu:watch" => show_menu(&state, chat_id, Some(message_id), "watch").await?,
         "menu:portfolio" => show_menu(&state, chat_id, Some(message_id), "portfolio").await?,
+        "menu:limitup" => show_menu(&state, chat_id, Some(message_id), "limitup").await?,
         "menu:sector" => show_menu(&state, chat_id, Some(message_id), "sector").await?,
         "menu:tools" => show_menu(&state, chat_id, Some(message_id), "tools").await?,
         "menu:daban" => show_menu(&state, chat_id, Some(message_id), "daban").await?,
@@ -1444,6 +1563,46 @@ async fn handle_telegram_callback(
                 chat_id,
                 user_id,
                 "daban".to_string(),
+                "".to_string(),
+            )
+            .await?
+        }
+        "cmd:limitup" => {
+            handle_telegram_command(
+                state.clone(),
+                chat_id,
+                user_id,
+                "limitup".to_string(),
+                "".to_string(),
+            )
+            .await?
+        }
+        "cmd:strong" => {
+            handle_telegram_command(
+                state.clone(),
+                chat_id,
+                user_id,
+                "strong".to_string(),
+                "".to_string(),
+            )
+            .await?
+        }
+        "cmd:startup" => {
+            handle_telegram_command(
+                state.clone(),
+                chat_id,
+                user_id,
+                "startup".to_string(),
+                "".to_string(),
+            )
+            .await?
+        }
+        "cmd:limitup_sync" => {
+            handle_telegram_command(
+                state.clone(),
+                chat_id,
+                user_id,
+                "limitup_sync".to_string(),
                 "".to_string(),
             )
             .await?
@@ -1826,6 +1985,83 @@ async fn handle_telegram_command(
                     tg_send(&state, chat_id, &DabanService::format_report_text(&report)).await?;
                 }
             }
+        }
+        "limitup" => {
+            tg_send(
+                &state,
+                chat_id,
+                &format_limit_up_overview(state.clone()).await?,
+            )
+            .await?;
+        }
+        "strong" => {
+            tg_send(
+                &state,
+                chat_id,
+                &format_strong_limit_up(state.clone(), 7).await?,
+            )
+            .await?;
+        }
+        "startup" => {
+            tg_send(
+                &state,
+                chat_id,
+                &format_startup_watchlist(state.clone()).await?,
+            )
+            .await?;
+        }
+        "limitup_report" => match postgres::get_latest_report(&state.db, "limitup").await? {
+            Some(report) => tg_send(&state, chat_id, &report).await?,
+            None => {
+                tg_send(
+                    &state,
+                    chat_id,
+                    "📭 暂无涨停股报告\n使用 <code>/limitup_sync</code> 或等待定时任务生成",
+                )
+                .await?
+            }
+        },
+        "strong_report" => match postgres::get_latest_report(&state.db, "strong").await? {
+            Some(report) => tg_send(&state, chat_id, &report).await?,
+            None => {
+                tg_send(
+                    &state,
+                    chat_id,
+                    "📭 暂无强势股报告\n请先同步涨停数据或等待定时任务生成",
+                )
+                .await?
+            }
+        },
+        "limitup_sync" => {
+            tg_send(&state, chat_id, "⏳ 正在同步涨停数据...").await?;
+            let target_date = crate::market_time::beijing_today();
+            let svc = LimitUpService::new(state.clone(), state.provider.clone());
+            let stocks = svc.fetch_and_save(target_date).await?;
+            let report_svc = crate::services::market_report::MarketReportService::new(
+                state.clone(),
+                Arc::new(crate::services::market::MarketService::new(
+                    state.clone(),
+                    state.provider.clone(),
+                )),
+                Arc::new(LimitUpService::new(state.clone(), state.provider.clone())),
+                Arc::new(crate::services::sector::SectorService::new(
+                    state.clone(),
+                    state.provider.clone(),
+                )),
+            );
+            let _ = report_svc.generate_limitup_report(target_date).await;
+            let _ = report_svc.generate_strong_report(target_date, 7).await;
+            tg_send(
+                &state,
+                chat_id,
+                &format!(
+                    "✅ 涨停同步完成\n日期: {}\n记录数: {}\n\n{}",
+                    target_date,
+                    stocks.len(),
+                    format_limit_up_overview(state.clone()).await?
+                ),
+            )
+            .await?;
         }
         "scan" => {
             run_scan_command(state.clone(), chat_id, None).await?;
@@ -2255,6 +2491,39 @@ async fn get_daily_report(State(state): State<Arc<AppState>>, headers: HeaderMap
     }
 }
 
+async fn get_report_by_type(
+    state: Arc<AppState>,
+    report_type: &'static str,
+) -> std::result::Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match postgres::get_latest_report(&state.db, report_type).await {
+        Ok(Some(content)) => Ok(Json(json!({"content": content}))),
+        Ok(None) => Ok(Json(json!({"status": "no_report_yet"}))),
+        Err(e) => Err(api_error(&e.to_string())),
+    }
+}
+
+async fn get_limitup_report(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult {
+    if !check_auth(&headers, state.config.api_key.as_deref()) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "unauthorized"})),
+        ));
+    }
+
+    get_report_by_type(state, "limitup").await
+}
+
+async fn get_strong_report(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult {
+    if !check_auth(&headers, state.config.api_key.as_deref()) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "unauthorized"})),
+        ));
+    }
+
+    get_report_by_type(state, "strong").await
+}
+
 async fn market_overview(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -2448,6 +2717,28 @@ async fn chart_navigation(
                 if !codes.iter().any(|c| c == &code) {
                     codes.push(code);
                 }
+            }
+        }
+    } else if context == "limit_up_strong" {
+        let items = LimitUpService::new(state.clone(), state.provider.clone())
+            .get_strong_stocks(7, 3)
+            .await
+            .map_err(|e| api_error(&e.to_string()))?;
+        for item in items {
+            let code = normalize_stock_code(&item.code);
+            if !codes.iter().any(|c| c == &code) {
+                codes.push(code);
+            }
+        }
+    } else if context == "limit_up_startup" {
+        let items = LimitUpService::new(state.clone(), state.provider.clone())
+            .get_startup_watchlist()
+            .await
+            .map_err(|e| api_error(&e.to_string()))?;
+        for item in items {
+            let code = normalize_stock_code(&item.code);
+            if !codes.iter().any(|c| c == &code) {
+                codes.push(code);
             }
         }
     }
@@ -2961,4 +3252,34 @@ async fn trigger_weekly_report(
         crate::scheduler::run_weekly_report_job(s, p, push).await;
     });
     Ok(Json(json!({"status": "started", "job": "report/weekly"})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn telegram_help_text_mentions_limit_up_commands() {
+        let text = telegram_help_text();
+        assert!(text.contains("/strong"));
+        assert!(text.contains("/startup"));
+        assert!(text.contains("/limitup"));
+    }
+
+    #[test]
+    fn telegram_help_text_mentions_report_commands() {
+        let text = telegram_help_text();
+        assert!(text.contains("/limitup_report"));
+        assert!(text.contains("/strong_report"));
+    }
+
+    #[test]
+    fn menu_content_exposes_limit_up_entry() {
+        let (main_text, main_markup) = menu_content("main");
+        let (limit_text, _) = menu_content("limitup");
+
+        assert!(main_text.contains("Qbot"));
+        assert!(main_markup.to_string().contains("menu:limitup"));
+        assert!(limit_text.contains("涨停"));
+    }
 }

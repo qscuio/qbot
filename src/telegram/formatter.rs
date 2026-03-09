@@ -2,6 +2,7 @@ use crate::market_time::beijing_now;
 use crate::services::limit_up::LimitUpSummary;
 use crate::services::market::MarketOverview;
 use crate::services::sector::SectorRank;
+use crate::storage::postgres::StrongLimitUpStock;
 
 pub fn format_daily_report(
     overview: &MarketOverview,
@@ -101,26 +102,155 @@ pub fn format_limit_up_report(
     date: chrono::NaiveDate,
     stocks: &[crate::data::types::LimitUpStock],
 ) -> String {
+    let mut rows: Vec<&crate::data::types::LimitUpStock> = stocks.iter().collect();
+    rows.sort_by(|a, b| {
+        b.fd_amount
+            .partial_cmp(&a.fd_amount)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.code.cmp(&b.code))
+    });
+
+    let burst = rows.iter().filter(|s| s.open_times > 0).count();
+    let sealed = rows.len().saturating_sub(burst);
+
     let mut msg = format!(
-        "🎯 <b>涨停板 {}</b> — {} 只\n\n",
-        date.format("%m-%d"),
+        "🎯 <b>涨停股报告 {}</b>\n━━━━━━━━━━━━━━━━━━━━━\n总数: {} 只 | 封板: {} | 炸板: {}\n\n",
+        date.format("%Y-%m-%d"),
+        rows.len(),
+        sealed,
+        burst
+    );
+
+    if rows.is_empty() {
+        msg.push_str("📭 暂无涨停数据");
+        return msg;
+    }
+
+    msg.push_str("🏆 <b>封单额靠前</b>\n");
+    for (idx, stock) in rows.iter().take(20).enumerate() {
+        let amount = stock.fd_amount / 10_000.0;
+        msg.push_str(&format!(
+            "{}. {} ({}) {:+.1}% 封单{:.0}万 打开{}次\n",
+            idx + 1,
+            stock.name,
+            stock.code,
+            stock.pct_chg,
+            amount,
+            stock.open_times
+        ));
+    }
+
+    msg.push_str(&format!("\n🕐 {}", beijing_now().format("%H:%M")));
+    msg
+}
+
+pub fn format_strong_stock_report(
+    date: chrono::NaiveDate,
+    days: i64,
+    stocks: &[StrongLimitUpStock],
+) -> String {
+    let mut msg = format!(
+        "💪 <b>近期强势股报告 {}</b>\n━━━━━━━━━━━━━━━━━━━━━\n窗口: 近{}日 | 命中: {}只\n\n",
+        date.format("%Y-%m-%d"),
+        days,
         stocks.len()
     );
 
-    // Group by streak
-    let mut by_streak: std::collections::HashMap<i32, Vec<&crate::data::types::LimitUpStock>> =
-        std::collections::HashMap::new();
-    for s in stocks {
-        by_streak.entry(s.open_times).or_default().push(s);
+    if stocks.is_empty() {
+        msg.push_str("📭 暂无符合条件的强势股");
+        return msg;
     }
 
-    if let Some(daban) = by_streak.get(&0) {
-        msg.push_str(&format!("🏆 一字板 ({}):\n", daban.len()));
-        for s in daban.iter().take(10) {
-            msg.push_str(&format!("  {} {}\n", s.code, s.name));
-        }
-        msg.push('\n');
+    for (idx, stock) in stocks.iter().take(20).enumerate() {
+        msg.push_str(&format!(
+            "{}. {} ({}) - {}次涨停\n",
+            idx + 1,
+            stock.name,
+            stock.code,
+            stock.limit_count
+        ));
     }
 
+    msg.push_str(&format!("\n🕐 {}", beijing_now().format("%H:%M")));
     msg
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::types::LimitUpStock;
+    use crate::storage::postgres::StrongLimitUpStock;
+    use chrono::NaiveDate;
+
+    fn d(raw: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(raw, "%Y-%m-%d").unwrap()
+    }
+
+    #[test]
+    fn format_limit_up_report_includes_summary_and_names() {
+        let report = format_limit_up_report(
+            d("2026-03-09"),
+            &[
+                LimitUpStock {
+                    code: "600001.SH".to_string(),
+                    name: "Alpha".to_string(),
+                    trade_date: d("2026-03-09"),
+                    close: 10.2,
+                    pct_chg: 10.0,
+                    fd_amount: 1_500_000.0,
+                    first_time: Some("09:35".to_string()),
+                    last_time: Some("14:51".to_string()),
+                    open_times: 0,
+                    strth: 82.0,
+                    limit: "U".to_string(),
+                },
+                LimitUpStock {
+                    code: "600002.SH".to_string(),
+                    name: "Beta".to_string(),
+                    trade_date: d("2026-03-09"),
+                    close: 8.7,
+                    pct_chg: 9.9,
+                    fd_amount: 900_000.0,
+                    first_time: Some("10:11".to_string()),
+                    last_time: Some("14:40".to_string()),
+                    open_times: 2,
+                    strth: 61.0,
+                    limit: "U".to_string(),
+                },
+            ],
+        );
+
+        assert!(report.contains("2026-03-09"));
+        assert!(report.contains("2 只"));
+        assert!(report.contains("Alpha"));
+        assert!(report.contains("Beta"));
+    }
+
+    #[test]
+    fn format_strong_stock_report_includes_window_and_counts() {
+        let report = format_strong_stock_report(
+            d("2026-03-09"),
+            7,
+            &[
+                StrongLimitUpStock {
+                    code: "600010.SH".to_string(),
+                    name: "Solo".to_string(),
+                    limit_count: 4,
+                    latest_trade_date: d("2026-03-09"),
+                },
+                StrongLimitUpStock {
+                    code: "600011.SH".to_string(),
+                    name: "Repeat".to_string(),
+                    limit_count: 3,
+                    latest_trade_date: d("2026-03-08"),
+                },
+            ],
+        );
+
+        assert!(report.contains("强势股"));
+        assert!(report.contains("7日"));
+        assert!(report.contains("4次涨停"));
+        assert!(report.contains("Solo"));
+        assert!(report.contains("Repeat"));
+    }
 }

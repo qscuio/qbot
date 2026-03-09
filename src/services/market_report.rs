@@ -57,6 +57,22 @@ impl MarketReportService {
         Ok(report)
     }
 
+    pub async fn generate_limitup_report(&self, date: NaiveDate) -> Result<String> {
+        info!("Generating standalone limit-up report for {}", date);
+        let stocks = self.limit_up.get_stocks_by_date(date).await?;
+        let report = formatter::format_limit_up_report(date, &stocks);
+        postgres::save_report(&self.state.db, "limitup", &report).await?;
+        Ok(report)
+    }
+
+    pub async fn generate_strong_report(&self, date: NaiveDate, days: i64) -> Result<String> {
+        info!("Generating standalone strong-stock report for {}", date);
+        let stocks = self.limit_up.get_strong_stocks(days, 3).await?;
+        let report = formatter::format_strong_stock_report(date, days, &stocks);
+        postgres::save_report(&self.state.db, "strong", &report).await?;
+        Ok(report)
+    }
+
     pub async fn generate_weekly(&self) -> Result<String> {
         let date = beijing_today();
         let start = date - Duration::days(date.weekday().num_days_from_monday() as i64);
