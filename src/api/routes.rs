@@ -625,6 +625,34 @@ async fn format_startup_watchlist(state: Arc<AppState>) -> crate::error::Result<
     Ok(lines.join("\n"))
 }
 
+async fn load_limitup_report_text(state: Arc<AppState>) -> crate::error::Result<Option<String>> {
+    if let Some(report) = postgres::get_latest_report(&state.db, "limitup").await? {
+        if report.contains("<a href=") {
+            return Ok(Some(report));
+        }
+    }
+
+    let svc = LimitUpService::new(state.clone(), state.provider.clone());
+    let Some(trade_date) = svc.latest_trade_date().await? else {
+        return Ok(None);
+    };
+
+    let report_svc = crate::services::market_report::MarketReportService::new(
+        state.clone(),
+        Arc::new(crate::services::market::MarketService::new(
+            state.clone(),
+            state.provider.clone(),
+        )),
+        Arc::new(LimitUpService::new(state.clone(), state.provider.clone())),
+        Arc::new(crate::services::sector::SectorService::new(
+            state.clone(),
+            state.provider.clone(),
+        )),
+    );
+
+    report_svc.generate_limitup_report(trade_date).await.map(Some)
+}
+
 async fn format_portfolio(state: Arc<AppState>, user_id: i64) -> crate::error::Result<String> {
     let svc = PortfolioService::new(state);
     let items = svc.list_positions(user_id).await?;
@@ -2010,7 +2038,7 @@ async fn handle_telegram_command(
             )
             .await?;
         }
-        "limitup_report" => match postgres::get_latest_report(&state.db, "limitup").await? {
+        "limitup_report" => match load_limitup_report_text(state.clone()).await? {
             Some(report) => tg_send(&state, chat_id, &report).await?,
             None => {
                 tg_send(

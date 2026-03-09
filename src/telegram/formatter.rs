@@ -98,6 +98,26 @@ pub fn format_scan_alert(signal_name: &str, icon: &str, hits: &[serde_json::Valu
     msg
 }
 
+fn escape_html(raw: &str) -> String {
+    raw.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn normalize_stock_code(raw: &str) -> String {
+    raw.split('.')
+        .next()
+        .unwrap_or(raw)
+        .trim()
+        .to_ascii_uppercase()
+}
+
+fn quote_url_for_stock(code: &str) -> String {
+    let code = normalize_stock_code(code);
+    let market = if code.starts_with('6') { "1" } else { "0" };
+    format!("https://wap.eastmoney.com/quote/stock/{market}.{code}.html")
+}
+
 pub fn format_limit_up_report(
     date: chrono::NaiveDate,
     stocks: &[crate::data::types::LimitUpStock],
@@ -129,11 +149,13 @@ pub fn format_limit_up_report(
     msg.push_str("🏆 <b>封单额靠前</b>\n");
     for (idx, stock) in rows.iter().take(20).enumerate() {
         let amount = stock.fd_amount / 10_000.0;
+        let url = escape_html(&quote_url_for_stock(&stock.code));
         msg.push_str(&format!(
-            "{}. {} ({}) {:+.1}% 封单{:.0}万 打开{}次\n",
+            "{}. <a href=\"{}\">{}</a> ({}) {:+.1}% 封单{:.0}万 打开{}次\n",
             idx + 1,
-            stock.name,
-            stock.code,
+            url,
+            escape_html(&stock.name),
+            escape_html(&stock.code),
             stock.pct_chg,
             amount,
             stock.open_times
@@ -222,8 +244,12 @@ mod tests {
 
         assert!(report.contains("2026-03-09"));
         assert!(report.contains("2 只"));
-        assert!(report.contains("Alpha"));
-        assert!(report.contains("Beta"));
+        assert!(report.contains(
+            "<a href=\"https://wap.eastmoney.com/quote/stock/1.600001.html\">Alpha</a>"
+        ));
+        assert!(report.contains(
+            "<a href=\"https://wap.eastmoney.com/quote/stock/1.600002.html\">Beta</a>"
+        ));
     }
 
     #[test]
