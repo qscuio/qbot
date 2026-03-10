@@ -232,6 +232,11 @@ impl DabanService {
     }
 
     pub fn format_report_text(report: &DabanReport) -> String {
+        let base = std::env::var("WEBHOOK_URL").ok();
+        Self::format_report_text_with_base(report, base.as_deref())
+    }
+
+    fn format_report_text_with_base(report: &DabanReport, miniapp_base: Option<&str>) -> String {
         let mut msg = format!(
             "🎯 <b>打板评分</b> {}\n总数: {} 封板: {} 炸板: {}\n情绪: <b>{}</b>  平均分: <b>{:.1}</b>\n\n",
             report.summary.date,
@@ -243,11 +248,11 @@ impl DabanService {
         );
 
         for (idx, s) in report.top.iter().take(12).enumerate() {
+            let label = format!("{} {}", s.code, s.name).trim().to_string();
             msg.push_str(&format!(
-                "{}. <b>{}</b> {}  分数:{:.1}  {}\n",
+                "{}. {}  分数:{:.1}  {}\n",
                 idx + 1,
-                s.code,
-                s.name,
+                crate::telegram::formatter::stock_anchor_with_base(&s.code, &label, miniapp_base),
                 s.score,
                 s.verdict
             ));
@@ -346,5 +351,42 @@ impl DabanService {
 
             sleep(Duration::from_secs(120)).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_report_text_links_ranked_stocks_to_internal_chart() {
+        let report = DabanReport {
+            summary: DabanSummary {
+                date: NaiveDate::from_ymd_opt(2026, 3, 10).unwrap(),
+                total: 1,
+                sealed: 1,
+                burst: 0,
+                avg_score: 88.6,
+                sentiment: "强势".to_string(),
+            },
+            top: vec![DabanScore {
+                code: "600519.SH".to_string(),
+                name: "贵州茅台".to_string(),
+                score: 88.6,
+                seal_score: 30.0,
+                time_score: 20.0,
+                burst_penalty: 0.0,
+                executability: "可打".to_string(),
+                verdict: "强烈推荐".to_string(),
+            }],
+        };
+
+        let text =
+            DabanService::format_report_text_with_base(&report, Some("https://bot.example/"));
+
+        assert!(text.contains("打板评分"));
+        assert!(text.contains(
+            "<a href=\"https://bot.example/miniapp/chart/?code=600519\">600519.SH 贵州茅台</a>"
+        ));
     }
 }

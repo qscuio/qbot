@@ -915,7 +915,10 @@ async fn load_limitup_report_text(state: Arc<AppState>) -> crate::error::Result<
         )),
     );
 
-    report_svc.generate_limitup_report(trade_date).await.map(Some)
+    report_svc
+        .generate_limitup_report(trade_date)
+        .await
+        .map(Some)
 }
 
 async fn format_portfolio(state: Arc<AppState>, user_id: i64) -> crate::error::Result<String> {

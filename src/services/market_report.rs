@@ -104,21 +104,66 @@ impl MarketReportService {
         .fetch_all(&self.state.db)
         .await?;
 
-        let mut report = format!("📅 <b>周报 - {}</b>\n\n", date.format("%Y-%m-%d"));
-        report.push_str("🏆 <b>本周涨幅榜 Top 20</b>\n");
-        for (i, (code, name, gain_pct)) in rows.iter().enumerate() {
-            let gain = gain_pct.unwrap_or(0.0);
-            report.push_str(&format!(
-                "{}. {} {} {}{:.1}%\n",
-                i + 1,
-                code,
-                name.as_deref().unwrap_or(""),
-                if gain >= 0.0 { "+" } else { "" },
-                gain,
-            ));
-        }
+        let report = format_weekly_report(date, &rows);
 
         postgres::save_report(&self.state.db, "weekly", &report).await?;
         Ok(report)
+    }
+}
+
+fn format_weekly_report(date: NaiveDate, rows: &[(String, Option<String>, Option<f64>)]) -> String {
+    let base = std::env::var("WEBHOOK_URL").ok();
+    format_weekly_report_with_base(date, rows, base.as_deref())
+}
+
+fn format_weekly_report_with_base(
+    date: NaiveDate,
+    rows: &[(String, Option<String>, Option<f64>)],
+    miniapp_base: Option<&str>,
+) -> String {
+    let mut report = format!("📅 <b>周报 - {}</b>\n\n", date.format("%Y-%m-%d"));
+    report.push_str("🏆 <b>本周涨幅榜 Top 20</b>\n");
+    for (i, (code, name, gain_pct)) in rows.iter().enumerate() {
+        let gain = gain_pct.unwrap_or(0.0);
+        let label = match name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            Some(name) => format!("{code} {name}"),
+            None => code.clone(),
+        };
+        report.push_str(&format!(
+            "{}. {} {}{:.1}%\n",
+            i + 1,
+            formatter::stock_anchor_with_base(code, &label, miniapp_base),
+            if gain >= 0.0 { "+" } else { "" },
+            gain,
+        ));
+    }
+    report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::NaiveDate;
+
+    #[test]
+    fn weekly_report_links_top_gainers_to_internal_chart() {
+        let report = format_weekly_report_with_base(
+            NaiveDate::from_ymd_opt(2026, 3, 10).unwrap(),
+            &[(
+                "600519.SH".to_string(),
+                Some("贵州茅台".to_string()),
+                Some(12.3),
+            )],
+            Some("https://bot.example"),
+        );
+
+        assert!(report.contains("周报"));
+        assert!(report.contains(
+            "<a href=\"https://bot.example/miniapp/chart/?code=600519\">600519.SH 贵州茅台</a> +12.3%"
+        ));
     }
 }

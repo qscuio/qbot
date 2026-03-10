@@ -85,19 +85,6 @@ pub fn format_daily_report(
     msg
 }
 
-pub fn format_scan_alert(signal_name: &str, icon: &str, hits: &[serde_json::Value]) -> String {
-    let mut msg = format!("{} <b>{}</b> — {} 只\n\n", icon, signal_name, hits.len());
-    for hit in hits.iter().take(20) {
-        let code = hit["code"].as_str().unwrap_or("");
-        let name = hit["name"].as_str().unwrap_or("");
-        msg.push_str(&format!("• {} {}\n", code, name));
-    }
-    if hits.len() > 20 {
-        msg.push_str(&format!("... 共 {} 只\n", hits.len()));
-    }
-    msg
-}
-
 fn escape_html(raw: &str) -> String {
     raw.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -112,15 +99,57 @@ fn normalize_stock_code(raw: &str) -> String {
         .to_ascii_uppercase()
 }
 
-fn quote_url_for_stock(code: &str) -> String {
+fn chart_url_for_stock(code: &str) -> Option<String> {
+    let base = std::env::var("WEBHOOK_URL").ok();
+    chart_url_for_stock_with_base(code, base.as_deref())
+}
+
+fn chart_url_for_stock_with_base(code: &str, miniapp_base: Option<&str>) -> Option<String> {
     let code = normalize_stock_code(code);
-    let market = if code.starts_with('6') { "1" } else { "0" };
-    format!("https://wap.eastmoney.com/quote/stock/{market}.{code}.html")
+    if code.is_empty() {
+        return None;
+    }
+
+    let base = miniapp_base?.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return None;
+    }
+
+    Some(format!("{base}/miniapp/chart/?code={code}"))
+}
+
+pub fn stock_anchor(code: &str, label: &str) -> String {
+    let label = escape_html(label);
+    match chart_url_for_stock(code) {
+        Some(url) => format!("<a href=\"{}\">{}</a>", escape_html(&url), label),
+        None => label,
+    }
+}
+
+pub(crate) fn stock_anchor_with_base(
+    code: &str,
+    label: &str,
+    miniapp_base: Option<&str>,
+) -> String {
+    let label = escape_html(label);
+    match chart_url_for_stock_with_base(code, miniapp_base) {
+        Some(url) => format!("<a href=\"{}\">{}</a>", escape_html(&url), label),
+        None => label,
+    }
 }
 
 pub fn format_limit_up_report(
     date: chrono::NaiveDate,
     stocks: &[crate::data::types::LimitUpStock],
+) -> String {
+    let base = std::env::var("WEBHOOK_URL").ok();
+    format_limit_up_report_with_base(date, stocks, base.as_deref())
+}
+
+pub(crate) fn format_limit_up_report_with_base(
+    date: chrono::NaiveDate,
+    stocks: &[crate::data::types::LimitUpStock],
+    miniapp_base: Option<&str>,
 ) -> String {
     let mut rows: Vec<&crate::data::types::LimitUpStock> = stocks.iter().collect();
     rows.sort_by(|a, b| {
@@ -149,12 +178,14 @@ pub fn format_limit_up_report(
     msg.push_str("🏆 <b>封单额靠前</b>\n");
     for (idx, stock) in rows.iter().take(20).enumerate() {
         let amount = stock.fd_amount / 10_000.0;
-        let url = escape_html(&quote_url_for_stock(&stock.code));
+        let anchor = match miniapp_base {
+            Some(base) => stock_anchor_with_base(&stock.code, &stock.name, Some(base)),
+            None => stock_anchor(&stock.code, &stock.name),
+        };
         msg.push_str(&format!(
-            "{}. <a href=\"{}\">{}</a> ({}) {:+.1}% 封单{:.0}万 打开{}次\n",
+            "{}. {} ({}) {:+.1}% 封单{:.0}万 打开{}次\n",
             idx + 1,
-            url,
-            escape_html(&stock.name),
+            anchor,
             escape_html(&stock.code),
             stock.pct_chg,
             amount,
@@ -171,6 +202,16 @@ pub fn format_strong_stock_report(
     days: i64,
     stocks: &[StrongLimitUpStock],
 ) -> String {
+    let base = std::env::var("WEBHOOK_URL").ok();
+    format_strong_stock_report_with_base(date, days, stocks, base.as_deref())
+}
+
+pub(crate) fn format_strong_stock_report_with_base(
+    date: chrono::NaiveDate,
+    days: i64,
+    stocks: &[StrongLimitUpStock],
+    miniapp_base: Option<&str>,
+) -> String {
     let mut msg = format!(
         "💪 <b>近期强势股报告 {}</b>\n━━━━━━━━━━━━━━━━━━━━━\n窗口: 近{}日 | 命中: {}只\n\n",
         date.format("%Y-%m-%d"),
@@ -184,16 +225,48 @@ pub fn format_strong_stock_report(
     }
 
     for (idx, stock) in stocks.iter().take(20).enumerate() {
+        let label = format!("{} ({})", stock.name, stock.code);
+        let anchor = match miniapp_base {
+            Some(base) => stock_anchor_with_base(&stock.code, &label, Some(base)),
+            None => stock_anchor(&stock.code, &label),
+        };
         msg.push_str(&format!(
-            "{}. {} ({}) - {}次涨停\n",
+            "{}. {} - {}次涨停\n",
             idx + 1,
-            stock.name,
-            stock.code,
+            anchor,
             stock.limit_count
         ));
     }
 
     msg.push_str(&format!("\n🕐 {}", beijing_now().format("%H:%M")));
+    msg
+}
+
+pub fn format_scan_alert(signal_name: &str, icon: &str, hits: &[serde_json::Value]) -> String {
+    let base = std::env::var("WEBHOOK_URL").ok();
+    format_scan_alert_with_base(signal_name, icon, hits, base.as_deref())
+}
+
+pub(crate) fn format_scan_alert_with_base(
+    signal_name: &str,
+    icon: &str,
+    hits: &[serde_json::Value],
+    miniapp_base: Option<&str>,
+) -> String {
+    let mut msg = format!("{} <b>{}</b> — {} 只\n\n", icon, signal_name, hits.len());
+    for hit in hits.iter().take(20) {
+        let code = hit["code"].as_str().unwrap_or("");
+        let name = hit["name"].as_str().unwrap_or("");
+        let label = format!("{code} {name}").trim().to_string();
+        let anchor = match miniapp_base {
+            Some(base) => stock_anchor_with_base(code, &label, Some(base)),
+            None => stock_anchor(code, &label),
+        };
+        msg.push_str(&format!("• {}\n", anchor));
+    }
+    if hits.len() > 20 {
+        msg.push_str(&format!("... 共 {} 只\n", hits.len()));
+    }
     msg
 }
 
@@ -210,7 +283,7 @@ mod tests {
 
     #[test]
     fn format_limit_up_report_includes_summary_and_names() {
-        let report = format_limit_up_report(
+        let report = format_limit_up_report_with_base(
             d("2026-03-09"),
             &[
                 LimitUpStock {
@@ -240,21 +313,22 @@ mod tests {
                     limit: "U".to_string(),
                 },
             ],
+            Some("https://bot.example/"),
         );
 
         assert!(report.contains("2026-03-09"));
         assert!(report.contains("2 只"));
-        assert!(report.contains(
-            "<a href=\"https://wap.eastmoney.com/quote/stock/1.600001.html\">Alpha</a>"
-        ));
-        assert!(report.contains(
-            "<a href=\"https://wap.eastmoney.com/quote/stock/1.600002.html\">Beta</a>"
-        ));
+        assert!(
+            report.contains("<a href=\"https://bot.example/miniapp/chart/?code=600001\">Alpha</a>")
+        );
+        assert!(
+            report.contains("<a href=\"https://bot.example/miniapp/chart/?code=600002\">Beta</a>")
+        );
     }
 
     #[test]
     fn format_strong_stock_report_includes_window_and_counts() {
-        let report = format_strong_stock_report(
+        let report = format_strong_stock_report_with_base(
             d("2026-03-09"),
             7,
             &[
@@ -271,12 +345,35 @@ mod tests {
                     latest_trade_date: d("2026-03-08"),
                 },
             ],
+            Some("https://bot.example"),
         );
 
         assert!(report.contains("强势股"));
         assert!(report.contains("7日"));
         assert!(report.contains("4次涨停"));
-        assert!(report.contains("Solo"));
-        assert!(report.contains("Repeat"));
+        assert!(report.contains(
+            "<a href=\"https://bot.example/miniapp/chart/?code=600010\">Solo (600010.SH)</a>"
+        ));
+        assert!(report.contains(
+            "<a href=\"https://bot.example/miniapp/chart/?code=600011\">Repeat (600011.SH)</a>"
+        ));
+    }
+
+    #[test]
+    fn format_scan_alert_links_hits_to_internal_chart() {
+        let report = format_scan_alert_with_base(
+            "强势突破",
+            "⚡",
+            &[serde_json::json!({
+                "code": "300001.SZ",
+                "name": "Gamma",
+            })],
+            Some("https://bot.example/root/"),
+        );
+
+        assert!(report.contains("强势突破"));
+        assert!(report.contains(
+            "<a href=\"https://bot.example/root/miniapp/chart/?code=300001\">300001.SZ Gamma</a>"
+        ));
     }
 }
