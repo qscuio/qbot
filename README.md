@@ -145,9 +145,9 @@ Jobs are scheduled with fixed `UTC+08:00` in code (`Job::new_async_tz`).
 
 | Time (Beijing) | Days | Job |
 |----------------|------|-----|
-| 15:05 | Mon–Fri | Fetch OHLCV, limit-up stocks, sector data |
-| 15:35 | Mon–Fri | Run full signal scan, cache to Redis |
-| 16:00 | Mon–Fri | Generate daily report, push to Telegram |
+| 17:00 | Mon–Fri | Fetch OHLCV, limit-up stocks, sector data |
+| 17:30 | Mon–Fri | Run full signal scan, cache to Redis |
+| 18:00 | Mon–Fri | Generate daily report, push to Telegram |
 | 20:00 | Friday | Generate weekly report, push to Telegram |
 
 Time basis:

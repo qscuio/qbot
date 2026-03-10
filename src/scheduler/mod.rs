@@ -12,7 +12,12 @@ use crate::services::{
 use crate::state::AppState;
 use crate::telegram::pusher::TelegramPusher;
 
-/// Fetch today's OHLCV, limit-up stocks, and sector data (15:05 job).
+const FETCH_JOB_CRON: &str = "0 0 17 * * Mon,Tue,Wed,Thu,Fri";
+const SCAN_JOB_CRON: &str = "0 30 17 * * Mon,Tue,Wed,Thu,Fri";
+const DAILY_REPORT_JOB_CRON: &str = "0 0 18 * * Mon,Tue,Wed,Thu,Fri";
+const WEEKLY_REPORT_JOB_CRON: &str = "0 0 20 * * Fri";
+
+/// Fetch today's OHLCV, limit-up stocks, and sector data (17:00 job).
 pub async fn run_fetch_job(state: Arc<AppState>, provider: Arc<dyn DataProvider>) {
     let _guard = state.fetch_job_lock.lock().await;
     let today = beijing_today();
@@ -35,7 +40,7 @@ pub async fn run_fetch_job(state: Arc<AppState>, provider: Arc<dyn DataProvider>
     }
 }
 
-/// Run all 21 signal detectors and cache results to Redis (15:35 job).
+/// Run all 21 signal detectors and cache results to Redis (17:30 job).
 pub async fn run_scan_job(state: Arc<AppState>) {
     let _guard = state.scan_job_lock.lock().await;
     info!("Scan job: running full signal scan");
@@ -58,7 +63,7 @@ pub async fn run_scan_job(state: Arc<AppState>) {
     }
 }
 
-/// Generate daily market report and push to Telegram (16:00 job).
+/// Generate daily market report and push to Telegram (18:00 job).
 pub async fn run_daily_report_job(
     state: Arc<AppState>,
     provider: Arc<dyn DataProvider>,
@@ -163,13 +168,13 @@ pub async fn start_scheduler(
 ) -> anyhow::Result<JobScheduler> {
     let sched = JobScheduler::new().await?;
 
-    // 15:05 weekdays
+    // 17:00 weekdays
     {
         let s = state.clone();
         let p = provider.clone();
         sched
             .add(Job::new_async_tz(
-                "0 5 15 * * Mon,Tue,Wed,Thu,Fri",
+                FETCH_JOB_CRON,
                 beijing_tz(),
                 move |_, _| {
                     let s = s.clone();
@@ -180,12 +185,12 @@ pub async fn start_scheduler(
             .await?;
     }
 
-    // 15:35 weekdays
+    // 17:30 weekdays
     {
         let s = state.clone();
         sched
             .add(Job::new_async_tz(
-                "0 35 15 * * Mon,Tue,Wed,Thu,Fri",
+                SCAN_JOB_CRON,
                 beijing_tz(),
                 move |_, _| {
                     let s = s.clone();
@@ -195,14 +200,14 @@ pub async fn start_scheduler(
             .await?;
     }
 
-    // 16:00 weekdays
+    // 18:00 weekdays
     {
         let s = state.clone();
         let p = provider.clone();
         let push = pusher.clone();
         sched
             .add(Job::new_async_tz(
-                "0 0 16 * * Mon,Tue,Wed,Thu,Fri",
+                DAILY_REPORT_JOB_CRON,
                 beijing_tz(),
                 move |_, _| {
                     let s = s.clone();
@@ -221,7 +226,7 @@ pub async fn start_scheduler(
         let push = pusher.clone();
         sched
             .add(Job::new_async_tz(
-                "0 0 20 * * Fri",
+                WEEKLY_REPORT_JOB_CRON,
                 beijing_tz(),
                 move |_, _| {
                     let s = s.clone();
@@ -236,4 +241,21 @@ pub async fn start_scheduler(
     sched.start().await?;
     info!("Scheduler started with 4 jobs");
     Ok(sched)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn weekday_pipeline_runs_after_tushare_eod_window() {
+        assert_eq!(FETCH_JOB_CRON, "0 0 17 * * Mon,Tue,Wed,Thu,Fri");
+        assert_eq!(SCAN_JOB_CRON, "0 30 17 * * Mon,Tue,Wed,Thu,Fri");
+        assert_eq!(DAILY_REPORT_JOB_CRON, "0 0 18 * * Mon,Tue,Wed,Thu,Fri");
+    }
+
+    #[test]
+    fn weekly_report_schedule_stays_on_friday_evening() {
+        assert_eq!(WEEKLY_REPORT_JOB_CRON, "0 0 20 * * Fri");
+    }
 }
