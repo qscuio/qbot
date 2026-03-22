@@ -119,7 +119,7 @@ fn format_weekly_report(date: NaiveDate, rows: &[(String, Option<String>, Option
 fn format_weekly_report_with_base(
     date: NaiveDate,
     rows: &[(String, Option<String>, Option<f64>)],
-    miniapp_base: Option<&str>,
+    webhook_url: Option<&str>,
 ) -> String {
     let mut report = format!("📅 <b>周报 - {}</b>\n\n", date.format("%Y-%m-%d"));
     report.push_str("🏆 <b>本周涨幅榜 Top 20</b>\n");
@@ -136,7 +136,7 @@ fn format_weekly_report_with_base(
         report.push_str(&format!(
             "{}. {} {}{:.1}%\n",
             i + 1,
-            formatter::stock_anchor_with_base(code, &label, miniapp_base),
+            formatter::stock_anchor_with_base(code, &label, webhook_url),
             if gain >= 0.0 { "+" } else { "" },
             gain,
         ));

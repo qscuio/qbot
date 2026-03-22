@@ -840,18 +840,19 @@ async fn format_strong_limit_up(state: Arc<AppState>, days: i64) -> crate::error
         ));
     }
 
-    let miniapp_base = state.config.webhook_url.as_deref();
+    let webhook_url = state.config.webhook_url.as_deref();
     let mut lines = vec![
         format!("💪 <b>强势股</b> ({}日, {})", days, items.len()),
         "━━━━━━━━━━━━━━━━━━━━━".to_string(),
     ];
     for (idx, item) in items.iter().take(30).enumerate() {
-        let url = chart_url_for_stock(&item.code, miniapp_base, Some("limit_up_strong"));
+        let anchor = crate::telegram::formatter::stock_anchor_with_base(
+            &item.code, &item.name, webhook_url,
+        );
         lines.push(format!(
-            "{}. <a href=\"{}\">{}</a> ({}) - {}次涨停",
+            "{}. {} ({}) - {}次涨停",
             idx + 1,
-            url,
-            escape_html(&item.name),
+            anchor,
             escape_html(&item.code),
             item.limit_count
         ));
@@ -870,19 +871,20 @@ async fn format_startup_watchlist(state: Arc<AppState>) -> crate::error::Result<
         );
     }
 
-    let miniapp_base = state.config.webhook_url.as_deref();
+    let webhook_url = state.config.webhook_url.as_deref();
     let mut lines = vec![
         format!("👀 <b>启动追踪</b> ({})", items.len()),
         "━━━━━━━━━━━━━━━━━━━━━".to_string(),
         "<i>近30日仅涨停一次，再次涨停将自动移除</i>".to_string(),
     ];
     for (idx, item) in items.iter().take(30).enumerate() {
-        let url = chart_url_for_stock(&item.code, miniapp_base, Some("limit_up_startup"));
+        let anchor = crate::telegram::formatter::stock_anchor_with_base(
+            &item.code, &item.name, webhook_url,
+        );
         lines.push(format!(
-            "{}. <a href=\"{}\">{}</a> ({}) {}",
+            "{}. {} ({}) {}",
             idx + 1,
-            url,
-            escape_html(&item.name),
+            anchor,
             escape_html(&item.code),
             item.first_limit_date.format("%m/%d")
         ));
@@ -1247,22 +1249,21 @@ fn normalize_stock_code(raw: &str) -> String {
         .to_ascii_uppercase()
 }
 
-fn chart_url_for_stock(code: &str, miniapp_base: Option<&str>, context: Option<&str>) -> String {
-    let code = normalize_stock_code(code);
-    if let Some(base) = miniapp_base {
-        let mut url = format!(
-            "{}/miniapp/chart/?code={}",
-            base.trim_end_matches('/'),
-            code
-        );
-        if let Some(ctx) = context.filter(|v| !v.trim().is_empty()) {
-            url.push_str("&context=");
-            url.push_str(ctx);
-        }
-        return url;
+fn chart_url_for_stock(code: &str, miniapp_base: Option<&str>, context: Option<&str>) -> Option<String> {
+    let base = miniapp_base?.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return None;
     }
-    let market = if code.starts_with('6') { "1" } else { "0" };
-    format!("https://wap.eastmoney.com/quote/stock/{market}.{code}.html")
+    let code = normalize_stock_code(code);
+    if code.is_empty() {
+        return None;
+    }
+    let mut url = format!("{base}/miniapp/chart/?code={code}");
+    if let Some(ctx) = context.filter(|v| !v.trim().is_empty()) {
+        url.push_str("&context=");
+        url.push_str(ctx);
+    }
+    Some(url)
 }
 
 fn trim_chars(raw: &str, max_chars: usize) -> String {
@@ -1384,17 +1385,22 @@ fn build_scan_hit_markup(
     for (idx, hit) in hits.iter().enumerate() {
         let ordinal = start_index + idx + 1;
         let text = format_scan_hit_button_text(hit, ordinal);
-        let chart_url = chart_url_for_stock(&hit.code, miniapp_base, context);
-        let button = if use_web_app {
-            json!({
-                "text": text,
-                "web_app": {"url": chart_url},
-            })
-        } else {
-            json!({
-                "text": text,
-                "url": chart_url,
-            })
+        let button = match chart_url_for_stock(&hit.code, miniapp_base, context) {
+            Some(chart_url) if use_web_app => {
+                json!({
+                    "text": text,
+                    "web_app": {"url": chart_url},
+                })
+            }
+            Some(chart_url) => {
+                json!({
+                    "text": text,
+                    "url": chart_url,
+                })
+            }
+            None => {
+                cb_button(&text, &format!("chart:{}", normalize_stock_code(&hit.code)))
+            }
         };
         rows.push(vec![button]);
     }
@@ -2514,15 +2520,15 @@ async fn handle_telegram_command(
                     .await?
                     .unwrap_or_else(|| raw.to_uppercase());
                 let code6 = normalize_stock_code(&code);
-                if let Some(base) = state.config.webhook_url.as_deref() {
-                    let app_url = chart_url_for_stock(&code, Some(base), None);
+                if let Some(app_url) = chart_url_for_stock(&code, state.config.webhook_url.as_deref(), None) {
+                    let base = state.config.webhook_url.as_deref().unwrap_or("").trim_end_matches('/');
                     let msg = format!(
                         "📈 <b>Chart: {}</b>\n\n自绘K线: {}\n数据接口: {}/api/chart/data/{}\n筹码接口: {}/api/chart/chips/{}",
                         escape_html(&code),
                         escape_html(&app_url),
-                        base.trim_end_matches('/'),
+                        base,
                         escape_html(&code),
-                        base.trim_end_matches('/'),
+                        base,
                         escape_html(&code)
                     );
                     tg_send_with_markup(&state, chat_id, &msg, chart_open_button(&app_url)).await?;

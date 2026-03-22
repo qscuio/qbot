@@ -104,13 +104,13 @@ fn chart_url_for_stock(code: &str) -> Option<String> {
     chart_url_for_stock_with_base(code, base.as_deref())
 }
 
-fn chart_url_for_stock_with_base(code: &str, miniapp_base: Option<&str>) -> Option<String> {
+fn chart_url_for_stock_with_base(code: &str, webhook_url: Option<&str>) -> Option<String> {
     let code = normalize_stock_code(code);
     if code.is_empty() {
         return None;
     }
 
-    let base = miniapp_base?.trim().trim_end_matches('/');
+    let base = webhook_url?.trim().trim_end_matches('/');
     if base.is_empty() {
         return None;
     }
@@ -129,10 +129,10 @@ pub fn stock_anchor(code: &str, label: &str) -> String {
 pub(crate) fn stock_anchor_with_base(
     code: &str,
     label: &str,
-    miniapp_base: Option<&str>,
+    webhook_url: Option<&str>,
 ) -> String {
     let label = escape_html(label);
-    match chart_url_for_stock_with_base(code, miniapp_base) {
+    match chart_url_for_stock_with_base(code, webhook_url) {
         Some(url) => format!("<a href=\"{}\">{}</a>", escape_html(&url), label),
         None => label,
     }
@@ -149,7 +149,7 @@ pub fn format_limit_up_report(
 pub(crate) fn format_limit_up_report_with_base(
     date: chrono::NaiveDate,
     stocks: &[crate::data::types::LimitUpStock],
-    miniapp_base: Option<&str>,
+    webhook_url: Option<&str>,
 ) -> String {
     let mut rows: Vec<&crate::data::types::LimitUpStock> = stocks.iter().collect();
     rows.sort_by(|a, b| {
@@ -178,10 +178,7 @@ pub(crate) fn format_limit_up_report_with_base(
     msg.push_str("🏆 <b>封单额靠前</b>\n");
     for (idx, stock) in rows.iter().take(20).enumerate() {
         let amount = stock.fd_amount / 10_000.0;
-        let anchor = match miniapp_base {
-            Some(base) => stock_anchor_with_base(&stock.code, &stock.name, Some(base)),
-            None => stock_anchor(&stock.code, &stock.name),
-        };
+        let anchor = stock_anchor_with_base(&stock.code, &stock.name, webhook_url);
         msg.push_str(&format!(
             "{}. {} ({}) {:+.1}% 封单{:.0}万 打开{}次\n",
             idx + 1,
@@ -210,7 +207,7 @@ pub(crate) fn format_strong_stock_report_with_base(
     date: chrono::NaiveDate,
     days: i64,
     stocks: &[StrongLimitUpStock],
-    miniapp_base: Option<&str>,
+    webhook_url: Option<&str>,
 ) -> String {
     let mut msg = format!(
         "💪 <b>近期强势股报告 {}</b>\n━━━━━━━━━━━━━━━━━━━━━\n窗口: 近{}日 | 命中: {}只\n\n",
@@ -226,10 +223,7 @@ pub(crate) fn format_strong_stock_report_with_base(
 
     for (idx, stock) in stocks.iter().take(20).enumerate() {
         let label = format!("{} ({})", stock.name, stock.code);
-        let anchor = match miniapp_base {
-            Some(base) => stock_anchor_with_base(&stock.code, &label, Some(base)),
-            None => stock_anchor(&stock.code, &label),
-        };
+        let anchor = stock_anchor_with_base(&stock.code, &label, webhook_url);
         msg.push_str(&format!(
             "{}. {} - {}次涨停\n",
             idx + 1,
@@ -251,17 +245,14 @@ pub(crate) fn format_scan_alert_with_base(
     signal_name: &str,
     icon: &str,
     hits: &[serde_json::Value],
-    miniapp_base: Option<&str>,
+    webhook_url: Option<&str>,
 ) -> String {
     let mut msg = format!("{} <b>{}</b> — {} 只\n\n", icon, signal_name, hits.len());
     for hit in hits.iter().take(20) {
         let code = hit["code"].as_str().unwrap_or("");
         let name = hit["name"].as_str().unwrap_or("");
         let label = format!("{code} {name}").trim().to_string();
-        let anchor = match miniapp_base {
-            Some(base) => stock_anchor_with_base(code, &label, Some(base)),
-            None => stock_anchor(code, &label),
-        };
+        let anchor = stock_anchor_with_base(code, &label, webhook_url);
         msg.push_str(&format!("• {}\n", anchor));
     }
     if hits.len() > 20 {
@@ -313,7 +304,7 @@ mod tests {
                     limit: "U".to_string(),
                 },
             ],
-            Some("https://bot.example/"),
+            Some("https://bot.example"),
         );
 
         assert!(report.contains("2026-03-09"));

@@ -236,7 +236,7 @@ impl DabanService {
         Self::format_report_text_with_base(report, base.as_deref())
     }
 
-    fn format_report_text_with_base(report: &DabanReport, miniapp_base: Option<&str>) -> String {
+    fn format_report_text_with_base(report: &DabanReport, webhook_url: Option<&str>) -> String {
         let mut msg = format!(
             "🎯 <b>打板评分</b> {}\n总数: {} 封板: {} 炸板: {}\n情绪: <b>{}</b>  平均分: <b>{:.1}</b>\n\n",
             report.summary.date,
@@ -252,7 +252,7 @@ impl DabanService {
             msg.push_str(&format!(
                 "{}. {}  分数:{:.1}  {}\n",
                 idx + 1,
-                crate::telegram::formatter::stock_anchor_with_base(&s.code, &label, miniapp_base),
+                crate::telegram::formatter::stock_anchor_with_base(&s.code, &label, webhook_url),
                 s.score,
                 s.verdict
             ));
