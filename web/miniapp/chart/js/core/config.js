@@ -8,9 +8,9 @@ export const DEFAULT_STOCK_CODE = 'sh000001';
 export const CHART_CONFIG = {
     defaultVisibleBars: 60,
     autoRefreshInterval: 5000,
-    defaultDays: 250,
-    defaultWeeklyDays: 100,
-    defaultMonthlyDays: 60,
+    defaultDays: 5000,
+    defaultWeeklyDays: 2000,
+    defaultMonthlyDays: 1000,
     chipLookback: 60,
     chipBuckets: 120,
 };

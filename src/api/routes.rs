@@ -3017,7 +3017,7 @@ async fn chart_data(
         ));
     }
 
-    let days = query.days.unwrap_or(60).clamp(1, 1000);
+    let days = query.days.unwrap_or(60).clamp(1, 99999);
     let period = normalize_period(query.period.as_deref());
     let code = postgres::resolve_stock_code(&state.db, &raw_code)
         .await
