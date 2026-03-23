@@ -840,19 +840,15 @@ async fn format_strong_limit_up(state: Arc<AppState>, days: i64) -> crate::error
         ));
     }
 
-    let webhook_url = state.config.webhook_url.as_deref();
     let mut lines = vec![
         format!("💪 <b>强势股</b> ({}日, {})", days, items.len()),
         "━━━━━━━━━━━━━━━━━━━━━".to_string(),
     ];
     for (idx, item) in items.iter().take(30).enumerate() {
-        let anchor = crate::telegram::formatter::stock_anchor_with_base(
-            &item.code, &item.name, webhook_url,
-        );
         lines.push(format!(
             "{}. {} ({}) - {}次涨停",
             idx + 1,
-            anchor,
+            escape_html(&item.name),
             escape_html(&item.code),
             item.limit_count
         ));
@@ -871,20 +867,16 @@ async fn format_startup_watchlist(state: Arc<AppState>) -> crate::error::Result<
         );
     }
 
-    let webhook_url = state.config.webhook_url.as_deref();
     let mut lines = vec![
         format!("👀 <b>启动追踪</b> ({})", items.len()),
         "━━━━━━━━━━━━━━━━━━━━━".to_string(),
         "<i>近30日仅涨停一次，再次涨停将自动移除</i>".to_string(),
     ];
     for (idx, item) in items.iter().take(30).enumerate() {
-        let anchor = crate::telegram::formatter::stock_anchor_with_base(
-            &item.code, &item.name, webhook_url,
-        );
         lines.push(format!(
             "{}. {} ({}) {}",
             idx + 1,
-            anchor,
+            escape_html(&item.name),
             escape_html(&item.code),
             item.first_limit_date.format("%m/%d")
         ));
@@ -892,16 +884,47 @@ async fn format_startup_watchlist(state: Arc<AppState>) -> crate::error::Result<
     Ok(lines.join("\n"))
 }
 
-async fn load_limitup_report_text(state: Arc<AppState>) -> crate::error::Result<Option<String>> {
-    if let Some(report) = postgres::get_latest_report(&state.db, "limitup").await? {
-        if report.contains("<a href=") {
-            return Ok(Some(report));
-        }
-    }
+async fn send_strong_limit_up(
+    state: Arc<AppState>,
+    chat_id: i64,
+    days: i64,
+) -> crate::error::Result<()> {
+    let svc = LimitUpService::new(state.clone(), state.provider.clone());
+    let items = svc.get_strong_stocks(days, 3).await?;
+    let text = format_strong_limit_up(state.clone(), days).await?;
 
+    match crate::telegram::formatter::strong_stock_report_markup(&items) {
+        Some(markup) => tg_send_with_markup(&state, chat_id, &text, markup).await,
+        None => tg_send(&state, chat_id, &text).await,
+    }
+}
+
+async fn send_startup_watchlist(
+    state: Arc<AppState>,
+    chat_id: i64,
+) -> crate::error::Result<()> {
+    let svc = LimitUpService::new(state.clone(), state.provider.clone());
+    let items = svc.get_startup_watchlist().await?;
+    let text = format_startup_watchlist(state.clone()).await?;
+
+    match crate::telegram::formatter::startup_watchlist_markup(&items) {
+        Some(markup) => tg_send_with_markup(&state, chat_id, &text, markup).await,
+        None => tg_send(&state, chat_id, &text).await,
+    }
+}
+
+async fn send_latest_limitup_report(
+    state: Arc<AppState>,
+    chat_id: i64,
+) -> crate::error::Result<()> {
     let svc = LimitUpService::new(state.clone(), state.provider.clone());
     let Some(trade_date) = svc.latest_trade_date().await? else {
-        return Ok(None);
+        return tg_send(
+            &state,
+            chat_id,
+            "📭 暂无涨停股报告\n使用 <code>/limitup_sync</code> 或等待定时任务生成",
+        )
+        .await;
     };
 
     let report_svc = crate::services::market_report::MarketReportService::new(
@@ -917,10 +940,50 @@ async fn load_limitup_report_text(state: Arc<AppState>) -> crate::error::Result<
         )),
     );
 
-    report_svc
-        .generate_limitup_report(trade_date)
-        .await
-        .map(Some)
+    let report = report_svc.generate_limitup_report(trade_date).await?;
+    let stocks = report_svc.load_limitup_report_data(trade_date).await?;
+
+    match crate::telegram::formatter::limit_up_report_markup(&stocks) {
+        Some(markup) => tg_send_with_markup(&state, chat_id, &report, markup).await,
+        None => tg_send(&state, chat_id, &report).await,
+    }
+}
+
+async fn send_latest_strong_report(
+    state: Arc<AppState>,
+    chat_id: i64,
+    days: i64,
+) -> crate::error::Result<()> {
+    let svc = LimitUpService::new(state.clone(), state.provider.clone());
+    let Some(trade_date) = svc.latest_trade_date().await? else {
+        return tg_send(
+            &state,
+            chat_id,
+            "📭 暂无强势股报告\n请先同步涨停数据或等待定时任务生成",
+        )
+        .await;
+    };
+
+    let report_svc = crate::services::market_report::MarketReportService::new(
+        state.clone(),
+        Arc::new(crate::services::market::MarketService::new(
+            state.clone(),
+            state.provider.clone(),
+        )),
+        Arc::new(LimitUpService::new(state.clone(), state.provider.clone())),
+        Arc::new(crate::services::sector::SectorService::new(
+            state.clone(),
+            state.provider.clone(),
+        )),
+    );
+
+    let report = report_svc.generate_strong_report(trade_date, days).await?;
+    let stocks = report_svc.load_strong_report_data(days).await?;
+
+    match crate::telegram::formatter::strong_stock_report_markup(&stocks) {
+        Some(markup) => tg_send_with_markup(&state, chat_id, &report, markup).await,
+        None => tg_send(&state, chat_id, &report).await,
+    }
 }
 
 async fn format_portfolio(state: Arc<AppState>, user_id: i64) -> crate::error::Result<String> {
@@ -2290,12 +2353,20 @@ async fn handle_telegram_command(
                     .await?;
                     let svc = DabanService::new(state.clone());
                     let report = svc.build_report(None, 20).await?;
-                    tg_send(&state, chat_id, &DabanService::format_report_text(&report)).await?;
+                    let text = DabanService::format_report_text(&report);
+                    match DabanService::format_report_markup(&report) {
+                        Some(markup) => tg_send_with_markup(&state, chat_id, &text, markup).await?,
+                        None => tg_send(&state, chat_id, &text).await?,
+                    }
                 }
                 _ => {
                     let svc = DabanService::new(state.clone());
                     let report = svc.build_report(None, 20).await?;
-                    tg_send(&state, chat_id, &DabanService::format_report_text(&report)).await?;
+                    let text = DabanService::format_report_text(&report);
+                    match DabanService::format_report_markup(&report) {
+                        Some(markup) => tg_send_with_markup(&state, chat_id, &text, markup).await?,
+                        None => tg_send(&state, chat_id, &text).await?,
+                    }
                 }
             }
         }
@@ -2356,43 +2427,13 @@ async fn handle_telegram_command(
             .await?;
         }
         "strong" => {
-            tg_send(
-                &state,
-                chat_id,
-                &format_strong_limit_up(state.clone(), 7).await?,
-            )
-            .await?;
+            send_strong_limit_up(state.clone(), chat_id, 7).await?;
         }
         "startup" => {
-            tg_send(
-                &state,
-                chat_id,
-                &format_startup_watchlist(state.clone()).await?,
-            )
-            .await?;
+            send_startup_watchlist(state.clone(), chat_id).await?;
         }
-        "limitup_report" => match load_limitup_report_text(state.clone()).await? {
-            Some(report) => tg_send(&state, chat_id, &report).await?,
-            None => {
-                tg_send(
-                    &state,
-                    chat_id,
-                    "📭 暂无涨停股报告\n使用 <code>/limitup_sync</code> 或等待定时任务生成",
-                )
-                .await?
-            }
-        },
-        "strong_report" => match postgres::get_latest_report(&state.db, "strong").await? {
-            Some(report) => tg_send(&state, chat_id, &report).await?,
-            None => {
-                tg_send(
-                    &state,
-                    chat_id,
-                    "📭 暂无强势股报告\n请先同步涨停数据或等待定时任务生成",
-                )
-                .await?
-            }
-        },
+        "limitup_report" => send_latest_limitup_report(state.clone(), chat_id).await?,
+        "strong_report" => send_latest_strong_report(state.clone(), chat_id, 7).await?,
         "limitup_sync" => {
             tg_send(&state, chat_id, "⏳ 正在同步涨停数据...").await?;
             let target_date = crate::market_time::beijing_today();

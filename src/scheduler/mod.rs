@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use chrono::{Datelike, Duration};
 use tokio_cron_scheduler::{Job, JobScheduler};
 use tracing::{info, warn};
 
@@ -98,7 +99,14 @@ pub async fn run_daily_report_job(
     match report_svc.generate_limitup_report(today).await {
         Ok(report) => {
             if let Some(channel) = alert_channel {
-                if let Err(e) = pusher.push(channel, &report).await {
+                let push_result = match report_svc.load_limitup_report_data(today).await {
+                    Ok(stocks) => match crate::telegram::formatter::limit_up_report_markup(&stocks) {
+                        Some(markup) => pusher.push_with_markup(channel, &report, markup).await,
+                        None => pusher.push(channel, &report).await,
+                    },
+                    Err(_) => pusher.push(channel, &report).await,
+                };
+                if let Err(e) = push_result {
                     warn!("Limit-up report push failed: {}", e);
                 }
             }
@@ -109,7 +117,14 @@ pub async fn run_daily_report_job(
     match report_svc.generate_strong_report(today, 7).await {
         Ok(report) => {
             if let Some(channel) = alert_channel {
-                if let Err(e) = pusher.push(channel, &report).await {
+                let push_result = match report_svc.load_strong_report_data(7).await {
+                    Ok(stocks) => match crate::telegram::formatter::strong_stock_report_markup(&stocks) {
+                        Some(markup) => pusher.push_with_markup(channel, &report, markup).await,
+                        None => pusher.push(channel, &report).await,
+                    },
+                    Err(_) => pusher.push(channel, &report).await,
+                };
+                if let Err(e) = push_result {
                     warn!("Strong-stock report push failed: {}", e);
                 }
             }
@@ -148,11 +163,20 @@ pub async fn run_weekly_report_job(
     let limit_svc = Arc::new(LimitUpService::new(state.clone(), provider.clone()));
     let sector_svc = Arc::new(SectorService::new(state.clone(), provider.clone()));
     let report_svc = MarketReportService::new(state.clone(), market_svc, limit_svc, sector_svc);
+    let today = beijing_today();
+    let start = today - Duration::days(today.weekday().num_days_from_monday() as i64);
 
     match report_svc.generate_weekly().await {
         Ok(report) => {
             if let Some(channel) = &state.config.report_channel {
-                if let Err(e) = pusher.push(channel, &report).await {
+                let push_result = match report_svc.load_weekly_report_rows(start, today).await {
+                    Ok(rows) => match crate::services::market_report::weekly_report_markup(&rows) {
+                        Some(markup) => pusher.push_with_markup(channel, &report, markup).await,
+                        None => pusher.push(channel, &report).await,
+                    },
+                    Err(_) => pusher.push(channel, &report).await,
+                };
+                if let Err(e) = push_result {
                     warn!("Telegram push failed: {}", e);
                 }
             }

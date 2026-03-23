@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use chrono::{Datelike, NaiveDate, Timelike, Weekday};
 use serde::Serialize;
+use serde_json::{json, Value};
 use tokio::time::{sleep, Duration};
 use tracing::warn;
 
@@ -236,7 +237,12 @@ impl DabanService {
         Self::format_report_text_with_base(report, base.as_deref())
     }
 
-    fn format_report_text_with_base(report: &DabanReport, webhook_url: Option<&str>) -> String {
+    pub fn format_report_markup(report: &DabanReport) -> Option<Value> {
+        let base = std::env::var("WEBHOOK_URL").ok();
+        Self::format_report_markup_with_base(report, base.as_deref())
+    }
+
+    fn format_report_text_with_base(report: &DabanReport, _webhook_url: Option<&str>) -> String {
         let mut msg = format!(
             "🎯 <b>打板评分</b> {}\n总数: {} 封板: {} 炸板: {}\n情绪: <b>{}</b>  平均分: <b>{:.1}</b>\n\n",
             report.summary.date,
@@ -248,16 +254,35 @@ impl DabanService {
         );
 
         for (idx, s) in report.top.iter().take(12).enumerate() {
-            let label = format!("{} {}", s.code, s.name).trim().to_string();
             msg.push_str(&format!(
                 "{}. {}  分数:{:.1}  {}\n",
                 idx + 1,
-                crate::telegram::formatter::stock_anchor_with_base(&s.code, &label, webhook_url),
+                format!("{} {}", s.code, s.name).trim(),
                 s.score,
                 s.verdict
             ));
         }
         msg
+    }
+
+    fn format_report_markup_with_base(report: &DabanReport, webhook_url: Option<&str>) -> Option<Value> {
+        let buttons: Vec<Vec<Value>> = report
+            .top
+            .iter()
+            .take(12)
+            .enumerate()
+            .filter_map(|(idx, stock)| {
+                let label = format!("{}. {} ({})", idx + 1, stock.name.trim(), stock.code.split('.').next().unwrap_or(&stock.code));
+                crate::telegram::formatter::stock_button_with_base(&stock.code, &label, webhook_url)
+                    .map(|button| vec![button])
+            })
+            .collect();
+
+        if buttons.is_empty() {
+            return None;
+        }
+
+        Some(json!({ "inline_keyboard": buttons }))
     }
 
     fn in_trading_hours() -> bool {
@@ -342,7 +367,11 @@ impl DabanService {
             let sig = Self::live_signature(&report);
             if sig != last_sig {
                 let msg = Self::format_report_text(&report);
-                if let Err(e) = pusher.push(&channel, &msg).await {
+                let push_result = match Self::format_report_markup(&report) {
+                    Some(markup) => pusher.push_with_markup(&channel, &msg, markup).await,
+                    None => pusher.push(&channel, &msg).await,
+                };
+                if let Err(e) = push_result {
                     warn!("daban live push failed: {}", e);
                 } else {
                     last_sig = sig;
@@ -359,7 +388,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn format_report_text_links_ranked_stocks_to_internal_chart() {
+    fn format_report_text_lists_ranked_stocks_without_html_links() {
         let report = DabanReport {
             summary: DabanSummary {
                 date: NaiveDate::from_ymd_opt(2026, 3, 10).unwrap(),
@@ -385,8 +414,44 @@ mod tests {
             DabanService::format_report_text_with_base(&report, Some("https://bot.example/"));
 
         assert!(text.contains("打板评分"));
-        assert!(text.contains(
-            "<a href=\"https://bot.example/miniapp/chart/?code=600519\">600519.SH 贵州茅台</a>"
-        ));
+        assert!(text.contains("1. 600519.SH 贵州茅台  分数:88.6  强烈推荐"));
+        assert!(!text.contains("<a href="));
+    }
+
+    #[test]
+    fn format_report_markup_uses_web_app_buttons() {
+        let report = DabanReport {
+            summary: DabanSummary {
+                date: NaiveDate::from_ymd_opt(2026, 3, 10).unwrap(),
+                total: 1,
+                sealed: 1,
+                burst: 0,
+                avg_score: 88.6,
+                sentiment: "强势".to_string(),
+            },
+            top: vec![DabanScore {
+                code: "600519.SH".to_string(),
+                name: "贵州茅台".to_string(),
+                score: 88.6,
+                seal_score: 30.0,
+                time_score: 20.0,
+                burst_penalty: 0.0,
+                executability: "可打".to_string(),
+                verdict: "强烈推荐".to_string(),
+            }],
+        };
+
+        let markup =
+            DabanService::format_report_markup_with_base(&report, Some("https://bot.example/"))
+                .expect("markup");
+
+        assert_eq!(
+            markup["inline_keyboard"][0][0]["web_app"]["url"].as_str(),
+            Some("https://bot.example/miniapp/chart/?code=600519")
+        );
+        assert_eq!(
+            markup["inline_keyboard"][0][0]["text"].as_str(),
+            Some("1. 贵州茅台 (600519)")
+        );
     }
 }
