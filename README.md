@@ -183,6 +183,7 @@ Push to `main` triggers `.github/workflows/deploy.yml`, which:
 | `REPORT_CHANNEL` | Yes | Telegram channel ID for reports |
 | `STOCK_ALERT_CHANNEL` | No | Telegram channel ID for burst alerts |
 | `DABAN_CHANNEL` | No | Telegram channel ID for daban notifications |
+| `ENABLE_SIGNAL_AUTO_TRADING` | No | Set to `true` to run the signal-based auto paper-trading loop |
 | `ENABLE_DABAN_LIVE` | No | Set to `true` to run intraday daban live loop |
 | `ENABLE_AI_ANALYSIS` | No | Set to `true` to run daily AI market overview push |
 | `ENABLE_CHIP_DIST` | No | Set to `true` to run daily chip distribution refresh |

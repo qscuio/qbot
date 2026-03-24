@@ -57,8 +57,7 @@ jobs:
             REDIS_URL=redis://127.0.0.1:6379
             API_PORT=8080
             ENABLE_BURST_MONITOR=true
-            ENABLE_TRADING_SIM=false
-            ENABLE_DABAN_SIM=false
+            ENABLE_SIGNAL_AUTO_TRADING=${{ secrets.ENABLE_SIGNAL_AUTO_TRADING || 'false' }}
             ENABLE_DABAN_LIVE=${{ secrets.ENABLE_DABAN_LIVE || 'false' }}
             ENABLE_AI_ANALYSIS=${{ secrets.ENABLE_AI_ANALYSIS || 'false' }}
             ENABLE_CHIP_DIST=${{ secrets.ENABLE_CHIP_DIST || 'true' }}
