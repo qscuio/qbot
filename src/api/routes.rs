@@ -482,7 +482,9 @@ fn telegram_help_text() -> String {
         "/scan_stats     信号前瞻收益统计",
         "/autosim        自动交易账户快照",
         "/autosim_report 自动交易最新日报",
+        "/sim            普通模拟交易",
         "/daban          打板评分",
+        "/daban sim      打板模拟交易",
         "/daban portfolio 打板持仓",
         "/daban stats    打板统计",
         "",
@@ -555,6 +557,190 @@ fn parse_scan_stats_args(args: &str) -> (Option<String>, i64) {
     }
 
     (signal_id, normalize_scan_stats_days(days))
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ManualSimAction {
+    Overview,
+    Balance,
+    Positions,
+    Stats,
+    Buy {
+        code: String,
+        price: f64,
+        shares: i32,
+        name: Option<String>,
+    },
+    Sell {
+        position_id: i64,
+        price: f64,
+        reason: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum DabanSimAction {
+    Overview,
+    Balance,
+    Positions,
+    Stats,
+    Buy {
+        code: String,
+        price: f64,
+        shares: i32,
+        score: Option<f64>,
+        name: Option<String>,
+    },
+    Sell {
+        position_id: i64,
+        price: f64,
+        reason: Option<String>,
+    },
+}
+
+fn parse_manual_sim_args(args: &str) -> std::result::Result<ManualSimAction, String> {
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    if parts.is_empty() {
+        return Ok(ManualSimAction::Overview);
+    }
+
+    match parts[0].to_ascii_lowercase().as_str() {
+        "balance" => Ok(ManualSimAction::Balance),
+        "positions" | "portfolio" => Ok(ManualSimAction::Positions),
+        "stats" => Ok(ManualSimAction::Stats),
+        "buy" => {
+            if parts.len() < 4 {
+                return Err("用法: <code>/sim buy &lt;代码&gt; &lt;价格&gt; &lt;股数&gt; [名称]</code>".to_string());
+            }
+            let price = parts[2]
+                .parse::<f64>()
+                .map_err(|_| "❌ 买入价格格式错误".to_string())?;
+            let shares = parts[3]
+                .parse::<i32>()
+                .map_err(|_| "❌ 买入股数格式错误".to_string())?;
+            if price <= 0.0 || shares <= 0 {
+                return Err("❌ 买入价格和股数必须为正数".to_string());
+            }
+            Ok(ManualSimAction::Buy {
+                code: parts[1].to_string(),
+                price,
+                shares,
+                name: if parts.len() > 4 {
+                    Some(parts[4..].join(" "))
+                } else {
+                    None
+                },
+            })
+        }
+        "sell" => {
+            if parts.len() < 3 {
+                return Err(
+                    "用法: <code>/sim sell &lt;持仓ID&gt; &lt;卖出价&gt; [原因]</code>".to_string(),
+                );
+            }
+            let position_id = parts[1]
+                .parse::<i64>()
+                .map_err(|_| "❌ 持仓ID格式错误".to_string())?;
+            let price = parts[2]
+                .parse::<f64>()
+                .map_err(|_| "❌ 卖出价格格式错误".to_string())?;
+            if position_id <= 0 || price <= 0.0 {
+                return Err("❌ 持仓ID和卖出价格必须为正数".to_string());
+            }
+            Ok(ManualSimAction::Sell {
+                position_id,
+                price,
+                reason: if parts.len() > 3 {
+                    Some(parts[3..].join(" "))
+                } else {
+                    None
+                },
+            })
+        }
+        other => Err(format!(
+            "❓ 未识别的模拟子命令 <code>{}</code>\n可用: <code>/sim</code> <code>balance</code> <code>positions</code> <code>stats</code> <code>buy</code> <code>sell</code>",
+            escape_html(other)
+        )),
+    }
+}
+
+fn parse_daban_sim_args(args: &str) -> std::result::Result<DabanSimAction, String> {
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    if parts.is_empty() {
+        return Ok(DabanSimAction::Overview);
+    }
+
+    match parts[0].to_ascii_lowercase().as_str() {
+        "balance" => Ok(DabanSimAction::Balance),
+        "positions" | "portfolio" => Ok(DabanSimAction::Positions),
+        "stats" => Ok(DabanSimAction::Stats),
+        "buy" => {
+            if parts.len() < 4 {
+                return Err(
+                    "用法: <code>/daban sim buy &lt;代码&gt; &lt;价格&gt; &lt;股数&gt; [评分] [名称]</code>"
+                        .to_string(),
+                );
+            }
+            let price = parts[2]
+                .parse::<f64>()
+                .map_err(|_| "❌ 买入价格格式错误".to_string())?;
+            let shares = parts[3]
+                .parse::<i32>()
+                .map_err(|_| "❌ 买入股数格式错误".to_string())?;
+            if price <= 0.0 || shares <= 0 {
+                return Err("❌ 买入价格和股数必须为正数".to_string());
+            }
+            let mut score = None;
+            let mut name_start = 4usize;
+            if parts.len() > 4 {
+                if let Ok(parsed) = parts[4].parse::<f64>() {
+                    score = Some(parsed);
+                    name_start = 5;
+                }
+            }
+            Ok(DabanSimAction::Buy {
+                code: parts[1].to_string(),
+                price,
+                shares,
+                score,
+                name: if parts.len() > name_start {
+                    Some(parts[name_start..].join(" "))
+                } else {
+                    None
+                },
+            })
+        }
+        "sell" => {
+            if parts.len() < 3 {
+                return Err(
+                    "用法: <code>/daban sim sell &lt;持仓ID&gt; &lt;卖出价&gt; [原因]</code>"
+                        .to_string(),
+                );
+            }
+            let position_id = parts[1]
+                .parse::<i64>()
+                .map_err(|_| "❌ 持仓ID格式错误".to_string())?;
+            let price = parts[2]
+                .parse::<f64>()
+                .map_err(|_| "❌ 卖出价格格式错误".to_string())?;
+            if position_id <= 0 || price <= 0.0 {
+                return Err("❌ 持仓ID和卖出价格必须为正数".to_string());
+            }
+            Ok(DabanSimAction::Sell {
+                position_id,
+                price,
+                reason: if parts.len() > 3 {
+                    Some(parts[3..].join(" "))
+                } else {
+                    None
+                },
+            })
+        }
+        other => Err(format!(
+            "❓ 未识别的打板模拟子命令 <code>{}</code>\n可用: <code>/daban sim</code> <code>balance</code> <code>positions</code> <code>stats</code> <code>buy</code> <code>sell</code>",
+            escape_html(other)
+        )),
+    }
 }
 
 fn format_horizon_metric(horizon: &HorizonPerformance) -> String {
@@ -1087,6 +1273,71 @@ async fn format_daban_stats(state: Arc<AppState>) -> crate::error::Result<String
         stats.open_positions,
         stats.closed_trades,
         stats.avg_closed_pnl_pct,
+        stats.realized_pnl
+    ))
+}
+
+async fn format_sim_portfolio(state: Arc<AppState>) -> crate::error::Result<String> {
+    let svc = TradingSimService::new(state.clone());
+    let balance = svc.get_balance("general").await?;
+    let positions = svc.list_open_positions("general").await?;
+
+    if positions.is_empty() {
+        return Ok(format!(
+            "🧪 <b>普通模拟持仓</b>\n\n📭 当前无持仓\n💵 可用资金: {:.2}",
+            balance
+        ));
+    }
+
+    let mut lines = vec![
+        "🧪 <b>普通模拟持仓</b>".to_string(),
+        "━━━━━━━━━━━━━━━━━━━━━".to_string(),
+    ];
+    for p in positions.iter().take(20) {
+        lines.push(format!(
+            "#{} <b>{}</b> ({})\n   成本: {:.2}  股数: {}\n   浮盈亏: {:+.2}%",
+            p.id,
+            escape_html(p.name.as_deref().unwrap_or(&p.code)),
+            escape_html(&p.code),
+            p.entry_price,
+            p.shares,
+            p.unrealized_pnl_pct.unwrap_or(0.0)
+        ));
+    }
+    lines.push(format!("💵 可用资金: {:.2}", balance));
+    Ok(lines.join("\n"))
+}
+
+async fn format_sim_stats(state: Arc<AppState>) -> crate::error::Result<String> {
+    let stats = TradingSimService::new(state).stats("general").await?;
+    Ok(format!(
+        "📊 <b>普通模拟统计</b>\n━━━━━━━━━━━━━━━━━━━━━\n💵 余额: {:.2}\n📦 持仓数: {}\n🧾 已平仓: {}\n📈 平均收益: {:+.2}%\n💰 已实现盈亏: {:+.2}",
+        stats.balance,
+        stats.open_positions,
+        stats.closed_trades,
+        stats.avg_closed_pnl_pct,
+        stats.realized_pnl
+    ))
+}
+
+async fn format_sim_overview(state: Arc<AppState>) -> crate::error::Result<String> {
+    let stats = TradingSimService::new(state).stats("general").await?;
+    Ok(format!(
+        "🧪 <b>普通模拟交易</b>\n━━━━━━━━━━━━━━━━━━━━━\n💵 余额: {:.2}\n📦 持仓数: {}\n🧾 已平仓: {}\n💰 已实现盈亏: {:+.2}\n\n命令:\n• <code>/sim balance</code>\n• <code>/sim positions</code>\n• <code>/sim stats</code>\n• <code>/sim buy &lt;代码&gt; &lt;价格&gt; &lt;股数&gt; [名称]</code>\n• <code>/sim sell &lt;持仓ID&gt; &lt;卖出价&gt; [原因]</code>",
+        stats.balance,
+        stats.open_positions,
+        stats.closed_trades,
+        stats.realized_pnl
+    ))
+}
+
+async fn format_daban_sim_overview(state: Arc<AppState>) -> crate::error::Result<String> {
+    let stats = DabanSimService::new(state).stats().await?;
+    Ok(format!(
+        "🧱 <b>打板模拟交易</b>\n━━━━━━━━━━━━━━━━━━━━━\n💵 余额: {:.2}\n📦 持仓数: {}\n🧾 已平仓: {}\n💰 已实现盈亏: {:+.2}\n\n命令:\n• <code>/daban sim balance</code>\n• <code>/daban sim positions</code>\n• <code>/daban sim stats</code>\n• <code>/daban sim buy &lt;代码&gt; &lt;价格&gt; &lt;股数&gt; [评分] [名称]</code>\n• <code>/daban sim sell &lt;持仓ID&gt; &lt;卖出价&gt; [原因]</code>",
+        stats.balance,
+        stats.open_positions,
+        stats.closed_trades,
         stats.realized_pnl
     ))
 }
@@ -1626,7 +1877,10 @@ fn main_menu_markup() -> Value {
             cb_button("🏭 板块/AI", "menu:sector"),
         ],
         vec![
+            cb_button("🧪 模拟交易", "menu:sim"),
             cb_button("🛠 工具", "menu:tools"),
+        ],
+        vec![
             cb_button("❓ 帮助", "cmd:help"),
         ],
     ])
@@ -1701,7 +1955,50 @@ fn daban_menu_markup() -> Value {
             cb_button("📈 打板统计", "cmd:daban_stats"),
             cb_button("⚡ 打板扫描", "cmd:daban_scan"),
         ],
+        vec![cb_button("🧪 打板模拟", "menu:daban_sim")],
         vec![cb_button("◀️ 返回主菜单", "menu:main")],
+    ])
+}
+
+fn sim_menu_markup() -> Value {
+    inline_keyboard(vec![
+        vec![
+            cb_button("🧪 模拟总览", "cmd:sim"),
+            cb_button("💵 余额", "cmd:sim_balance"),
+        ],
+        vec![
+            cb_button("📦 持仓", "cmd:sim_positions"),
+            cb_button("📊 统计", "cmd:sim_stats"),
+        ],
+        vec![
+            cb_button("➕ 买入", "prompt:sim_buy"),
+            cb_button("➖ 卖出", "prompt:sim_sell"),
+        ],
+        vec![
+            cb_button("🧱 打板模拟", "menu:daban_sim"),
+            cb_button("◀️ 返回主菜单", "menu:main"),
+        ],
+    ])
+}
+
+fn daban_sim_menu_markup() -> Value {
+    inline_keyboard(vec![
+        vec![
+            cb_button("🧱 模拟总览", "cmd:daban_sim"),
+            cb_button("💵 余额", "cmd:daban_sim_balance"),
+        ],
+        vec![
+            cb_button("📦 持仓", "cmd:daban_sim_positions"),
+            cb_button("📊 统计", "cmd:daban_sim_stats"),
+        ],
+        vec![
+            cb_button("➕ 买入", "prompt:daban_sim_buy"),
+            cb_button("➖ 卖出", "prompt:daban_sim_sell"),
+        ],
+        vec![
+            cb_button("🧪 普通模拟", "menu:sim"),
+            cb_button("◀️ 返回打板菜单", "menu:daban"),
+        ],
     ])
 }
 
@@ -1761,9 +2058,17 @@ fn menu_content(menu: &str) -> (String, Value) {
             "🛠 <b>工具菜单</b>\n选择一个操作".to_string(),
             tools_menu_markup(),
         ),
+        "sim" => (
+            "🧪 <b>模拟交易菜单</b>\n选择一个操作".to_string(),
+            sim_menu_markup(),
+        ),
         "daban" => (
             "🧱 <b>打板菜单</b>\n选择一个操作".to_string(),
             daban_menu_markup(),
+        ),
+        "daban_sim" => (
+            "🧱 <b>打板模拟菜单</b>\n选择一个操作".to_string(),
+            daban_sim_menu_markup(),
         ),
         "scan" => (
             "🔍 <b>信号扫描 - 分类菜单</b>\n━━━━━━━━━━━━━━━━━━━━━\n<i>先选分类，再选具体信号；也可直接查看预启动池</i>"
@@ -1891,7 +2196,9 @@ async fn handle_telegram_callback(
         "menu:limitup" => show_menu(&state, chat_id, Some(message_id), "limitup").await?,
         "menu:sector" => show_menu(&state, chat_id, Some(message_id), "sector").await?,
         "menu:tools" => show_menu(&state, chat_id, Some(message_id), "tools").await?,
+        "menu:sim" => show_menu(&state, chat_id, Some(message_id), "sim").await?,
         "menu:daban" => show_menu(&state, chat_id, Some(message_id), "daban").await?,
+        "menu:daban_sim" => show_menu(&state, chat_id, Some(message_id), "daban_sim").await?,
         "cmd:help" => send_help_with_menu(&state, chat_id).await?,
         "cmd:mywatch" => {
             handle_telegram_command(
@@ -1930,6 +2237,46 @@ async fn handle_telegram_callback(
                 user_id,
                 "daban".to_string(),
                 "".to_string(),
+            )
+            .await?
+        }
+        "cmd:sim" => {
+            handle_telegram_command(
+                state.clone(),
+                chat_id,
+                user_id,
+                "sim".to_string(),
+                "".to_string(),
+            )
+            .await?
+        }
+        "cmd:sim_balance" => {
+            handle_telegram_command(
+                state.clone(),
+                chat_id,
+                user_id,
+                "sim".to_string(),
+                "balance".to_string(),
+            )
+            .await?
+        }
+        "cmd:sim_positions" => {
+            handle_telegram_command(
+                state.clone(),
+                chat_id,
+                user_id,
+                "sim".to_string(),
+                "positions".to_string(),
+            )
+            .await?
+        }
+        "cmd:sim_stats" => {
+            handle_telegram_command(
+                state.clone(),
+                chat_id,
+                user_id,
+                "sim".to_string(),
+                "stats".to_string(),
             )
             .await?
         }
@@ -2000,6 +2347,46 @@ async fn handle_telegram_callback(
                 user_id,
                 "daban".to_string(),
                 "stats".to_string(),
+            )
+            .await?
+        }
+        "cmd:daban_sim" => {
+            handle_telegram_command(
+                state.clone(),
+                chat_id,
+                user_id,
+                "daban".to_string(),
+                "sim".to_string(),
+            )
+            .await?
+        }
+        "cmd:daban_sim_balance" => {
+            handle_telegram_command(
+                state.clone(),
+                chat_id,
+                user_id,
+                "daban".to_string(),
+                "sim balance".to_string(),
+            )
+            .await?
+        }
+        "cmd:daban_sim_positions" => {
+            handle_telegram_command(
+                state.clone(),
+                chat_id,
+                user_id,
+                "daban".to_string(),
+                "sim positions".to_string(),
+            )
+            .await?
+        }
+        "cmd:daban_sim_stats" => {
+            handle_telegram_command(
+                state.clone(),
+                chat_id,
+                user_id,
+                "daban".to_string(),
+                "sim stats".to_string(),
             )
             .await?
         }
@@ -2128,6 +2515,38 @@ async fn handle_telegram_callback(
         }
         "prompt:port_del" => {
             tg_send(&state, chat_id, "用法: <code>/port del &lt;代码&gt;</code>").await?
+        }
+        "prompt:sim_buy" => {
+            tg_send(
+                &state,
+                chat_id,
+                "用法: <code>/sim buy &lt;代码&gt; &lt;价格&gt; &lt;股数&gt; [名称]</code>",
+            )
+            .await?
+        }
+        "prompt:sim_sell" => {
+            tg_send(
+                &state,
+                chat_id,
+                "用法: <code>/sim sell &lt;持仓ID&gt; &lt;卖出价&gt; [原因]</code>",
+            )
+            .await?
+        }
+        "prompt:daban_sim_buy" => {
+            tg_send(
+                &state,
+                chat_id,
+                "用法: <code>/daban sim buy &lt;代码&gt; &lt;价格&gt; &lt;股数&gt; [评分] [名称]</code>",
+            )
+            .await?
+        }
+        "prompt:daban_sim_sell" => {
+            tg_send(
+                &state,
+                chat_id,
+                "用法: <code>/daban sim sell &lt;持仓ID&gt; &lt;卖出价&gt; [原因]</code>",
+            )
+            .await?
         }
         "prompt:history" => tg_send(&state, chat_id, "用法: <code>/history 600519</code>").await?,
         "prompt:chart" => tg_send(&state, chat_id, "用法: <code>/chart 600519</code>").await?,
@@ -2330,10 +2749,80 @@ async fn handle_telegram_command(
                 }
             }
         }
+        "sim" => match parse_manual_sim_args(&args) {
+            Ok(ManualSimAction::Overview) => {
+                tg_send(&state, chat_id, &format_sim_overview(state.clone()).await?).await?
+            }
+            Ok(ManualSimAction::Balance) => {
+                let balance = TradingSimService::new(state.clone()).get_balance("general").await?;
+                tg_send(
+                    &state,
+                    chat_id,
+                    &format!("💵 <b>普通模拟余额</b>\n\n当前可用资金: {:.2}", balance),
+                )
+                .await?
+            }
+            Ok(ManualSimAction::Positions) => {
+                tg_send(&state, chat_id, &format_sim_portfolio(state.clone()).await?).await?
+            }
+            Ok(ManualSimAction::Stats) => {
+                tg_send(&state, chat_id, &format_sim_stats(state.clone()).await?).await?
+            }
+            Ok(ManualSimAction::Buy {
+                code,
+                price,
+                shares,
+                name,
+            }) => {
+                let trade = TradingSimService::new(state.clone())
+                    .buy("general", &code, name, price, shares)
+                    .await?;
+                tg_send(
+                    &state,
+                    chat_id,
+                    &format!(
+                        "✅ <b>普通模拟买入成功</b>\n\n持仓ID: {}\n股票: {}\n价格: {:.2}\n股数: {}",
+                        trade.position_id,
+                        escape_html(&trade.code),
+                        trade.entry_price,
+                        trade.shares
+                    ),
+                )
+                .await?;
+                tg_send(&state, chat_id, &format_sim_portfolio(state.clone()).await?).await?;
+            }
+            Ok(ManualSimAction::Sell {
+                position_id,
+                price,
+                reason,
+            }) => {
+                let trade = TradingSimService::new(state.clone())
+                    .sell("general", position_id, price, reason)
+                    .await?;
+                tg_send(
+                    &state,
+                    chat_id,
+                    &format!(
+                        "✅ <b>普通模拟卖出成功</b>\n\n持仓ID: {}\n股票: {}\n卖出价: {:.2}\n收益: {:+.2}%",
+                        trade.position_id,
+                        escape_html(&trade.code),
+                        trade.exit_price.unwrap_or(price),
+                        trade.pnl_pct.unwrap_or(0.0)
+                    ),
+                )
+                .await?;
+                tg_send(&state, chat_id, &format_sim_stats(state.clone()).await?).await?;
+            }
+            Err(msg) => tg_send(&state, chat_id, &msg).await?,
+        },
         "daban" => {
-            let sub = args.trim().to_ascii_lowercase();
+            let parts: Vec<&str> = args.split_whitespace().collect();
+            let sub = parts
+                .first()
+                .map(|s| s.to_ascii_lowercase())
+                .unwrap_or_default();
             match sub.as_str() {
-                "portfolio" => {
+                "portfolio" if parts.len() == 1 => {
                     tg_send(
                         &state,
                         chat_id,
@@ -2341,10 +2830,10 @@ async fn handle_telegram_command(
                     )
                     .await?
                 }
-                "stats" => {
+                "stats" if parts.len() == 1 => {
                     tg_send(&state, chat_id, &format_daban_stats(state.clone()).await?).await?
                 }
-                "scan" => {
+                "scan" if parts.len() == 1 => {
                     tg_send(
                         &state,
                         chat_id,
@@ -2357,6 +2846,93 @@ async fn handle_telegram_command(
                     match DabanService::format_report_markup(&report) {
                         Some(markup) => tg_send_with_markup(&state, chat_id, &text, markup).await?,
                         None => tg_send(&state, chat_id, &text).await?,
+                    }
+                }
+                "sim" => {
+                    let sim_args = if parts.len() > 1 {
+                        parts[1..].join(" ")
+                    } else {
+                        String::new()
+                    };
+                    match parse_daban_sim_args(&sim_args) {
+                        Ok(DabanSimAction::Overview) => {
+                            tg_send(&state, chat_id, &format_daban_sim_overview(state.clone()).await?)
+                                .await?
+                        }
+                        Ok(DabanSimAction::Balance) => {
+                            let balance = DabanSimService::new(state.clone()).get_balance().await?;
+                            tg_send(
+                                &state,
+                                chat_id,
+                                &format!("💵 <b>打板模拟余额</b>\n\n当前可用资金: {:.2}", balance),
+                            )
+                            .await?
+                        }
+                        Ok(DabanSimAction::Positions) => {
+                            tg_send(
+                                &state,
+                                chat_id,
+                                &format_daban_portfolio(state.clone()).await?,
+                            )
+                            .await?
+                        }
+                        Ok(DabanSimAction::Stats) => {
+                            tg_send(&state, chat_id, &format_daban_stats(state.clone()).await?)
+                                .await?
+                        }
+                        Ok(DabanSimAction::Buy {
+                            code,
+                            price,
+                            shares,
+                            score,
+                            name,
+                        }) => {
+                            let trade = DabanSimService::new(state.clone())
+                                .buy(&code, name, price, shares, score)
+                                .await?;
+                            tg_send(
+                                &state,
+                                chat_id,
+                                &format!(
+                                    "✅ <b>打板模拟买入成功</b>\n\n持仓ID: {}\n股票: {}\n价格: {:.2}\n股数: {}",
+                                    trade.position_id,
+                                    escape_html(&trade.code),
+                                    trade.entry_price,
+                                    trade.shares
+                                ),
+                            )
+                            .await?;
+                            tg_send(
+                                &state,
+                                chat_id,
+                                &format_daban_portfolio(state.clone()).await?,
+                            )
+                            .await?;
+                        }
+                        Ok(DabanSimAction::Sell {
+                            position_id,
+                            price,
+                            reason,
+                        }) => {
+                            let trade = DabanSimService::new(state.clone())
+                                .sell(position_id, price, reason)
+                                .await?;
+                            tg_send(
+                                &state,
+                                chat_id,
+                                &format!(
+                                    "✅ <b>打板模拟卖出成功</b>\n\n持仓ID: {}\n股票: {}\n卖出价: {:.2}\n收益: {:+.2}%",
+                                    trade.position_id,
+                                    escape_html(&trade.code),
+                                    trade.exit_price.unwrap_or(price),
+                                    trade.pnl_pct.unwrap_or(0.0)
+                                ),
+                            )
+                            .await?;
+                            tg_send(&state, chat_id, &format_daban_stats(state.clone()).await?)
+                                .await?;
+                        }
+                        Err(msg) => tg_send(&state, chat_id, &msg).await?,
                     }
                 }
                 _ => {
@@ -3790,6 +4366,13 @@ mod tests {
     }
 
     #[test]
+    fn telegram_help_text_mentions_manual_sim_commands() {
+        let text = telegram_help_text();
+        assert!(text.contains("/sim"));
+        assert!(text.contains("/daban sim"));
+    }
+
+    #[test]
     fn parse_scan_stats_args_supports_signal_and_days() {
         let (signal_id, days) = parse_scan_stats_args("startup 120");
         assert_eq!(signal_id.as_deref(), Some("startup"));
@@ -3811,6 +4394,121 @@ mod tests {
         assert!(limit_text.contains("涨停"));
         assert!(scan_text.contains("预启动池"));
         assert!(scan_markup.to_string().contains("cmd:prestart"));
+    }
+
+    #[test]
+    fn menu_content_exposes_manual_sim_entries() {
+        let (_, main_markup) = menu_content("main");
+        let (_, daban_markup) = menu_content("daban");
+        let (sim_text, sim_markup) = menu_content("sim");
+        let (daban_sim_text, daban_sim_markup) = menu_content("daban_sim");
+
+        assert!(main_markup.to_string().contains("menu:sim"));
+        assert!(daban_markup.to_string().contains("menu:daban_sim"));
+        assert!(sim_text.contains("模拟"));
+        assert!(sim_markup.to_string().contains("cmd:sim_balance"));
+        assert!(sim_markup.to_string().contains("prompt:sim_buy"));
+        assert!(daban_sim_text.contains("打板"));
+        assert!(daban_sim_markup.to_string().contains("cmd:daban_sim_balance"));
+        assert!(daban_sim_markup.to_string().contains("prompt:daban_sim_buy"));
+    }
+
+    #[test]
+    fn parse_manual_sim_args_supports_views_and_trades() {
+        assert!(matches!(
+            parse_manual_sim_args("").unwrap(),
+            ManualSimAction::Overview
+        ));
+        assert!(matches!(
+            parse_manual_sim_args("balance").unwrap(),
+            ManualSimAction::Balance
+        ));
+        assert!(matches!(
+            parse_manual_sim_args("positions").unwrap(),
+            ManualSimAction::Positions
+        ));
+        assert!(matches!(
+            parse_manual_sim_args("stats").unwrap(),
+            ManualSimAction::Stats
+        ));
+
+        match parse_manual_sim_args("buy 600519 1500 100 贵州茅台").unwrap() {
+            ManualSimAction::Buy {
+                code,
+                price,
+                shares,
+                name,
+            } => {
+                assert_eq!(code, "600519");
+                assert_eq!(price, 1500.0);
+                assert_eq!(shares, 100);
+                assert_eq!(name.as_deref(), Some("贵州茅台"));
+            }
+            _ => panic!("expected buy action"),
+        }
+
+        match parse_manual_sim_args("sell 12 1510 止盈离场").unwrap() {
+            ManualSimAction::Sell {
+                position_id,
+                price,
+                reason,
+            } => {
+                assert_eq!(position_id, 12);
+                assert_eq!(price, 1510.0);
+                assert_eq!(reason.as_deref(), Some("止盈离场"));
+            }
+            _ => panic!("expected sell action"),
+        }
+    }
+
+    #[test]
+    fn parse_daban_sim_args_supports_views_and_trades() {
+        assert!(matches!(
+            parse_daban_sim_args("").unwrap(),
+            DabanSimAction::Overview
+        ));
+        assert!(matches!(
+            parse_daban_sim_args("balance").unwrap(),
+            DabanSimAction::Balance
+        ));
+        assert!(matches!(
+            parse_daban_sim_args("positions").unwrap(),
+            DabanSimAction::Positions
+        ));
+        assert!(matches!(
+            parse_daban_sim_args("stats").unwrap(),
+            DabanSimAction::Stats
+        ));
+
+        match parse_daban_sim_args("buy 603000 9.80 1000 87.5 样本股份").unwrap() {
+            DabanSimAction::Buy {
+                code,
+                price,
+                shares,
+                score,
+                name,
+            } => {
+                assert_eq!(code, "603000");
+                assert_eq!(price, 9.80);
+                assert_eq!(shares, 1000);
+                assert_eq!(score, Some(87.5));
+                assert_eq!(name.as_deref(), Some("样本股份"));
+            }
+            _ => panic!("expected daban buy action"),
+        }
+
+        match parse_daban_sim_args("sell 8 10.21 炸板止盈").unwrap() {
+            DabanSimAction::Sell {
+                position_id,
+                price,
+                reason,
+            } => {
+                assert_eq!(position_id, 8);
+                assert_eq!(price, 10.21);
+                assert_eq!(reason.as_deref(), Some("炸板止盈"));
+            }
+            _ => panic!("expected daban sell action"),
+        }
     }
 
     #[test]

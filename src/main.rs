@@ -80,6 +80,7 @@ async fn main() -> Result<()> {
         ("scan_stats", "信号统计"),
         ("autosim", "自动交易状态"),
         ("autosim_report", "自动交易日报"),
+        ("sim", "普通模拟交易"),
         ("daban", "打板评分"),
         ("limitup", "涨停追踪概览"),
         ("strong", "近期强势股"),
