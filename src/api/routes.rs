@@ -19,7 +19,7 @@ use crate::services::daban::DabanService;
 use crate::services::daban_sim::DabanSimService;
 use crate::services::limit_up::LimitUpService;
 use crate::services::portfolio::PortfolioService;
-use crate::services::prestart::{PrestartCandidate, PrestartService};
+use crate::services::prestart::{PrestartCandidate, PrestartService, is_prestart_signal};
 use crate::services::scanner::{ScannerService, SignalHit};
 use crate::services::scanner_stats::{
     HorizonPerformance, ScannerStatsService, SignalPerformanceSummary,
@@ -826,9 +826,17 @@ fn format_signal_auto_status(accounts: &[StrategyAccountSnapshot]) -> String {
         return "🤖 <b>自动交易状态</b>\n\n📭 暂无策略账户".to_string();
     }
 
+    let mut standard_accounts: Vec<&StrategyAccountSnapshot> = accounts
+        .iter()
+        .filter(|account| {
+            account.signal_id != "auto_daban"
+                && account.signal_id != "auto_strong"
+                && !is_prestart_signal(&account.signal_id)
+        })
+        .collect();
     let mut prestart_accounts: Vec<&StrategyAccountSnapshot> = accounts
         .iter()
-        .filter(|account| account.signal_id != "auto_daban" && account.signal_id != "auto_strong")
+        .filter(|account| is_prestart_signal(&account.signal_id))
         .collect();
     let mut daban_accounts: Vec<&StrategyAccountSnapshot> = accounts
         .iter()
@@ -847,6 +855,7 @@ fn format_signal_auto_status(accounts: &[StrategyAccountSnapshot]) -> String {
                 .then_with(|| a.signal_id.cmp(&b.signal_id))
         });
     };
+    sort_group(&mut standard_accounts);
     sort_group(&mut prestart_accounts);
     sort_group(&mut daban_accounts);
     sort_group(&mut strong_accounts);
@@ -856,6 +865,7 @@ fn format_signal_auto_status(accounts: &[StrategyAccountSnapshot]) -> String {
         "━━━━━━━━━━━━━━━━━━━━━".to_string(),
     ];
 
+    append_signal_auto_group(&mut lines, "📈 普通信号", &standard_accounts);
     append_signal_auto_group(&mut lines, "🌱 预启动", &prestart_accounts);
     append_signal_auto_group(&mut lines, "🧱 自动打板", &daban_accounts);
     append_signal_auto_group(&mut lines, "💪 自动强势股", &strong_accounts);
@@ -4515,6 +4525,24 @@ mod tests {
     fn signal_auto_status_groups_prestart_daban_and_strong_accounts() {
         let text = format_signal_auto_status(&[
             StrategyAccountSnapshot {
+                signal_id: "startup".to_string(),
+                signal_name: "底部快速启动".to_string(),
+                cash_balance: 100_000.0,
+                initial_capital: 100_000.0,
+                open_positions: 0,
+                pending_candidates: 1,
+                equity: 100_500.0,
+                pnl_pct: 0.5,
+                realized_pnl: 500.0,
+                unrealized_pnl: 0.0,
+                closed_trades: 1,
+                winning_trades: 1,
+                weekly_pnl: 300.0,
+                max_drawdown_pct: 2.0,
+                win_streak: 1,
+                loss_streak: 0,
+            },
+            StrategyAccountSnapshot {
                 signal_id: "ma_bullish".to_string(),
                 signal_name: "均线多头".to_string(),
                 cash_balance: 100_000.0,
@@ -4570,6 +4598,7 @@ mod tests {
             },
         ]);
 
+        assert!(text.contains("📈 普通信号"));
         assert!(text.contains("🌱 预启动"));
         assert!(text.contains("🧱 自动打板"));
         assert!(text.contains("💪 自动强势股"));

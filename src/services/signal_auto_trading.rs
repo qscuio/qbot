@@ -197,32 +197,39 @@ impl SignalAutoTradingService {
                 continue;
             }
 
-            if !is_prestart_signal(&account.signal_id) {
+            if is_prestart_signal(&account.signal_id) {
+                if let Some(best) = self
+                    .pick_best_prestart_candidate(
+                        &account.signal_id,
+                        &prestart_candidates,
+                        PrestartTier::A,
+                    )
+                    .await?
+                {
+                    self.save_candidate(&account, signal_date, &best).await?;
+                    created += 1;
+                    continue;
+                }
+
+                if let Some(observe) = self
+                    .pick_best_prestart_candidate(
+                        &account.signal_id,
+                        &prestart_candidates,
+                        PrestartTier::B,
+                    )
+                    .await?
+                {
+                    self.record_watch_only(&account, &observe).await?;
+                }
                 continue;
             }
 
             if let Some(best) = self
-                .pick_best_prestart_candidate(
-                    &account.signal_id,
-                    &prestart_candidates,
-                    PrestartTier::A,
-                )
+                .pick_best_signal_candidate(&account.signal_id, results)
                 .await?
             {
                 self.save_candidate(&account, signal_date, &best).await?;
                 created += 1;
-                continue;
-            }
-
-            if let Some(observe) = self
-                .pick_best_prestart_candidate(
-                    &account.signal_id,
-                    &prestart_candidates,
-                    PrestartTier::B,
-                )
-                .await?
-            {
-                self.record_watch_only(&account, &observe).await?;
             }
         }
 
@@ -936,6 +943,33 @@ impl SignalAutoTradingService {
         Ok(best)
     }
 
+    async fn pick_best_signal_candidate(
+        &self,
+        signal_id: &str,
+        results: &HashMap<String, Vec<SignalHit>>,
+    ) -> Result<Option<CandidateScore>> {
+        let Some(hits) = results.get(signal_id) else {
+            return Ok(None);
+        };
+
+        let mut best: Option<CandidateScore> = None;
+        for hit in hits {
+            let bars = match postgres::get_stock_history(&self.state.db, &hit.code, 90).await {
+                Ok(v) if v.len() >= 25 => v,
+                _ => continue,
+            };
+            let Some(candidate) = build_signal_candidate(signal_id, hit, &bars) else {
+                continue;
+            };
+            match &best {
+                Some(current) if current.score >= candidate.score => {}
+                _ => best = Some(candidate),
+            }
+        }
+
+        Ok(best)
+    }
+
     async fn pick_best_daban_candidate(
         &self,
         target_date: NaiveDate,
@@ -1430,6 +1464,25 @@ fn score_candidate(signal_id: &str, bars: &[Candle]) -> (f64, Vec<String>) {
     (round2(score.max(0.0)), reasons)
 }
 
+fn build_signal_candidate(signal_id: &str, hit: &SignalHit, bars: &[Candle]) -> Option<CandidateScore> {
+    if bars.len() < 25 {
+        return None;
+    }
+
+    let (score, reasons) = score_candidate(signal_id, bars);
+    let selection_reason = reasons.join("；");
+    Some(CandidateScore {
+        code: hit.code.clone(),
+        name: hit.name.clone(),
+        score,
+        selection_reason,
+        metadata: serde_json::json!({
+            "signal_hit": hit,
+            "score_reasons": reasons,
+        }),
+    })
+}
+
 fn compute_max_drawdown_pct(
     initial_capital: f64,
     realized_pnl: f64,
@@ -1518,6 +1571,12 @@ fn format_signal_auto_daily_report(
 
     append_daily_account_group(
         &mut lines,
+        "📈 普通信号",
+        accounts,
+        signal_auto_group_key_standard,
+    );
+    append_daily_account_group(
+        &mut lines,
         "🌱 预启动",
         accounts,
         signal_auto_group_key_prestart,
@@ -1538,6 +1597,12 @@ fn format_signal_auto_daily_report(
     if !events.is_empty() {
         lines.push(String::new());
         lines.push("<b>今日动作</b>".to_string());
+        append_daily_event_group(
+            &mut lines,
+            "📈 普通信号",
+            events,
+            signal_auto_group_key_standard,
+        );
         append_daily_event_group(
             &mut lines,
             "🌱 预启动",
@@ -1648,8 +1713,12 @@ fn append_daily_event_group(
     }
 }
 
+fn signal_auto_group_key_standard(signal_id: &str) -> bool {
+    signal_id != AUTO_DABAN_ID && signal_id != AUTO_STRONG_ID && !is_prestart_signal(signal_id)
+}
+
 fn signal_auto_group_key_prestart(signal_id: &str) -> bool {
-    signal_id != AUTO_DABAN_ID && signal_id != AUTO_STRONG_ID
+    is_prestart_signal(signal_id)
 }
 
 fn signal_auto_group_key_daban(signal_id: &str) -> bool {
@@ -2042,6 +2111,34 @@ mod tests {
     }
 
     #[test]
+    fn build_signal_candidate_wraps_scan_hit_for_standard_strategy() {
+        let mut bars = Vec::new();
+        for _ in 0..30 {
+            bars.push(candle(10.0, 10.3, 9.9, 10.1, 1_000_000));
+        }
+        bars.pop();
+        bars.push(candle(10.0, 10.9, 9.95, 10.85, 3_200_000));
+
+        let hit = SignalHit {
+            code: "600010.SH".to_string(),
+            name: "包钢股份".to_string(),
+            signal_id: "startup".to_string(),
+            signal_name: "底部快速启动".to_string(),
+            icon: "🚀".to_string(),
+            metadata: serde_json::json!({"source": "unit-test"}),
+        };
+
+        let candidate =
+            build_signal_candidate("startup", &hit, &bars).expect("expected signal candidate");
+
+        assert_eq!(candidate.code, "600010.SH");
+        assert_eq!(candidate.name, "包钢股份");
+        assert!(candidate.score > 60.0);
+        assert!(!candidate.selection_reason.is_empty());
+        assert!(candidate.metadata.to_string().contains("unit-test"));
+    }
+
+    #[test]
     fn daban_candidate_score_rewards_tradeable_board_strength() {
         let mut bars = Vec::new();
         for _ in 0..30 {
@@ -2093,6 +2190,24 @@ mod tests {
         let report = format_signal_auto_daily_report(
             NaiveDate::from_ymd_opt(2026, 3, 9).unwrap(),
             &[
+                StrategyAccountSnapshot {
+                    signal_id: "startup".to_string(),
+                    signal_name: "底部快速启动".to_string(),
+                    cash_balance: 100_000.0,
+                    initial_capital: 100_000.0,
+                    open_positions: 0,
+                    pending_candidates: 1,
+                    equity: 100_000.0,
+                    pnl_pct: 0.0,
+                    realized_pnl: 0.0,
+                    unrealized_pnl: 0.0,
+                    closed_trades: 0,
+                    winning_trades: 0,
+                    weekly_pnl: 0.0,
+                    max_drawdown_pct: 1.0,
+                    win_streak: 0,
+                    loss_streak: 0,
+                },
                 StrategyAccountSnapshot {
                     signal_id: "ma_bullish".to_string(),
                     signal_name: "均线多头".to_string(),
@@ -2150,6 +2265,12 @@ mod tests {
             ],
             &[
                 SignalAutoEventLine {
+                    signal_id: "startup".to_string(),
+                    signal_name: "底部快速启动".to_string(),
+                    title: "候选入池".to_string(),
+                    detail: "候选 Delta".to_string(),
+                },
+                SignalAutoEventLine {
                     signal_id: "ma_bullish".to_string(),
                     signal_name: "均线多头".to_string(),
                     title: "B档观察".to_string(),
@@ -2170,6 +2291,7 @@ mod tests {
             ],
         );
 
+        assert!(report.contains("📈 普通信号"));
         assert!(report.contains("🌱 预启动"));
         assert!(report.contains("🧱 自动打板"));
         assert!(report.contains("💪 自动强势股"));
@@ -2178,6 +2300,7 @@ mod tests {
         assert!(report.contains("已实现 +800 | 未实现 +200 | 胜率 50.0% (1/2)"));
         assert!(report.contains("本周收益 +350"));
         assert!(report.contains("回撤 3.80% | 连胜 1 | 连亏 0"));
+        assert!(report.contains("底部快速启动 候选入池"));
         assert!(report.contains("均线多头 B档观察"));
         assert!(report.contains("自动打板 候选入池"));
         assert!(report.contains("自动强势股 候选入池"));
