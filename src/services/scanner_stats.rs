@@ -3,6 +3,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::error::Result;
+use crate::services::scan_ranker::{
+    POOL_LONG_A_ID, POOL_LONG_B_ID, POOL_MID_A_ID, POOL_MID_B_ID, POOL_SHORT_A_ID, POOL_SHORT_B_ID,
+};
 use crate::state::AppState;
 use crate::storage::postgres;
 
@@ -88,11 +91,25 @@ pub fn summarize_signal_performance(
         .collect();
 
     summaries.sort_by(|a, b| {
-        b.total_samples
-            .cmp(&a.total_samples)
+        signal_summary_sort_rank(&a.signal_id)
+            .cmp(&signal_summary_sort_rank(&b.signal_id))
+            .then_with(|| b.total_samples.cmp(&a.total_samples))
             .then_with(|| a.signal_id.cmp(&b.signal_id))
     });
     summaries
+}
+
+fn signal_summary_sort_rank(signal_id: &str) -> i32 {
+    match signal_id {
+        POOL_SHORT_A_ID => 0,
+        POOL_SHORT_B_ID => 1,
+        POOL_MID_A_ID => 2,
+        POOL_MID_B_ID => 3,
+        POOL_LONG_A_ID => 4,
+        POOL_LONG_B_ID => 5,
+        "multi_signal" => 6,
+        _ => 20,
+    }
 }
 
 fn summarize_horizon(days: usize, rows: &[&SignalOutcomeSample]) -> HorizonPerformance {
@@ -208,5 +225,42 @@ mod tests {
         assert_eq!(summaries[1].signal_id, "breakout");
         assert_eq!(summaries[1].total_samples, 1);
         assert_eq!(summaries[1].horizons[0].avg_return_pct, 5.0);
+    }
+
+    #[test]
+    fn summarize_signal_performance_prioritizes_ranked_pools_before_raw_signals() {
+        let summaries = summarize_signal_performance(&[
+            SignalOutcomeSample {
+                signal_id: "startup".to_string(),
+                entry_close: 10.0,
+                close_1d: Some(10.5),
+                close_3d: Some(10.7),
+                close_5d: Some(10.9),
+                close_10d: Some(11.1),
+            },
+            SignalOutcomeSample {
+                signal_id: "startup".to_string(),
+                entry_close: 9.0,
+                close_1d: Some(9.1),
+                close_3d: Some(9.2),
+                close_5d: Some(9.3),
+                close_10d: Some(9.5),
+            },
+            SignalOutcomeSample {
+                signal_id: crate::services::scan_ranker::POOL_SHORT_A_ID.to_string(),
+                entry_close: 12.0,
+                close_1d: Some(12.6),
+                close_3d: Some(13.0),
+                close_5d: Some(13.3),
+                close_10d: Some(13.8),
+            },
+        ]);
+
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(
+            summaries[0].signal_id,
+            crate::services::scan_ranker::POOL_SHORT_A_ID
+        );
+        assert_eq!(summaries[1].signal_id, "startup");
     }
 }

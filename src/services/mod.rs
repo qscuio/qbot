@@ -8,6 +8,7 @@ pub mod market;
 pub mod market_report;
 pub mod portfolio;
 pub mod prestart;
+pub mod scan_ranker;
 pub mod scanner;
 pub mod scanner_stats;
 pub mod sector;

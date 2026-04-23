@@ -15,6 +15,9 @@ use crate::services::limit_up::LimitUpService;
 use crate::services::prestart::{
     is_prestart_signal, PrestartCandidate, PrestartService, PrestartTier,
 };
+use crate::services::scan_ranker::{
+    POOL_LONG_A_ID, POOL_LONG_B_ID, POOL_MID_A_ID, POOL_MID_B_ID, POOL_SHORT_A_ID, POOL_SHORT_B_ID,
+};
 use crate::services::scanner::SignalHit;
 use crate::signals::base::{avg_volume, sma};
 use crate::signals::registry::SignalRegistry;
@@ -36,6 +39,27 @@ const AUTO_STRONG_NAME: &str = "自动强势股";
 const DABAN_MIN_SCORE: f64 = 60.0;
 const STRONG_WINDOW_DAYS: i64 = 7;
 const STRONG_MIN_LIMIT_COUNT: i64 = 3;
+const AUTO_STRONG_POOL_PRIORITY: [&str; 3] = [POOL_SHORT_A_ID, POOL_MID_A_ID, POOL_LONG_A_ID];
+
+fn builtin_ranked_pool_accounts() -> [(&'static str, &'static str); 3] {
+    [
+        (POOL_SHORT_A_ID, "短线A档"),
+        (POOL_MID_A_ID, "中线A档"),
+        (POOL_LONG_A_ID, "长线A档"),
+    ]
+}
+
+fn is_ranked_pool_signal(signal_id: &str) -> bool {
+    matches!(
+        signal_id,
+        POOL_SHORT_A_ID
+            | POOL_SHORT_B_ID
+            | POOL_MID_A_ID
+            | POOL_MID_B_ID
+            | POOL_LONG_A_ID
+            | POOL_LONG_B_ID
+    )
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StrategyAccountSnapshot {
@@ -153,6 +177,9 @@ impl SignalAutoTradingService {
             self.ensure_account(signal.signal_id(), signal.display_name())
                 .await?;
         }
+        for (signal_id, signal_name) in builtin_ranked_pool_accounts() {
+            self.ensure_account(signal_id, signal_name).await?;
+        }
         self.ensure_account(AUTO_DABAN_ID, AUTO_DABAN_NAME).await?;
         self.ensure_account(AUTO_STRONG_ID, AUTO_STRONG_NAME)
             .await?;
@@ -170,7 +197,10 @@ impl SignalAutoTradingService {
             .list_candidates_from_scan(results, 50)
             .await?;
         let daban_candidate = self.pick_best_daban_candidate(signal_date).await?;
-        let strong_candidate = self.pick_best_strong_candidate(signal_date).await?;
+        let strong_candidate = match self.pick_best_ranked_pool_candidate(results).await? {
+            Some(candidate) => Some(candidate),
+            None => self.pick_best_strong_candidate(signal_date).await?,
+        };
         let mut created = 0usize;
 
         for account in accounts {
@@ -970,6 +1000,35 @@ impl SignalAutoTradingService {
         Ok(best)
     }
 
+    async fn pick_best_ranked_pool_candidate(
+        &self,
+        results: &HashMap<String, Vec<SignalHit>>,
+    ) -> Result<Option<CandidateScore>> {
+        let mut best: Option<CandidateScore> = None;
+
+        for signal_id in AUTO_STRONG_POOL_PRIORITY {
+            let Some(hits) = results.get(signal_id) else {
+                continue;
+            };
+
+            for hit in hits {
+                let bars = match postgres::get_stock_history(&self.state.db, &hit.code, 90).await {
+                    Ok(v) if v.len() >= 25 => v,
+                    _ => continue,
+                };
+                let Some(candidate) = build_signal_candidate(signal_id, hit, &bars) else {
+                    continue;
+                };
+                match &best {
+                    Some(current) if current.score >= candidate.score => {}
+                    _ => best = Some(candidate),
+                }
+            }
+        }
+
+        Ok(best)
+    }
+
     async fn pick_best_daban_candidate(
         &self,
         target_date: NaiveDate,
@@ -1464,23 +1523,89 @@ fn score_candidate(signal_id: &str, bars: &[Candle]) -> (f64, Vec<String>) {
     (round2(score.max(0.0)), reasons)
 }
 
-fn build_signal_candidate(signal_id: &str, hit: &SignalHit, bars: &[Candle]) -> Option<CandidateScore> {
+fn build_signal_candidate(
+    signal_id: &str,
+    hit: &SignalHit,
+    bars: &[Candle],
+) -> Option<CandidateScore> {
     if bars.len() < 25 {
         return None;
     }
 
-    let (score, reasons) = score_candidate(signal_id, bars);
-    let selection_reason = reasons.join("；");
+    let (overlay_score, score_reasons) = score_candidate(signal_id, bars);
+    if signal_id.starts_with("pool_") {
+        let pool_score = hit
+            .metadata
+            .get("score")
+            .and_then(|value| value.as_f64())
+            .unwrap_or(overlay_score);
+        let pool_reasons = metadata_string_vec(&hit.metadata, "reasons");
+        let risk_flags = metadata_string_vec(&hit.metadata, "risk_flags");
+        let trigger_name = hit
+            .metadata
+            .get("trigger_name")
+            .and_then(|value| value.as_str())
+            .unwrap_or(hit.signal_name.as_str());
+
+        let mut reasons = Vec::new();
+        push_unique_reason(
+            &mut reasons,
+            format!("{} {}", hit.signal_name, trigger_name),
+        );
+        for reason in &pool_reasons {
+            push_unique_reason(&mut reasons, reason);
+        }
+        for reason in score_reasons.iter().take(2) {
+            push_unique_reason(&mut reasons, reason);
+        }
+        if reasons.is_empty() {
+            reasons.push("池内综合排序领先".to_string());
+        }
+
+        return Some(CandidateScore {
+            code: hit.code.clone(),
+            name: hit.name.clone(),
+            score: round2(pool_score * 0.8 + overlay_score * 0.2),
+            selection_reason: reasons.join("；"),
+            metadata: serde_json::json!({
+                "signal_hit": hit,
+                "pool_score": pool_score,
+                "pool_reasons": pool_reasons,
+                "risk_flags": risk_flags,
+                "score_reasons": score_reasons,
+            }),
+        });
+    }
+
+    let selection_reason = score_reasons.join("；");
     Some(CandidateScore {
         code: hit.code.clone(),
         name: hit.name.clone(),
-        score,
+        score: overlay_score,
         selection_reason,
         metadata: serde_json::json!({
             "signal_hit": hit,
-            "score_reasons": reasons,
+            "score_reasons": score_reasons,
         }),
     })
+}
+
+fn metadata_string_vec(metadata: &serde_json::Value, key: &str) -> Vec<String> {
+    metadata
+        .get(key)
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flat_map(|items| items.iter())
+        .filter_map(|item| item.as_str().map(ToString::to_string))
+        .collect()
+}
+
+fn push_unique_reason(reasons: &mut Vec<String>, reason: impl AsRef<str>) {
+    let value = reason.as_ref().trim();
+    if value.is_empty() || reasons.iter().any(|item| item == value) {
+        return;
+    }
+    reasons.push(value.to_string());
 }
 
 fn compute_max_drawdown_pct(
@@ -1571,6 +1696,12 @@ fn format_signal_auto_daily_report(
 
     append_daily_account_group(
         &mut lines,
+        "🎯 分层票池",
+        accounts,
+        signal_auto_group_key_ranked_pool,
+    );
+    append_daily_account_group(
+        &mut lines,
         "📈 普通信号",
         accounts,
         signal_auto_group_key_standard,
@@ -1597,6 +1728,12 @@ fn format_signal_auto_daily_report(
     if !events.is_empty() {
         lines.push(String::new());
         lines.push("<b>今日动作</b>".to_string());
+        append_daily_event_group(
+            &mut lines,
+            "🎯 分层票池",
+            events,
+            signal_auto_group_key_ranked_pool,
+        );
         append_daily_event_group(
             &mut lines,
             "📈 普通信号",
@@ -1714,7 +1851,14 @@ fn append_daily_event_group(
 }
 
 fn signal_auto_group_key_standard(signal_id: &str) -> bool {
-    signal_id != AUTO_DABAN_ID && signal_id != AUTO_STRONG_ID && !is_prestart_signal(signal_id)
+    signal_id != AUTO_DABAN_ID
+        && signal_id != AUTO_STRONG_ID
+        && !is_ranked_pool_signal(signal_id)
+        && !is_prestart_signal(signal_id)
+}
+
+fn signal_auto_group_key_ranked_pool(signal_id: &str) -> bool {
+    is_ranked_pool_signal(signal_id)
 }
 
 fn signal_auto_group_key_prestart(signal_id: &str) -> bool {
@@ -2139,6 +2283,49 @@ mod tests {
     }
 
     #[test]
+    fn build_signal_candidate_prefers_ranked_pool_score_and_reasons() {
+        let mut bars = Vec::new();
+        for _ in 0..30 {
+            bars.push(candle(10.0, 10.4, 9.9, 10.2, 1_200_000));
+        }
+        bars.pop();
+        bars.push(candle(10.2, 10.95, 10.1, 10.88, 3_000_000));
+
+        let hit = SignalHit {
+            code: "300001.SZ".to_string(),
+            name: "特锐德".to_string(),
+            signal_id: "pool_short_a".to_string(),
+            signal_name: "短线A档".to_string(),
+            icon: "🔥".to_string(),
+            metadata: serde_json::json!({
+                "score": 91.0,
+                "trigger_name": "强势分歧转强",
+                "reasons": ["强势票分歧后重新转强", "收盘已突破短期压力"],
+                "risk_flags": ["量能不足"]
+            }),
+        };
+
+        let candidate = build_signal_candidate("pool_short_a", &hit, &bars)
+            .expect("expected ranked pool candidate");
+
+        assert!(candidate.score >= 85.0);
+        assert!(candidate.selection_reason.contains("强势分歧转强"));
+        assert!(candidate.selection_reason.contains("强势票分歧后重新转强"));
+        assert!(candidate.metadata.to_string().contains("risk_flags"));
+        assert!(candidate.metadata.to_string().contains("pool_short_a"));
+    }
+
+    #[test]
+    fn builtin_ranked_pool_accounts_include_short_mid_long_a_lines() {
+        let accounts = builtin_ranked_pool_accounts();
+
+        assert_eq!(accounts.len(), 3);
+        assert!(accounts.contains(&(POOL_SHORT_A_ID, "短线A档")));
+        assert!(accounts.contains(&(POOL_MID_A_ID, "中线A档")));
+        assert!(accounts.contains(&(POOL_LONG_A_ID, "长线A档")));
+    }
+
+    #[test]
     fn daban_candidate_score_rewards_tradeable_board_strength() {
         let mut bars = Vec::new();
         for _ in 0..30 {
@@ -2304,5 +2491,60 @@ mod tests {
         assert!(report.contains("均线多头 B档观察"));
         assert!(report.contains("自动打板 候选入池"));
         assert!(report.contains("自动强势股 候选入池"));
+    }
+
+    #[test]
+    fn daily_report_groups_ranked_pool_accounts_separately() {
+        let report = format_signal_auto_daily_report(
+            NaiveDate::from_ymd_opt(2026, 3, 9).unwrap(),
+            &[
+                StrategyAccountSnapshot {
+                    signal_id: POOL_SHORT_A_ID.to_string(),
+                    signal_name: "短线A档".to_string(),
+                    cash_balance: 101_000.0,
+                    initial_capital: 100_000.0,
+                    open_positions: 1,
+                    pending_candidates: 0,
+                    equity: 103_000.0,
+                    pnl_pct: 3.0,
+                    realized_pnl: 1500.0,
+                    unrealized_pnl: 1500.0,
+                    closed_trades: 2,
+                    winning_trades: 2,
+                    weekly_pnl: 1000.0,
+                    max_drawdown_pct: 2.5,
+                    win_streak: 2,
+                    loss_streak: 0,
+                },
+                StrategyAccountSnapshot {
+                    signal_id: "startup".to_string(),
+                    signal_name: "底部快速启动".to_string(),
+                    cash_balance: 100_000.0,
+                    initial_capital: 100_000.0,
+                    open_positions: 0,
+                    pending_candidates: 1,
+                    equity: 100_200.0,
+                    pnl_pct: 0.2,
+                    realized_pnl: 200.0,
+                    unrealized_pnl: 0.0,
+                    closed_trades: 1,
+                    winning_trades: 1,
+                    weekly_pnl: 100.0,
+                    max_drawdown_pct: 1.0,
+                    win_streak: 1,
+                    loss_streak: 0,
+                },
+            ],
+            &[SignalAutoEventLine {
+                signal_id: POOL_SHORT_A_ID.to_string(),
+                signal_name: "短线A档".to_string(),
+                title: "候选入池".to_string(),
+                detail: "候选 PoolAlpha".to_string(),
+            }],
+        );
+
+        assert!(report.contains("🎯 分层票池"));
+        assert!(report.contains("短线A档 候选入池: 候选 PoolAlpha"));
+        assert!(report.contains("📈 普通信号"));
     }
 }

@@ -19,7 +19,11 @@ use crate::services::daban::DabanService;
 use crate::services::daban_sim::DabanSimService;
 use crate::services::limit_up::LimitUpService;
 use crate::services::portfolio::PortfolioService;
-use crate::services::prestart::{PrestartCandidate, PrestartService, is_prestart_signal};
+use crate::services::prestart::{is_prestart_signal, PrestartCandidate, PrestartService};
+use crate::services::scan_ranker::{
+    ranked_pool_meta, POOL_LONG_A_ID, POOL_LONG_B_ID, POOL_MID_A_ID, POOL_MID_B_ID,
+    POOL_SHORT_A_ID, POOL_SHORT_B_ID,
+};
 use crate::services::scanner::{ScannerService, SignalHit};
 use crate::services::scanner_stats::{
     HorizonPerformance, ScannerStatsService, SignalPerformanceSummary,
@@ -831,8 +835,13 @@ fn format_signal_auto_status(accounts: &[StrategyAccountSnapshot]) -> String {
         .filter(|account| {
             account.signal_id != "auto_daban"
                 && account.signal_id != "auto_strong"
+                && !account.signal_id.starts_with("pool_")
                 && !is_prestart_signal(&account.signal_id)
         })
+        .collect();
+    let mut ranked_pool_accounts: Vec<&StrategyAccountSnapshot> = accounts
+        .iter()
+        .filter(|account| account.signal_id.starts_with("pool_"))
         .collect();
     let mut prestart_accounts: Vec<&StrategyAccountSnapshot> = accounts
         .iter()
@@ -856,6 +865,7 @@ fn format_signal_auto_status(accounts: &[StrategyAccountSnapshot]) -> String {
         });
     };
     sort_group(&mut standard_accounts);
+    sort_group(&mut ranked_pool_accounts);
     sort_group(&mut prestart_accounts);
     sort_group(&mut daban_accounts);
     sort_group(&mut strong_accounts);
@@ -865,6 +875,7 @@ fn format_signal_auto_status(accounts: &[StrategyAccountSnapshot]) -> String {
         "━━━━━━━━━━━━━━━━━━━━━".to_string(),
     ];
 
+    append_signal_auto_group(&mut lines, "🎯 分层票池", &ranked_pool_accounts);
     append_signal_auto_group(&mut lines, "📈 普通信号", &standard_accounts);
     append_signal_auto_group(&mut lines, "🌱 预启动", &prestart_accounts);
     append_signal_auto_group(&mut lines, "🧱 自动打板", &daban_accounts);
@@ -1095,10 +1106,7 @@ async fn send_strong_limit_up(
     }
 }
 
-async fn send_startup_watchlist(
-    state: Arc<AppState>,
-    chat_id: i64,
-) -> crate::error::Result<()> {
+async fn send_startup_watchlist(state: Arc<AppState>, chat_id: i64) -> crate::error::Result<()> {
     let svc = LimitUpService::new(state.clone(), state.provider.clone());
     let items = svc.get_startup_watchlist().await?;
     let text = format_startup_watchlist(state.clone()).await?;
@@ -1493,6 +1501,12 @@ async fn send_hot_sectors(
 
 fn scan_signal_meta() -> HashMap<String, (String, String)> {
     let mut meta: HashMap<String, (String, String)> = HashMap::new();
+    for (signal_id, display_name, icon) in ranked_pool_meta() {
+        meta.insert(
+            signal_id.to_string(),
+            (display_name.to_string(), icon.to_string()),
+        );
+    }
     for s in SignalRegistry::get_enabled() {
         meta.insert(
             s.signal_id().to_string(),
@@ -1517,8 +1531,26 @@ fn scan_signal_rows(results: &HashMap<String, Vec<SignalHit>>) -> Vec<(String, u
             }
         })
         .collect();
-    rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    rows.sort_by(|a, b| {
+        scan_signal_sort_rank(&a.0)
+            .cmp(&scan_signal_sort_rank(&b.0))
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| a.0.cmp(&b.0))
+    });
     rows
+}
+
+fn scan_signal_sort_rank(signal_id: &str) -> i32 {
+    match signal_id {
+        POOL_SHORT_A_ID => 0,
+        POOL_SHORT_B_ID => 1,
+        POOL_MID_A_ID => 2,
+        POOL_MID_B_ID => 3,
+        POOL_LONG_A_ID => 4,
+        POOL_LONG_B_ID => 5,
+        "multi_signal" => 6,
+        _ => 20,
+    }
 }
 
 fn format_scan_summary(
@@ -1573,7 +1605,11 @@ fn normalize_stock_code(raw: &str) -> String {
         .to_ascii_uppercase()
 }
 
-fn chart_url_for_stock(code: &str, miniapp_base: Option<&str>, context: Option<&str>) -> Option<String> {
+fn chart_url_for_stock(
+    code: &str,
+    miniapp_base: Option<&str>,
+    context: Option<&str>,
+) -> Option<String> {
     let base = miniapp_base?.trim().trim_end_matches('/');
     if base.is_empty() {
         return None;
@@ -1610,6 +1646,28 @@ fn scan_signal_in_category(signal_id: &str, group: &str, category: &str) -> bool
     }
 }
 
+fn scan_signal_category(signal_id: &str) -> Option<&'static str> {
+    match signal_id {
+        POOL_SHORT_A_ID | POOL_SHORT_B_ID | "multi_signal" => Some("hot"),
+        POOL_MID_A_ID | POOL_MID_B_ID => Some("trend"),
+        POOL_LONG_A_ID | POOL_LONG_B_ID => Some("period"),
+        _ => {
+            for signal in SignalRegistry::get_enabled() {
+                if signal.signal_id() != signal_id {
+                    continue;
+                }
+                for category in ["hot", "trend", "pattern", "board", "period"] {
+                    if scan_signal_in_category(signal_id, signal.group(), category) {
+                        return Some(category);
+                    }
+                }
+                return None;
+            }
+            None
+        }
+    }
+}
+
 fn scan_category_title(category: &str) -> Option<&'static str> {
     match category {
         "hot" => Some("启动/量价"),
@@ -1633,13 +1691,34 @@ fn scan_category_content(category: &str) -> Option<(String, Value)> {
                 cb_button("⭐ 多信号共振", "scan:s:multi_signal"),
             ]);
             rows.push(vec![
+                cb_button("📊 信号统计", "cmd:scan_stats"),
+                cb_button("🤖 自动交易", "cmd:autosim"),
+            ]);
+            rows.push(vec![cb_button("📰 自动日报", "cmd:autosim_report")]);
+            rows.push(vec![
                 cb_button("📊 DB状态", "cmd:dbcheck"),
                 cb_button("🔄 DB修复", "cmd:dbsync"),
             ]);
             rows.push(vec![cb_button("📚 全量回补", "cmd:dbsync_full")]);
         }
         "hot" => {
+            rows.push(vec![
+                cb_button("🔥 短线A档", &format!("scan:s:{POOL_SHORT_A_ID}")),
+                cb_button("🟠 短线B档", &format!("scan:s:{POOL_SHORT_B_ID}")),
+            ]);
             rows.push(vec![cb_button("⭐ 多信号共振", "scan:s:multi_signal")]);
+        }
+        "trend" => {
+            rows.push(vec![
+                cb_button("📈 中线A档", &format!("scan:s:{POOL_MID_A_ID}")),
+                cb_button("🧭 中线B档", &format!("scan:s:{POOL_MID_B_ID}")),
+            ]);
+        }
+        "period" => {
+            rows.push(vec![
+                cb_button("🏛️ 长线A档", &format!("scan:s:{POOL_LONG_A_ID}")),
+                cb_button("🌱 长线B档", &format!("scan:s:{POOL_LONG_B_ID}")),
+            ]);
         }
         _ => {}
     }
@@ -1675,6 +1754,10 @@ fn format_scan_hit_button_text(hit: &SignalHit, ordinal: usize) -> String {
     if hit.signal_id == "multi_signal" {
         if let Some(count) = hit.metadata.get("count").and_then(|v| v.as_u64()) {
             text.push_str(&format!(" {}信号", count));
+        }
+    } else if hit.signal_id.starts_with("pool_") {
+        if let Some(score) = hit.metadata.get("score").and_then(|v| v.as_f64()) {
+            text.push_str(&format!(" {:.1}", score));
         }
     }
     trim_chars(&text, 62)
@@ -1722,9 +1805,7 @@ fn build_scan_hit_markup(
                     "url": chart_url,
                 })
             }
-            None => {
-                cb_button(&text, &format!("chart:{}", normalize_stock_code(&hit.code)))
-            }
+            None => cb_button(&text, &format!("chart:{}", normalize_stock_code(&hit.code))),
         };
         rows.push(vec![button]);
     }
@@ -1748,7 +1829,13 @@ fn build_scan_hit_markup(
         }
     }
 
-    rows.push(vec![cb_button("◀️ 返回扫描菜单", "menu:scan")]);
+    let mut back_row = Vec::new();
+    if let Some(category) = scan_signal_category(signal_id) {
+        back_row.push(cb_button("◀️ 返回本分类", &format!("scan:menu:{category}")));
+    }
+    back_row.push(cb_button("🔍 扫描首页", "menu:scan"));
+    rows.push(back_row);
+    rows.push(vec![cb_button("🏠 主菜单", "menu:main")]);
     json!({ "inline_keyboard": rows })
 }
 
@@ -1890,9 +1977,7 @@ fn main_menu_markup() -> Value {
             cb_button("🧪 模拟交易", "menu:sim"),
             cb_button("🛠 工具", "menu:tools"),
         ],
-        vec![
-            cb_button("❓ 帮助", "cmd:help"),
-        ],
+        vec![cb_button("❓ 帮助", "cmd:help")],
     ])
 }
 
@@ -1950,7 +2035,14 @@ fn tools_menu_markup() -> Value {
             cb_button("📚 全量回补", "cmd:dbsync_full"),
             cb_button("📜 历史查询", "prompt:history"),
         ],
-        vec![cb_button("📈 K线图", "prompt:chart")],
+        vec![
+            cb_button("📊 信号统计", "cmd:scan_stats"),
+            cb_button("🤖 自动交易", "cmd:autosim"),
+        ],
+        vec![
+            cb_button("📰 自动日报", "cmd:autosim_report"),
+            cb_button("📈 K线图", "prompt:chart"),
+        ],
         vec![cb_button("◀️ 返回主菜单", "menu:main")],
     ])
 }
@@ -2040,7 +2132,22 @@ fn scan_menu_markup() -> Value {
             cb_button("🗓 周/月周期", "scan:menu:period"),
             cb_button("⚙️ 工具/控制", "scan:menu:tools"),
         ],
-        vec![cb_button("🌱 预启动池", "cmd:prestart")],
+        vec![
+            cb_button("🔥 短线A档", &format!("scan:s:{POOL_SHORT_A_ID}")),
+            cb_button("📈 中线A档", &format!("scan:s:{POOL_MID_A_ID}")),
+        ],
+        vec![
+            cb_button("🏛️ 长线A档", &format!("scan:s:{POOL_LONG_A_ID}")),
+            cb_button("🌱 预启动池", "cmd:prestart"),
+        ],
+        vec![
+            cb_button("📊 信号统计", "cmd:scan_stats"),
+            cb_button("🤖 自动交易", "cmd:autosim"),
+        ],
+        vec![
+            cb_button("📰 自动日报", "cmd:autosim_report"),
+            cb_button("⚙️ 扫描工具", "scan:menu:tools"),
+        ],
         vec![cb_button("◀️ 返回主菜单", "menu:main")],
     ];
     inline_keyboard(rows)
@@ -2090,6 +2197,50 @@ fn menu_content(menu: &str) -> (String, Value) {
             main_menu_markup(),
         ),
     }
+}
+
+fn scan_result_panel_markup() -> Value {
+    inline_keyboard(vec![
+        vec![
+            cb_button("⚙️ 扫描工具", "scan:menu:tools"),
+            cb_button("◀️ 返回扫描菜单", "menu:scan"),
+        ],
+        vec![cb_button("🏠 主菜单", "menu:main")],
+    ])
+}
+
+fn autosim_panel_markup() -> Value {
+    inline_keyboard(vec![
+        vec![
+            cb_button("🤖 自动交易", "cmd:autosim"),
+            cb_button("📰 自动日报", "cmd:autosim_report"),
+        ],
+        vec![
+            cb_button("🛠 工具菜单", "menu:tools"),
+            cb_button("🏠 主菜单", "menu:main"),
+        ],
+    ])
+}
+
+async fn show_text_panel(
+    state: &Arc<AppState>,
+    chat_id: i64,
+    message_id: Option<i64>,
+    text: &str,
+    markup: Value,
+) -> crate::error::Result<()> {
+    if let Some(mid) = message_id {
+        if state
+            .pusher
+            .edit_message_with_markup(chat_id, mid, text, markup.clone())
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+    }
+
+    tg_send_with_markup(state, chat_id, text, markup).await
 }
 
 async fn show_menu(
@@ -2142,6 +2293,84 @@ async fn send_help_with_menu(state: &Arc<AppState>, chat_id: i64) -> crate::erro
     let mut text = telegram_help_text();
     text.push_str("\n\n<i>也可使用下方按钮导航</i>");
     tg_send_with_markup(state, chat_id, &text, main_menu_markup()).await
+}
+
+async fn show_scan_stats_panel(
+    state: &Arc<AppState>,
+    chat_id: i64,
+    message_id: Option<i64>,
+) -> crate::error::Result<()> {
+    let lookback_days = normalize_scan_stats_days(None);
+    let mut summaries = ScannerStatsService::new(state.clone())
+        .summarize(lookback_days, None)
+        .await?;
+    summaries.truncate(8);
+    show_text_panel(
+        state,
+        chat_id,
+        message_id,
+        &format_scan_stats_text(&summaries, lookback_days, None),
+        scan_result_panel_markup(),
+    )
+    .await
+}
+
+async fn show_prestart_panel(
+    state: &Arc<AppState>,
+    chat_id: i64,
+    message_id: Option<i64>,
+) -> crate::error::Result<()> {
+    let candidates = PrestartService::new(state.clone())
+        .list_candidates(20)
+        .await?;
+    show_text_panel(
+        state,
+        chat_id,
+        message_id,
+        &format_prestart_text(&candidates, 20),
+        scan_result_panel_markup(),
+    )
+    .await
+}
+
+async fn show_autosim_panel(
+    state: &Arc<AppState>,
+    chat_id: i64,
+    message_id: Option<i64>,
+) -> crate::error::Result<()> {
+    let accounts = SignalAutoTradingService::new(
+        state.clone(),
+        Arc::new(crate::data::sina::SinaClient::new()),
+    )
+    .list_account_snapshots()
+    .await?;
+    show_text_panel(
+        state,
+        chat_id,
+        message_id,
+        &format_signal_auto_status(&accounts),
+        autosim_panel_markup(),
+    )
+    .await
+}
+
+async fn show_autosim_report_panel(
+    state: &Arc<AppState>,
+    chat_id: i64,
+    message_id: Option<i64>,
+) -> crate::error::Result<()> {
+    let text = match SignalAutoTradingService::new(
+        state.clone(),
+        Arc::new(crate::data::sina::SinaClient::new()),
+    )
+    .latest_report()
+    .await?
+    {
+        Some(report) => report,
+        None => "📭 暂无自动交易日报\n开启自动交易后，收盘会自动生成并推送".to_string(),
+    };
+
+    show_text_panel(state, chat_id, message_id, &text, autosim_panel_markup()).await
 }
 
 async fn run_scan_command(
@@ -2290,16 +2519,7 @@ async fn handle_telegram_callback(
             )
             .await?
         }
-        "cmd:prestart" => {
-            handle_telegram_command(
-                state.clone(),
-                chat_id,
-                user_id,
-                "prestart".to_string(),
-                "".to_string(),
-            )
-            .await?
-        }
+        "cmd:prestart" => show_prestart_panel(&state, chat_id, Some(message_id)).await?,
         "cmd:limitup" => {
             handle_telegram_command(
                 state.clone(),
@@ -2510,6 +2730,9 @@ async fn handle_telegram_callback(
             )
             .await?
         }
+        "cmd:scan_stats" => show_scan_stats_panel(&state, chat_id, Some(message_id)).await?,
+        "cmd:autosim" => show_autosim_panel(&state, chat_id, Some(message_id)).await?,
+        "cmd:autosim_report" => show_autosim_report_panel(&state, chat_id, Some(message_id)).await?,
         "scan:all" => run_scan_command(state.clone(), chat_id, None).await?,
         "prompt:watch_add" => tg_send(&state, chat_id, "用法: <code>/watch 600519</code>").await?,
         "prompt:watch_del" => {
@@ -2764,7 +2987,9 @@ async fn handle_telegram_command(
                 tg_send(&state, chat_id, &format_sim_overview(state.clone()).await?).await?
             }
             Ok(ManualSimAction::Balance) => {
-                let balance = TradingSimService::new(state.clone()).get_balance("general").await?;
+                let balance = TradingSimService::new(state.clone())
+                    .get_balance("general")
+                    .await?;
                 tg_send(
                     &state,
                     chat_id,
@@ -2866,8 +3091,12 @@ async fn handle_telegram_command(
                     };
                     match parse_daban_sim_args(&sim_args) {
                         Ok(DabanSimAction::Overview) => {
-                            tg_send(&state, chat_id, &format_daban_sim_overview(state.clone()).await?)
-                                .await?
+                            tg_send(
+                                &state,
+                                chat_id,
+                                &format_daban_sim_overview(state.clone()).await?,
+                            )
+                            .await?
                         }
                         Ok(DabanSimAction::Balance) => {
                             let balance = DabanSimService::new(state.clone()).get_balance().await?;
@@ -3147,8 +3376,15 @@ async fn handle_telegram_command(
                     .await?
                     .unwrap_or_else(|| raw.to_uppercase());
                 let code6 = normalize_stock_code(&code);
-                if let Some(app_url) = chart_url_for_stock(&code, state.config.webhook_url.as_deref(), None) {
-                    let base = state.config.webhook_url.as_deref().unwrap_or("").trim_end_matches('/');
+                if let Some(app_url) =
+                    chart_url_for_stock(&code, state.config.webhook_url.as_deref(), None)
+                {
+                    let base = state
+                        .config
+                        .webhook_url
+                        .as_deref()
+                        .unwrap_or("")
+                        .trim_end_matches('/');
                     let msg = format!(
                         "📈 <b>Chart: {}</b>\n\n自绘K线: {}\n数据接口: {}/api/chart/data/{}\n筹码接口: {}/api/chart/chips/{}",
                         escape_html(&code),
@@ -4407,6 +4643,40 @@ mod tests {
     }
 
     #[test]
+    fn scan_signal_meta_and_categories_expose_ranked_pools() {
+        let meta = scan_signal_meta();
+        assert_eq!(
+            meta.get(crate::services::scan_ranker::POOL_SHORT_A_ID)
+                .map(|entry| entry.0.as_str()),
+            Some("短线A档")
+        );
+        assert_eq!(
+            meta.get(crate::services::scan_ranker::POOL_MID_A_ID)
+                .map(|entry| entry.0.as_str()),
+            Some("中线A档")
+        );
+        assert_eq!(
+            meta.get(crate::services::scan_ranker::POOL_LONG_A_ID)
+                .map(|entry| entry.0.as_str()),
+            Some("长线A档")
+        );
+
+        let (_, hot_markup) = scan_category_content("hot").expect("hot category");
+        let (_, trend_markup) = scan_category_content("trend").expect("trend category");
+        let (_, period_markup) = scan_category_content("period").expect("period category");
+
+        assert!(hot_markup
+            .to_string()
+            .contains(crate::services::scan_ranker::POOL_SHORT_A_ID));
+        assert!(trend_markup
+            .to_string()
+            .contains(crate::services::scan_ranker::POOL_MID_A_ID));
+        assert!(period_markup
+            .to_string()
+            .contains(crate::services::scan_ranker::POOL_LONG_A_ID));
+    }
+
+    #[test]
     fn menu_content_exposes_manual_sim_entries() {
         let (_, main_markup) = menu_content("main");
         let (_, daban_markup) = menu_content("daban");
@@ -4419,8 +4689,61 @@ mod tests {
         assert!(sim_markup.to_string().contains("cmd:sim_balance"));
         assert!(sim_markup.to_string().contains("prompt:sim_buy"));
         assert!(daban_sim_text.contains("打板"));
-        assert!(daban_sim_markup.to_string().contains("cmd:daban_sim_balance"));
-        assert!(daban_sim_markup.to_string().contains("prompt:daban_sim_buy"));
+        assert!(daban_sim_markup
+            .to_string()
+            .contains("cmd:daban_sim_balance"));
+        assert!(daban_sim_markup
+            .to_string()
+            .contains("prompt:daban_sim_buy"));
+    }
+
+    #[test]
+    fn tools_and_scan_menus_expose_scan_stats_and_autosim_entries() {
+        let (_, tools_markup) = menu_content("tools");
+        let (_, scan_tools_markup) = scan_category_content("tools").expect("scan tools category");
+
+        assert!(tools_markup.to_string().contains("cmd:scan_stats"));
+        assert!(tools_markup.to_string().contains("cmd:autosim"));
+        assert!(tools_markup.to_string().contains("cmd:autosim_report"));
+        assert!(scan_tools_markup.to_string().contains("cmd:scan_stats"));
+        assert!(scan_tools_markup.to_string().contains("cmd:autosim"));
+    }
+
+    #[test]
+    fn scan_menu_exposes_ranked_pool_shortcuts() {
+        let (_, scan_markup) = menu_content("scan");
+        let markup = scan_markup.to_string();
+
+        assert!(markup.contains(crate::services::scan_ranker::POOL_SHORT_A_ID));
+        assert!(markup.contains(crate::services::scan_ranker::POOL_MID_A_ID));
+        assert!(markup.contains(crate::services::scan_ranker::POOL_LONG_A_ID));
+        assert!(markup.contains("cmd:scan_stats"));
+        assert!(markup.contains("cmd:autosim"));
+    }
+
+    #[test]
+    fn scan_hit_markup_includes_category_back_button_for_ranked_pool() {
+        let markup = build_scan_hit_markup(
+            &[SignalHit {
+                code: "300001.SZ".to_string(),
+                name: "特锐德".to_string(),
+                signal_id: crate::services::scan_ranker::POOL_SHORT_A_ID.to_string(),
+                signal_name: "短线A档".to_string(),
+                icon: "🔥".to_string(),
+                metadata: serde_json::json!({"score": 91.2}),
+            }],
+            Some("https://example.com"),
+            Some("scanner_pool_short_a"),
+            crate::services::scan_ranker::POOL_SHORT_A_ID,
+            1,
+            1,
+            0,
+        );
+
+        let markup = markup.to_string();
+        assert!(markup.contains("scan:menu:hot"));
+        assert!(markup.contains("menu:scan"));
+        assert!(markup.contains("menu:main"));
     }
 
     #[test]
@@ -4607,5 +4930,51 @@ mod tests {
         assert!(text.contains("已实现 +1500 | 未实现 +1000 | 胜率 66.7% (2/3)"));
         assert!(text.contains("本周收益 +900"));
         assert!(text.contains("回撤: 4.50%  连胜: 2  连亏: 0"));
+    }
+
+    #[test]
+    fn signal_auto_status_groups_ranked_pool_accounts_separately() {
+        let text = format_signal_auto_status(&[
+            StrategyAccountSnapshot {
+                signal_id: crate::services::scan_ranker::POOL_SHORT_A_ID.to_string(),
+                signal_name: "短线A档".to_string(),
+                cash_balance: 100_000.0,
+                initial_capital: 100_000.0,
+                open_positions: 1,
+                pending_candidates: 0,
+                equity: 103_200.0,
+                pnl_pct: 3.2,
+                realized_pnl: 2200.0,
+                unrealized_pnl: 1000.0,
+                closed_trades: 2,
+                winning_trades: 2,
+                weekly_pnl: 1800.0,
+                max_drawdown_pct: 3.6,
+                win_streak: 2,
+                loss_streak: 0,
+            },
+            StrategyAccountSnapshot {
+                signal_id: "startup".to_string(),
+                signal_name: "底部快速启动".to_string(),
+                cash_balance: 100_000.0,
+                initial_capital: 100_000.0,
+                open_positions: 0,
+                pending_candidates: 1,
+                equity: 100_400.0,
+                pnl_pct: 0.4,
+                realized_pnl: 400.0,
+                unrealized_pnl: 0.0,
+                closed_trades: 1,
+                winning_trades: 1,
+                weekly_pnl: 200.0,
+                max_drawdown_pct: 1.4,
+                win_streak: 1,
+                loss_streak: 0,
+            },
+        ]);
+
+        assert!(text.contains("🎯 分层票池"));
+        assert!(text.contains("短线A档"));
+        assert!(text.contains("📈 普通信号"));
     }
 }
