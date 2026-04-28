@@ -9,7 +9,7 @@ use crate::services::scan_ranker::{
 use crate::state::AppState;
 use crate::storage::postgres;
 
-pub const FORWARD_HORIZONS: [usize; 4] = [1, 3, 5, 10];
+pub const FORWARD_HORIZONS: [usize; 5] = [1, 3, 5, 10, 20];
 
 #[derive(Debug, Clone)]
 pub struct SignalOutcomeSample {
@@ -19,6 +19,7 @@ pub struct SignalOutcomeSample {
     pub close_3d: Option<f64>,
     pub close_5d: Option<f64>,
     pub close_10d: Option<f64>,
+    pub close_20d: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -66,6 +67,7 @@ impl From<postgres::SignalOutcomeRow> for SignalOutcomeSample {
             close_3d: value.close_3d,
             close_5d: value.close_5d,
             close_10d: value.close_10d,
+            close_20d: value.close_20d,
         }
     }
 }
@@ -121,6 +123,7 @@ fn summarize_horizon(days: usize, rows: &[&SignalOutcomeSample]) -> HorizonPerfo
                 3 => sample.close_3d,
                 5 => sample.close_5d,
                 10 => sample.close_10d,
+                20 => sample.close_20d,
                 _ => None,
             }?;
             if sample.entry_close <= 0.0 {
@@ -169,6 +172,7 @@ mod tests {
                 close_3d: Some(9.0),
                 close_5d: None,
                 close_10d: Some(12.0),
+                close_20d: Some(13.0),
             },
             SignalOutcomeSample {
                 signal_id: "startup".to_string(),
@@ -177,6 +181,7 @@ mod tests {
                 close_3d: Some(22.0),
                 close_5d: Some(24.0),
                 close_10d: None,
+                close_20d: Some(26.0),
             },
             SignalOutcomeSample {
                 signal_id: "breakout".to_string(),
@@ -185,6 +190,7 @@ mod tests {
                 close_3d: Some(8.8),
                 close_5d: Some(9.2),
                 close_10d: Some(9.6),
+                close_20d: Some(10.4),
             },
         ]);
 
@@ -219,6 +225,12 @@ mod tests {
                     avg_return_pct: 20.0,
                     win_rate_pct: 100.0,
                 },
+                HorizonPerformance {
+                    days: 20,
+                    samples: 2,
+                    avg_return_pct: 30.0,
+                    win_rate_pct: 100.0,
+                },
             ]
         );
 
@@ -237,6 +249,7 @@ mod tests {
                 close_3d: Some(10.7),
                 close_5d: Some(10.9),
                 close_10d: Some(11.1),
+                close_20d: Some(11.3),
             },
             SignalOutcomeSample {
                 signal_id: "startup".to_string(),
@@ -245,6 +258,7 @@ mod tests {
                 close_3d: Some(9.2),
                 close_5d: Some(9.3),
                 close_10d: Some(9.5),
+                close_20d: Some(9.7),
             },
             SignalOutcomeSample {
                 signal_id: crate::services::scan_ranker::POOL_SHORT_A_ID.to_string(),
@@ -253,6 +267,7 @@ mod tests {
                 close_3d: Some(13.0),
                 close_5d: Some(13.3),
                 close_10d: Some(13.8),
+                close_20d: Some(14.4),
             },
         ]);
 

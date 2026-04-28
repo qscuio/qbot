@@ -54,6 +54,7 @@ struct RankedCandidate {
     risk_flags: Vec<String>,
     factor_breakdown: Vec<(String, f64)>,
     supporting_signals: Vec<String>,
+    matched_setups: Vec<(&'static str, &'static str)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -106,7 +107,16 @@ pub fn rank_scan_inputs(inputs: &[RankInput]) -> HashMap<String, Vec<SignalHit>>
             continue;
         }
 
-        for candidate in classify_input(input, metrics) {
+        let mut candidates = classify_input(input, metrics);
+        let matched_setups: Vec<(&'static str, &'static str)> = candidates
+            .iter()
+            .map(|candidate| (candidate.trigger_id, candidate.trigger_name))
+            .collect();
+        for candidate in &mut candidates {
+            candidate.matched_setups = matched_setups.clone();
+        }
+
+        for candidate in candidates {
             match best_by_code.get(input.code.as_str()) {
                 Some(current) if current.score >= candidate.score => {}
                 _ => {
@@ -167,6 +177,9 @@ impl RankedCandidate {
                     serde_json::json!({"name": name, "score": round2(value)})
                 }).collect::<Vec<_>>(),
                 "supporting_signals": self.supporting_signals,
+                "matched_setups": self.matched_setups.into_iter().map(|(id, name)| {
+                    serde_json::json!({"id": id, "name": name})
+                }).collect::<Vec<_>>(),
             }),
         }
     }
@@ -194,6 +207,36 @@ fn classify_input(input: &RankInput, metrics: Metrics) -> Vec<RankedCandidate> {
     }
     candidates
 }
+
+const SHORT_EVIDENCE_SIGNALS: &[&str] = &[
+    "strong_first_neg",
+    "broken_board",
+    "fanbao",
+    "kuangbiao",
+    "breakout",
+    "startup",
+    "volume_surge",
+    "volume_price",
+    "uptrend_breakout",
+];
+
+const MID_EVIDENCE_SIGNALS: &[&str] = &[
+    "ma_bullish",
+    "ma_pullback",
+    "strong_pullback",
+    "uptrend_breakout",
+    "breakout",
+    "volume_price",
+    "startup",
+];
+
+const LONG_EVIDENCE_SIGNALS: &[&str] = &[
+    "low_accumulation",
+    "bottom_quick_start",
+    "downtrend_reversal",
+    "long_cycle_reversal",
+    "weekly_monthly_bullish",
+];
 
 fn score_short_strong_reclaim(input: &RankInput, metrics: Metrics) -> Option<RankedCandidate> {
     if !has_any_signal(
@@ -226,6 +269,10 @@ fn score_short_strong_reclaim(input: &RankInput, metrics: Metrics) -> Option<Ran
         factors.push(("短压突破".to_string(), 6.0));
         reasons.push("收盘已突破短期压力".to_string());
     }
+    if let Some(factor) = evidence_factor(&input.hits, SHORT_EVIDENCE_SIGNALS) {
+        factors.push(factor);
+        reasons.push("旧信号提供短线证据".to_string());
+    }
     let (risk_flags, penalties) = common_penalties(metrics);
     let score = factor_sum(&factors) - penalties.iter().map(|(_, v)| *v).sum::<f64>();
     let tier = tier_for(LineType::Short, score)?;
@@ -242,13 +289,11 @@ fn score_short_strong_reclaim(input: &RankInput, metrics: Metrics) -> Option<Ran
         risk_flags,
         factor_breakdown: extend_factors(factors, penalties),
         supporting_signals: supporting_signal_ids(&input.hits),
+        matched_setups: Vec::new(),
     })
 }
 
 fn score_short_platform_breakout(input: &RankInput, metrics: Metrics) -> Option<RankedCandidate> {
-    if !has_any_signal(&input.hits, &["breakout", "uptrend_breakout", "startup"]) {
-        return None;
-    }
     if input.bars.len() < 25
         || metrics.breakout_10_pct <= 0.0
         || metrics.recent_10_range_pct > 12.0
@@ -270,7 +315,12 @@ fn score_short_platform_breakout(input: &RankInput, metrics: Metrics) -> Option<
         ),
         ("收盘质量".to_string(), metrics.close_pos * 10.0),
     ];
-    let reasons = vec!["强势整理后再次突破平台".to_string()];
+    let mut factors = factors;
+    let mut reasons = vec!["强势整理后再次突破平台".to_string()];
+    if let Some(factor) = evidence_factor(&input.hits, SHORT_EVIDENCE_SIGNALS) {
+        factors.push(factor);
+        reasons.push("旧信号提供短线证据".to_string());
+    }
     let (risk_flags, penalties) = common_penalties(metrics);
     let score = factor_sum(&factors) - penalties.iter().map(|(_, v)| *v).sum::<f64>();
     let tier = tier_for(LineType::Short, score)?;
@@ -287,16 +337,11 @@ fn score_short_platform_breakout(input: &RankInput, metrics: Metrics) -> Option<
         risk_flags,
         factor_breakdown: extend_factors(factors, penalties),
         supporting_signals: supporting_signal_ids(&input.hits),
+        matched_setups: Vec::new(),
     })
 }
 
 fn score_mid_trend_breakout(input: &RankInput, metrics: Metrics) -> Option<RankedCandidate> {
-    if !has_any_signal(
-        &input.hits,
-        &["breakout", "uptrend_breakout", "startup", "ma_bullish"],
-    ) {
-        return None;
-    }
     if input.bars.len() < 65
         || metrics.today_close < metrics.ma20
         || metrics.ma20 < metrics.ma60 * 0.98
@@ -325,7 +370,12 @@ fn score_mid_trend_breakout(input: &RankInput, metrics: Metrics) -> Option<Ranke
         ),
         ("收盘质量".to_string(), metrics.close_pos * 8.0),
     ];
-    let reasons = vec!["中期趋势完好并放量突破".to_string()];
+    let mut factors = factors;
+    let mut reasons = vec!["中期趋势完好并放量突破".to_string()];
+    if let Some(factor) = evidence_factor(&input.hits, MID_EVIDENCE_SIGNALS) {
+        factors.push(factor);
+        reasons.push("旧信号提供中线证据".to_string());
+    }
     let (risk_flags, penalties) = common_penalties(metrics);
     let score = factor_sum(&factors) - penalties.iter().map(|(_, v)| *v).sum::<f64>();
     let tier = tier_for(LineType::Mid, score)?;
@@ -342,21 +392,11 @@ fn score_mid_trend_breakout(input: &RankInput, metrics: Metrics) -> Option<Ranke
         risk_flags,
         factor_breakdown: extend_factors(factors, penalties),
         supporting_signals: supporting_signal_ids(&input.hits),
+        matched_setups: Vec::new(),
     })
 }
 
 fn score_mid_pullback_resume(input: &RankInput, metrics: Metrics) -> Option<RankedCandidate> {
-    if !has_any_signal(
-        &input.hits,
-        &[
-            "ma_pullback",
-            "strong_pullback",
-            "ma_bullish",
-            "volume_price",
-        ],
-    ) {
-        return None;
-    }
     let today = input.bars.last()?;
     if input.bars.len() < 40
         || metrics.today_close < metrics.ma20
@@ -380,7 +420,12 @@ fn score_mid_pullback_resume(input: &RankInput, metrics: Metrics) -> Option<Rank
         ),
         ("收盘质量".to_string(), metrics.close_pos * 8.0),
     ];
-    let reasons = vec!["趋势内回踩后重新转强".to_string()];
+    let mut factors = factors;
+    let mut reasons = vec!["趋势内回踩后重新转强".to_string()];
+    if let Some(factor) = evidence_factor(&input.hits, MID_EVIDENCE_SIGNALS) {
+        factors.push(factor);
+        reasons.push("旧信号提供中线证据".to_string());
+    }
     let (risk_flags, penalties) = common_penalties(metrics);
     let score = factor_sum(&factors) - penalties.iter().map(|(_, v)| *v).sum::<f64>();
     let tier = tier_for(LineType::Mid, score)?;
@@ -397,20 +442,11 @@ fn score_mid_pullback_resume(input: &RankInput, metrics: Metrics) -> Option<Rank
         risk_flags,
         factor_breakdown: extend_factors(factors, penalties),
         supporting_signals: supporting_signal_ids(&input.hits),
+        matched_setups: Vec::new(),
     })
 }
 
 fn score_long_box_breakout(input: &RankInput, metrics: Metrics) -> Option<RankedCandidate> {
-    if !has_any_signal(
-        &input.hits,
-        &[
-            "low_accumulation",
-            "bottom_quick_start",
-            "weekly_monthly_bullish",
-        ],
-    ) {
-        return None;
-    }
     if input.bars.len() < 70
         || metrics.breakout_20_pct <= 0.0
         || metrics.recent_20_range_pct > 18.0
@@ -433,7 +469,12 @@ fn score_long_box_breakout(input: &RankInput, metrics: Metrics) -> Option<Ranked
         ),
         ("收盘质量".to_string(), metrics.close_pos * 7.0),
     ];
-    let reasons = vec!["底部整理后放量脱离箱体".to_string()];
+    let mut factors = factors;
+    let mut reasons = vec!["底部整理后放量脱离箱体".to_string()];
+    if let Some(factor) = evidence_factor(&input.hits, LONG_EVIDENCE_SIGNALS) {
+        factors.push(factor);
+        reasons.push("旧信号提供长线证据".to_string());
+    }
     let (risk_flags, penalties) = common_penalties(metrics);
     let score = factor_sum(&factors) - penalties.iter().map(|(_, v)| *v).sum::<f64>();
     let tier = tier_for(LineType::Long, score)?;
@@ -450,20 +491,11 @@ fn score_long_box_breakout(input: &RankInput, metrics: Metrics) -> Option<Ranked
         risk_flags,
         factor_breakdown: extend_factors(factors, penalties),
         supporting_signals: supporting_signal_ids(&input.hits),
+        matched_setups: Vec::new(),
     })
 }
 
 fn score_long_reversal_repair(input: &RankInput, metrics: Metrics) -> Option<RankedCandidate> {
-    if !has_any_signal(
-        &input.hits,
-        &[
-            "downtrend_reversal",
-            "long_cycle_reversal",
-            "bottom_quick_start",
-        ],
-    ) {
-        return None;
-    }
     if input.bars.len() < 70
         || metrics.today_close < metrics.ma20
         || metrics.ma20 < metrics.ma20_prev * 0.99
@@ -486,7 +518,12 @@ fn score_long_reversal_repair(input: &RankInput, metrics: Metrics) -> Option<Ran
         ),
         ("收盘质量".to_string(), metrics.close_pos * 7.0),
     ];
-    let reasons = vec!["长期下跌后进入右侧修复阶段".to_string()];
+    let mut factors = factors;
+    let mut reasons = vec!["长期下跌后进入右侧修复阶段".to_string()];
+    if let Some(factor) = evidence_factor(&input.hits, LONG_EVIDENCE_SIGNALS) {
+        factors.push(factor);
+        reasons.push("旧信号提供长线证据".to_string());
+    }
     let (risk_flags, penalties) = common_penalties(metrics);
     let score = factor_sum(&factors) - penalties.iter().map(|(_, v)| *v).sum::<f64>();
     let tier = tier_for(LineType::Long, score)?;
@@ -503,6 +540,7 @@ fn score_long_reversal_repair(input: &RankInput, metrics: Metrics) -> Option<Ran
         risk_flags,
         factor_breakdown: extend_factors(factors, penalties),
         supporting_signals: supporting_signal_ids(&input.hits),
+        matched_setups: Vec::new(),
     })
 }
 
@@ -600,10 +638,7 @@ fn common_penalties(metrics: Metrics) -> (Vec<String>, Vec<(String, f64)>) {
 
 fn is_hard_reject(input: &RankInput, metrics: Metrics) -> bool {
     let name = input.name.trim().to_ascii_uppercase();
-    name.contains("ST")
-        || input.name.contains('退')
-        || metrics.today_close <= 0.0
-        || input.hits.is_empty()
+    name.contains("ST") || input.name.contains('退') || metrics.today_close <= 0.0
 }
 
 fn has_any_signal(hits: &[SignalHit], signal_ids: &[&str]) -> bool {
@@ -612,6 +647,21 @@ fn has_any_signal(hits: &[SignalHit], signal_ids: &[&str]) -> bool {
             .iter()
             .any(|signal_id| hit.signal_id == *signal_id)
     })
+}
+
+fn evidence_factor(hits: &[SignalHit], signal_ids: &[&str]) -> Option<(String, f64)> {
+    let count = hits
+        .iter()
+        .filter(|hit| {
+            signal_ids
+                .iter()
+                .any(|signal_id| hit.signal_id == *signal_id)
+        })
+        .count();
+    if count == 0 {
+        return None;
+    }
+    Some(("旧信号证据".to_string(), (count as f64 * 3.0).min(6.0)))
 }
 
 fn supporting_signal_ids(hits: &[SignalHit]) -> Vec<String> {
@@ -793,6 +843,28 @@ mod tests {
     }
 
     #[test]
+    fn rank_scan_inputs_emits_short_pool_without_raw_signal_hits() {
+        let mut bars = Vec::new();
+        for _ in 0..35 {
+            bars.push(candle(10.0, 10.3, 9.9, 10.1, 1_000_000, 120_000_000.0));
+        }
+        bars.pop();
+        bars.push(candle(10.2, 11.0, 10.1, 10.95, 2_800_000, 360_000_000.0));
+
+        let pools = rank_scan_inputs(&[RankInput {
+            code: "600000.SH".to_string(),
+            name: "浦发银行".to_string(),
+            bars,
+            hits: vec![],
+        }]);
+
+        assert!(
+            !pools[POOL_SHORT_A_ID].is_empty() || !pools[POOL_SHORT_B_ID].is_empty(),
+            "expected a structure-only short pool candidate"
+        );
+    }
+
+    #[test]
     fn rank_scan_inputs_emits_mid_pool_for_trend_breakout_candidate() {
         let mut bars = Vec::new();
         for i in 0..70 {
@@ -823,6 +895,52 @@ mod tests {
             !pools[POOL_MID_A_ID].is_empty() || !pools[POOL_MID_B_ID].is_empty(),
             "expected at least one mid-tier pool hit"
         );
+    }
+
+    #[test]
+    fn rank_scan_inputs_rewards_old_signal_evidence() {
+        let mut bars = Vec::new();
+        for i in 0..70 {
+            let close = 8.0 + i as f64 * 0.05;
+            bars.push(candle(
+                close - 0.08,
+                close + 0.10,
+                close - 0.12,
+                close,
+                1_200_000,
+                220_000_000.0,
+            ));
+        }
+        bars.pop();
+        bars.push(candle(11.4, 11.9, 11.3, 11.85, 2_400_000, 420_000_000.0));
+
+        let without_evidence = rank_scan_inputs(&[RankInput {
+            code: "300001.SZ".to_string(),
+            name: "特锐德".to_string(),
+            bars: bars.clone(),
+            hits: vec![],
+        }]);
+        let with_evidence = rank_scan_inputs(&[RankInput {
+            code: "300001.SZ".to_string(),
+            name: "特锐德".to_string(),
+            bars,
+            hits: vec![hit("300001.SZ", "特锐德", "ma_bullish", "均线多头")],
+        }]);
+
+        let score_without = score_from_hit(
+            without_evidence[POOL_MID_A_ID]
+                .first()
+                .or_else(|| without_evidence[POOL_MID_B_ID].first())
+                .expect("expected structure-only mid candidate"),
+        );
+        let with_hit = with_evidence[POOL_MID_A_ID]
+            .first()
+            .or_else(|| with_evidence[POOL_MID_B_ID].first())
+            .expect("expected mid candidate with evidence");
+        let score_with = score_from_hit(with_hit);
+
+        assert!(score_with > score_without);
+        assert!(with_hit.metadata.get("matched_setups").is_some());
     }
 
     #[test]

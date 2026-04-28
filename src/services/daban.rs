@@ -252,27 +252,30 @@ impl DabanService {
             report.summary.sentiment,
             report.summary.avg_score
         );
-
-        for (idx, s) in report.top.iter().take(12).enumerate() {
-            msg.push_str(&format!(
-                "{}. {}  分数:{:.1}  {}\n",
-                idx + 1,
-                format!("{} {}", s.code, s.name).trim(),
-                s.score,
-                s.verdict
-            ));
+        if report.top.is_empty() {
+            msg.push_str("📭 暂无打板候选");
+        } else {
+            msg.push_str("<i>点击下方按钮打开K线</i>");
         }
         msg
     }
 
-    fn format_report_markup_with_base(report: &DabanReport, webhook_url: Option<&str>) -> Option<Value> {
+    fn format_report_markup_with_base(
+        report: &DabanReport,
+        webhook_url: Option<&str>,
+    ) -> Option<Value> {
         let buttons: Vec<Vec<Value>> = report
             .top
             .iter()
             .take(12)
             .enumerate()
             .filter_map(|(idx, stock)| {
-                let label = format!("{}. {} ({})", idx + 1, stock.name.trim(), stock.code.split('.').next().unwrap_or(&stock.code));
+                let label = format!(
+                    "{}. {} ({})",
+                    idx + 1,
+                    stock.name.trim(),
+                    stock.code.split('.').next().unwrap_or(&stock.code)
+                );
                 crate::telegram::formatter::stock_button_with_base(&stock.code, &label, webhook_url)
                     .map(|button| vec![button])
             })
@@ -388,7 +391,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn format_report_text_lists_ranked_stocks_without_html_links() {
+    fn format_report_text_keeps_ranked_stocks_out_of_body_when_buttons_are_used() {
         let report = DabanReport {
             summary: DabanSummary {
                 date: NaiveDate::from_ymd_opt(2026, 3, 10).unwrap(),
@@ -414,8 +417,9 @@ mod tests {
             DabanService::format_report_text_with_base(&report, Some("https://bot.example/"));
 
         assert!(text.contains("打板评分"));
-        assert!(text.contains("1. 600519.SH 贵州茅台  分数:88.6  强烈推荐"));
+        assert!(!text.contains("1. 600519.SH 贵州茅台"));
         assert!(!text.contains("<a href="));
+        assert!(text.contains("点击下方按钮"));
     }
 
     #[test]

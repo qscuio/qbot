@@ -22,13 +22,15 @@ use crate::services::portfolio::PortfolioService;
 use crate::services::prestart::{is_prestart_signal, PrestartCandidate, PrestartService};
 use crate::services::scan_ranker::{
     ranked_pool_meta, POOL_LONG_A_ID, POOL_LONG_B_ID, POOL_MID_A_ID, POOL_MID_B_ID,
-    POOL_SHORT_A_ID, POOL_SHORT_B_ID,
+    POOL_SHORT_A_ID, POOL_SHORT_B_ID, RANKED_POOL_IDS,
 };
 use crate::services::scanner::{ScannerService, SignalHit};
 use crate::services::scanner_stats::{
     HorizonPerformance, ScannerStatsService, SignalPerformanceSummary,
 };
-use crate::services::signal_auto_trading::{SignalAutoTradingService, StrategyAccountSnapshot};
+use crate::services::signal_auto_trading::{
+    SignalAutoEvent, SignalAutoOpenPosition, SignalAutoTradingService, StrategyAccountSnapshot,
+};
 use crate::services::trading_sim::TradingSimService;
 use crate::services::watchlist::WatchlistService;
 use crate::signals::registry::SignalRegistry;
@@ -482,9 +484,14 @@ fn telegram_help_text() -> String {
         "",
         "<b>Signals / Daban</b>",
         "/scan           扫描信号",
+        "/pick           周期选股菜单",
+        "/pick short|mid|long  按周期扫描A档票池",
+        "/pick_stats     短中长票池有效性统计",
         "/prestart       预启动候选池",
         "/scan_stats     信号前瞻收益统计",
         "/autosim        自动交易账户快照",
+        "/autosim positions 自动交易持仓",
+        "/autosim history 自动交易历史",
         "/autosim_report 自动交易最新日报",
         "/sim            普通模拟交易",
         "/daban          打板评分",
@@ -561,6 +568,22 @@ fn parse_scan_stats_args(args: &str) -> (Option<String>, i64) {
     }
 
     (signal_id, normalize_scan_stats_days(days))
+}
+
+fn pick_horizon_signal_id(raw: &str) -> Option<&'static str> {
+    match raw
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "short" | "s" | "短线" => Some(POOL_SHORT_A_ID),
+        "mid" | "middle" | "m" | "中线" => Some(POOL_MID_A_ID),
+        "long" | "l" | "长线" => Some(POOL_LONG_A_ID),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -809,6 +832,12 @@ fn format_scan_stats_text(
             .find(|h| h.days == 10)
             .map(format_horizon_metric)
             .unwrap_or_else(|| "10d n=0".to_string());
+        let horizon_20 = summary
+            .horizons
+            .iter()
+            .find(|h| h.days == 20)
+            .map(format_horizon_metric)
+            .unwrap_or_else(|| "20d n=0".to_string());
 
         lines.push(format!(
             "{}. {} <b>{}</b> <code>{}</code> 样本{}",
@@ -820,9 +849,61 @@ fn format_scan_stats_text(
         ));
         lines.push(format!("   {} | {}", horizon_1, horizon_3));
         lines.push(format!("   {} | {}", horizon_5, horizon_10));
+        lines.push(format!("   {}", horizon_20));
     }
 
     lines.join("\n")
+}
+
+fn format_pick_stats_text(summaries: &[SignalPerformanceSummary], lookback_days: i64) -> String {
+    let pool_summaries: Vec<SignalPerformanceSummary> = RANKED_POOL_IDS
+        .iter()
+        .filter_map(|pool_id| {
+            summaries
+                .iter()
+                .find(|summary| summary.signal_id == *pool_id)
+                .cloned()
+        })
+        .collect();
+
+    if pool_summaries.is_empty() {
+        return format!(
+            "🎯 <b>票池有效性</b> (近{}日)\n\n📭 暂无短/中/长票池有效样本",
+            lookback_days
+        );
+    }
+
+    let mut text = format!(
+        "🎯 <b>票池有效性</b> (近{}日)\n━━━━━━━━━━━━━━━━━━━━━\n<i>格式: 平均收益 / 胜率 (样本)</i>\n\n",
+        lookback_days
+    );
+    let meta = scan_signal_meta();
+    for (idx, summary) in pool_summaries.iter().enumerate() {
+        let (name, icon) = meta
+            .get(&summary.signal_id)
+            .cloned()
+            .unwrap_or_else(|| (summary.signal_id.clone(), "•".to_string()));
+        let metric = |days| {
+            summary
+                .horizons
+                .iter()
+                .find(|h| h.days == days)
+                .map(format_horizon_metric)
+                .unwrap_or_else(|| format!("{}d n=0", days))
+        };
+
+        text.push_str(&format!(
+            "{}. {} <b>{}</b> 样本{}\n",
+            idx + 1,
+            icon,
+            escape_html(&name),
+            summary.total_samples
+        ));
+        text.push_str(&format!("   {} | {}\n", metric(1), metric(3)));
+        text.push_str(&format!("   {} | {}\n", metric(5), metric(10)));
+        text.push_str(&format!("   {}\n", metric(20)));
+    }
+    text
 }
 
 fn format_signal_auto_status(accounts: &[StrategyAccountSnapshot]) -> String {
@@ -880,6 +961,109 @@ fn format_signal_auto_status(accounts: &[StrategyAccountSnapshot]) -> String {
     append_signal_auto_group(&mut lines, "🌱 预启动", &prestart_accounts);
     append_signal_auto_group(&mut lines, "🧱 自动打板", &daban_accounts);
     append_signal_auto_group(&mut lines, "💪 自动强势股", &strong_accounts);
+
+    lines.join("\n")
+}
+
+fn format_signal_auto_positions(positions: &[SignalAutoOpenPosition]) -> String {
+    if positions.is_empty() {
+        return "📦 <b>自动交易持仓</b>\n\n📭 当前无自动交易持仓".to_string();
+    }
+
+    let total_market_value: f64 = positions
+        .iter()
+        .map(|position| {
+            position.current_price.unwrap_or(position.entry_price) * position.shares as f64
+        })
+        .sum();
+    let avg_pnl = positions
+        .iter()
+        .filter_map(|position| position.unrealized_pnl_pct)
+        .sum::<f64>()
+        / positions
+            .iter()
+            .filter(|position| position.unrealized_pnl_pct.is_some())
+            .count()
+            .max(1) as f64;
+
+    [
+        format!("📦 <b>自动交易持仓</b> ({} 个持仓)", positions.len()),
+        "━━━━━━━━━━━━━━━━━━━━━".to_string(),
+        format!("市值: {:.0} | 平均浮盈亏: {:+.2}%", total_market_value, avg_pnl),
+        "<i>点击下方按钮打开K线</i>".to_string(),
+    ]
+    .join("\n")
+}
+
+fn signal_auto_positions_markup(
+    positions: &[SignalAutoOpenPosition],
+    miniapp_base: Option<&str>,
+) -> Option<Value> {
+    let mut rows: Vec<Vec<Value>> = positions
+        .iter()
+        .take(30)
+        .enumerate()
+        .filter_map(|(idx, position)| {
+            let code = normalize_stock_code(&position.code);
+            let pnl = position
+                .unrealized_pnl_pct
+                .map(|value| format!(" {:+.1}%", value))
+                .unwrap_or_default();
+            let label = format!(
+                "{}. {} {} ({}){}",
+                idx + 1,
+                position.signal_name.trim(),
+                position.name.trim(),
+                code,
+                pnl
+            );
+            crate::telegram::formatter::stock_button_with_base(
+                &position.code,
+                &label,
+                miniapp_base,
+            )
+            .map(|button| vec![button])
+        })
+        .collect();
+
+    if rows.is_empty() {
+        return None;
+    }
+
+    rows.push(vec![
+        cb_button("📜 历史", "cmd:autosim_history"),
+        cb_button("📊 统计", "cmd:autosim_stats"),
+    ]);
+    Some(inline_keyboard(rows))
+}
+
+fn format_signal_auto_history(events: &[SignalAutoEvent]) -> String {
+    if events.is_empty() {
+        return "📜 <b>自动交易历史</b>\n\n📭 暂无自动交易事件".to_string();
+    }
+
+    let mut lines = vec![
+        format!("📜 <b>自动交易历史</b> (最近 {})", events.len()),
+        "━━━━━━━━━━━━━━━━━━━━━".to_string(),
+    ];
+
+    for event in events.iter().take(20) {
+        let first_detail_line = event.detail.lines().next().unwrap_or("").trim();
+        let code = event.code.as_deref().unwrap_or_default();
+        let suffix = if code.is_empty() {
+            String::new()
+        } else {
+            format!(" <code>{}</code>", escape_html(code))
+        };
+        lines.push(format!(
+            "• {} <b>{}</b>{}\n  {} {}",
+            event.event_time.format("%m-%d %H:%M"),
+            escape_html(&event.title),
+            suffix,
+            escape_html(&event.signal_name),
+            escape_html(first_detail_line)
+        ));
+    }
 
     lines.join("\n")
 }
@@ -954,61 +1138,103 @@ fn format_prestart_text(candidates: &[PrestartCandidate], limit: usize) -> Strin
         .filter(|item| item.tier == crate::services::prestart::PrestartTier::A)
         .count();
     let b_count = candidates.len().saturating_sub(a_count);
-    let mut lines = vec![
+    let lines = vec![
         format!("🌱 <b>预启动候选</b> (Top {})", limit.min(candidates.len())),
         "━━━━━━━━━━━━━━━━━━━━━".to_string(),
         format!(
             "<i>A档: 至少3/5共振 | B档: 核心(ma_bullish/slow_bull)+辅助共振 | A {} / B {}</i>",
             a_count, b_count
         ),
+        "<i>点击下方按钮打开K线</i>".to_string(),
     ];
-
-    for (idx, item) in candidates.iter().enumerate() {
-        lines.push(format!(
-            "{}. [{}档] <b>{}</b> ({}) {:.1}分",
-            idx + 1,
-            item.tier,
-            escape_html(&item.name),
-            escape_html(&item.code),
-            item.score
-        ));
-        lines.push(format!(
-            "   共振: {}",
-            escape_html(&item.matched_signal_names.join(" / "))
-        ));
-        lines.push(format!(
-            "   涨幅 {:+.1}% | 成交额 {:.1}亿 | 15日振幅 {:.1}% | 距前高 {:.1}%",
-            item.gain_pct, item.amount_yi, item.range_15_pct, item.gap_to_high_pct
-        ));
-    }
 
     lines.join("\n")
 }
 
-async fn format_watchlist(state: Arc<AppState>, user_id: i64) -> crate::error::Result<String> {
-    let svc = WatchlistService::new(state);
-    let items = svc.list_stocks(user_id).await?;
+fn prestart_candidate_markup(
+    candidates: &[PrestartCandidate],
+    miniapp_base: Option<&str>,
+) -> Option<Value> {
+    let mut rows: Vec<Vec<Value>> = candidates
+        .iter()
+        .take(20)
+        .enumerate()
+        .filter_map(|(idx, item)| {
+            let code = normalize_stock_code(&item.code);
+            let label = format!(
+                "{}. [{}] {} ({}) {:.1}",
+                idx + 1,
+                item.tier,
+                item.name.trim(),
+                code,
+                item.score
+            );
+            crate::telegram::formatter::stock_button_with_base(&item.code, &label, miniapp_base)
+                .map(|button| vec![button])
+        })
+        .collect();
 
-    if items.is_empty() {
-        return Ok(
-            "⭐ <b>自选列表</b>\n\n📭 暂无自选股票\n使用 <code>/watch 600519</code> 添加"
-                .to_string(),
-        );
+    if rows.is_empty() {
+        return None;
     }
 
-    let mut lines = vec![
+    rows.push(vec![
+        cb_button("🔍 扫描菜单", "menu:scan"),
+        cb_button("🏠 主菜单", "menu:main"),
+    ]);
+    Some(inline_keyboard(rows))
+}
+
+fn format_watchlist_text(items: &[crate::services::watchlist::WatchlistItem]) -> String {
+    if items.is_empty() {
+        return "⭐ <b>自选列表</b>\n\n📭 暂无自选股票\n使用 <code>/watch 600519</code> 添加"
+            .to_string();
+    }
+
+    [
         format!("⭐ <b>自选列表</b> ({})", items.len()),
         "━━━━━━━━━━━━━━━━━━━━━".to_string(),
-    ];
-    for (idx, item) in items.iter().take(80).enumerate() {
-        lines.push(format!(
-            "{}. <b>{}</b> ({})",
-            idx + 1,
-            escape_html(&item.name),
-            escape_html(&item.code)
-        ));
+        "<i>点击下方按钮打开K线</i>".to_string(),
+    ]
+    .join("\n")
+}
+
+fn watchlist_markup(
+    items: &[crate::services::watchlist::WatchlistItem],
+    miniapp_base: Option<&str>,
+) -> Option<Value> {
+    let rows: Vec<Vec<Value>> = items
+        .iter()
+        .take(80)
+        .enumerate()
+        .filter_map(|(idx, item)| {
+            let code = normalize_stock_code(&item.code);
+            let label = format!("{}. {} ({})", idx + 1, item.name.trim(), code);
+            crate::telegram::formatter::stock_button_with_base(&item.code, &label, miniapp_base)
+                .map(|button| vec![button])
+        })
+        .collect();
+
+    if rows.is_empty() {
+        None
+    } else {
+        Some(inline_keyboard(rows))
     }
-    Ok(lines.join("\n"))
+}
+
+async fn send_watchlist(
+    state: Arc<AppState>,
+    chat_id: i64,
+    user_id: i64,
+) -> crate::error::Result<()> {
+    let svc = WatchlistService::new(state.clone());
+    let items = svc.list_stocks(user_id).await?;
+    let text = format_watchlist_text(&items);
+
+    match watchlist_markup(&items, state.config.webhook_url.as_deref()) {
+        Some(markup) => tg_send_with_markup(&state, chat_id, &text, markup).await,
+        None => tg_send(&state, chat_id, &text).await,
+    }
 }
 
 async fn format_limit_up_overview(state: Arc<AppState>) -> crate::error::Result<String> {
@@ -1036,59 +1262,50 @@ async fn format_limit_up_overview(state: Arc<AppState>) -> crate::error::Result<
     ))
 }
 
+fn format_strong_limit_up_text(
+    days: i64,
+    items: &[crate::storage::postgres::StrongLimitUpStock],
+) -> String {
+    if items.is_empty() {
+        return format!(
+            "💪 <b>强势股</b> ({}日)\n\n📭 暂无符合条件的强势股",
+            days
+        );
+    }
+
+    [
+        format!("💪 <b>强势股</b> ({}日, {})", days, items.len()),
+        "━━━━━━━━━━━━━━━━━━━━━".to_string(),
+        "<i>点击下方按钮打开K线</i>".to_string(),
+    ]
+    .join("\n")
+}
+
 async fn format_strong_limit_up(state: Arc<AppState>, days: i64) -> crate::error::Result<String> {
     let svc = LimitUpService::new(state.clone(), state.provider.clone());
     let items = svc.get_strong_stocks(days, 3).await?;
+    Ok(format_strong_limit_up_text(days, &items))
+}
 
+fn format_startup_watchlist_text(items: &[crate::storage::postgres::StartupWatchStock]) -> String {
     if items.is_empty() {
-        return Ok(format!(
-            "💪 <b>强势股</b> ({}日)\n\n📭 暂无符合条件的强势股",
-            days
-        ));
+        return "👀 <b>启动追踪</b>\n\n📭 暂无观察股\n<i>近30日只涨停过一次的股票会进入这里</i>"
+            .to_string();
     }
 
-    let mut lines = vec![
-        format!("💪 <b>强势股</b> ({}日, {})", days, items.len()),
+    [
+        format!("👀 <b>启动追踪</b> ({})", items.len()),
         "━━━━━━━━━━━━━━━━━━━━━".to_string(),
-    ];
-    for (idx, item) in items.iter().take(30).enumerate() {
-        lines.push(format!(
-            "{}. {} ({}) - {}次涨停",
-            idx + 1,
-            escape_html(&item.name),
-            escape_html(&item.code),
-            item.limit_count
-        ));
-    }
-    Ok(lines.join("\n"))
+        "<i>近30日仅涨停一次，再次涨停将自动移除</i>".to_string(),
+        "<i>点击下方按钮打开K线</i>".to_string(),
+    ]
+    .join("\n")
 }
 
 async fn format_startup_watchlist(state: Arc<AppState>) -> crate::error::Result<String> {
     let svc = LimitUpService::new(state.clone(), state.provider.clone());
     let items = svc.get_startup_watchlist().await?;
-
-    if items.is_empty() {
-        return Ok(
-            "👀 <b>启动追踪</b>\n\n📭 暂无观察股\n<i>近30日只涨停过一次的股票会进入这里</i>"
-                .to_string(),
-        );
-    }
-
-    let mut lines = vec![
-        format!("👀 <b>启动追踪</b> ({})", items.len()),
-        "━━━━━━━━━━━━━━━━━━━━━".to_string(),
-        "<i>近30日仅涨停一次，再次涨停将自动移除</i>".to_string(),
-    ];
-    for (idx, item) in items.iter().take(30).enumerate() {
-        lines.push(format!(
-            "{}. {} ({}) {}",
-            idx + 1,
-            escape_html(&item.name),
-            escape_html(&item.code),
-            item.first_limit_date.format("%m/%d")
-        ));
-    }
-    Ok(lines.join("\n"))
+    Ok(format_startup_watchlist_text(&items))
 }
 
 async fn send_strong_limit_up(
@@ -1963,21 +2180,24 @@ fn main_menu_markup() -> Value {
     inline_keyboard(vec![
         vec![
             cb_button("🔍 信号扫描", "menu:scan"),
+            cb_button("🎯 周期选股", "menu:pick"),
+        ],
+        vec![
             cb_button("🧱 打板", "menu:daban"),
+            cb_button("📈 涨停追踪", "menu:limitup"),
         ],
         vec![
             cb_button("⭐ 自选", "menu:watch"),
             cb_button("💼 持仓", "menu:portfolio"),
         ],
         vec![
-            cb_button("📈 涨停追踪", "menu:limitup"),
             cb_button("🏭 板块/AI", "menu:sector"),
+            cb_button("🧪 模拟交易", "menu:sim"),
         ],
         vec![
-            cb_button("🧪 模拟交易", "menu:sim"),
             cb_button("🛠 工具", "menu:tools"),
+            cb_button("❓ 帮助", "cmd:help"),
         ],
-        vec![cb_button("❓ 帮助", "cmd:help")],
     ])
 }
 
@@ -2120,6 +2340,7 @@ fn limitup_menu_markup() -> Value {
 
 fn scan_menu_markup() -> Value {
     let rows: Vec<Vec<Value>> = vec![
+        vec![cb_button("🎯 周期选股", "menu:pick")],
         vec![
             cb_button("🚀 启动/量价", "scan:menu:hot"),
             cb_button("📈 趋势/回踩", "scan:menu:trend"),
@@ -2153,8 +2374,38 @@ fn scan_menu_markup() -> Value {
     inline_keyboard(rows)
 }
 
+fn pick_menu_markup() -> Value {
+    inline_keyboard(vec![
+        vec![
+            cb_button("🔥 短线A档", &format!("scan:s:{POOL_SHORT_A_ID}")),
+            cb_button("🟠 短线B档", &format!("scan:s:{POOL_SHORT_B_ID}")),
+        ],
+        vec![
+            cb_button("📈 中线A档", &format!("scan:s:{POOL_MID_A_ID}")),
+            cb_button("🧭 中线B档", &format!("scan:s:{POOL_MID_B_ID}")),
+        ],
+        vec![
+            cb_button("🏛️ 长线A档", &format!("scan:s:{POOL_LONG_A_ID}")),
+            cb_button("🌱 长线B档", &format!("scan:s:{POOL_LONG_B_ID}")),
+        ],
+        vec![
+            cb_button("🌱 预启动池", "cmd:prestart"),
+            cb_button("📊 票池统计", "cmd:pick_stats"),
+        ],
+        vec![
+            cb_button("🔍 扫描菜单", "menu:scan"),
+            cb_button("🏠 主菜单", "menu:main"),
+        ],
+    ])
+}
+
 fn menu_content(menu: &str) -> (String, Value) {
     match menu {
+        "pick" => (
+            "🎯 <b>周期选股</b>\n━━━━━━━━━━━━━━━━━━━━━\n<i>按交易周期选择票池：短线偏1-5日，中线偏5-20日，长线偏20日以上</i>"
+                .to_string(),
+            pick_menu_markup(),
+        ),
         "watch" => (
             "⭐ <b>自选菜单</b>\n选择一个操作".to_string(),
             watch_menu_markup(),
@@ -2212,7 +2463,11 @@ fn scan_result_panel_markup() -> Value {
 fn autosim_panel_markup() -> Value {
     inline_keyboard(vec![
         vec![
-            cb_button("🤖 自动交易", "cmd:autosim"),
+            cb_button("📊 统计", "cmd:autosim_stats"),
+            cb_button("📦 持仓", "cmd:autosim_positions"),
+        ],
+        vec![
+            cb_button("📜 历史", "cmd:autosim_history"),
             cb_button("📰 自动日报", "cmd:autosim_report"),
         ],
         vec![
@@ -2315,6 +2570,25 @@ async fn show_scan_stats_panel(
     .await
 }
 
+async fn show_pick_stats_panel(
+    state: &Arc<AppState>,
+    chat_id: i64,
+    message_id: Option<i64>,
+) -> crate::error::Result<()> {
+    let lookback_days = normalize_scan_stats_days(None);
+    let summaries = ScannerStatsService::new(state.clone())
+        .summarize(lookback_days, None)
+        .await?;
+    show_text_panel(
+        state,
+        chat_id,
+        message_id,
+        &format_pick_stats_text(&summaries, lookback_days),
+        pick_menu_markup(),
+    )
+    .await
+}
+
 async fn show_prestart_panel(
     state: &Arc<AppState>,
     chat_id: i64,
@@ -2323,12 +2597,15 @@ async fn show_prestart_panel(
     let candidates = PrestartService::new(state.clone())
         .list_candidates(20)
         .await?;
+    let text = format_prestart_text(&candidates, 20);
+    let markup = prestart_candidate_markup(&candidates, state.config.webhook_url.as_deref())
+        .unwrap_or_else(scan_result_panel_markup);
     show_text_panel(
         state,
         chat_id,
         message_id,
-        &format_prestart_text(&candidates, 20),
-        scan_result_panel_markup(),
+        &text,
+        markup,
     )
     .await
 }
@@ -2349,6 +2626,44 @@ async fn show_autosim_panel(
         chat_id,
         message_id,
         &format_signal_auto_status(&accounts),
+        autosim_panel_markup(),
+    )
+    .await
+}
+
+async fn show_autosim_positions_panel(
+    state: &Arc<AppState>,
+    chat_id: i64,
+    message_id: Option<i64>,
+) -> crate::error::Result<()> {
+    let positions = SignalAutoTradingService::new(
+        state.clone(),
+        Arc::new(crate::data::sina::SinaClient::new()),
+    )
+    .list_open_position_snapshots()
+    .await?;
+    let text = format_signal_auto_positions(&positions);
+    let markup = signal_auto_positions_markup(&positions, state.config.webhook_url.as_deref())
+        .unwrap_or_else(autosim_panel_markup);
+    show_text_panel(state, chat_id, message_id, &text, markup).await
+}
+
+async fn show_autosim_history_panel(
+    state: &Arc<AppState>,
+    chat_id: i64,
+    message_id: Option<i64>,
+) -> crate::error::Result<()> {
+    let events = SignalAutoTradingService::new(
+        state.clone(),
+        Arc::new(crate::data::sina::SinaClient::new()),
+    )
+    .list_recent_events(20)
+    .await?;
+    show_text_panel(
+        state,
+        chat_id,
+        message_id,
+        &format_signal_auto_history(&events),
         autosim_panel_markup(),
     )
     .await
@@ -2430,6 +2745,7 @@ async fn handle_telegram_callback(
     match data.as_str() {
         "menu:main" => show_menu(&state, chat_id, Some(message_id), "main").await?,
         "menu:scan" => show_menu(&state, chat_id, Some(message_id), "scan").await?,
+        "menu:pick" => show_menu(&state, chat_id, Some(message_id), "pick").await?,
         "menu:watch" => show_menu(&state, chat_id, Some(message_id), "watch").await?,
         "menu:portfolio" => show_menu(&state, chat_id, Some(message_id), "portfolio").await?,
         "menu:limitup" => show_menu(&state, chat_id, Some(message_id), "limitup").await?,
@@ -2731,7 +3047,16 @@ async fn handle_telegram_callback(
             .await?
         }
         "cmd:scan_stats" => show_scan_stats_panel(&state, chat_id, Some(message_id)).await?,
-        "cmd:autosim" => show_autosim_panel(&state, chat_id, Some(message_id)).await?,
+        "cmd:pick_stats" => show_pick_stats_panel(&state, chat_id, Some(message_id)).await?,
+        "cmd:autosim" | "cmd:autosim_stats" => {
+            show_autosim_panel(&state, chat_id, Some(message_id)).await?
+        }
+        "cmd:autosim_positions" => {
+            show_autosim_positions_panel(&state, chat_id, Some(message_id)).await?
+        }
+        "cmd:autosim_history" => {
+            show_autosim_history_panel(&state, chat_id, Some(message_id)).await?
+        }
         "cmd:autosim_report" => show_autosim_report_panel(&state, chat_id, Some(message_id)).await?,
         "scan:all" => run_scan_command(state.clone(), chat_id, None).await?,
         "prompt:watch_add" => tg_send(&state, chat_id, "用法: <code>/watch 600519</code>").await?,
@@ -2834,8 +3159,7 @@ async fn handle_telegram_command(
         "watch" => {
             let code = args.split_whitespace().next().unwrap_or_default();
             if code.is_empty() {
-                let text = format_watchlist(state.clone(), user_id).await?;
-                tg_send(&state, chat_id, &text).await?;
+                send_watchlist(state.clone(), chat_id, user_id).await?;
             } else {
                 let svc = WatchlistService::new(state.clone());
                 let resolved = svc.add_stock(user_id, code).await?;
@@ -2879,8 +3203,7 @@ async fn handle_telegram_command(
             }
         }
         "mywatch" => {
-            let text = format_watchlist(state.clone(), user_id).await?;
-            tg_send(&state, chat_id, &text).await?;
+            send_watchlist(state.clone(), chat_id, user_id).await?;
         }
         "export" => {
             let svc = WatchlistService::new(state.clone());
@@ -3198,21 +3521,72 @@ async fn handle_telegram_command(
             )
             .await?;
         }
+        "pick_stats" => {
+            let lookback_days = normalize_scan_stats_days(args.trim().parse::<i64>().ok());
+            let summaries = ScannerStatsService::new(state.clone())
+                .summarize(lookback_days, None)
+                .await?;
+            tg_send(
+                &state,
+                chat_id,
+                &format_pick_stats_text(&summaries, lookback_days),
+            )
+            .await?;
+        }
         "prestart" => {
             let limit = args.trim().parse::<usize>().unwrap_or(20).clamp(1, 50);
             let candidates = PrestartService::new(state.clone())
                 .list_candidates(limit)
                 .await?;
-            tg_send(&state, chat_id, &format_prestart_text(&candidates, limit)).await?;
+            let text = format_prestart_text(&candidates, limit);
+            match prestart_candidate_markup(&candidates, state.config.webhook_url.as_deref()) {
+                Some(markup) => tg_send_with_markup(&state, chat_id, &text, markup).await?,
+                None => tg_send(&state, chat_id, &text).await?,
+            }
         }
         "autosim" => {
-            let accounts = SignalAutoTradingService::new(
-                state.clone(),
-                Arc::new(crate::data::sina::SinaClient::new()),
-            )
-            .list_account_snapshots()
-            .await?;
-            tg_send(&state, chat_id, &format_signal_auto_status(&accounts)).await?;
+            match args
+                .split_whitespace()
+                .next()
+                .unwrap_or("stats")
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "positions" | "position" | "portfolio" | "持仓" => {
+                    let positions = SignalAutoTradingService::new(
+                        state.clone(),
+                        Arc::new(crate::data::sina::SinaClient::new()),
+                    )
+                    .list_open_position_snapshots()
+                    .await?;
+                    let text = format_signal_auto_positions(&positions);
+                    match signal_auto_positions_markup(
+                        &positions,
+                        state.config.webhook_url.as_deref(),
+                    ) {
+                        Some(markup) => tg_send_with_markup(&state, chat_id, &text, markup).await?,
+                        None => tg_send(&state, chat_id, &text).await?,
+                    }
+                }
+                "history" | "events" | "trades" | "历史" => {
+                    let events = SignalAutoTradingService::new(
+                        state.clone(),
+                        Arc::new(crate::data::sina::SinaClient::new()),
+                    )
+                    .list_recent_events(20)
+                    .await?;
+                    tg_send(&state, chat_id, &format_signal_auto_history(&events)).await?;
+                }
+                _ => {
+                    let accounts = SignalAutoTradingService::new(
+                        state.clone(),
+                        Arc::new(crate::data::sina::SinaClient::new()),
+                    )
+                    .list_account_snapshots()
+                    .await?;
+                    tg_send(&state, chat_id, &format_signal_auto_status(&accounts)).await?;
+                }
+            }
         }
         "autosim_report" => {
             match SignalAutoTradingService::new(
@@ -3282,6 +3656,20 @@ async fn handle_telegram_command(
         }
         "scan" => {
             run_scan_command(state.clone(), chat_id, None).await?;
+        }
+        "pick" => {
+            if args.trim().is_empty() {
+                show_menu(&state, chat_id, None, "pick").await?;
+            } else if let Some(signal_id) = pick_horizon_signal_id(&args) {
+                run_scan_command(state.clone(), chat_id, Some(signal_id)).await?;
+            } else {
+                tg_send(
+                    &state,
+                    chat_id,
+                    "用法: <code>/pick short</code>、<code>/pick mid</code>、<code>/pick long</code>",
+                )
+                .await?;
+            }
         }
         "industry" => send_sector_snapshot(state.clone(), chat_id, "industry").await?,
         "concept" => send_sector_snapshot(state.clone(), chat_id, "concept").await?,
@@ -4599,9 +4987,92 @@ mod tests {
     }
 
     #[test]
+    fn telegram_help_text_mentions_pick_command() {
+        let text = telegram_help_text();
+        assert!(text.contains("/pick"));
+        assert!(text.contains("/pick_stats"));
+    }
+
+    #[test]
     fn telegram_help_text_mentions_prestart_command() {
         let text = telegram_help_text();
         assert!(text.contains("/prestart"));
+    }
+
+    #[test]
+    fn prestart_text_keeps_candidate_rows_out_of_body_and_markup_has_buttons() {
+        let candidates = vec![PrestartCandidate {
+            code: "300001.SZ".to_string(),
+            name: "Gamma".to_string(),
+            tier: crate::services::prestart::PrestartTier::A,
+            score: 86.5,
+            matched_signal_ids: vec!["ma_bullish".to_string()],
+            matched_signal_names: vec!["均线多头".to_string()],
+            reasons: vec![],
+            gain_pct: 2.1,
+            amount_yi: 3.2,
+            range_15_pct: 6.5,
+            gap_to_high_pct: 1.2,
+            ma20_extension_pct: 4.0,
+        }];
+
+        let text = format_prestart_text(&candidates, 20);
+        assert!(text.contains("预启动候选"));
+        assert!(!text.contains("[A档] <b>Gamma</b> (300001.SZ)"));
+        assert!(!text.contains("共振:"));
+        assert!(text.contains("点击下方按钮"));
+
+        let markup = prestart_candidate_markup(&candidates, Some("https://bot.example"))
+            .expect("markup");
+        assert_eq!(
+            markup["inline_keyboard"][0][0]["web_app"]["url"].as_str(),
+            Some("https://bot.example/miniapp/chart/?code=300001")
+        );
+    }
+
+    #[test]
+    fn watchlist_text_keeps_stock_rows_out_of_body_and_markup_has_buttons() {
+        let items = vec![crate::services::watchlist::WatchlistItem {
+            code: "600519.SH".to_string(),
+            name: "贵州茅台".to_string(),
+        }];
+
+        let text = format_watchlist_text(&items);
+        assert!(text.contains("自选列表"));
+        assert!(!text.contains("1. <b>贵州茅台</b> (600519.SH)"));
+        assert!(text.contains("点击下方按钮"));
+
+        let markup = watchlist_markup(&items, Some("https://bot.example")).expect("markup");
+        assert_eq!(
+            markup["inline_keyboard"][0][0]["web_app"]["url"].as_str(),
+            Some("https://bot.example/miniapp/chart/?code=600519")
+        );
+    }
+
+    #[test]
+    fn limit_tracking_command_texts_keep_stock_rows_out_of_body() {
+        let strong = vec![crate::storage::postgres::StrongLimitUpStock {
+            code: "600010.SH".to_string(),
+            name: "Solo".to_string(),
+            limit_count: 4,
+            latest_trade_date: chrono::NaiveDate::from_ymd_opt(2026, 3, 9).unwrap(),
+        }];
+        let startup = vec![crate::storage::postgres::StartupWatchStock {
+            code: "300001.SZ".to_string(),
+            name: "Gamma".to_string(),
+            first_limit_date: chrono::NaiveDate::from_ymd_opt(2026, 3, 9).unwrap(),
+            first_limit_close: 12.3,
+        }];
+
+        let strong_text = format_strong_limit_up_text(7, &strong);
+        assert!(strong_text.contains("强势股"));
+        assert!(!strong_text.contains("1. Solo (600010.SH)"));
+        assert!(strong_text.contains("点击下方按钮"));
+
+        let startup_text = format_startup_watchlist_text(&startup);
+        assert!(startup_text.contains("启动追踪"));
+        assert!(!startup_text.contains("1. Gamma (300001.SZ)"));
+        assert!(startup_text.contains("点击下方按钮"));
     }
 
     #[test]
@@ -4609,6 +5080,64 @@ mod tests {
         let text = telegram_help_text();
         assert!(text.contains("/autosim"));
         assert!(text.contains("/autosim_report"));
+    }
+
+    #[test]
+    fn autosim_panel_exposes_positions_history_and_stats() {
+        let markup = autosim_panel_markup().to_string();
+
+        assert!(markup.contains("cmd:autosim_positions"));
+        assert!(markup.contains("cmd:autosim_history"));
+        assert!(markup.contains("cmd:autosim_stats"));
+    }
+
+    #[test]
+    fn signal_auto_positions_text_uses_buttons_for_stock_rows() {
+        let positions = vec![crate::services::signal_auto_trading::SignalAutoOpenPosition {
+            id: 7,
+            signal_id: "auto_daban".to_string(),
+            signal_name: "自动打板".to_string(),
+            code: "300001.SZ".to_string(),
+            name: "Gamma".to_string(),
+            entry_price: 12.30,
+            shares: 1000,
+            entry_date: chrono::NaiveDate::from_ymd_opt(2026, 4, 27).unwrap(),
+            current_price: Some(13.00),
+            unrealized_pnl_pct: Some(5.69),
+        }];
+
+        let text = format_signal_auto_positions(&positions);
+        assert!(text.contains("自动交易持仓"));
+        assert!(text.contains("1 个持仓"));
+        assert!(!text.contains("300001.SZ Gamma"));
+        assert!(text.contains("点击下方按钮"));
+
+        let markup =
+            signal_auto_positions_markup(&positions, Some("https://bot.example")).expect("markup");
+        assert_eq!(
+            markup["inline_keyboard"][0][0]["web_app"]["url"].as_str(),
+            Some("https://bot.example/miniapp/chart/?code=300001")
+        );
+    }
+
+    #[test]
+    fn signal_auto_history_formats_recent_events() {
+        let events = vec![crate::services::signal_auto_trading::SignalAutoEvent {
+            signal_id: "auto_daban".to_string(),
+            signal_name: "自动打板".to_string(),
+            event_type: "buy".to_string(),
+            code: Some("300001.SZ".to_string()),
+            title: "自动买入".to_string(),
+            detail: "300001.SZ Gamma\n买入价 12.30，1000股".to_string(),
+            event_time: chrono::DateTime::parse_from_rfc3339("2026-04-27T10:00:00+08:00")
+                .unwrap(),
+        }];
+
+        let text = format_signal_auto_history(&events);
+        assert!(text.contains("自动交易历史"));
+        assert!(text.contains("自动打板"));
+        assert!(text.contains("自动买入"));
+        assert!(text.contains("300001.SZ"));
     }
 
     #[test]
@@ -4627,6 +5156,14 @@ mod tests {
         let (signal_id, days) = parse_scan_stats_args("90");
         assert_eq!(signal_id, None);
         assert_eq!(days, 90);
+    }
+
+    #[test]
+    fn parse_pick_horizon_maps_to_ranked_pool_ids() {
+        assert_eq!(pick_horizon_signal_id("short"), Some(POOL_SHORT_A_ID));
+        assert_eq!(pick_horizon_signal_id("mid"), Some(POOL_MID_A_ID));
+        assert_eq!(pick_horizon_signal_id("long"), Some(POOL_LONG_A_ID));
+        assert_eq!(pick_horizon_signal_id("bad"), None);
     }
 
     #[test]
@@ -4710,6 +5247,38 @@ mod tests {
     }
 
     #[test]
+    fn pick_stats_text_filters_to_ranked_pools_and_includes_20d() {
+        let summaries = vec![
+            SignalPerformanceSummary {
+                signal_id: crate::services::scan_ranker::POOL_SHORT_A_ID.to_string(),
+                total_samples: 3,
+                horizons: vec![HorizonPerformance {
+                    days: 20,
+                    samples: 2,
+                    avg_return_pct: 8.5,
+                    win_rate_pct: 50.0,
+                }],
+            },
+            SignalPerformanceSummary {
+                signal_id: "startup".to_string(),
+                total_samples: 10,
+                horizons: vec![HorizonPerformance {
+                    days: 20,
+                    samples: 10,
+                    avg_return_pct: 1.0,
+                    win_rate_pct: 40.0,
+                }],
+            },
+        ];
+
+        let text = format_pick_stats_text(&summaries, 180);
+        assert!(text.contains("票池有效性"));
+        assert!(text.contains("短线A档"));
+        assert!(text.contains("20d"));
+        assert!(!text.contains("startup"));
+    }
+
+    #[test]
     fn scan_menu_exposes_ranked_pool_shortcuts() {
         let (_, scan_markup) = menu_content("scan");
         let markup = scan_markup.to_string();
@@ -4719,6 +5288,25 @@ mod tests {
         assert!(markup.contains(crate::services::scan_ranker::POOL_LONG_A_ID));
         assert!(markup.contains("cmd:scan_stats"));
         assert!(markup.contains("cmd:autosim"));
+    }
+
+    #[test]
+    fn menus_expose_horizon_pick_buttons() {
+        let (_, main_markup) = menu_content("main");
+        let (_, scan_markup) = menu_content("scan");
+        let (pick_text, pick_markup) = menu_content("pick");
+        let pick_markup = pick_markup.to_string();
+
+        assert!(main_markup.to_string().contains("menu:pick"));
+        assert!(scan_markup.to_string().contains("menu:pick"));
+        assert!(pick_text.contains("周期选股"));
+        assert!(pick_markup.contains(crate::services::scan_ranker::POOL_SHORT_A_ID));
+        assert!(pick_markup.contains(crate::services::scan_ranker::POOL_SHORT_B_ID));
+        assert!(pick_markup.contains(crate::services::scan_ranker::POOL_MID_A_ID));
+        assert!(pick_markup.contains(crate::services::scan_ranker::POOL_MID_B_ID));
+        assert!(pick_markup.contains(crate::services::scan_ranker::POOL_LONG_A_ID));
+        assert!(pick_markup.contains(crate::services::scan_ranker::POOL_LONG_B_ID));
+        assert!(pick_markup.contains("cmd:pick_stats"));
     }
 
     #[test]

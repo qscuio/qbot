@@ -242,19 +242,7 @@ pub(crate) fn format_limit_up_report_with_base(
         return msg;
     }
 
-    msg.push_str("🏆 <b>封单额靠前</b>\n");
-    for (idx, stock) in rows.iter().take(20).enumerate() {
-        let amount = stock.fd_amount / 10_000.0;
-        msg.push_str(&format!(
-            "{}. {} ({}) {:+.1}% 封单{:.0}万 打开{}次\n",
-            idx + 1,
-            escape_html(stock.name.trim()),
-            escape_html(&stock.code),
-            stock.pct_chg,
-            amount,
-            stock.open_times
-        ));
-    }
+    msg.push_str("🏆 <b>封单额靠前</b>\n<i>点击下方按钮打开K线</i>");
 
     msg.push_str(&format!("\n🕐 {}", beijing_now().format("%H:%M")));
     msg
@@ -343,14 +331,15 @@ pub(crate) fn format_strong_stock_report_with_base(
         return msg;
     }
 
-    for (idx, stock) in stocks.iter().take(20).enumerate() {
-        msg.push_str(&format!(
-            "{}. {} - {}次涨停\n",
-            idx + 1,
-            escape_html(&format!("{} ({})", stock.name.trim(), stock.code)),
-            stock.limit_count
-        ));
-    }
+    let max_limit_count = stocks
+        .iter()
+        .map(|stock| stock.limit_count)
+        .max()
+        .unwrap_or(0);
+    msg.push_str(&format!(
+        "<i>最高{}次涨停，点击下方按钮打开K线</i>",
+        max_limit_count
+    ));
 
     msg.push_str(&format!("\n🕐 {}", beijing_now().format("%H:%M")));
     msg
@@ -397,14 +386,15 @@ pub(crate) fn format_scan_alert_with_base(
     _webhook_url: Option<&str>,
 ) -> String {
     let mut msg = format!("{} <b>{}</b> — {} 只\n\n", icon, signal_name, hits.len());
-    for hit in hits.iter().take(20) {
-        let code = hit["code"].as_str().unwrap_or("");
-        let name = hit["name"].as_str().unwrap_or("");
-        let label = format!("{code} {name}").trim().to_string();
-        msg.push_str(&format!("• {}\n", escape_html(&label)));
-    }
     if hits.len() > 20 {
-        msg.push_str(&format!("... 共 {} 只\n", hits.len()));
+        msg.push_str(&format!(
+            "<i>下方显示前 20 只按钮，共 {} 只</i>",
+            hits.len()
+        ));
+    } else if hits.is_empty() {
+        msg.push_str("📭 暂无命中");
+    } else {
+        msg.push_str("<i>点击下方按钮打开K线</i>");
     }
     msg
 }
@@ -421,7 +411,7 @@ mod tests {
     }
 
     #[test]
-    fn format_limit_up_report_includes_summary_and_names() {
+    fn format_limit_up_report_keeps_stock_rows_out_of_body_when_buttons_are_used() {
         let report = format_limit_up_report_with_base(
             d("2026-03-09"),
             &[
@@ -457,9 +447,10 @@ mod tests {
 
         assert!(report.contains("2026-03-09"));
         assert!(report.contains("2 只"));
-        assert!(report.contains("1. Alpha (600001.SH) +10.0%"));
-        assert!(report.contains("2. Beta (600002.SH) +9.9%"));
+        assert!(!report.contains("1. Alpha (600001.SH) +10.0%"));
+        assert!(!report.contains("2. Beta (600002.SH) +9.9%"));
         assert!(!report.contains("<a href="));
+        assert!(report.contains("点击下方按钮"));
     }
 
     #[test]
@@ -493,7 +484,7 @@ mod tests {
     }
 
     #[test]
-    fn format_strong_stock_report_includes_window_and_counts() {
+    fn format_strong_stock_report_keeps_stock_rows_out_of_body_when_buttons_are_used() {
         let report = format_strong_stock_report_with_base(
             d("2026-03-09"),
             7,
@@ -517,9 +508,10 @@ mod tests {
         assert!(report.contains("强势股"));
         assert!(report.contains("7日"));
         assert!(report.contains("4次涨停"));
-        assert!(report.contains("1. Solo (600010.SH) - 4次涨停"));
-        assert!(report.contains("2. Repeat (600011.SH) - 3次涨停"));
+        assert!(!report.contains("1. Solo (600010.SH) - 4次涨停"));
+        assert!(!report.contains("2. Repeat (600011.SH) - 3次涨停"));
         assert!(!report.contains("<a href="));
+        assert!(report.contains("点击下方按钮"));
     }
 
     #[test]
@@ -569,7 +561,7 @@ mod tests {
     }
 
     #[test]
-    fn format_scan_alert_lists_hits_without_html_links() {
+    fn format_scan_alert_keeps_hit_rows_out_of_body_when_buttons_are_used() {
         let report = format_scan_alert_with_base(
             "强势突破",
             "⚡",
@@ -581,8 +573,9 @@ mod tests {
         );
 
         assert!(report.contains("强势突破"));
-        assert!(report.contains("• 300001.SZ Gamma"));
+        assert!(!report.contains("• 300001.SZ Gamma"));
         assert!(!report.contains("<a href="));
+        assert!(report.contains("点击下方按钮"));
     }
 
     #[test]

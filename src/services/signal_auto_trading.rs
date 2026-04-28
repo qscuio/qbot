@@ -81,6 +81,31 @@ pub struct StrategyAccountSnapshot {
     pub loss_streak: i64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct SignalAutoOpenPosition {
+    pub id: i64,
+    pub signal_id: String,
+    pub signal_name: String,
+    pub code: String,
+    pub name: String,
+    pub entry_price: f64,
+    pub shares: i32,
+    pub entry_date: NaiveDate,
+    pub current_price: Option<f64>,
+    pub unrealized_pnl_pct: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SignalAutoEvent {
+    pub signal_id: String,
+    pub signal_name: String,
+    pub event_type: String,
+    pub code: Option<String>,
+    pub title: String,
+    pub detail: String,
+    pub event_time: DateTime<FixedOffset>,
+}
+
 #[derive(Debug, Clone)]
 struct SignalAutoEventLine {
     signal_id: String,
@@ -436,6 +461,124 @@ impl SignalAutoTradingService {
 
     pub async fn latest_report(&self) -> Result<Option<String>> {
         postgres::get_latest_report(&self.state.db, "signal_auto").await
+    }
+
+    pub async fn list_open_position_snapshots(&self) -> Result<Vec<SignalAutoOpenPosition>> {
+        let rows: Vec<(
+            i64,
+            String,
+            String,
+            String,
+            Option<String>,
+            f64,
+            i32,
+            NaiveDate,
+            Option<f64>,
+        )> = sqlx::query_as(
+            r#"SELECT p.id,
+                      p.signal_id,
+                      a.signal_name,
+                      p.code,
+                      p.name,
+                      p.entry_price::float8,
+                      p.shares,
+                      p.entry_date,
+                      last_bar.close::float8 AS current_price
+               FROM signal_strategy_positions p
+               JOIN signal_strategy_accounts a ON a.id = p.account_id
+               LEFT JOIN LATERAL (
+                 SELECT close
+                 FROM stock_daily_bars b
+                 WHERE b.code = p.code
+                 ORDER BY b.trade_date DESC
+                 LIMIT 1
+               ) last_bar ON TRUE
+               WHERE p.is_open = TRUE
+               ORDER BY p.entry_date DESC, p.id DESC"#,
+        )
+        .fetch_all(&self.state.db)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    id,
+                    signal_id,
+                    signal_name,
+                    code,
+                    name,
+                    entry_price,
+                    shares,
+                    entry_date,
+                    current_price,
+                )| {
+                    let unrealized_pnl_pct = current_price.map(|price| {
+                        if entry_price <= 0.0 {
+                            0.0
+                        } else {
+                            round2((price - entry_price) / entry_price * 100.0)
+                        }
+                    });
+                    SignalAutoOpenPosition {
+                        id,
+                        signal_id,
+                        signal_name,
+                        name: name.unwrap_or_else(|| code.clone()),
+                        code,
+                        entry_price: round2(entry_price),
+                        shares,
+                        entry_date,
+                        current_price: current_price.map(round2),
+                        unrealized_pnl_pct,
+                    }
+                },
+            )
+            .collect())
+    }
+
+    pub async fn list_recent_events(&self, limit: i64) -> Result<Vec<SignalAutoEvent>> {
+        let rows: Vec<(
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+            String,
+            DateTime<FixedOffset>,
+        )> = sqlx::query_as(
+            r#"SELECT e.signal_id,
+                      a.signal_name,
+                      e.event_type,
+                      e.code,
+                      e.title,
+                      e.detail,
+                      e.event_time
+               FROM signal_strategy_events e
+               JOIN signal_strategy_accounts a ON a.id = e.account_id
+               ORDER BY e.event_time DESC, e.id DESC
+               LIMIT $1"#,
+        )
+        .bind(limit.clamp(1, 50))
+        .fetch_all(&self.state.db)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(signal_id, signal_name, event_type, code, title, detail, event_time)| {
+                    SignalAutoEvent {
+                        signal_id,
+                        signal_name,
+                        event_type,
+                        code,
+                        title,
+                        detail,
+                        event_time,
+                    }
+                },
+            )
+            .collect())
     }
 
     pub async fn list_account_snapshots(&self) -> Result<Vec<StrategyAccountSnapshot>> {

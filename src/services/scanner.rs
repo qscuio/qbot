@@ -157,14 +157,12 @@ impl ScannerService {
                         });
                 }
 
-                if !stock_hits.is_empty() {
-                    rank_inputs.push(RankInput {
-                        code: code.clone(),
-                        name: name.clone(),
-                        bars,
-                        hits: stock_hits,
-                    });
-                }
+                rank_inputs.push(RankInput {
+                    code: code.clone(),
+                    name: name.clone(),
+                    bars,
+                    hits: stock_hits,
+                });
 
                 checked += 1;
             }

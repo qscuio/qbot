@@ -139,24 +139,11 @@ fn format_weekly_report_with_base(
     _webhook_url: Option<&str>,
 ) -> String {
     let mut report = format!("📅 <b>周报 - {}</b>\n\n", date.format("%Y-%m-%d"));
-    report.push_str("🏆 <b>本周涨幅榜 Top 20</b>\n");
-    for (i, (code, name, gain_pct)) in rows.iter().enumerate() {
-        let gain = gain_pct.unwrap_or(0.0);
-        let label = match name
-            .as_deref()
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-        {
-            Some(name) => format!("{code} {name}"),
-            None => code.clone(),
-        };
-        report.push_str(&format!(
-            "{}. {} {}{:.1}%\n",
-            i + 1,
-            label,
-            if gain >= 0.0 { "+" } else { "" },
-            gain,
-        ));
+    report.push_str(&format!("🏆 <b>本周涨幅榜 Top {}</b>\n", rows.len().min(20)));
+    if rows.is_empty() {
+        report.push_str("📭 暂无周涨幅数据");
+    } else {
+        report.push_str("<i>点击下方按钮打开K线</i>");
     }
     report
 }
@@ -197,7 +184,7 @@ mod tests {
     use chrono::NaiveDate;
 
     #[test]
-    fn weekly_report_lists_top_gainers_without_html_links() {
+    fn weekly_report_keeps_top_gainer_rows_out_of_body_when_buttons_are_used() {
         let report = format_weekly_report_with_base(
             NaiveDate::from_ymd_opt(2026, 3, 10).unwrap(),
             &[(
@@ -209,8 +196,9 @@ mod tests {
         );
 
         assert!(report.contains("周报"));
-        assert!(report.contains("1. 600519.SH 贵州茅台 +12.3%"));
+        assert!(!report.contains("1. 600519.SH 贵州茅台 +12.3%"));
         assert!(!report.contains("<a href="));
+        assert!(report.contains("点击下方按钮"));
     }
 
     #[test]

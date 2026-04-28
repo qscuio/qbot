@@ -29,6 +29,7 @@ pub struct SignalOutcomeRow {
     pub close_3d: Option<f64>,
     pub close_5d: Option<f64>,
     pub close_10d: Option<f64>,
+    pub close_20d: Option<f64>,
 }
 
 /// Run sqlx migrations
@@ -193,6 +194,7 @@ pub async fn list_signal_outcome_samples(
         Option<f64>,
         Option<f64>,
         Option<f64>,
+        Option<f64>,
     )> = sqlx::query_as(
         r#"WITH deduped AS (
                    SELECT DISTINCT ON (
@@ -216,7 +218,8 @@ pub async fn list_signal_outcome_samples(
                       h1.close::float8 AS close_1d,
                       h3.close::float8 AS close_3d,
                       h5.close::float8 AS close_5d,
-                      h10.close::float8 AS close_10d
+                      h10.close::float8 AS close_10d,
+                      h20.close::float8 AS close_20d
                FROM deduped d
                JOIN stock_daily_bars entry
                  ON entry.code = d.code
@@ -257,6 +260,15 @@ pub async fn list_signal_outcome_samples(
                    OFFSET 9
                    LIMIT 1
                ) h10 ON TRUE
+               LEFT JOIN LATERAL (
+                   SELECT b.close
+                   FROM stock_daily_bars b
+                   WHERE b.code = d.code
+                     AND b.trade_date > d.signal_date
+                   ORDER BY b.trade_date ASC
+                   OFFSET 19
+                   LIMIT 1
+               ) h20 ON TRUE
                ORDER BY d.signal_id, d.signal_date DESC, d.code"#,
     )
     .bind(days)
@@ -267,13 +279,16 @@ pub async fn list_signal_outcome_samples(
     Ok(rows
         .into_iter()
         .map(
-            |(signal_id, entry_close, close_1d, close_3d, close_5d, close_10d)| SignalOutcomeRow {
-                signal_id,
-                entry_close,
-                close_1d,
-                close_3d,
-                close_5d,
-                close_10d,
+            |(signal_id, entry_close, close_1d, close_3d, close_5d, close_10d, close_20d)| {
+                SignalOutcomeRow {
+                    signal_id,
+                    entry_close,
+                    close_1d,
+                    close_3d,
+                    close_5d,
+                    close_10d,
+                    close_20d,
+                }
             },
         )
         .collect())
