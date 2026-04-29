@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use chrono::{Datelike, Duration};
+use std::sync::Arc;
 use tokio_cron_scheduler::{Job, JobScheduler};
 use tracing::{info, warn};
 
@@ -100,7 +100,8 @@ pub async fn run_daily_report_job(
         Ok(report) => {
             if let Some(channel) = alert_channel {
                 let push_result = match report_svc.load_limitup_report_data(today).await {
-                    Ok(stocks) => match crate::telegram::formatter::limit_up_report_markup(&stocks) {
+                    Ok(stocks) => match crate::telegram::formatter::limit_up_report_markup(&stocks)
+                    {
                         Some(markup) => pusher.push_with_markup(channel, &report, markup).await,
                         None => pusher.push(channel, &report).await,
                     },
@@ -118,10 +119,12 @@ pub async fn run_daily_report_job(
         Ok(report) => {
             if let Some(channel) = alert_channel {
                 let push_result = match report_svc.load_strong_report_data(7).await {
-                    Ok(stocks) => match crate::telegram::formatter::strong_stock_report_markup(&stocks) {
-                        Some(markup) => pusher.push_with_markup(channel, &report, markup).await,
-                        None => pusher.push(channel, &report).await,
-                    },
+                    Ok(stocks) => {
+                        match crate::telegram::formatter::strong_stock_report_markup(&stocks) {
+                            Some(markup) => pusher.push_with_markup(channel, &report, markup).await,
+                            None => pusher.push(channel, &report).await,
+                        }
+                    }
                     Err(_) => pusher.push(channel, &report).await,
                 };
                 if let Err(e) = push_result {

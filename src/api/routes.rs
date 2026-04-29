@@ -989,7 +989,10 @@ fn format_signal_auto_positions(positions: &[SignalAutoOpenPosition]) -> String 
     [
         format!("📦 <b>自动交易持仓</b> ({} 个持仓)", positions.len()),
         "━━━━━━━━━━━━━━━━━━━━━".to_string(),
-        format!("市值: {:.0} | 平均浮盈亏: {:+.2}%", total_market_value, avg_pnl),
+        format!(
+            "市值: {:.0} | 平均浮盈亏: {:+.2}%",
+            total_market_value, avg_pnl
+        ),
         "<i>点击下方按钮打开K线</i>".to_string(),
     ]
     .join("\n")
@@ -1017,12 +1020,8 @@ fn signal_auto_positions_markup(
                 code,
                 pnl
             );
-            crate::telegram::formatter::stock_button_with_base(
-                &position.code,
-                &label,
-                miniapp_base,
-            )
-            .map(|button| vec![button])
+            crate::telegram::formatter::stock_button_with_base(&position.code, &label, miniapp_base)
+                .map(|button| vec![button])
         })
         .collect();
 
@@ -1267,10 +1266,7 @@ fn format_strong_limit_up_text(
     items: &[crate::storage::postgres::StrongLimitUpStock],
 ) -> String {
     if items.is_empty() {
-        return format!(
-            "💪 <b>强势股</b> ({}日)\n\n📭 暂无符合条件的强势股",
-            days
-        );
+        return format!("💪 <b>强势股</b> ({}日)\n\n📭 暂无符合条件的强势股", days);
     }
 
     [
@@ -2361,6 +2357,7 @@ fn scan_menu_markup() -> Value {
             cb_button("🏛️ 长线A档", &format!("scan:s:{POOL_LONG_A_ID}")),
             cb_button("🌱 预启动池", "cmd:prestart"),
         ],
+        vec![cb_button("🔁 做T信号", "scan:s:t_trade")],
         vec![
             cb_button("📊 信号统计", "cmd:scan_stats"),
             cb_button("🤖 自动交易", "cmd:autosim"),
@@ -2600,14 +2597,7 @@ async fn show_prestart_panel(
     let text = format_prestart_text(&candidates, 20);
     let markup = prestart_candidate_markup(&candidates, state.config.webhook_url.as_deref())
         .unwrap_or_else(scan_result_panel_markup);
-    show_text_panel(
-        state,
-        chat_id,
-        message_id,
-        &text,
-        markup,
-    )
-    .await
+    show_text_panel(state, chat_id, message_id, &text, markup).await
 }
 
 async fn show_autosim_panel(
@@ -5022,8 +5012,8 @@ mod tests {
         assert!(!text.contains("共振:"));
         assert!(text.contains("点击下方按钮"));
 
-        let markup = prestart_candidate_markup(&candidates, Some("https://bot.example"))
-            .expect("markup");
+        let markup =
+            prestart_candidate_markup(&candidates, Some("https://bot.example")).expect("markup");
         assert_eq!(
             markup["inline_keyboard"][0][0]["web_app"]["url"].as_str(),
             Some("https://bot.example/miniapp/chart/?code=300001")
@@ -5093,18 +5083,20 @@ mod tests {
 
     #[test]
     fn signal_auto_positions_text_uses_buttons_for_stock_rows() {
-        let positions = vec![crate::services::signal_auto_trading::SignalAutoOpenPosition {
-            id: 7,
-            signal_id: "auto_daban".to_string(),
-            signal_name: "自动打板".to_string(),
-            code: "300001.SZ".to_string(),
-            name: "Gamma".to_string(),
-            entry_price: 12.30,
-            shares: 1000,
-            entry_date: chrono::NaiveDate::from_ymd_opt(2026, 4, 27).unwrap(),
-            current_price: Some(13.00),
-            unrealized_pnl_pct: Some(5.69),
-        }];
+        let positions = vec![
+            crate::services::signal_auto_trading::SignalAutoOpenPosition {
+                id: 7,
+                signal_id: "auto_daban".to_string(),
+                signal_name: "自动打板".to_string(),
+                code: "300001.SZ".to_string(),
+                name: "Gamma".to_string(),
+                entry_price: 12.30,
+                shares: 1000,
+                entry_date: chrono::NaiveDate::from_ymd_opt(2026, 4, 27).unwrap(),
+                current_price: Some(13.00),
+                unrealized_pnl_pct: Some(5.69),
+            },
+        ];
 
         let text = format_signal_auto_positions(&positions);
         assert!(text.contains("自动交易持仓"));
@@ -5129,8 +5121,7 @@ mod tests {
             code: Some("300001.SZ".to_string()),
             title: "自动买入".to_string(),
             detail: "300001.SZ Gamma\n买入价 12.30，1000股".to_string(),
-            event_time: chrono::DateTime::parse_from_rfc3339("2026-04-27T10:00:00+08:00")
-                .unwrap(),
+            event_time: chrono::DateTime::parse_from_rfc3339("2026-04-27T10:00:00+08:00").unwrap(),
         }];
 
         let text = format_signal_auto_history(&events);
@@ -5197,6 +5188,10 @@ mod tests {
                 .map(|entry| entry.0.as_str()),
             Some("长线A档")
         );
+        assert_eq!(
+            meta.get("t_trade").map(|entry| entry.0.as_str()),
+            Some("做T信号")
+        );
 
         let (_, hot_markup) = scan_category_content("hot").expect("hot category");
         let (_, trend_markup) = scan_category_content("trend").expect("trend category");
@@ -5208,6 +5203,7 @@ mod tests {
         assert!(trend_markup
             .to_string()
             .contains(crate::services::scan_ranker::POOL_MID_A_ID));
+        assert!(trend_markup.to_string().contains("scan:s:t_trade"));
         assert!(period_markup
             .to_string()
             .contains(crate::services::scan_ranker::POOL_LONG_A_ID));
@@ -5286,6 +5282,7 @@ mod tests {
         assert!(markup.contains(crate::services::scan_ranker::POOL_SHORT_A_ID));
         assert!(markup.contains(crate::services::scan_ranker::POOL_MID_A_ID));
         assert!(markup.contains(crate::services::scan_ranker::POOL_LONG_A_ID));
+        assert!(markup.contains("scan:s:t_trade"));
         assert!(markup.contains("cmd:scan_stats"));
         assert!(markup.contains("cmd:autosim"));
     }

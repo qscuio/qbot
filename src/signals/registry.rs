@@ -27,6 +27,7 @@ impl SignalRegistry {
                 Box::new(UptrendBreakoutSignal),
                 Box::new(DowntrendReversalSignal),
                 Box::new(LinRegSignal),
+                Box::new(TTradeSignal),
                 // Pattern
                 Box::new(SlowBullSignal),
                 Box::new(SmallBullishSignal),

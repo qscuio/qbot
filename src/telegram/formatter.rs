@@ -158,11 +158,7 @@ pub fn stock_anchor(code: &str, label: &str) -> String {
     }
 }
 
-pub(crate) fn stock_anchor_with_base(
-    code: &str,
-    label: &str,
-    webhook_url: Option<&str>,
-) -> String {
+pub(crate) fn stock_anchor_with_base(code: &str, label: &str, webhook_url: Option<&str>) -> String {
     let label = escape_html(label);
     match chart_url_for_stock_with_base(code, webhook_url) {
         Some(url) => format!("<a href=\"{}\">{}</a>", escape_html(&url), label),
@@ -403,7 +399,7 @@ pub(crate) fn format_scan_alert_with_base(
 mod tests {
     use super::*;
     use crate::data::types::LimitUpStock;
-    use crate::storage::postgres::{StrongLimitUpStock, StartupWatchStock};
+    use crate::storage::postgres::{StartupWatchStock, StrongLimitUpStock};
     use chrono::NaiveDate;
 
     fn d(raw: &str) -> NaiveDate {

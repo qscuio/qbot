@@ -242,3 +242,147 @@ impl SignalDetector for LinRegSignal {
         }
     }
 }
+
+/// 做T信号 — 趋势向上且波动充足，适合做T滚动
+pub struct TTradeSignal;
+impl SignalDetector for TTradeSignal {
+    fn signal_id(&self) -> &'static str {
+        "t_trade"
+    }
+    fn display_name(&self) -> &'static str {
+        "做T信号"
+    }
+    fn icon(&self) -> &'static str {
+        "🔁"
+    }
+    fn group(&self) -> &'static str {
+        "trend"
+    }
+    fn min_bars(&self) -> usize {
+        60
+    }
+
+    fn detect(&self, bars: &[Candle], _ctx: &StockContext) -> SignalResult {
+        let n = bars.len();
+        if n < 60 {
+            return SignalResult::no();
+        }
+
+        let today = &bars[n - 1];
+        let prev = &bars[n - 2];
+        if prev.close <= 0.0 || today.close <= 0.0 || today.high <= today.low {
+            return SignalResult::no();
+        }
+
+        let c = closes(bars);
+        let ma10 = match sma(&c, 10) {
+            Some(v) => v,
+            None => return SignalResult::no(),
+        };
+        let ma20 = match sma(&c, 20) {
+            Some(v) => v,
+            None => return SignalResult::no(),
+        };
+
+        let gain_pct = (today.close - prev.close) / prev.close * 100.0;
+        let amplitude_pct = (today.high - today.low) / prev.close * 100.0;
+        let close_pos = (today.close - today.low) / (today.high - today.low);
+        let vol_ratio = today.volume as f64 / avg_volume(&bars[..n - 1], 10).max(1.0);
+
+        let trend_ok = today.close >= ma20 && ma10 >= ma20 * 0.995;
+        let amplitude_ok = (3.5..=12.0).contains(&amplitude_pct);
+        let gain_ok = (-2.5..=5.5).contains(&gain_pct);
+        let vol_ok = (1.1..=4.5).contains(&vol_ratio);
+        let close_ok = (0.35..=0.9).contains(&close_pos);
+
+        if trend_ok && amplitude_ok && gain_ok && vol_ok && close_ok {
+            SignalResult::yes()
+                .with_meta("gain_pct", serde_json::json!(gain_pct))
+                .with_meta("amplitude_pct", serde_json::json!(amplitude_pct))
+                .with_meta("vol_ratio", serde_json::json!(vol_ratio))
+                .with_meta("close_pos", serde_json::json!(close_pos))
+        } else {
+            SignalResult::no()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::NaiveDate;
+
+    fn candle(open: f64, high: f64, low: f64, close: f64, volume: i64) -> Candle {
+        Candle {
+            trade_date: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            open,
+            high,
+            low,
+            close,
+            volume,
+            amount: close * volume as f64,
+            turnover: None,
+            pe: None,
+            pb: None,
+        }
+    }
+
+    fn rising_bars() -> Vec<Candle> {
+        let mut bars = Vec::new();
+        for i in 0..59 {
+            let close = 10.0 + i as f64 * 0.03;
+            bars.push(candle(
+                close * 0.998,
+                close * 1.01,
+                close * 0.99,
+                close,
+                1_000_000,
+            ));
+        }
+        bars
+    }
+
+    #[test]
+    fn t_trade_signal_triggers_when_trend_and_volatility_match() {
+        let mut bars = rising_bars();
+        let prev_close = bars.last().unwrap().close;
+        let close = prev_close * 1.018;
+        bars.push(candle(
+            close * 0.992,
+            close * 1.03,
+            close * 0.965,
+            close,
+            2_000_000,
+        ));
+
+        let sig = TTradeSignal;
+        let ctx = StockContext {
+            code: "600000.SH".to_string(),
+            name: "Test".to_string(),
+        };
+        let result = sig.detect(&bars, &ctx);
+        assert!(result.triggered);
+        assert!(result.metadata.contains_key("amplitude_pct"));
+    }
+
+    #[test]
+    fn t_trade_signal_rejects_low_amplitude_days() {
+        let mut bars = rising_bars();
+        let prev_close = bars.last().unwrap().close;
+        let close = prev_close * 1.01;
+        bars.push(candle(
+            close * 0.999,
+            close * 1.004,
+            close * 0.996,
+            close,
+            2_000_000,
+        ));
+
+        let sig = TTradeSignal;
+        let ctx = StockContext {
+            code: "600000.SH".to_string(),
+            name: "Test".to_string(),
+        };
+        assert!(!sig.detect(&bars, &ctx).triggered);
+    }
+}

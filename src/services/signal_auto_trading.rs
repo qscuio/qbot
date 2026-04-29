@@ -27,6 +27,7 @@ use crate::storage::postgres::{self, StrongLimitUpStock};
 const INITIAL_CAPITAL: f64 = 100_000.0;
 const DEFAULT_STOP_LOSS_PCT: f64 = 5.0;
 const DEFAULT_TRAILING_STOP_PCT: f64 = 3.5;
+const TRAILING_ACTIVATION_PCT: f64 = 5.0;
 const BUY_START_MINUTE: u32 = 9 * 60 + 35;
 const BUY_END_MINUTE: u32 = 14 * 60 + 30;
 const EXPIRE_MINUTE: u32 = 14 * 60 + 45;
@@ -973,7 +974,8 @@ impl SignalAutoTradingService {
                 continue;
             };
 
-            let new_peak = position.peak_price.max(quote.price);
+            let intraday_high = quote.high.max(quote.price);
+            let new_peak = position.peak_price.max(intraday_high);
             if new_peak > position.peak_price {
                 sqlx::query(
                     r#"UPDATE signal_strategy_positions
@@ -2243,7 +2245,7 @@ fn evaluate_exit_signal(
         };
     }
 
-    if peak_price > entry_price * 1.01 {
+    if peak_price >= entry_price * (1.0 + TRAILING_ACTIVATION_PCT / 100.0) {
         let trailing_line = peak_price * (1.0 - trailing_stop_pct / 100.0);
         if quote.price <= trailing_line {
             return ExitDecision {
@@ -2381,6 +2383,48 @@ mod tests {
             3.5,
         );
         assert!(next_day.sell_now);
+    }
+
+    #[test]
+    fn exit_signal_requires_minimum_peak_gain_for_trailing_stop() {
+        let quote = Quote {
+            code: "600000.SH".to_string(),
+            name: "Test".to_string(),
+            price: 9.93,
+            open: 10.1,
+            high: 10.2,
+            low: 9.9,
+            prev_close: 10.0,
+            change_pct: -0.7,
+            volume: 1_000_000,
+            amount: 9_930_000.0,
+            timestamp: Utc::now().naive_utc(),
+        };
+
+        let decision = evaluate_exit_signal(
+            NaiveDate::from_ymd_opt(2026, 3, 11).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 3, 10).unwrap(),
+            &quote,
+            10.0,
+            10.3,
+            9.5,
+            3.5,
+        );
+        assert!(!decision.sell_now);
+
+        let activated = evaluate_exit_signal(
+            NaiveDate::from_ymd_opt(2026, 3, 11).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 3, 10).unwrap(),
+            &Quote {
+                price: 10.13,
+                ..quote
+            },
+            10.0,
+            10.5,
+            9.5,
+            3.5,
+        );
+        assert!(activated.sell_now);
     }
 
     #[test]

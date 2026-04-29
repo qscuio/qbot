@@ -3,9 +3,9 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tracing::info;
 
+use crate::data::types::LimitUpStock;
 use crate::error::Result;
 use crate::market_time::beijing_today;
-use crate::data::types::LimitUpStock;
 use crate::services::limit_up::LimitUpService;
 use crate::services::market::MarketService;
 use crate::services::sector::SectorService;
@@ -139,7 +139,10 @@ fn format_weekly_report_with_base(
     _webhook_url: Option<&str>,
 ) -> String {
     let mut report = format!("📅 <b>周报 - {}</b>\n\n", date.format("%Y-%m-%d"));
-    report.push_str(&format!("🏆 <b>本周涨幅榜 Top {}</b>\n", rows.len().min(20)));
+    report.push_str(&format!(
+        "🏆 <b>本周涨幅榜 Top {}</b>\n",
+        rows.len().min(20)
+    ));
     if rows.is_empty() {
         report.push_str("📭 暂无周涨幅数据");
     } else {
@@ -163,7 +166,11 @@ fn weekly_report_markup_with_base(
         .enumerate()
         .filter_map(|(idx, (code, name, _))| {
             let code_short = code.split('.').next().unwrap_or(code);
-            let label = match name.as_deref().map(str::trim).filter(|name| !name.is_empty()) {
+            let label = match name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+            {
                 Some(name) => format!("{}. {} ({})", idx + 1, name, code_short),
                 None => format!("{}. {}", idx + 1, code_short),
             };
