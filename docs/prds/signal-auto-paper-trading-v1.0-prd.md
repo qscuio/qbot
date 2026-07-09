@@ -1,5 +1,7 @@
 # Signal Auto Paper Trading - Product Requirements Document (PRD)
 
+> Current implementation review: [QBot 信号、模拟交易与 K 线画线实现评估](../reviews/2026-07-10-signal-trading-assessment.md). The review documents known gaps between this v1 PRD and production-grade paper/live trading requirements.
+
 ## Requirements Description
 
 ### Background

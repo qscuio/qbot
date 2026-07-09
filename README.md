@@ -41,12 +41,12 @@ A-share stock analysis bot. Fetches daily market data from Tushare, runs 24 sign
 
 | Group | Signals |
 |-------|---------|
-| Trend | MA crossover, golden cross, trend reversal |
-| Volume | Volume surge, accumulation |
-| Pattern | Hammer, engulfing, morning star, doji |
-| Momentum | RSI oversold rebound, breakout, startup, explosive volume-price |
-| Board | Limit-up continuation, daban |
-| Comprehensive | Multi-factor composite |
+| Trend | MA alignment, MA pullback, breakout, reversal, linear regression, T-trade suitability |
+| Volume | Volume surge, up-day/down-day volume balance |
+| Pattern | Slow bull, small bullish candles, triple bullish candles, engulfing, daily approximation of higher-period alignment |
+| Momentum | Breakout, startup, explosive volume-price, RSI oversold rebound |
+| Board | Broken-board recovery, strong first negative day |
+| Comprehensive | Bottom startup, long-cycle reversal, low-base accumulation breakout |
 
 ### Key Files
 
@@ -62,6 +62,15 @@ A-share stock analysis bot. Fetches daily market data from Tushare, runs 24 sign
 | `migrations/` | SQL migration files (SQLx embedded) |
 | `deploy/` | Docker Compose, systemd service, setup script |
 | `scripts/local-test.sh` | Local end-to-end bootstrap |
+| `docs/reviews/2026-07-10-signal-trading-assessment.md` | Current signal logic, paper-trading and chart-line assessment, risks, and proposed signal roadmap |
+
+### Engineering Reviews and Research
+
+- [Signal, paper-trading, and chart-line assessment](docs/reviews/2026-07-10-signal-trading-assessment.md)
+- [Market-event framework research](docs/research/2026-07-10-market-event-framework-research.md)
+- [Analysis platform architecture](docs/superpowers/specs/2026-07-10-analysis-platform-architecture-design.md)
+- [Strong-stock pattern engine design](docs/superpowers/specs/2026-07-10-strong-stock-pattern-engine-design.md)
+- [Market-event reasoning design](docs/superpowers/specs/2026-07-10-market-event-reasoning-design.md)
 
 ---
 
