@@ -47,11 +47,13 @@ read_env_value() {
 WEBHOOK_URL="${WEBHOOK_URL:-$(read_env_value WEBHOOK_URL)}"
 API_PORT="${API_PORT:-$(read_env_value API_PORT)}"
 LETSENCRYPT_EMAIL="${LETSENCRYPT_EMAIL:-$(read_env_value LETSENCRYPT_EMAIL)}"
+NGINX_HTTPS_LISTEN="${NGINX_HTTPS_LISTEN:-$(read_env_value NGINX_HTTPS_LISTEN)}"
 
 configure_nginx_proxy() {
     local webhook_url="${WEBHOOK_URL:-}"
     local api_port="${API_PORT:-8080}"
     local letsencrypt_email="${LETSENCRYPT_EMAIL:-}"
+    local https_listen="${NGINX_HTTPS_LISTEN:-443}"
 
     if [ -z "$webhook_url" ]; then
         echo "WEBHOOK_URL is empty; skipping Nginx setup"
@@ -110,7 +112,7 @@ server {
     location / { return 301 https://\$host\$request_uri; }
 }
 server {
-    listen 443 ssl http2;
+    listen ${https_listen} ssl http2;
     server_name ${host};
     ssl_certificate ${cert_path};
     ssl_certificate_key ${key_path};

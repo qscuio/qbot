@@ -180,6 +180,7 @@ Push to `main` triggers `.github/workflows/deploy.yml`, which:
 | `TELEGRAM_WEBHOOK_SECRET` | No | Secret token for Telegram webhook header verification |
 | `WEBHOOK_URL` | No | Public base URL (used to auto-register webhook as `${WEBHOOK_URL}/telegram/webhook`) |
 | `LETSENCRYPT_EMAIL` | No | Optional override email for Let's Encrypt. If empty, deploy uses `admin@<webhook-domain>` |
+| `NGINX_HTTPS_LISTEN` | No | HTTPS listen address for generated Nginx site. Defaults to `127.0.0.1:8445` in GitHub deploy so public `443` can be owned by a front stream/SNI proxy |
 | `REPORT_CHANNEL` | Yes | Telegram channel ID for reports |
 | `STOCK_ALERT_CHANNEL` | No | Telegram channel ID for burst alerts |
 | `DABAN_CHANNEL` | No | Telegram channel ID for daban notifications |
@@ -229,6 +230,7 @@ sudo journalctl -u qbot -f
   - `LETSENCRYPT_EMAIL` is optional; default is `admin@<domain>`.
   - For Cloudflare domains, set DNS to **gray cloud (DNS only)** during issuance/renewal.
   - Deploy is strict: if HTTPS cert issuance fails, deployment fails (no HTTP fallback).
+  - If public `443` is already handled by an Nginx stream/SNI proxy, set `NGINX_HTTPS_LISTEN=127.0.0.1:8445` so the generated qbot site does not bind public `443`.
 
 Supported command set (webhook):
 - `/start`, `/help`

@@ -56,6 +56,7 @@ jobs:
             DATABASE_URL=postgresql://qbot:qbot@127.0.0.1/qbot
             REDIS_URL=redis://127.0.0.1:6379
             API_PORT=8080
+            NGINX_HTTPS_LISTEN=${{ secrets.NGINX_HTTPS_LISTEN || '127.0.0.1:8445' }}
             ENABLE_BURST_MONITOR=true
             ENABLE_SIGNAL_AUTO_TRADING=${{ secrets.ENABLE_SIGNAL_AUTO_TRADING || 'false' }}
             ENABLE_DABAN_LIVE=${{ secrets.ENABLE_DABAN_LIVE || 'false' }}
@@ -100,6 +101,7 @@ jobs:
             }
             WEBHOOK_URL="$(read_env_value WEBHOOK_URL)"
             API_PORT="$(read_env_value API_PORT)"
+            NGINX_HTTPS_LISTEN="$(read_env_value NGINX_HTTPS_LISTEN)"
             LETSENCRYPT_EMAIL="${{ secrets.LETSENCRYPT_EMAIL }}"
 
             # Ensure required native build deps exist for crates using native-tls/openssl.
@@ -138,6 +140,7 @@ jobs:
             configure_nginx_proxy() {
               webhook_url="${WEBHOOK_URL:-}"
               api_port="${API_PORT:-8080}"
+              https_listen="${NGINX_HTTPS_LISTEN:-443}"
 
               if [ -z "$webhook_url" ]; then
                 echo "WEBHOOK_URL is empty; skipping Nginx reverse-proxy setup"
@@ -214,7 +217,7 @@ jobs:
             }
 
             server {
-                listen 443 ssl http2;
+                listen ${https_listen} ssl http2;
                 server_name ${host};
 
                 ssl_certificate ${cert_path};
