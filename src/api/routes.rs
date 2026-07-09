@@ -342,6 +342,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/scan/latest", get(get_scan_latest))
         .route("/api/scan/prestart", get(get_prestart_candidates))
         .route("/api/scan/stats", get(get_scan_stats))
+        .route("/api/scan/daily-stats", get(get_daily_scan_stats))
         .route("/api/scan/trigger", post(trigger_scan))
         .route("/api/report/daily", get(get_daily_report))
         .route("/api/report/signal_auto", get(get_signal_auto_report))
@@ -374,6 +375,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/daban/sim/stats", get(daban_sim_stats))
         .route("/api/jobs/fetch", post(trigger_fetch))
         .route("/api/jobs/scan", post(trigger_scan_job))
+        .route("/api/jobs/scan/archive", post(trigger_daily_signal_archive))
         .route("/api/jobs/report/daily", post(trigger_daily_report))
         .route("/api/jobs/report/weekly", post(trigger_weekly_report))
         .nest_service(
@@ -489,6 +491,7 @@ fn telegram_help_text() -> String {
         "/pick_stats     短中长票池有效性统计",
         "/prestart       预启动候选池",
         "/scan_stats     信号前瞻收益统计",
+        "/daily_scan_stats 每日归档信号统计",
         "/autosim        自动交易账户快照",
         "/autosim positions 自动交易持仓",
         "/autosim history 自动交易历史",
@@ -786,20 +789,43 @@ fn format_scan_stats_text(
     lookback_days: i64,
     only_signal: Option<&str>,
 ) -> String {
+    format_scan_performance_text("📊", "信号统计", summaries, lookback_days, only_signal)
+}
+
+fn format_daily_scan_stats_text(
+    summaries: &[SignalPerformanceSummary],
+    lookback_days: i64,
+    only_signal: Option<&str>,
+) -> String {
+    format_scan_performance_text("🗃️", "每日归档统计", summaries, lookback_days, only_signal)
+}
+
+fn format_scan_performance_text(
+    title_icon: &str,
+    title: &str,
+    summaries: &[SignalPerformanceSummary],
+    lookback_days: i64,
+    only_signal: Option<&str>,
+) -> String {
     let meta = scan_signal_meta();
     if summaries.is_empty() {
         return match only_signal {
             Some(signal_id) => format!(
-                "📊 <b>信号统计</b>\n\n📭 近{}日暂无 <code>{}</code> 的有效样本",
+                "{} <b>{}</b>\n\n📭 近{}日暂无 <code>{}</code> 的有效样本",
+                title_icon,
+                title,
                 lookback_days,
                 escape_html(signal_id)
             ),
-            None => format!("📊 <b>信号统计</b>\n\n📭 近{}日暂无有效样本", lookback_days),
+            None => format!(
+                "{} <b>{}</b>\n\n📭 近{}日暂无有效样本",
+                title_icon, title, lookback_days
+            ),
         };
     }
 
     let mut lines = vec![
-        format!("📊 <b>信号统计</b> (近{}日)", lookback_days),
+        format!("{} <b>{}</b> (近{}日)", title_icon, title, lookback_days),
         "━━━━━━━━━━━━━━━━━━━━━".to_string(),
     ];
 
@@ -3511,6 +3537,19 @@ async fn handle_telegram_command(
             )
             .await?;
         }
+        "daily_scan_stats" => {
+            let (signal_id, lookback_days) = parse_scan_stats_args(&args);
+            let mut summaries = ScannerStatsService::new(state.clone())
+                .summarize_daily_archive(lookback_days, signal_id.as_deref())
+                .await?;
+            summaries.truncate(if signal_id.is_some() { 1 } else { 8 });
+            tg_send(
+                &state,
+                chat_id,
+                &format_daily_scan_stats_text(&summaries, lookback_days, signal_id.as_deref()),
+            )
+            .await?;
+        }
         "pick_stats" => {
             let lookback_days = normalize_scan_stats_days(args.trim().parse::<i64>().ok());
             let summaries = ScannerStatsService::new(state.clone())
@@ -4126,6 +4165,37 @@ async fn get_scan_stats(
     summaries.truncate(limit);
 
     Ok(Json(json!({
+        "lookback_days": lookback_days,
+        "signal_id": signal_id,
+        "count": summaries.len(),
+        "signals": summaries,
+    })))
+}
+
+async fn get_daily_scan_stats(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<ScanStatsQuery>,
+) -> ApiResult {
+    if !check_auth(&headers, state.config.api_key.as_deref()) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "unauthorized"})),
+        ));
+    }
+
+    let lookback_days = normalize_scan_stats_days(query.days);
+    let signal_id = query.signal_id.as_deref();
+    let limit = query.limit.unwrap_or(10).clamp(1, 50);
+
+    let mut summaries = ScannerStatsService::new(state)
+        .summarize_daily_archive(lookback_days, signal_id)
+        .await
+        .map_err(|e| api_error(&e.to_string()))?;
+    summaries.truncate(limit);
+
+    Ok(Json(json!({
+        "source": "daily_signal_scan_results",
         "lookback_days": lookback_days,
         "signal_id": signal_id,
         "count": summaries.len(),
@@ -4916,6 +4986,23 @@ async fn trigger_scan_job(State(state): State<Arc<AppState>>, headers: HeaderMap
     Ok(Json(json!({"status": "started", "job": "scan"})))
 }
 
+async fn trigger_daily_signal_archive(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> ApiResult {
+    if !check_auth(&headers, state.config.api_key.as_deref()) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "unauthorized"})),
+        ));
+    }
+    let s = state.clone();
+    tokio::spawn(async move {
+        crate::scheduler::run_daily_signal_archive_job(s).await;
+    });
+    Ok(Json(json!({"status": "started", "job": "scan/archive"})))
+}
+
 async fn trigger_daily_report(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult {
     if !check_auth(&headers, state.config.api_key.as_deref()) {
         return Err((
@@ -4974,6 +5061,7 @@ mod tests {
     fn telegram_help_text_mentions_scan_stats_command() {
         let text = telegram_help_text();
         assert!(text.contains("/scan_stats"));
+        assert!(text.contains("/daily_scan_stats"));
     }
 
     #[test]

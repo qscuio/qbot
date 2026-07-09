@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use chrono::NaiveDate;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -29,6 +30,15 @@ pub struct SignalHit {
     pub metadata: serde_json::Value,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DailySignalArchiveSummary {
+    pub scan_date: NaiveDate,
+    pub run_id: Uuid,
+    pub rows: usize,
+    pub codes: usize,
+    pub signals: usize,
+}
+
 pub struct ScannerService {
     state: Arc<AppState>,
 }
@@ -53,14 +63,36 @@ fn flatten_scan_results_for_storage(
     rows
 }
 
+fn flatten_scan_results_for_daily_archive(
+    results: &HashMap<String, Vec<SignalHit>>,
+) -> Vec<postgres::DailySignalScanRow> {
+    let mut rows: Vec<postgres::DailySignalScanRow> = results
+        .values()
+        .flat_map(|hits| {
+            hits.iter().map(|hit| postgres::DailySignalScanRow {
+                code: hit.code.clone(),
+                name: hit.name.clone(),
+                signal_id: hit.signal_id.clone(),
+                signal_name: hit.signal_name.clone(),
+                icon: hit.icon.clone(),
+                metadata: hit.metadata.clone(),
+            })
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        a.signal_id
+            .cmp(&b.signal_id)
+            .then_with(|| a.code.cmp(&b.code))
+    });
+    rows
+}
+
 impl ScannerService {
     pub fn new(state: Arc<AppState>) -> Self {
         ScannerService { state }
     }
 
-    pub async fn run_full_scan(&self) -> Result<HashMap<String, Vec<SignalHit>>> {
-        info!("Starting full stock scan...");
-        let run_id = Uuid::new_v4();
+    async fn collect_scan_results(&self) -> Result<HashMap<String, Vec<SignalHit>>> {
         let signals = SignalRegistry::get_enabled();
 
         if signals.is_empty() {
@@ -178,16 +210,24 @@ impl ScannerService {
             results.insert(pool_id, hits);
         }
 
-        let db_inserts = flatten_scan_results_for_storage(&results);
-        if !db_inserts.is_empty() {
-            postgres::save_scan_results(&self.state.db, run_id, &db_inserts).await?;
-        }
-
         let total_hits: usize = results.values().map(|v| v.len()).sum();
         info!(
             "Scan complete: {} stocks checked, {} signal hits",
             checked, total_hits
         );
+
+        Ok(results)
+    }
+
+    pub async fn run_full_scan(&self) -> Result<HashMap<String, Vec<SignalHit>>> {
+        info!("Starting full stock scan...");
+        let run_id = Uuid::new_v4();
+        let results = self.collect_scan_results().await?;
+
+        let db_inserts = flatten_scan_results_for_storage(&results);
+        if !db_inserts.is_empty() {
+            postgres::save_scan_results(&self.state.db, run_id, &db_inserts).await?;
+        }
 
         // Cache results
         let json = serde_json::to_value(&results).unwrap_or_default();
@@ -195,6 +235,43 @@ impl ScannerService {
         let _ = cache.cache_scan_results(&json).await;
 
         Ok(results)
+    }
+
+    pub async fn run_daily_archive_scan(
+        &self,
+        scan_date: NaiveDate,
+    ) -> Result<DailySignalArchiveSummary> {
+        info!("Starting daily signal archive scan for {}", scan_date);
+        let run_id = Uuid::new_v4();
+        let results = self.collect_scan_results().await?;
+        let rows = flatten_scan_results_for_daily_archive(&results);
+        let saved =
+            postgres::save_daily_signal_scan_results(&self.state.db, scan_date, run_id, &rows)
+                .await?;
+
+        let codes = rows
+            .iter()
+            .map(|row| row.code.as_str())
+            .collect::<HashSet<_>>()
+            .len();
+        let signals = rows
+            .iter()
+            .map(|row| row.signal_id.as_str())
+            .collect::<HashSet<_>>()
+            .len();
+
+        info!(
+            "Daily signal archive complete: date={}, rows={}, codes={}, signals={}, run_id={}",
+            scan_date, saved, codes, signals, run_id
+        );
+
+        Ok(DailySignalArchiveSummary {
+            scan_date,
+            run_id,
+            rows: saved,
+            codes,
+            signals,
+        })
     }
 }
 
@@ -247,5 +324,42 @@ mod tests {
         assert!(signal_ids.contains(&"startup"));
         assert!(signal_ids.contains(&"pool_short_a"));
         assert!(signal_ids.contains(&"multi_signal"));
+    }
+
+    #[test]
+    fn flatten_scan_results_for_daily_archive_preserves_display_fields() {
+        let mut results = HashMap::new();
+        results.insert(
+            "startup".to_string(),
+            vec![SignalHit {
+                code: "600000.SH".to_string(),
+                name: "浦发银行".to_string(),
+                signal_id: "startup".to_string(),
+                signal_name: "底部快速启动".to_string(),
+                icon: "🚀".to_string(),
+                metadata: serde_json::json!({"source": "raw"}),
+            }],
+        );
+        results.insert(
+            "multi_signal".to_string(),
+            vec![SignalHit {
+                code: "002594.SZ".to_string(),
+                name: "比亚迪".to_string(),
+                signal_id: "multi_signal".to_string(),
+                signal_name: "多信号(3)".to_string(),
+                icon: "⭐".to_string(),
+                metadata: serde_json::json!({"count": 3}),
+            }],
+        );
+
+        let rows = flatten_scan_results_for_daily_archive(&results);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].signal_id, "multi_signal");
+        assert_eq!(rows[0].signal_name, "多信号(3)");
+        assert_eq!(rows[0].icon, "⭐");
+        assert_eq!(rows[1].signal_id, "startup");
+        assert_eq!(rows[1].signal_name, "底部快速启动");
+        assert_eq!(rows[1].icon, "🚀");
     }
 }

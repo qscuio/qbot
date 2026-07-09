@@ -32,6 +32,16 @@ pub struct SignalOutcomeRow {
     pub close_20d: Option<f64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct DailySignalScanRow {
+    pub code: String,
+    pub name: String,
+    pub signal_id: String,
+    pub signal_name: String,
+    pub icon: String,
+    pub metadata: serde_json::Value,
+}
+
 /// Run sqlx migrations
 pub async fn run_migrations(pool: &PgPool) -> Result<()> {
     sqlx::migrate!("./migrations")
@@ -137,6 +147,13 @@ pub async fn get_stock_codes_with_data(pool: &PgPool) -> Result<Vec<String>> {
     Ok(rows.into_iter().map(|r| r.0).collect())
 }
 
+pub async fn latest_stock_trade_date(pool: &PgPool) -> Result<Option<NaiveDate>> {
+    let row: (Option<NaiveDate>,) = sqlx::query_as("SELECT MAX(trade_date) FROM stock_daily_bars")
+        .fetch_one(pool)
+        .await?;
+    Ok(row.0)
+}
+
 /// Upsert stock info
 pub async fn upsert_stock_info(pool: &PgPool, stocks: &[StockInfo]) -> Result<()> {
     let mut tx = pool.begin().await?;
@@ -178,6 +195,45 @@ pub async fn save_scan_results(
     }
     tx.commit().await?;
     Ok(())
+}
+
+pub async fn save_daily_signal_scan_results(
+    pool: &PgPool,
+    scan_date: NaiveDate,
+    run_id: Uuid,
+    rows: &[DailySignalScanRow],
+) -> Result<usize> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    let mut tx = pool.begin().await?;
+    for row in rows {
+        sqlx::query(
+            r#"INSERT INTO daily_signal_scan_results
+               (scan_date, run_id, code, name, signal_id, signal_name, icon, metadata)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+               ON CONFLICT (scan_date, signal_id, code) DO UPDATE SET
+                   run_id=EXCLUDED.run_id,
+                   name=EXCLUDED.name,
+                   signal_name=EXCLUDED.signal_name,
+                   icon=EXCLUDED.icon,
+                   metadata=EXCLUDED.metadata,
+                   scanned_at=NOW()"#,
+        )
+        .bind(scan_date)
+        .bind(run_id)
+        .bind(&row.code)
+        .bind(&row.name)
+        .bind(&row.signal_id)
+        .bind(&row.signal_name)
+        .bind(&row.icon)
+        .bind(&row.metadata)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(rows.len())
 }
 
 pub async fn list_signal_outcome_samples(
@@ -270,6 +326,105 @@ pub async fn list_signal_outcome_samples(
                    LIMIT 1
                ) h20 ON TRUE
                ORDER BY d.signal_id, d.signal_date DESC, d.code"#,
+    )
+    .bind(days)
+    .bind(signal_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(signal_id, entry_close, close_1d, close_3d, close_5d, close_10d, close_20d)| {
+                SignalOutcomeRow {
+                    signal_id,
+                    entry_close,
+                    close_1d,
+                    close_3d,
+                    close_5d,
+                    close_10d,
+                    close_20d,
+                }
+            },
+        )
+        .collect())
+}
+
+pub async fn list_daily_signal_outcome_samples(
+    pool: &PgPool,
+    lookback_days: i64,
+    signal_id: Option<&str>,
+) -> Result<Vec<SignalOutcomeRow>> {
+    let days = lookback_days.clamp(1, 3650) as i32;
+
+    let rows: Vec<(
+        String,
+        f64,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+    )> = sqlx::query_as(
+        r#"SELECT ds.signal_id,
+                  entry.close::float8 AS entry_close,
+                  h1.close::float8 AS close_1d,
+                  h3.close::float8 AS close_3d,
+                  h5.close::float8 AS close_5d,
+                  h10.close::float8 AS close_10d,
+                  h20.close::float8 AS close_20d
+           FROM daily_signal_scan_results ds
+           JOIN stock_daily_bars entry
+             ON entry.code = ds.code
+            AND entry.trade_date = ds.scan_date
+           LEFT JOIN LATERAL (
+               SELECT b.close
+               FROM stock_daily_bars b
+               WHERE b.code = ds.code
+                 AND b.trade_date > ds.scan_date
+               ORDER BY b.trade_date ASC
+               OFFSET 0
+               LIMIT 1
+           ) h1 ON TRUE
+           LEFT JOIN LATERAL (
+               SELECT b.close
+               FROM stock_daily_bars b
+               WHERE b.code = ds.code
+                 AND b.trade_date > ds.scan_date
+               ORDER BY b.trade_date ASC
+               OFFSET 2
+               LIMIT 1
+           ) h3 ON TRUE
+           LEFT JOIN LATERAL (
+               SELECT b.close
+               FROM stock_daily_bars b
+               WHERE b.code = ds.code
+                 AND b.trade_date > ds.scan_date
+               ORDER BY b.trade_date ASC
+               OFFSET 4
+               LIMIT 1
+           ) h5 ON TRUE
+           LEFT JOIN LATERAL (
+               SELECT b.close
+               FROM stock_daily_bars b
+               WHERE b.code = ds.code
+                 AND b.trade_date > ds.scan_date
+               ORDER BY b.trade_date ASC
+               OFFSET 9
+               LIMIT 1
+           ) h10 ON TRUE
+           LEFT JOIN LATERAL (
+               SELECT b.close
+               FROM stock_daily_bars b
+               WHERE b.code = ds.code
+                 AND b.trade_date > ds.scan_date
+               ORDER BY b.trade_date ASC
+               OFFSET 19
+               LIMIT 1
+           ) h20 ON TRUE
+           WHERE ds.scan_date >= ((NOW() AT TIME ZONE 'Asia/Shanghai')::date - $1::int)
+             AND ($2::text IS NULL OR ds.signal_id = $2)
+           ORDER BY ds.signal_id, ds.scan_date DESC, ds.code"#,
     )
     .bind(days)
     .bind(signal_id)
@@ -758,6 +913,46 @@ mod tests {
         assert_eq!(items[0].name, "Solo");
         assert_eq!(items[0].first_limit_date, d("2026-03-08"));
         assert!((items[0].first_limit_close - 9.8).abs() < f64::EPSILON);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn daily_signal_scan_results_upsert_by_scan_date_signal_and_code(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let rows = vec![DailySignalScanRow {
+            code: "600000.SH".to_string(),
+            name: "浦发银行".to_string(),
+            signal_id: "startup".to_string(),
+            signal_name: "底部快速启动".to_string(),
+            icon: "🚀".to_string(),
+            metadata: serde_json::json!({"score": 80}),
+        }];
+        let scan_date = d("2026-03-09");
+
+        let first = save_daily_signal_scan_results(&pool, scan_date, Uuid::new_v4(), &rows)
+            .await
+            .unwrap();
+        let updated = vec![DailySignalScanRow {
+            metadata: serde_json::json!({"score": 88}),
+            ..rows[0].clone()
+        }];
+        let second = save_daily_signal_scan_results(&pool, scan_date, Uuid::new_v4(), &updated)
+            .await
+            .unwrap();
+
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM daily_signal_scan_results")
+            .fetch_one(&pool)
+            .await?;
+        let metadata: (serde_json::Value,) =
+            sqlx::query_as("SELECT metadata FROM daily_signal_scan_results")
+                .fetch_one(&pool)
+                .await?;
+
+        assert_eq!(first, 1);
+        assert_eq!(second, 1);
+        assert_eq!(count.0, 1);
+        assert_eq!(metadata.0["score"], serde_json::json!(88));
         Ok(())
     }
 }

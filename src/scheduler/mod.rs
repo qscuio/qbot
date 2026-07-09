@@ -11,10 +11,12 @@ use crate::services::{
     stock_history::StockHistoryService,
 };
 use crate::state::AppState;
+use crate::storage::postgres;
 use crate::telegram::pusher::TelegramPusher;
 
 const FETCH_JOB_CRON: &str = "0 0 17 * * Mon,Tue,Wed,Thu,Fri";
 const SCAN_JOB_CRON: &str = "0 30 17 * * Mon,Tue,Wed,Thu,Fri";
+const DAILY_SIGNAL_ARCHIVE_JOB_CRON: &str = "0 5 20 * * Mon,Tue,Wed,Thu,Fri";
 const DAILY_REPORT_JOB_CRON: &str = "0 0 18 * * Mon,Tue,Wed,Thu,Fri";
 const WEEKLY_REPORT_JOB_CRON: &str = "0 0 20 * * Fri";
 
@@ -41,7 +43,7 @@ pub async fn run_fetch_job(state: Arc<AppState>, provider: Arc<dyn DataProvider>
     }
 }
 
-/// Run all 22 signal detectors and cache results to Redis (17:30 job).
+/// Run all enabled signal detectors and cache results to Redis (17:30 job).
 pub async fn run_scan_job(state: Arc<AppState>) {
     let _guard = state.scan_job_lock.lock().await;
     info!("Scan job: running full signal scan");
@@ -61,6 +63,35 @@ pub async fn run_scan_job(state: Arc<AppState>) {
         Err(e) => {
             warn!("Scan failed: {}", e);
         }
+    }
+}
+
+/// Run all enabled signal detectors and save a daily archive snapshot (20:05 job).
+pub async fn run_daily_signal_archive_job(state: Arc<AppState>) {
+    let _guard = state.scan_job_lock.lock().await;
+    let scan_date = match postgres::latest_stock_trade_date(&state.db).await {
+        Ok(Some(date)) => date,
+        Ok(None) => {
+            warn!("Daily signal archive skipped: stock_daily_bars is empty");
+            return;
+        }
+        Err(e) => {
+            warn!(
+                "Daily signal archive skipped: latest trade date failed: {}",
+                e
+            );
+            return;
+        }
+    };
+
+    info!("Daily signal archive job: scanning for {}", scan_date);
+    let scanner = ScannerService::new(state.clone());
+    match scanner.run_daily_archive_scan(scan_date).await {
+        Ok(summary) => info!(
+            "Daily signal archive saved: date={}, rows={}, codes={}, signals={}",
+            summary.scan_date, summary.rows, summary.codes, summary.signals
+        ),
+        Err(e) => warn!("Daily signal archive failed: {}", e),
     }
 }
 
@@ -265,8 +296,23 @@ pub async fn start_scheduler(
             .await?;
     }
 
+    // 20:05 weekdays
+    {
+        let s = state.clone();
+        sched
+            .add(Job::new_async_tz(
+                DAILY_SIGNAL_ARCHIVE_JOB_CRON,
+                beijing_tz(),
+                move |_, _| {
+                    let s = s.clone();
+                    Box::pin(async move { run_daily_signal_archive_job(s).await })
+                },
+            )?)
+            .await?;
+    }
+
     sched.start().await?;
-    info!("Scheduler started with 4 jobs");
+    info!("Scheduler started with 5 jobs");
     Ok(sched)
 }
 
@@ -279,6 +325,10 @@ mod tests {
         assert_eq!(FETCH_JOB_CRON, "0 0 17 * * Mon,Tue,Wed,Thu,Fri");
         assert_eq!(SCAN_JOB_CRON, "0 30 17 * * Mon,Tue,Wed,Thu,Fri");
         assert_eq!(DAILY_REPORT_JOB_CRON, "0 0 18 * * Mon,Tue,Wed,Thu,Fri");
+        assert_eq!(
+            DAILY_SIGNAL_ARCHIVE_JOB_CRON,
+            "0 5 20 * * Mon,Tue,Wed,Thu,Fri"
+        );
     }
 
     #[test]

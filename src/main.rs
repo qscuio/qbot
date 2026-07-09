@@ -78,6 +78,7 @@ async fn main() -> Result<()> {
         ("scan", "扫描信号"),
         ("prestart", "预启动候选"),
         ("scan_stats", "信号统计"),
+        ("daily_scan_stats", "每日归档统计"),
         ("autosim", "自动交易状态"),
         ("autosim_report", "自动交易日报"),
         ("sim", "普通模拟交易"),
@@ -204,13 +205,14 @@ async fn main() -> Result<()> {
         }
     }
 
-    // --run-now: fire all 4 jobs sequentially for local testing
+    // --run-now: fire all jobs sequentially for local testing
     if std::env::args().any(|a| a == "--run-now") {
         info!("--run-now: firing all jobs sequentially");
         scheduler::run_fetch_job(state.clone(), provider.clone()).await;
         scheduler::run_scan_job(state.clone()).await;
         scheduler::run_daily_report_job(state.clone(), provider.clone(), pusher.clone()).await;
         scheduler::run_weekly_report_job(state.clone(), provider.clone(), pusher.clone()).await;
+        scheduler::run_daily_signal_archive_job(state.clone()).await;
         info!("--run-now: all jobs complete, API server starting");
     }
 

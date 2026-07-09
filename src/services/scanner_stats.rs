@@ -56,6 +56,18 @@ impl ScannerStatsService {
         let samples: Vec<SignalOutcomeSample> = rows.into_iter().map(Into::into).collect();
         Ok(summarize_signal_performance(&samples))
     }
+
+    pub async fn summarize_daily_archive(
+        &self,
+        lookback_days: i64,
+        signal_id: Option<&str>,
+    ) -> Result<Vec<SignalPerformanceSummary>> {
+        let rows =
+            postgres::list_daily_signal_outcome_samples(&self.state.db, lookback_days, signal_id)
+                .await?;
+        let samples: Vec<SignalOutcomeSample> = rows.into_iter().map(Into::into).collect();
+        Ok(summarize_signal_performance(&samples))
+    }
 }
 
 impl From<postgres::SignalOutcomeRow> for SignalOutcomeSample {

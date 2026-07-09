@@ -1,6 +1,6 @@
 # qbot
 
-A-share stock analysis bot. Fetches daily market data from Tushare, runs 22 signal detectors, generates reports, and pushes them to a Telegram channel on a cron schedule.
+A-share stock analysis bot. Fetches daily market data from Tushare, runs 23 signal detectors, generates reports, archives daily signal snapshots, and pushes reports to a Telegram channel on a cron schedule.
 
 ---
 
@@ -37,7 +37,7 @@ A-share stock analysis bot. Fetches daily market data from Tushare, runs 22 sign
      └──────────────────────────────┘
 ```
 
-### Signal System (22 detectors across 6 groups)
+### Signal System (23 detectors across 6 groups)
 
 | Group | Signals |
 |-------|---------|
@@ -53,13 +53,13 @@ A-share stock analysis bot. Fetches daily market data from Tushare, runs 22 sign
 | Path | Purpose |
 |------|---------|
 | `src/main.rs` | Boot sequence, `--run-now` flag |
-| `src/scheduler/mod.rs` | 4 cron jobs + reusable job functions |
+| `src/scheduler/mod.rs` | 5 cron jobs + reusable job functions |
 | `src/api/routes.rs` | REST API routes incl. job trigger endpoints |
-| `src/signals/` | All 22 signal detectors |
+| `src/signals/` | All 23 signal detectors |
 | `src/services/` | Business logic (scanner, reports, limit-up, etc.) |
 | `src/storage/` | PostgreSQL helpers + Redis cache |
 | `src/telegram/` | Pusher + message formatter |
-| `migrations/` | 9 SQL migration files (SQLx embedded) |
+| `migrations/` | SQL migration files (SQLx embedded) |
 | `deploy/` | Docker Compose, systemd service, setup script |
 | `scripts/local-test.sh` | Local end-to-end bootstrap |
 
@@ -105,7 +105,7 @@ Copy `.env.example` to `.env` and fill in:
 
 ## Local Testing
 
-Runs the full stack locally: PostgreSQL via Docker, Redis native, all 4 jobs fired immediately.
+Runs the full stack locally: PostgreSQL via Docker, Redis native, all jobs fired immediately.
 
 ```bash
 # First run: creates .env from .env.example, then exits
@@ -123,7 +123,8 @@ curl http://localhost:8080/health
 
 # Trigger jobs individually
 curl -X POST http://localhost:8080/api/jobs/fetch          # fetch OHLCV + limit-up + sector
-curl -X POST http://localhost:8080/api/jobs/scan           # run 22 signal detectors
+curl -X POST http://localhost:8080/api/jobs/scan           # run 23 signal detectors
+curl -X POST http://localhost:8080/api/jobs/scan/archive   # archive daily signal snapshot
 curl -X POST http://localhost:8080/api/jobs/report/daily   # generate + push daily report
 curl -X POST http://localhost:8080/api/jobs/report/weekly  # generate + push weekly report
 
@@ -131,6 +132,7 @@ curl -X POST http://localhost:8080/api/jobs/report/weekly  # generate + push wee
 curl http://localhost:8080/api/scan/latest
 curl http://localhost:8080/api/scan/prestart
 curl http://localhost:8080/api/scan/stats
+curl http://localhost:8080/api/scan/daily-stats
 curl http://localhost:8080/api/report/daily
 ```
 
@@ -149,6 +151,7 @@ Jobs are scheduled with fixed `UTC+08:00` in code (`Job::new_async_tz`).
 | 17:30 | Mon–Fri | Run full signal scan, cache to Redis |
 | 18:00 | Mon–Fri | Generate daily report, push to Telegram |
 | 20:00 | Friday | Generate weekly report, push to Telegram |
+| 20:05 | Mon–Fri | Run full signal scan and archive triggered hits to `daily_signal_scan_results` |
 
 Time basis:
 - Runtime date/time logic uses fixed `UTC+08:00` (`Asia/Shanghai` equivalent), not server local timezone.
@@ -240,6 +243,7 @@ Supported command set (webhook):
 - `/scan`
 - `/prestart`
 - `/scan_stats`
+- `/daily_scan_stats`
 - `/autosim`, `/autosim_report`
 - `/daban`, `/daban portfolio`, `/daban stats`
 - `/industry`, `/concept`, `/hot7`, `/hot14`, `/hot30`, `/sector_sync`
@@ -336,10 +340,11 @@ curl -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
 |--------|------|------|-------------|
 | GET | `/health` | No | Service health check |
 | POST | `/telegram/webhook` | No* | Telegram inbound command webhook (`*` validated by `TELEGRAM_WEBHOOK_SECRET` if configured) |
-| GET | `/api/signals` | No | List all 22 signals |
+| GET | `/api/signals` | No | List all 23 signals |
 | GET | `/api/scan/latest` | Yes | Latest scan results from Redis |
 | GET | `/api/scan/prestart` | Yes | Pre-start candidate pool with A-tier `3/5` resonance and B-tier `core + auxiliary` setup from `ma_bullish/volume_price/slow_bull/small_bullish/triple_bullish` |
 | GET | `/api/scan/stats` | Yes | Forward-return stats by signal (`days`, optional `signal_id`, optional `limit`) |
+| GET | `/api/scan/daily-stats` | Yes | Forward-return stats from daily archived signal snapshots (`days`, optional `signal_id`, optional `limit`) |
 | GET | `/api/report/daily` | Yes | Latest daily report from DB |
 | GET | `/api/report/signal_auto` | Yes | Latest signal auto-trading daily report from DB |
 | GET | `/api/report/limitup` | Yes | Latest standalone limit-up report from DB |
@@ -371,6 +376,7 @@ curl -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
 | POST | `/api/scan/trigger` | Yes | Trigger scan (background) |
 | POST | `/api/jobs/fetch` | Yes | Trigger data fetch job |
 | POST | `/api/jobs/scan` | Yes | Trigger signal scan job |
+| POST | `/api/jobs/scan/archive` | Yes | Trigger daily signal archive job |
 | POST | `/api/jobs/report/daily` | Yes | Trigger daily report + push |
 | POST | `/api/jobs/report/weekly` | Yes | Trigger weekly report + push |
 
@@ -384,6 +390,7 @@ curl -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
 |-------|----------|
 | `stock_daily_bars` | OHLCV + indicators per stock per day |
 | `scan_results` | Signal hits per scan run |
+| `daily_signal_scan_results` | One archived daily snapshot of triggered signal hits per trade date |
 | `limit_up_stocks` | Limit-up stocks per day |
 | `sector_daily` | Sector performance per day |
 | `chip_distribution` | Chip distribution snapshots |
