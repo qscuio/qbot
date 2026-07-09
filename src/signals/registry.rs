@@ -41,6 +41,7 @@ impl SignalRegistry {
                 Box::new(BreakoutSignal),
                 Box::new(StartupSignal),
                 Box::new(KuangbiaoSignal),
+                Box::new(OversoldReboundSignal),
                 // Comprehensive
                 Box::new(BottomQuickStartSignal),
                 Box::new(BottomEarlyStartSignal),
