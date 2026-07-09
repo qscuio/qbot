@@ -19,6 +19,7 @@ use crate::services::scan_ranker::{
     POOL_LONG_A_ID, POOL_LONG_B_ID, POOL_MID_A_ID, POOL_MID_B_ID, POOL_SHORT_A_ID, POOL_SHORT_B_ID,
 };
 use crate::services::scanner::SignalHit;
+use crate::services::scanner_stats::{ScannerStatsService, SignalPerformanceSummary};
 use crate::signals::base::{avg_volume, sma};
 use crate::signals::registry::SignalRegistry;
 use crate::state::AppState;
@@ -41,6 +42,11 @@ const DABAN_MIN_SCORE: f64 = 60.0;
 const STRONG_WINDOW_DAYS: i64 = 7;
 const STRONG_MIN_LIMIT_COUNT: i64 = 3;
 const AUTO_STRONG_POOL_PRIORITY: [&str; 3] = [POOL_SHORT_A_ID, POOL_MID_A_ID, POOL_LONG_A_ID];
+const BACKTEST_GATE_LOOKBACK_DAYS: i64 = 120;
+const BACKTEST_GATE_HORIZON_DAYS: usize = 5;
+const BACKTEST_GATE_MIN_SAMPLES: usize = 20;
+const BACKTEST_GATE_MIN_AVG_RETURN_PCT: f64 = -0.5;
+const BACKTEST_GATE_MIN_WIN_RATE_PCT: f64 = 42.0;
 
 fn builtin_ranked_pool_accounts() -> [(&'static str, &'static str); 3] {
     [
@@ -182,6 +188,22 @@ struct EntryDecision {
     reason: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingCandidateAction {
+    WaitForNextDay,
+    WaitForBuyWindow,
+    FetchQuote,
+    Expire,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct BacktestGateDecision {
+    allowed: bool,
+    status: &'static str,
+    detail: String,
+    metadata: serde_json::Value,
+}
+
 #[derive(Debug, Clone)]
 struct ExitDecision {
     sell_now: bool,
@@ -227,6 +249,13 @@ impl SignalAutoTradingService {
             Some(candidate) => Some(candidate),
             None => self.pick_best_strong_candidate(signal_date).await?,
         };
+        let backtest_summaries: HashMap<String, SignalPerformanceSummary> =
+            ScannerStatsService::new(self.state.clone())
+                .summarize(BACKTEST_GATE_LOOKBACK_DAYS, None)
+                .await?
+                .into_iter()
+                .map(|summary| (summary.signal_id.clone(), summary))
+                .collect();
         let mut created = 0usize;
 
         for account in accounts {
@@ -239,16 +268,34 @@ impl SignalAutoTradingService {
 
             if account.signal_id == AUTO_DABAN_ID {
                 if let Some(best) = daban_candidate.clone() {
-                    self.save_candidate(&account, signal_date, &best).await?;
-                    created += 1;
+                    if self
+                        .save_candidate_after_backtest_gate(
+                            &account,
+                            signal_date,
+                            &best,
+                            &backtest_summaries,
+                        )
+                        .await?
+                    {
+                        created += 1;
+                    }
                 }
                 continue;
             }
 
             if account.signal_id == AUTO_STRONG_ID {
                 if let Some(best) = strong_candidate.clone() {
-                    self.save_candidate(&account, signal_date, &best).await?;
-                    created += 1;
+                    if self
+                        .save_candidate_after_backtest_gate(
+                            &account,
+                            signal_date,
+                            &best,
+                            &backtest_summaries,
+                        )
+                        .await?
+                    {
+                        created += 1;
+                    }
                 }
                 continue;
             }
@@ -262,8 +309,17 @@ impl SignalAutoTradingService {
                     )
                     .await?
                 {
-                    self.save_candidate(&account, signal_date, &best).await?;
-                    created += 1;
+                    if self
+                        .save_candidate_after_backtest_gate(
+                            &account,
+                            signal_date,
+                            &best,
+                            &backtest_summaries,
+                        )
+                        .await?
+                    {
+                        created += 1;
+                    }
                     continue;
                 }
 
@@ -284,8 +340,17 @@ impl SignalAutoTradingService {
                 .pick_best_signal_candidate(&account.signal_id, results)
                 .await?
             {
-                self.save_candidate(&account, signal_date, &best).await?;
-                created += 1;
+                if self
+                    .save_candidate_after_backtest_gate(
+                        &account,
+                        signal_date,
+                        &best,
+                        &backtest_summaries,
+                    )
+                    .await?
+                {
+                    created += 1;
+                }
             }
         }
 
@@ -370,6 +435,47 @@ impl SignalAutoTradingService {
         )
         .await?;
         Ok(())
+    }
+
+    async fn save_candidate_after_backtest_gate(
+        &self,
+        account: &StrategyAccountRow,
+        signal_date: NaiveDate,
+        candidate: &CandidateScore,
+        backtest_summaries: &HashMap<String, SignalPerformanceSummary>,
+    ) -> Result<bool> {
+        if !should_apply_backtest_gate(&account.signal_id) {
+            self.save_candidate(account, signal_date, candidate).await?;
+            return Ok(true);
+        }
+
+        let decision = evaluate_backtest_gate(backtest_summaries.get(&account.signal_id));
+        if !decision.allowed {
+            let detail = format!(
+                "候选未入池: {} {}\n评分: {:.1}\n逻辑: {}\n回测: {}",
+                candidate.code,
+                candidate.name,
+                candidate.score,
+                candidate.selection_reason,
+                decision.detail
+            );
+            self.record_event(
+                account.id,
+                None,
+                None,
+                &account.signal_id,
+                "backtest_blocked",
+                Some(&candidate.code),
+                "回测门槛未通过",
+                &detail,
+            )
+            .await?;
+            return Ok(false);
+        }
+
+        let enriched = candidate_with_backtest_gate_metadata(candidate, &decision);
+        self.save_candidate(account, signal_date, &enriched).await?;
+        Ok(true)
     }
 
     async fn record_watch_only(
@@ -815,36 +921,48 @@ impl SignalAutoTradingService {
 
     async fn process_pending_entries(&self) -> Result<()> {
         let now = beijing_now();
-        let minutes = now.hour() * 60 + now.minute();
+        let today = beijing_today();
         let pending = self.list_pending_candidates().await?;
         if pending.is_empty() {
             return Ok(());
         }
 
-        let refs: Vec<&str> = pending.iter().map(|row| row.code.as_str()).collect();
-        let quotes = self.sina.get_quotes(&refs).await?;
-
+        let mut quote_candidates = Vec::new();
         for candidate in pending {
+            match pending_candidate_action(now, candidate.signal_date, today) {
+                PendingCandidateAction::WaitForNextDay
+                | PendingCandidateAction::WaitForBuyWindow => {
+                    continue;
+                }
+                PendingCandidateAction::Expire => {
+                    self.skip_candidate(
+                        candidate.id,
+                        candidate.account_id,
+                        &candidate.signal_id,
+                        &candidate.code,
+                        "候选过期",
+                        "次日买入窗口结束，今日未出现承接确认条件",
+                    )
+                    .await?;
+                    continue;
+                }
+                PendingCandidateAction::FetchQuote => quote_candidates.push(candidate),
+            }
+        }
+
+        if quote_candidates.is_empty() {
+            return Ok(());
+        }
+
+        let quotes = {
+            let refs = unique_quote_refs(&quote_candidates);
+            self.sina.get_quotes(&refs).await?
+        };
+
+        for candidate in quote_candidates {
             let Some(quote) = quotes.get(&candidate.code) else {
                 continue;
             };
-
-            if candidate.signal_date >= beijing_today() {
-                continue;
-            }
-
-            if minutes > EXPIRE_MINUTE {
-                self.skip_candidate(
-                    candidate.id,
-                    candidate.account_id,
-                    &candidate.signal_id,
-                    &candidate.code,
-                    "候选过期",
-                    "次日买入窗口结束，今日未出现承接确认条件",
-                )
-                .await?;
-                continue;
-            }
 
             let decision = evaluate_entry_signal(now, quote);
             if !decision.buy_now {
@@ -881,7 +999,7 @@ impl SignalAutoTradingService {
                    WHERE id = $3"#,
             )
             .bind(cost)
-            .bind(beijing_today())
+            .bind(today)
             .bind(account.id)
             .execute(&mut *tx)
             .await?;
@@ -902,7 +1020,7 @@ impl SignalAutoTradingService {
             .bind(shares)
             .bind(quote.price * (1.0 - account.stop_loss_pct / 100.0))
             .bind(account.trailing_stop_pct)
-            .bind(beijing_today())
+            .bind(today)
             .bind(format!(
                 "评分最高候选，盘中承接确认。{}；候选逻辑：{}",
                 decision.reason, candidate.selection_reason
@@ -918,7 +1036,7 @@ impl SignalAutoTradingService {
                        updated_at = NOW()
                    WHERE id = $3"#,
             )
-            .bind(beijing_today())
+            .bind(today)
             .bind(&decision.reason)
             .bind(candidate.id)
             .execute(&mut *tx)
@@ -1638,7 +1756,9 @@ fn score_candidate(signal_id: &str, bars: &[Candle]) -> (f64, Vec<String>) {
 
     let heat_bonus = match signal_id {
         "startup" | "volume_surge" | "kuangbiao" | "breakout" | "uptrend_breakout"
-        | "bottom_quick_start" | "low_accumulation" => triangular_bonus(gain_pct, 4.0, 2.0, 8.0),
+        | "bottom_quick_start" | "bottom_early_start" | "low_accumulation" => {
+            triangular_bonus(gain_pct, 4.0, 2.0, 8.0)
+        }
         "ma_pullback" | "strong_pullback" | "strong_first_neg" | "fanbao" | "broken_board" => {
             triangular_bonus(gain_pct, 2.5, 0.5, 5.0)
         }
@@ -2152,6 +2272,167 @@ fn score_strong_candidate(
     (round2(score.max(0.0)), reasons)
 }
 
+fn pending_candidate_action(
+    now: DateTime<FixedOffset>,
+    signal_date: NaiveDate,
+    today: NaiveDate,
+) -> PendingCandidateAction {
+    if signal_date >= today {
+        return PendingCandidateAction::WaitForNextDay;
+    }
+
+    let minutes = now.hour() * 60 + now.minute();
+    if minutes > EXPIRE_MINUTE {
+        return PendingCandidateAction::Expire;
+    }
+    if minutes < BUY_START_MINUTE {
+        return PendingCandidateAction::WaitForBuyWindow;
+    }
+
+    PendingCandidateAction::FetchQuote
+}
+
+fn unique_quote_refs<'a>(rows: &'a [PendingCandidateRow]) -> Vec<&'a str> {
+    let mut refs = Vec::new();
+    for row in rows {
+        if refs.iter().any(|code| *code == row.code.as_str()) {
+            continue;
+        }
+        refs.push(row.code.as_str());
+    }
+    refs
+}
+
+fn should_apply_backtest_gate(signal_id: &str) -> bool {
+    !matches!(signal_id, AUTO_DABAN_ID | AUTO_STRONG_ID)
+}
+
+fn evaluate_backtest_gate(summary: Option<&SignalPerformanceSummary>) -> BacktestGateDecision {
+    let Some(summary) = summary else {
+        return BacktestGateDecision {
+            allowed: true,
+            status: "no_history",
+            detail: format!(
+                "最近{}天无历史样本，允许小仓位探索",
+                BACKTEST_GATE_LOOKBACK_DAYS
+            ),
+            metadata: serde_json::json!({
+                "status": "no_history",
+                "lookback_days": BACKTEST_GATE_LOOKBACK_DAYS,
+                "horizon_days": BACKTEST_GATE_HORIZON_DAYS,
+                "sample_threshold": BACKTEST_GATE_MIN_SAMPLES,
+            }),
+        };
+    };
+
+    let horizon = summary
+        .horizons
+        .iter()
+        .find(|row| row.days == BACKTEST_GATE_HORIZON_DAYS);
+    let horizon_samples = horizon.map(|row| row.samples).unwrap_or(0);
+    if summary.total_samples < BACKTEST_GATE_MIN_SAMPLES
+        || horizon_samples < BACKTEST_GATE_MIN_SAMPLES
+    {
+        return BacktestGateDecision {
+            allowed: true,
+            status: "insufficient_samples",
+            detail: format!(
+                "最近{}天{}日样本不足({}/{}), 允许探索",
+                BACKTEST_GATE_LOOKBACK_DAYS,
+                BACKTEST_GATE_HORIZON_DAYS,
+                horizon_samples,
+                BACKTEST_GATE_MIN_SAMPLES
+            ),
+            metadata: serde_json::json!({
+                "status": "insufficient_samples",
+                "signal_id": summary.signal_id,
+                "lookback_days": BACKTEST_GATE_LOOKBACK_DAYS,
+                "horizon_days": BACKTEST_GATE_HORIZON_DAYS,
+                "sample_threshold": BACKTEST_GATE_MIN_SAMPLES,
+                "total_samples": summary.total_samples,
+                "horizon_samples": horizon_samples,
+            }),
+        };
+    }
+
+    let Some(horizon) = horizon else {
+        return BacktestGateDecision {
+            allowed: true,
+            status: "insufficient_samples",
+            detail: format!("缺少{}日回测样本，允许探索", BACKTEST_GATE_HORIZON_DAYS),
+            metadata: serde_json::json!({
+                "status": "insufficient_samples",
+                "signal_id": summary.signal_id,
+                "lookback_days": BACKTEST_GATE_LOOKBACK_DAYS,
+                "horizon_days": BACKTEST_GATE_HORIZON_DAYS,
+                "sample_threshold": BACKTEST_GATE_MIN_SAMPLES,
+                "total_samples": summary.total_samples,
+                "horizon_samples": 0,
+            }),
+        };
+    };
+
+    let avg_ok = horizon.avg_return_pct >= BACKTEST_GATE_MIN_AVG_RETURN_PCT;
+    let win_ok = horizon.win_rate_pct >= BACKTEST_GATE_MIN_WIN_RATE_PCT;
+    let allowed = avg_ok && win_ok;
+    let status = if allowed { "passed" } else { "blocked" };
+    let detail = format!(
+        "最近{}天{}日回测: 样本{}，平均收益{:.2}%，胜率{:.2}%；门槛: 平均收益≥{:.2}%，胜率≥{:.2}%",
+        BACKTEST_GATE_LOOKBACK_DAYS,
+        BACKTEST_GATE_HORIZON_DAYS,
+        horizon.samples,
+        horizon.avg_return_pct,
+        horizon.win_rate_pct,
+        BACKTEST_GATE_MIN_AVG_RETURN_PCT,
+        BACKTEST_GATE_MIN_WIN_RATE_PCT
+    );
+
+    BacktestGateDecision {
+        allowed,
+        status,
+        detail,
+        metadata: serde_json::json!({
+            "status": status,
+            "signal_id": summary.signal_id,
+            "lookback_days": BACKTEST_GATE_LOOKBACK_DAYS,
+            "horizon_days": BACKTEST_GATE_HORIZON_DAYS,
+            "sample_threshold": BACKTEST_GATE_MIN_SAMPLES,
+            "total_samples": summary.total_samples,
+            "horizon_samples": horizon.samples,
+            "avg_return_pct": horizon.avg_return_pct,
+            "win_rate_pct": horizon.win_rate_pct,
+            "min_avg_return_pct": BACKTEST_GATE_MIN_AVG_RETURN_PCT,
+            "min_win_rate_pct": BACKTEST_GATE_MIN_WIN_RATE_PCT,
+        }),
+    }
+}
+
+fn candidate_with_backtest_gate_metadata(
+    candidate: &CandidateScore,
+    decision: &BacktestGateDecision,
+) -> CandidateScore {
+    let mut enriched = candidate.clone();
+    let gate_metadata = serde_json::json!({
+        "status": decision.status,
+        "detail": decision.detail,
+        "metrics": decision.metadata,
+    });
+
+    match enriched.metadata.as_object_mut() {
+        Some(obj) => {
+            obj.insert("backtest_gate".to_string(), gate_metadata);
+        }
+        None => {
+            enriched.metadata = serde_json::json!({
+                "original_metadata": enriched.metadata,
+                "backtest_gate": gate_metadata,
+            });
+        }
+    }
+
+    enriched
+}
+
 fn evaluate_entry_signal(now: DateTime<FixedOffset>, quote: &Quote) -> EntryDecision {
     let minutes = now.hour() * 60 + now.minute();
     if minutes < BUY_START_MINUTE {
@@ -2500,6 +2781,113 @@ mod tests {
         assert!(candidate.selection_reason.contains("强势票分歧后重新转强"));
         assert!(candidate.metadata.to_string().contains("risk_flags"));
         assert!(candidate.metadata.to_string().contains("pool_short_a"));
+    }
+
+    #[test]
+    fn backtest_gate_blocks_signal_with_poor_five_day_history() {
+        let summary = crate::services::scanner_stats::SignalPerformanceSummary {
+            signal_id: "bottom_quick_start".to_string(),
+            total_samples: 36,
+            horizons: vec![crate::services::scanner_stats::HorizonPerformance {
+                days: 5,
+                samples: 34,
+                avg_return_pct: -1.35,
+                win_rate_pct: 35.29,
+            }],
+        };
+
+        let decision = evaluate_backtest_gate(Some(&summary));
+
+        assert!(!decision.allowed);
+        assert_eq!(decision.status, "blocked");
+        assert!(decision.detail.contains("5日"));
+    }
+
+    #[test]
+    fn backtest_gate_allows_insufficient_history_for_exploration() {
+        let summary = crate::services::scanner_stats::SignalPerformanceSummary {
+            signal_id: "bottom_early_start".to_string(),
+            total_samples: 6,
+            horizons: vec![crate::services::scanner_stats::HorizonPerformance {
+                days: 5,
+                samples: 5,
+                avg_return_pct: -4.0,
+                win_rate_pct: 20.0,
+            }],
+        };
+
+        let decision = evaluate_backtest_gate(Some(&summary));
+
+        assert!(decision.allowed);
+        assert_eq!(decision.status, "insufficient_samples");
+        assert!(decision.metadata.to_string().contains("sample_threshold"));
+    }
+
+    #[test]
+    fn pending_candidate_expires_after_entry_window_without_quote_fetch() {
+        let tz = crate::market_time::beijing_tz();
+        let today = NaiveDate::from_ymd_opt(2026, 6, 9).unwrap();
+        let signal_date = NaiveDate::from_ymd_opt(2026, 6, 8).unwrap();
+        let after_expiry = tz.with_ymd_and_hms(2026, 6, 9, 14, 46, 0).unwrap();
+
+        assert_eq!(
+            pending_candidate_action(after_expiry, signal_date, today),
+            PendingCandidateAction::Expire
+        );
+
+        let before_buy_window = tz.with_ymd_and_hms(2026, 6, 9, 9, 31, 0).unwrap();
+        assert_eq!(
+            pending_candidate_action(before_buy_window, signal_date, today),
+            PendingCandidateAction::WaitForBuyWindow
+        );
+
+        let same_day_candidate = tz.with_ymd_and_hms(2026, 6, 9, 10, 5, 0).unwrap();
+        assert_eq!(
+            pending_candidate_action(same_day_candidate, today, today),
+            PendingCandidateAction::WaitForNextDay
+        );
+    }
+
+    #[test]
+    fn quote_refs_for_pending_candidates_are_deduplicated() {
+        let signal_date = NaiveDate::from_ymd_opt(2026, 6, 8).unwrap();
+        let rows = vec![
+            PendingCandidateRow {
+                id: 1,
+                account_id: 1,
+                signal_id: "startup".to_string(),
+                signal_name: "启动信号".to_string(),
+                signal_date,
+                code: "300069.SZ".to_string(),
+                name: "金利华电".to_string(),
+                score: 99.0,
+                selection_reason: "test".to_string(),
+            },
+            PendingCandidateRow {
+                id: 2,
+                account_id: 2,
+                signal_id: "linreg".to_string(),
+                signal_name: "线性回归".to_string(),
+                signal_date,
+                code: "300069.SZ".to_string(),
+                name: "金利华电".to_string(),
+                score: 101.0,
+                selection_reason: "test".to_string(),
+            },
+            PendingCandidateRow {
+                id: 3,
+                account_id: 3,
+                signal_id: "fanbao".to_string(),
+                signal_name: "反包".to_string(),
+                signal_date,
+                code: "688528.SH".to_string(),
+                name: "秦川物联".to_string(),
+                score: 94.0,
+                selection_reason: "test".to_string(),
+            },
+        ];
+
+        assert_eq!(unique_quote_refs(&rows), vec!["300069.SZ", "688528.SH"]);
     }
 
     #[test]

@@ -41,7 +41,7 @@ pub async fn run_fetch_job(state: Arc<AppState>, provider: Arc<dyn DataProvider>
     }
 }
 
-/// Run all 21 signal detectors and cache results to Redis (17:30 job).
+/// Run all 22 signal detectors and cache results to Redis (17:30 job).
 pub async fn run_scan_job(state: Arc<AppState>) {
     let _guard = state.scan_job_lock.lock().await;
     info!("Scan job: running full signal scan");

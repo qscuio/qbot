@@ -233,6 +233,7 @@ const MID_EVIDENCE_SIGNALS: &[&str] = &[
 const LONG_EVIDENCE_SIGNALS: &[&str] = &[
     "low_accumulation",
     "bottom_quick_start",
+    "bottom_early_start",
     "downtrend_reversal",
     "long_cycle_reversal",
     "weekly_monthly_bullish",

@@ -1,6 +1,6 @@
 # qbot
 
-A-share stock analysis bot. Fetches daily market data from Tushare, runs 21 signal detectors, generates reports, and pushes them to a Telegram channel on a cron schedule.
+A-share stock analysis bot. Fetches daily market data from Tushare, runs 22 signal detectors, generates reports, and pushes them to a Telegram channel on a cron schedule.
 
 ---
 
@@ -37,7 +37,7 @@ A-share stock analysis bot. Fetches daily market data from Tushare, runs 21 sign
      └──────────────────────────────┘
 ```
 
-### Signal System (21 detectors across 6 groups)
+### Signal System (22 detectors across 6 groups)
 
 | Group | Signals |
 |-------|---------|
@@ -55,7 +55,7 @@ A-share stock analysis bot. Fetches daily market data from Tushare, runs 21 sign
 | `src/main.rs` | Boot sequence, `--run-now` flag |
 | `src/scheduler/mod.rs` | 4 cron jobs + reusable job functions |
 | `src/api/routes.rs` | REST API routes incl. job trigger endpoints |
-| `src/signals/` | All 21 signal detectors |
+| `src/signals/` | All 22 signal detectors |
 | `src/services/` | Business logic (scanner, reports, limit-up, etc.) |
 | `src/storage/` | PostgreSQL helpers + Redis cache |
 | `src/telegram/` | Pusher + message formatter |
@@ -123,7 +123,7 @@ curl http://localhost:8080/health
 
 # Trigger jobs individually
 curl -X POST http://localhost:8080/api/jobs/fetch          # fetch OHLCV + limit-up + sector
-curl -X POST http://localhost:8080/api/jobs/scan           # run 21 signal detectors
+curl -X POST http://localhost:8080/api/jobs/scan           # run 22 signal detectors
 curl -X POST http://localhost:8080/api/jobs/report/daily   # generate + push daily report
 curl -X POST http://localhost:8080/api/jobs/report/weekly  # generate + push weekly report
 
@@ -334,7 +334,7 @@ curl -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
 |--------|------|------|-------------|
 | GET | `/health` | No | Service health check |
 | POST | `/telegram/webhook` | No* | Telegram inbound command webhook (`*` validated by `TELEGRAM_WEBHOOK_SECRET` if configured) |
-| GET | `/api/signals` | No | List all 21 signals |
+| GET | `/api/signals` | No | List all 22 signals |
 | GET | `/api/scan/latest` | Yes | Latest scan results from Redis |
 | GET | `/api/scan/prestart` | Yes | Pre-start candidate pool with A-tier `3/5` resonance and B-tier `core + auxiliary` setup from `ma_bullish/volume_price/slow_bull/small_bullish/triple_bullish` |
 | GET | `/api/scan/stats` | Yes | Forward-return stats by signal (`days`, optional `signal_id`, optional `limit`) |

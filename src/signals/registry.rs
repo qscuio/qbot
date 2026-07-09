@@ -43,6 +43,7 @@ impl SignalRegistry {
                 Box::new(KuangbiaoSignal),
                 // Comprehensive
                 Box::new(BottomQuickStartSignal),
+                Box::new(BottomEarlyStartSignal),
                 Box::new(LongCycleReversalSignal),
                 Box::new(LowAccumulationSignal),
             ];
