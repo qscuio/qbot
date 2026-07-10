@@ -21,15 +21,17 @@ impl SectorService {
     pub async fn fetch_and_save(&self, date: NaiveDate) -> Result<()> {
         let sectors = self.provider.get_sector_data(date).await?;
         info!("Sectors: {} records for {}", sectors.len(), date);
-        postgres::save_sector_data(&self.state.db, &sectors).await?;
-        MarketRepository::new(self.state.db.clone())
-            .append_sector_versions(
-                &sectors,
-                chrono::Utc::now(),
-                "observed",
-                self.provider.name(),
-            )
-            .await?;
+        let mut tx = self.state.db.begin().await?;
+        postgres::save_sector_data_in_tx(&mut tx, &sectors).await?;
+        MarketRepository::append_sector_versions_in_tx(
+            &mut tx,
+            &sectors,
+            chrono::Utc::now(),
+            "observed",
+            self.provider.name(),
+        )
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 

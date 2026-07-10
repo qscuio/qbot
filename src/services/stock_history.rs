@@ -51,15 +51,17 @@ impl StockHistoryService {
             match self.provider.get_daily_bars_by_date(*date).await {
                 Ok(bars) => {
                     let count = bars.len();
-                    postgres::upsert_daily_bars(&self.state.db, &bars).await?;
-                    MarketRepository::new(self.state.db.clone())
-                        .append_daily_bar_versions(
-                            &bars,
-                            chrono::Utc::now(),
-                            "estimated",
-                            self.provider.name(),
-                        )
-                        .await?;
+                    let mut tx = self.state.db.begin().await?;
+                    postgres::upsert_daily_bars_in_tx(&mut tx, &bars).await?;
+                    MarketRepository::append_daily_bar_versions_in_tx(
+                        &mut tx,
+                        &bars,
+                        chrono::Utc::now(),
+                        "estimated",
+                        self.provider.name(),
+                    )
+                    .await?;
+                    tx.commit().await?;
                     if i % 50 == 0 {
                         info!(
                             "Backfill progress: {}/{} ({}, {} bars)",
@@ -89,10 +91,17 @@ impl StockHistoryService {
 
         let bars = self.provider.get_daily_bars_by_date(today).await?;
         let count = bars.len();
-        postgres::upsert_daily_bars(&self.state.db, &bars).await?;
-        MarketRepository::new(self.state.db.clone())
-            .append_daily_bar_versions(&bars, chrono::Utc::now(), "observed", self.provider.name())
-            .await?;
+        let mut tx = self.state.db.begin().await?;
+        postgres::upsert_daily_bars_in_tx(&mut tx, &bars).await?;
+        MarketRepository::append_daily_bar_versions_in_tx(
+            &mut tx,
+            &bars,
+            chrono::Utc::now(),
+            "observed",
+            self.provider.name(),
+        )
+        .await?;
+        tx.commit().await?;
         info!("Daily update: {} bars saved for {}", count, today);
 
         // Also refresh stock info

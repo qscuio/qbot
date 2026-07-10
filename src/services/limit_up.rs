@@ -22,15 +22,17 @@ impl LimitUpService {
     pub async fn fetch_and_save(&self, date: NaiveDate) -> Result<Vec<LimitUpStock>> {
         let stocks = self.provider.get_limit_up_stocks(date).await?;
         info!("涨停板: {} stocks on {}", stocks.len(), date);
-        postgres::save_limit_up_stocks(&self.state.db, &stocks).await?;
-        MarketRepository::new(self.state.db.clone())
-            .append_limit_up_versions(
-                &stocks,
-                chrono::Utc::now(),
-                "observed",
-                self.provider.name(),
-            )
-            .await?;
+        let mut tx = self.state.db.begin().await?;
+        postgres::save_limit_up_stocks_in_tx(&mut tx, &stocks).await?;
+        MarketRepository::append_limit_up_versions_in_tx(
+            &mut tx,
+            &stocks,
+            chrono::Utc::now(),
+            "observed",
+            self.provider.name(),
+        )
+        .await?;
+        tx.commit().await?;
         postgres::rebuild_startup_watchlist(&self.state.db, date).await?;
         Ok(stocks)
     }

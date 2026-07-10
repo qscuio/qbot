@@ -1,6 +1,6 @@
 use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::Value;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::analysis::market_snapshot::{
@@ -133,6 +133,26 @@ impl MarketRepository {
         availability_quality: &str,
         source: &str,
     ) -> Result<usize> {
+        let mut tx = self.pool.begin().await?;
+        let inserted = Self::append_daily_bar_versions_in_tx(
+            &mut tx,
+            bars,
+            available_at,
+            availability_quality,
+            source,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(inserted)
+    }
+
+    pub async fn append_daily_bar_versions_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        bars: &[(String, Candle)],
+        available_at: chrono::DateTime<chrono::Utc>,
+        availability_quality: &str,
+        source: &str,
+    ) -> Result<usize> {
         let mut inserted = 0;
         for (code, bar) in bars {
             inserted += sqlx::query(
@@ -156,7 +176,7 @@ impl MarketRepository {
             .bind(available_at)
             .bind(availability_quality)
             .bind(source)
-            .execute(&self.pool)
+            .execute(&mut **tx)
             .await?
             .rows_affected() as usize;
         }
@@ -165,6 +185,26 @@ impl MarketRepository {
 
     pub async fn append_sector_versions(
         &self,
+        rows: &[SectorData],
+        available_at: DateTime<Utc>,
+        availability_quality: &str,
+        source: &str,
+    ) -> Result<usize> {
+        let mut tx = self.pool.begin().await?;
+        let inserted = Self::append_sector_versions_in_tx(
+            &mut tx,
+            rows,
+            available_at,
+            availability_quality,
+            source,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(inserted)
+    }
+
+    pub async fn append_sector_versions_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
         rows: &[SectorData],
         available_at: DateTime<Utc>,
         availability_quality: &str,
@@ -188,7 +228,7 @@ impl MarketRepository {
             .bind(available_at)
             .bind(availability_quality)
             .bind(source)
-            .execute(&self.pool)
+            .execute(&mut **tx)
             .await?
             .rows_affected() as usize;
         }
@@ -197,6 +237,26 @@ impl MarketRepository {
 
     pub async fn append_limit_up_versions(
         &self,
+        rows: &[LimitUpStock],
+        available_at: DateTime<Utc>,
+        availability_quality: &str,
+        source: &str,
+    ) -> Result<usize> {
+        let mut tx = self.pool.begin().await?;
+        let inserted = Self::append_limit_up_versions_in_tx(
+            &mut tx,
+            rows,
+            available_at,
+            availability_quality,
+            source,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(inserted)
+    }
+
+    pub async fn append_limit_up_versions_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
         rows: &[LimitUpStock],
         available_at: DateTime<Utc>,
         availability_quality: &str,
@@ -223,7 +283,7 @@ impl MarketRepository {
             .bind(available_at)
             .bind(availability_quality)
             .bind(source)
-            .execute(&self.pool)
+            .execute(&mut **tx)
             .await?
             .rows_affected() as usize;
         }
@@ -1290,6 +1350,113 @@ mod tests {
                 10.8,
                 2.2,
                 "estimated".to_string(),
+                "test".to_string()
+            )
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn append_sector_versions_records_metadata_and_is_idempotent(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = MarketRepository::new(pool.clone());
+        let available_at = dt(2026, 7, 10, 8);
+        let row = SectorData {
+            code: "BK0477".to_string(),
+            name: "Semiconductors".to_string(),
+            sector_type: "industry".to_string(),
+            change_pct: 2.34,
+            amount: 123_456_789.0,
+            trade_date: date(2026, 7, 10),
+        };
+
+        let inserted = repo
+            .append_sector_versions(&[row.clone(), row], available_at, "observed", "test")
+            .await
+            .unwrap();
+
+        let rows: Vec<(String, String, f64, chrono::DateTime<Utc>, String, String)> =
+            sqlx::query_as(
+                r#"SELECT name, sector_type, change_pct::float8, available_at,
+                          availability_quality, source
+                   FROM sector_daily_versions
+                   WHERE code = 'BK0477' AND trade_date = '2026-07-10'"#,
+            )
+            .fetch_all(&pool)
+            .await?;
+
+        assert_eq!(inserted, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0],
+            (
+                "Semiconductors".to_string(),
+                "industry".to_string(),
+                2.34,
+                available_at,
+                "observed".to_string(),
+                "test".to_string()
+            )
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn append_limit_up_versions_records_metadata_and_is_idempotent(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = MarketRepository::new(pool.clone());
+        let available_at = dt(2026, 7, 10, 8);
+        let row = LimitUpStock {
+            code: "600000.SH".to_string(),
+            name: "Alpha".to_string(),
+            trade_date: date(2026, 7, 10),
+            close: 10.5,
+            pct_chg: 10.01,
+            fd_amount: 987_654_321.0,
+            first_time: Some("09:35".to_string()),
+            last_time: Some("14:55".to_string()),
+            open_times: 2,
+            strth: 88.8,
+            limit: "U".to_string(),
+        };
+
+        let inserted = repo
+            .append_limit_up_versions(&[row.clone(), row], available_at, "observed", "test")
+            .await
+            .unwrap();
+
+        let rows: Vec<(
+            String,
+            String,
+            f64,
+            i32,
+            f64,
+            chrono::DateTime<Utc>,
+            String,
+            String,
+        )> = sqlx::query_as(
+            r#"SELECT name, limit_time, seal_amount::float8, burst_count,
+                      strth::float8, available_at, availability_quality, source
+               FROM limit_up_stock_versions
+               WHERE code = '600000.SH' AND trade_date = '2026-07-10'"#,
+        )
+        .fetch_all(&pool)
+        .await?;
+
+        assert_eq!(inserted, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0],
+            (
+                "Alpha".to_string(),
+                "09:35".to_string(),
+                987_654_321.0,
+                2,
+                88.8,
+                available_at,
+                "observed".to_string(),
                 "test".to_string()
             )
         );
