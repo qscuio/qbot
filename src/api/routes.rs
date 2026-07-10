@@ -348,6 +348,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/report/signal_auto", get(get_signal_auto_report))
         .route("/api/report/limitup", get(get_limitup_report))
         .route("/api/report/strong", get(get_strong_report))
+        .route("/api/analysis/data-status", get(get_analysis_data_status))
         .route("/api/signal-auto/accounts", get(get_signal_auto_accounts))
         .route("/api/market/overview", get(market_overview))
         .route("/api/chart/data/:code", get(chart_data))
@@ -4083,6 +4084,61 @@ async fn list_signals() -> Json<Value> {
         .collect();
     let count = signals.len();
     Json(json!({"signals": signals, "count": count}))
+}
+
+async fn get_analysis_data_status(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> ApiResult {
+    if !check_auth(&headers, state.config.api_key.as_deref()) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "unauthorized"})),
+        ));
+    }
+
+    let row: Option<(
+        String,
+        serde_json::Value,
+        Option<String>,
+        chrono::DateTime<chrono::Utc>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    )> = sqlx::query_as(
+        r#"SELECT status, details, error_message, started_at, completed_at
+           FROM analysis_data_runs
+           WHERE run_type = 'point_in_time_capability_probe'
+           ORDER BY started_at DESC
+           LIMIT 1"#,
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| api_error(&e.to_string()))?;
+
+    match row {
+        Some((status, details, error_message, started_at, completed_at)) => {
+            let missing_capabilities = details
+                .get("missing_capabilities")
+                .cloned()
+                .unwrap_or_else(|| json!([]));
+            Ok(Json(json!({
+                "run_type": "point_in_time_capability_probe",
+                "status": status,
+                "missing_capabilities": missing_capabilities,
+                "details": details,
+                "error_message": error_message,
+                "started_at": started_at,
+                "completed_at": completed_at,
+            })))
+        }
+        None => Ok(Json(json!({
+            "run_type": "point_in_time_capability_probe",
+            "status": "missing_probe",
+            "missing_capabilities": ["point_in_time_capability_probe"],
+            "details": {
+                "point_in_time_capability_probe": "missing: no point-in-time capability probe has been persisted"
+            }
+        }))),
+    }
 }
 
 async fn get_scan_latest(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult {
