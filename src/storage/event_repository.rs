@@ -594,6 +594,48 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn updating_claim_evidence_cannot_orphan_a_published_claim(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = EventRepository::new(pool.clone());
+        let row = evidence("source-published-claim-update", 1, "publishable");
+        save_evidence(&pool, &row).await;
+
+        let published = published_claim(row.evidence_id);
+        let draft = ClaimRow {
+            claim_id: Uuid::new_v4(),
+            claim_type: "fact".to_string(),
+            claim_text: "Internal draft note".to_string(),
+            confidence: 0.25,
+            review_status: "draft".to_string(),
+            evidence: Vec::new(),
+            created_at: dt(2026, 7, 10, 12),
+        };
+        let seeded = extraction(row.evidence_id, vec![published.clone(), draft.clone()]);
+        repo.save_extraction(&seeded).await.unwrap();
+
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            r#"UPDATE market_event_claim_evidence
+               SET claim_id = $1
+               WHERE claim_id = $2
+                 AND evidence_id = $3"#,
+        )
+        .bind(draft.claim_id)
+        .bind(published.claim_id)
+        .bind(row.evidence_id)
+        .execute(&mut *tx)
+        .await?;
+
+        let commit_error = tx.commit().await.unwrap_err();
+        assert!(commit_error
+            .to_string()
+            .contains("published market event claim"));
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn user_locked_duplicate_groups_are_not_overwritten_by_reprocessing(
         pool: PgPool,
     ) -> sqlx::Result<()> {

@@ -142,21 +142,27 @@ RETURNS TRIGGER AS $$
 DECLARE
     checked_claim_id UUID;
 BEGIN
-    checked_claim_id := COALESCE(NEW.claim_id, OLD.claim_id);
-
-    IF EXISTS (
-        SELECT 1
-        FROM market_event_claims c
-        WHERE c.claim_id = checked_claim_id
-          AND c.review_status = 'published'
-          AND NOT EXISTS (
-              SELECT 1
-              FROM market_event_claim_evidence ce
-              WHERE ce.claim_id = c.claim_id
-          )
-    ) THEN
-        RAISE EXCEPTION 'published market event claim % must reference evidence', checked_claim_id;
-    END IF;
+    FOR checked_claim_id IN
+        SELECT DISTINCT claim_id
+        FROM (
+            VALUES (NEW.claim_id), (OLD.claim_id)
+        ) AS affected_claims(claim_id)
+        WHERE claim_id IS NOT NULL
+    LOOP
+        IF EXISTS (
+            SELECT 1
+            FROM market_event_claims c
+            WHERE c.claim_id = checked_claim_id
+              AND c.review_status = 'published'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM market_event_claim_evidence ce
+                  WHERE ce.claim_id = c.claim_id
+              )
+        ) THEN
+            RAISE EXCEPTION 'published market event claim % must reference evidence', checked_claim_id;
+        END IF;
+    END LOOP;
 
     RETURN COALESCE(NEW, OLD);
 END;
