@@ -1138,7 +1138,7 @@ git commit -m "feat: refresh point-in-time supporting data"
 - Produces `adjust_candles`.
 - Consumes raw `Candle` values and dated adjustment factors.
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 ```rust
 #[test]
@@ -1171,7 +1171,7 @@ fn rejects_missing_factor_for_a_bar() {
 }
 ```
 
-- [ ] **Step 2: Verify failure**
+- [x] **Step 2: Verify failure**
 
 Run:
 
@@ -1181,7 +1181,7 @@ cargo test adjustment::tests -- --nocapture
 
 Expected: FAIL.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```rust
 pub fn adjust_candles(
@@ -1220,7 +1220,7 @@ pub fn adjust_candles(
 }
 ```
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run:
 
@@ -1230,7 +1230,7 @@ cargo test adjustment::tests
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/analysis/market_snapshot
