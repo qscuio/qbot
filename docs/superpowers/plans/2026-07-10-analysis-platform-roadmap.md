@@ -153,9 +153,9 @@ Database integration tests require a valid `DATABASE_URL` or SQLx test database 
 - Produces the point-in-time data contracts required by all later phases.
 - Later tasks must not start until `/api/analysis/data-status` reports all critical prerequisites available.
 
-- [ ] Execute every checkbox in the linked plan.
-- [ ] Run the Rust verification commands above.
-- [ ] Confirm no pattern, event, or decision-support candidate table is populated.
+- [x] Execute every checkbox in the linked plan.
+- [x] Run the Rust verification commands above.
+- [x] Confirm no pattern, event, or decision-support candidate table is populated.
 
 ### Task 2: Complete Gate 1
 
