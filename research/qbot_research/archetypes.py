@@ -297,7 +297,12 @@ def _fit_gmm(
     means_scaled = cast(FloatMatrix, model.means_)
     means = _inverse_scale(means_scaled, scaler, config.feature_columns)
     weights = cast(FloatMatrix, model.weights_)
-    covariances = cast(npt.NDArray[np.float64], model.covariances_)
+    covariances_scaled = cast(npt.NDArray[np.float64], model.covariances_)
+    covariances = _inverse_scale_covariances(
+        covariances_scaled,
+        scaler,
+        config.feature_columns,
+    )
     for cluster_id in range(cluster_count):
         sample_count = cluster_sample_counts[cluster_id]
         mean_scaled = means_scaled[cluster_id]
@@ -558,6 +563,16 @@ def _inverse_scale(
     means = np.array([scaler["mean"][feature] for feature in feature_columns], dtype=np.float64)
     scales = np.array([scaler["scale"][feature] for feature in feature_columns], dtype=np.float64)
     return scaled_values * scales + means
+
+
+def _inverse_scale_covariances(
+    scaled_covariances: npt.NDArray[np.float64],
+    scaler: dict[str, dict[str, float]],
+    feature_columns: Sequence[str],
+) -> npt.NDArray[np.float64]:
+    scales = np.array([scaler["scale"][feature] for feature in feature_columns], dtype=np.float64)
+    scale_matrix = np.outer(scales, scales)
+    return scaled_covariances * scale_matrix
 
 
 def _silhouette(scaled_matrix: FloatMatrix, labels: IntVector) -> float:

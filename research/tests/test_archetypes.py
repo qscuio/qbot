@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 
+import numpy as np
 import polars as pl
 import pytest
 
@@ -261,6 +262,78 @@ def test_discover_archetypes_compares_kmeans_and_gmm_with_serializable_payloads(
             assert candidate["mixture_covariance"]
             assert candidate["mixture_weight"] > 0.0
             assert candidate["bic"] < 0.0
+
+
+def test_discover_archetypes_exports_gmm_covariance_in_original_feature_units(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scaled_covariance = np.array(
+        [
+            [1.25, 0.40, -0.15],
+            [0.40, 0.75, 0.20],
+            [-0.15, 0.20, 1.50],
+        ],
+        dtype=np.float64,
+    )
+
+    class ControlledGmm:
+        def __init__(self, **_: object) -> None:
+            self.means_ = np.array(
+                [
+                    [0.0, 0.0, 0.0],
+                    [1.0, -1.0, 0.5],
+                ],
+                dtype=np.float64,
+            )
+            self.covariances_ = np.array(
+                [
+                    scaled_covariance,
+                    scaled_covariance * 2.0,
+                ],
+                dtype=np.float64,
+            )
+            self.weights_ = np.array([0.5, 0.5], dtype=np.float64)
+
+        def fit_predict(self, scaled_matrix: object) -> list[int]:
+            midpoint = len(scaled_matrix) // 2  # type: ignore[arg-type]
+            return [0] * midpoint + [1] * (len(scaled_matrix) - midpoint)  # type: ignore[arg-type]
+
+        def bic(self, _: object) -> float:
+            return -123.0
+
+    monkeypatch.setattr("qbot_research.archetypes.GaussianMixture", ControlledGmm)
+    config = ArchetypeDiscoveryConfig(
+        feature_columns=["return_20d", "return_60d", "relative_strength_20d"],
+        cluster_counts=[2],
+        min_family_samples=8,
+        min_cluster_size=3,
+        random_seed=13,
+        stability_iterations=2,
+        min_stability_score=0.0,
+    )
+
+    result = discover_archetypes(_trend_training_frame(), "trend", config)
+
+    gmm_cluster = next(
+        candidate for candidate in result["archetypes"]
+        if candidate["model_type"] == "gmm" and candidate["cluster_id"] == 0
+    )
+    scales = np.array(
+        [
+            gmm_cluster["scaler"]["scale"]["return_20d"],
+            gmm_cluster["scaler"]["scale"]["return_60d"],
+            gmm_cluster["scaler"]["scale"]["relative_strength_20d"],
+        ],
+        dtype=np.float64,
+    )
+    expected_covariance = np.diag(scales) @ scaled_covariance @ np.diag(scales)
+
+    assert gmm_cluster["mixture_mean"] == {
+        "return_20d": gmm_cluster["scaler"]["mean"]["return_20d"],
+        "return_60d": gmm_cluster["scaler"]["mean"]["return_60d"],
+        "relative_strength_20d": gmm_cluster["scaler"]["mean"]["relative_strength_20d"],
+    }
+    assert np.asarray(gmm_cluster["mixture_covariance"]) == pytest.approx(expected_covariance)
 
 
 def test_discover_archetypes_rejects_tiny_clusters_explicitly() -> None:
