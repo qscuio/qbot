@@ -92,43 +92,45 @@ Observed warning noise during test runs:
 
 ## Self-review findings
 
-- Fixed one issue found during self-review: `OfficialEventSource::from_config()` was initially leaking the env `source_id` before passing it into `new()`, which already performs the one required leak to satisfy the brief’s `fn source_id(&self) -> &'static str` contract. Final state only leaks once per adapter instance.
+- `OfficialEventSource::from_config()` now threads `Config::data_proxy` into adapter client construction so the official feed follows the same timeout/proxy convention used by the other outbound data clients.
+- Invalid `DATA_PROXY` values now fail fast with a clear `AppError::Config` instead of silently falling back to a direct client.
 - Retention behavior is enforced on both the mapped `content` field and persisted `raw_payload`.
 - No live network calls are made in tests; the `fetch()` path is exercised via a loopback HTTP server.
 
 ## Issues/concerns
 
-- The brief’s combination of env-driven `official_event_source_id: String` and `EventSource::source_id() -> &'static str` requires process-lifetime ownership for the selected source id. The implementation uses a single `Box::leak` per constructed adapter instance to satisfy that contract.
 - Warning noise remains in the crate, but the required verification commands passed.
 
 ## Fix subagent follow-up
 
 ### Summary
 
-- Replaced the leaked dynamic `source_id` path in `src/analysis/adapters/official_event_source.rs` with explicit supported-ID validation that maps the configured string to the static adapter ID.
-- Added a regression test proving `OFFICIAL_EVENT_SOURCE_ID=official:unsupported` is rejected with a clear config error while the supported configured ID still yields `official:market_event`.
-- Confirmed no `Box::leak` remains in the adapter implementation.
+- Updated `src/analysis/adapters/official_event_source.rs` so `OfficialEventSource::from_config()` passes `Config::data_proxy` through to `new()`, and `new()` now builds the HTTP client with `Client::builder().timeout(...).proxy(...)`.
+- Added focused regressions for:
+  - invalid `DATA_PROXY` rejection from `from_config()`
+  - proxy-aware `fetch()` behavior via a loopback HTTP proxy server that only succeeds when the configured proxy is actually used
+- Reconciled this report to the final no-leak implementation state. There is no remaining `Box::leak` claim for this adapter.
 
 ### RED
 
-- Added `from_config_rejects_unsupported_source_ids` in `src/analysis/adapters/official_event_source.rs`.
-- Ran `cargo test from_config_rejects_unsupported_source_ids -- --nocapture`.
-- First run failed for test-shape reasons (`unwrap_err()` required `Debug` on the adapter type), so the test was corrected without touching production code.
-- Reran `cargo test from_config_rejects_unsupported_source_ids -- --nocapture`.
-- Observed intended RED failure:
-  - panic: `expected config error, got Ok result`
+- Added `from_config_rejects_invalid_data_proxy` and `fetch_uses_data_proxy_from_config` in `src/analysis/adapters/official_event_source.rs`.
+- RED command 1:
+  - `cargo test from_config_rejects_invalid_data_proxy -- --nocapture`
+  - failed with panic: `expected config error, got Ok result`
+- RED command 2:
+  - `cargo test fetch_uses_data_proxy_from_config -- --nocapture`
+  - failed with `reqwest::Error` resolving `official-feed.invalid`, proving the adapter was bypassing the configured proxy and attempting a direct connection
 
 ### GREEN
 
-- Implemented `supported_source_id()` with explicit validation for:
-  - `official:market_event`
+- Implemented `build_client(data_proxy)` with a 20-second timeout, explicit `reqwest::Proxy::all(...)` validation, and config-error propagation on proxy/client build failures.
 - Reran `cargo test analysis::adapters::official_event_source -- --nocapture`.
-- Result: `6 passed; 0 failed`.
+- Result: `8 passed; 0 failed`.
 
 ### Final verification
 
 - `cargo fmt --all -- --check` -> pass
-- `cargo test analysis::adapters::official_event_source -- --nocapture` -> pass (`6 passed; 0 failed`)
+- `cargo test analysis::adapters::official_event_source -- --nocapture` -> pass (`8 passed; 0 failed`)
 - `cargo test --all --locked config::tests::test_config_defaults -- --nocapture` -> pass (`1 passed; 0 failed`)
 - `git diff --check` -> pass
 - `rg -n "Box::leak" src/analysis/adapters/official_event_source.rs` -> no matches
@@ -140,8 +142,8 @@ Observed warning noise during test runs:
 
 ### Commit hash
 
-- Final commit hash is reported in the subagent handoff response. This report section cannot embed the final self-referential hash because amending the report changes the commit ID.
+- Fix commit: `036923a` (`fix: wire official event source through proxy-aware client`)
 
 ### Concerns
 
-- Existing crate warning noise remains during test runs, but the required commands passed and the adapter leak path is removed.
+- Existing crate warning noise remains during test runs, but the required commands passed and the adapter now honors timeout/proxy configuration without a silent fallback.
