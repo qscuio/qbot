@@ -111,8 +111,28 @@ CREATE TABLE market_event_daily_briefs (
     generated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_event_evidence_available
-    ON market_event_evidence(available_at, effective_trade_date, status);
+CREATE INDEX idx_event_evidence_content_hash_lookup
+    ON market_event_evidence(
+        content_hash,
+        effective_trade_date,
+        available_at,
+        source_id,
+        source_item_id,
+        version,
+        evidence_id
+    );
+
+CREATE INDEX idx_event_evidence_publishable_lookup
+    ON market_event_evidence(
+        effective_trade_date,
+        status,
+        available_at,
+        first_seen_at,
+        source_id,
+        source_item_id,
+        version,
+        evidence_id
+    );
 
 CREATE INDEX idx_event_claims_review
     ON market_event_claims(review_status, created_at DESC);

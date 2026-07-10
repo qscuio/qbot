@@ -609,6 +609,41 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn evidence_lookup_indexes_match_repository_access_paths(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let indexes: Vec<(String, String)> = sqlx::query_as(
+            r#"SELECT indexname, indexdef
+               FROM pg_indexes
+               WHERE schemaname = 'public'
+                 AND tablename = 'market_event_evidence'
+               ORDER BY indexname ASC"#,
+        )
+        .fetch_all(&pool)
+        .await?;
+
+        let content_hash_lookup = indexes
+            .iter()
+            .find(|(name, _)| name == "idx_event_evidence_content_hash_lookup")
+            .map(|(_, definition)| definition.as_str())
+            .expect("missing idx_event_evidence_content_hash_lookup");
+        assert!(content_hash_lookup.contains(
+            "(content_hash, effective_trade_date, available_at, source_id, source_item_id, version, evidence_id)"
+        ));
+
+        let publishable_lookup = indexes
+            .iter()
+            .find(|(name, _)| name == "idx_event_evidence_publishable_lookup")
+            .map(|(_, definition)| definition.as_str())
+            .expect("missing idx_event_evidence_publishable_lookup");
+        assert!(publishable_lookup.contains(
+            "(effective_trade_date, status, available_at, first_seen_at, source_id, source_item_id, version, evidence_id)"
+        ));
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn updating_claim_evidence_cannot_orphan_a_published_claim(
         pool: PgPool,
     ) -> sqlx::Result<()> {
