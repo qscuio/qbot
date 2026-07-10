@@ -5,8 +5,6 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 
-const EXACT_DUPLICATE_RELATION: &str = "exact";
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct EventEvidenceRow {
     pub evidence_id: Uuid,
@@ -103,7 +101,6 @@ pub struct DailyEventBriefRow {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ManualEvidenceInsertResult {
     pub existing_rows: Vec<EventEvidenceRow>,
-    pub duplicate_group_id: Option<Uuid>,
 }
 
 #[derive(Clone)]
@@ -128,34 +125,12 @@ impl EventRepository {
         let mut tx = self.pool.begin().await?;
         lock_content_hash(&mut tx, &row.content_hash).await?;
 
-        let existing_rows = find_by_content_hash_in_tx(&mut tx, &row.content_hash).await?;
+        let existing_rows = find_manual_duplicate_candidates_in_tx(&mut tx, row).await?;
         insert_evidence_in_tx(&mut tx, row).await?;
-
-        let duplicate_group_id = if existing_rows.is_empty() {
-            None
-        } else {
-            let duplicate_group_id = duplicate_group_id(&row.content_hash);
-            save_duplicate_group_in_tx(
-                &mut tx,
-                &DuplicateGroupRow {
-                    duplicate_group_id,
-                    relation_type: EXACT_DUPLICATE_RELATION.to_string(),
-                    confidence: 1.0,
-                    locked_by_user: false,
-                    members: duplicate_group_members(&existing_rows, row.evidence_id),
-                    created_at: row.created_at,
-                },
-            )
-            .await?;
-            Some(duplicate_group_id)
-        };
 
         tx.commit().await?;
 
-        Ok(ManualEvidenceInsertResult {
-            existing_rows,
-            duplicate_group_id,
-        })
+        Ok(ManualEvidenceInsertResult { existing_rows })
     }
 
     pub async fn find_existing_source_item(
@@ -436,16 +411,19 @@ async fn insert_evidence_in_tx(
     Ok(())
 }
 
-async fn find_by_content_hash_in_tx(
+async fn find_manual_duplicate_candidates_in_tx(
     tx: &mut Transaction<'_, Postgres>,
-    hash: &str,
+    row: &EventEvidenceRow,
 ) -> Result<Vec<EventEvidenceRow>> {
     let sql = evidence_select_sql(
-        r#"WHERE content_hash = $1
-           ORDER BY effective_trade_date ASC, available_at ASC, source_id ASC,
+        r#"WHERE effective_trade_date = $1
+           ORDER BY available_at ASC, source_id ASC,
                     source_item_id ASC, version ASC, evidence_id ASC"#,
     );
-    let rows = sqlx::query(&sql).bind(hash).fetch_all(&mut **tx).await?;
+    let rows = sqlx::query(&sql)
+        .bind(row.effective_trade_date)
+        .fetch_all(&mut **tx)
+        .await?;
 
     Ok(rows.into_iter().map(event_evidence_from_row).collect())
 }
@@ -527,39 +505,6 @@ async fn save_duplicate_group_in_tx(
     .await?;
 
     Ok(())
-}
-
-fn duplicate_group_id(content_hash: &str) -> Uuid {
-    use sha2::{Digest, Sha256};
-
-    let digest = Sha256::digest(format!("market-event-duplicate:{content_hash}").as_bytes());
-    let mut bytes = [0_u8; 16];
-    bytes.copy_from_slice(&digest[..16]);
-    bytes[6] = (bytes[6] & 0x0f) | 0x50;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    Uuid::from_bytes(bytes)
-}
-
-fn duplicate_group_members(
-    existing_rows: &[EventEvidenceRow],
-    submitted_evidence_id: Uuid,
-) -> Vec<DuplicateGroupMemberRow> {
-    let representative_evidence_id = existing_rows
-        .first()
-        .map(|row| row.evidence_id)
-        .expect("existing duplicate rows are present");
-    let mut members: Vec<DuplicateGroupMemberRow> = existing_rows
-        .iter()
-        .map(|row| DuplicateGroupMemberRow {
-            evidence_id: row.evidence_id,
-            is_representative: row.evidence_id == representative_evidence_id,
-        })
-        .collect();
-    members.push(DuplicateGroupMemberRow {
-        evidence_id: submitted_evidence_id,
-        is_representative: false,
-    });
-    members
 }
 
 fn advisory_lock_key(content_hash: &str) -> i64 {
@@ -911,6 +856,52 @@ mod tests {
         .fetch_all(&pool)
         .await?;
         assert_eq!(members, vec![(original_member.evidence_id, true)]);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn manual_insert_surfaces_same_trade_date_near_duplicate_candidates(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = EventRepository::new(pool.clone());
+        let mut existing = evidence("source-near-existing", 1, "pending");
+        existing.title = "Acme wins major supply contract in Shenzhen".to_string();
+        existing.content = Some(
+            "Acme signed a long-term supply contract with Shenzhen transit authority today."
+                .to_string(),
+        );
+        existing.content_hash =
+            "417ab9cf2680f1ff64957b9964bbca6311e035f9d4ea46dbdcb5b1ffd7f86f1b".to_string();
+        existing.source_url = Some("https://example.test/existing-near".to_string());
+        save_evidence(&pool, &existing).await;
+
+        let mut near_duplicate = evidence("source-near-submitted", 1, "pending");
+        near_duplicate.title = "Acme wins major supply contract in Shenzhen market".to_string();
+        near_duplicate.content = Some(
+            "Acme signed a long-term supply contract with Shenzhen transit authority today. Follow-up details differ.".to_string(),
+        );
+        near_duplicate.content_hash =
+            "4efbe4c81ea18ee94cb09ea8c4db3b3b367b2817d1f0218b9793ed0d5e7b06fa".to_string();
+        near_duplicate.source_url = Some("https://example.test/submitted-near".to_string());
+        near_duplicate.created_at = dt(2026, 7, 10, 13);
+        near_duplicate.first_seen_at = dt(2026, 7, 10, 13);
+        near_duplicate.available_at = dt(2026, 7, 10, 13);
+
+        let inserted = repo.insert_manual_evidence(&near_duplicate).await.unwrap();
+
+        assert_eq!(
+            inserted
+                .existing_rows
+                .iter()
+                .map(|row| row.evidence_id)
+                .collect::<Vec<_>>(),
+            vec![existing.evidence_id]
+        );
+        assert_ne!(
+            inserted.existing_rows[0].content_hash,
+            near_duplicate.content_hash
+        );
+
         Ok(())
     }
 

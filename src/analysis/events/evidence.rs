@@ -12,7 +12,9 @@ use super::{
     TradingDateResolver,
 };
 use crate::error::{AppError, Result};
-use crate::storage::event_repository::{EventEvidenceRow, EventRepository};
+use crate::storage::event_repository::{
+    DuplicateGroupMemberRow, DuplicateGroupRow, EventEvidenceRow, EventRepository,
+};
 
 pub(crate) const MANUAL_SOURCE_TELEGRAM: &str = "manual:telegram";
 pub(crate) const MANUAL_SOURCE_REST: &str = "manual:rest";
@@ -125,21 +127,18 @@ impl ManualEvidenceIngestor {
             &duplicate_subject_from_row(&row),
             &duplicate_candidates_from_rows(&insert_result.existing_rows),
         );
-        let representative_id = match decision {
-            DuplicateDecision::Exact { representative_id }
-            | DuplicateDecision::NearDuplicate {
-                representative_id, ..
-            } => representative_id,
-            DuplicateDecision::ReviewRequired { .. } | DuplicateDecision::Independent => {
-                insert_result
-                    .existing_rows
-                    .first()
-                    .map(|existing| existing.evidence_id)
-                    .expect(
-                        "duplicate submissions must preserve at least one existing evidence row",
-                    )
-            }
-        };
+
+        if matches!(decision, DuplicateDecision::Independent) {
+            return Ok(ManualEventSubmissionOutcome::Inserted(submitted));
+        }
+
+        let duplicate_group =
+            duplicate_group_from_decision(&decision, &insert_result.existing_rows, &row);
+        self.repo.save_duplicate_group(&duplicate_group).await?;
+
+        let representative_id = decision
+            .representative_id()
+            .expect("non-independent duplicate decisions must select a representative");
         let representative = insert_result
             .existing_rows
             .iter()
@@ -148,9 +147,6 @@ impl ManualEvidenceIngestor {
             .expect(
                 "duplicate decision representative must exist in the existing-row candidate set",
             );
-        insert_result
-            .duplicate_group_id
-            .expect("duplicate submissions must record a duplicate group");
 
         Ok(ManualEventSubmissionOutcome::Existing(
             ExistingEventEvidenceRelation {
@@ -258,6 +254,61 @@ fn duplicate_candidates_from_rows(rows: &[EventEvidenceRow]) -> Vec<DuplicateCan
             content_hash: row.content_hash.clone(),
         })
         .collect()
+}
+
+fn duplicate_group_from_decision(
+    decision: &DuplicateDecision,
+    existing_rows: &[EventEvidenceRow],
+    submitted_row: &EventEvidenceRow,
+) -> DuplicateGroupRow {
+    let representative_id = decision
+        .representative_id()
+        .expect("independent submissions must not persist duplicate groups");
+    let confidence = decision
+        .confidence()
+        .expect("independent submissions must not persist duplicate groups");
+    let relation_type = decision
+        .relation_type()
+        .expect("independent submissions must not persist duplicate groups");
+
+    let member_id_set: std::collections::BTreeSet<Uuid> = decision
+        .candidate_ids()
+        .iter()
+        .copied()
+        .chain(std::iter::once(submitted_row.evidence_id))
+        .collect();
+    let mut members: Vec<DuplicateGroupMemberRow> = existing_rows
+        .iter()
+        .filter(|row| member_id_set.contains(&row.evidence_id))
+        .map(|row| DuplicateGroupMemberRow {
+            evidence_id: row.evidence_id,
+            is_representative: row.evidence_id == representative_id,
+        })
+        .collect();
+    members.push(DuplicateGroupMemberRow {
+        evidence_id: submitted_row.evidence_id,
+        is_representative: false,
+    });
+
+    DuplicateGroupRow {
+        duplicate_group_id: duplicate_group_id(representative_id),
+        relation_type: relation_type.to_string(),
+        confidence,
+        locked_by_user: false,
+        members,
+        created_at: submitted_row.created_at,
+    }
+}
+
+fn duplicate_group_id(representative_id: Uuid) -> Uuid {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(format!("market-event-duplicate:{representative_id}").as_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
 }
 
 #[cfg(test)]
@@ -427,6 +478,95 @@ mod tests {
         .await?;
         assert_eq!(group.0, "exact");
         assert_eq!(group.1, 1.0);
+
+        let members: Vec<(Uuid, bool)> = sqlx::query_as(
+            r#"SELECT evidence_id, is_representative
+               FROM market_event_duplicate_members
+               WHERE duplicate_group_id = $1
+               ORDER BY is_representative DESC, evidence_id ASC"#,
+        )
+        .bind(duplicate_group_id)
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0], (first.evidence_id, true));
+        assert!(members
+            .iter()
+            .any(|member| member.0 == duplicate.submitted.evidence_id && !member.1));
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn near_duplicate_manual_submission_reaches_live_ingest_path(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = EventRepository::new(pool.clone());
+        let ingestor =
+            ManualEvidenceIngestor::new(repo.clone(), Arc::new(AShareTradingDateResolver));
+
+        let first = assert_inserted(
+            ingestor
+                .submit_at(
+                    ManualSource::Rest,
+                    ManualEventInput {
+                        title: "Acme wins major supply contract in Shenzhen".to_string(),
+                        content: Some(
+                            "Acme signed a long-term supply contract with Shenzhen transit authority today.".to_string(),
+                        ),
+                        source_url: Some("https://example.com/contracts/acme-primary".to_string()),
+                        submitted_by: "operator".to_string(),
+                        published_at: Some(dt(2026, 7, 10, 7, 30, 0)),
+                    },
+                    dt(2026, 7, 10, 8, 0, 0),
+                )
+                .await
+                .unwrap(),
+        );
+
+        let duplicate = assert_existing(
+            ingestor
+                .submit_at(
+                    ManualSource::Rest,
+                    ManualEventInput {
+                        title: "Acme wins major supply contract in Shenzhen market".to_string(),
+                        content: Some(
+                            "Acme signed a long-term supply contract with Shenzhen transit authority today. Follow-up details differ.".to_string(),
+                        ),
+                        source_url: Some("https://example.com/contracts/acme-follow-up".to_string()),
+                        submitted_by: "operator".to_string(),
+                        published_at: Some(dt(2026, 7, 10, 7, 35, 0)),
+                    },
+                    dt(2026, 7, 10, 8, 5, 0),
+                )
+                .await
+                .unwrap(),
+        );
+
+        assert_eq!(duplicate.existing.evidence_id, first.evidence_id);
+        assert_ne!(duplicate.submitted.evidence_id, first.evidence_id);
+        assert_ne!(duplicate.submitted.content_hash, first.content_hash);
+
+        let duplicate_group_id: Uuid = sqlx::query_scalar(
+            r#"SELECT duplicate_group_id
+               FROM market_event_duplicate_members
+               WHERE evidence_id = $1"#,
+        )
+        .bind(duplicate.submitted.evidence_id)
+        .fetch_one(&pool)
+        .await?;
+
+        let group: (String, f64) = sqlx::query_as(
+            r#"SELECT relation_type, confidence::float8
+               FROM market_event_duplicate_groups
+               WHERE duplicate_group_id = $1"#,
+        )
+        .bind(duplicate_group_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(group.0, "near");
+        assert!(group.1 >= 0.92);
+        assert!(group.1 < 1.0);
 
         let members: Vec<(Uuid, bool)> = sqlx::query_as(
             r#"SELECT evidence_id, is_representative

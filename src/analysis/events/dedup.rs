@@ -11,15 +11,64 @@ const CONTENT_PREFIX_LIMIT: usize = 256;
 pub enum DuplicateDecision {
     Exact {
         representative_id: Uuid,
+        candidate_ids: Vec<Uuid>,
     },
     NearDuplicate {
         representative_id: Uuid,
         confidence: f64,
+        candidate_ids: Vec<Uuid>,
     },
     Independent,
     ReviewRequired {
+        representative_id: Uuid,
+        confidence: f64,
         candidate_ids: Vec<Uuid>,
     },
+}
+
+impl DuplicateDecision {
+    pub(crate) fn representative_id(&self) -> Option<Uuid> {
+        match self {
+            Self::Exact {
+                representative_id, ..
+            }
+            | Self::NearDuplicate {
+                representative_id, ..
+            }
+            | Self::ReviewRequired {
+                representative_id, ..
+            } => Some(*representative_id),
+            Self::Independent => None,
+        }
+    }
+
+    pub(crate) fn confidence(&self) -> Option<f64> {
+        match self {
+            Self::Exact { .. } => Some(1.0),
+            Self::NearDuplicate { confidence, .. } | Self::ReviewRequired { confidence, .. } => {
+                Some(*confidence)
+            }
+            Self::Independent => None,
+        }
+    }
+
+    pub(crate) fn relation_type(&self) -> Option<&'static str> {
+        match self {
+            Self::Exact { .. } => Some("exact"),
+            Self::NearDuplicate { .. } => Some("near"),
+            Self::ReviewRequired { .. } => Some("review_required"),
+            Self::Independent => None,
+        }
+    }
+
+    pub(crate) fn candidate_ids(&self) -> &[Uuid] {
+        match self {
+            Self::Exact { candidate_ids, .. }
+            | Self::NearDuplicate { candidate_ids, .. }
+            | Self::ReviewRequired { candidate_ids, .. } => candidate_ids.as_slice(),
+            Self::Independent => &[],
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -62,12 +111,15 @@ impl DuplicateDecider {
         subject: &DuplicateSubject,
         candidates: &[DuplicateCandidate],
     ) -> DuplicateDecision {
-        if let Some(exact) = candidates
+        let exact_matches: Vec<Uuid> = candidates
             .iter()
-            .find(|candidate| is_exact_match(subject, candidate))
-        {
+            .filter(|candidate| is_exact_match(subject, candidate))
+            .map(|candidate| candidate.representative_id)
+            .collect();
+        if let Some(representative_id) = exact_matches.first().copied() {
             return DuplicateDecision::Exact {
-                representative_id: exact.representative_id,
+                representative_id,
+                candidate_ids: exact_matches,
             };
         }
 
@@ -82,23 +134,24 @@ impl DuplicateDecider {
             .collect();
 
         if self.auto_near_duplicate_threshold >= CONSERVATIVE_NEAR_DUPLICATE_FLOOR {
-            if let Some((representative_id, confidence)) =
-                best_scored_candidate(&scored_candidates, self.auto_near_duplicate_threshold)
+            if let Some((representative_id, confidence, candidate_ids)) =
+                matching_scored_candidates(&scored_candidates, self.auto_near_duplicate_threshold)
             {
                 return DuplicateDecision::NearDuplicate {
                     representative_id,
                     confidence,
+                    candidate_ids,
                 };
             }
         } else {
-            let candidate_ids: Vec<Uuid> = scored_candidates
-                .iter()
-                .copied()
-                .filter(|(_, score)| *score >= self.auto_near_duplicate_threshold)
-                .map(|(representative_id, _)| representative_id)
-                .collect();
-            if !candidate_ids.is_empty() {
-                return DuplicateDecision::ReviewRequired { candidate_ids };
+            if let Some((representative_id, confidence, candidate_ids)) =
+                matching_scored_candidates(&scored_candidates, self.auto_near_duplicate_threshold)
+            {
+                return DuplicateDecision::ReviewRequired {
+                    representative_id,
+                    confidence,
+                    candidate_ids,
+                };
             }
         }
 
@@ -139,18 +192,33 @@ fn same_canonical_url(subject_url: Option<&str>, candidate_url: Option<&str>) ->
     subject_url == candidate_url
 }
 
-fn best_scored_candidate(
+fn matching_scored_candidates(
     scored_candidates: &[(Uuid, f64)],
     minimum_score: f64,
-) -> Option<(Uuid, f64)> {
-    scored_candidates
+) -> Option<(Uuid, f64, Vec<Uuid>)> {
+    let mut matching_candidates: Vec<(Uuid, f64)> = scored_candidates
         .iter()
         .copied()
         .filter(|(_, score)| *score >= minimum_score)
-        .max_by(|left, right| {
-            left.1
-                .total_cmp(&right.1)
-                .then_with(|| left.0.cmp(&right.0))
+        .collect();
+    matching_candidates.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+
+    matching_candidates
+        .first()
+        .map(|(representative_id, confidence)| {
+            (
+                *representative_id,
+                *confidence,
+                matching_candidates
+                    .iter()
+                    .map(|(candidate_id, _)| *candidate_id)
+                    .collect(),
+            )
         })
 }
 
@@ -224,14 +292,19 @@ fn normalized_prefix(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use chrono::{TimeZone, Utc};
     use sqlx::PgPool;
     use uuid::Uuid;
 
     use super::{DuplicateCandidate, DuplicateDecider, DuplicateDecision, DuplicateSubject};
     use crate::analysis::events::evidence::{content_hash, normalize_text};
+    use crate::analysis::events::{
+        AShareTradingDateResolver, ManualEventInput, ManualEventSubmissionOutcome,
+    };
     use crate::storage::event_repository::{
-        DuplicateGroupMemberRow, DuplicateGroupRow, EventEvidenceRow, EventRepository,
+        DuplicateGroupMemberRow, DuplicateGroupRow, EventRepository,
     };
 
     #[test]
@@ -269,6 +342,7 @@ mod tests {
             decision,
             DuplicateDecision::Exact {
                 representative_id: exact.representative_id,
+                candidate_ids: vec![exact.representative_id],
             }
         );
     }
@@ -298,6 +372,7 @@ mod tests {
             decision,
             DuplicateDecision::Exact {
                 representative_id: exact.representative_id,
+                candidate_ids: vec![exact.representative_id],
             }
         );
     }
@@ -353,6 +428,7 @@ mod tests {
             decision,
             DuplicateDecision::Exact {
                 representative_id: exact.representative_id,
+                candidate_ids: vec![exact.representative_id],
             }
         );
     }
@@ -382,12 +458,14 @@ mod tests {
             DuplicateDecision::NearDuplicate {
                 representative_id,
                 confidence,
+                candidate_ids,
             } => {
                 assert_eq!(representative_id, near.representative_id);
                 assert!(
                     confidence >= 0.92,
                     "expected conservative confidence, got {confidence}"
                 );
+                assert_eq!(candidate_ids, vec![near.representative_id]);
             }
             other => panic!("expected near duplicate, got {other:?}"),
         }
@@ -427,6 +505,8 @@ mod tests {
         assert_eq!(
             decision,
             DuplicateDecision::ReviewRequired {
+                representative_id: review.representative_id,
+                confidence: 0.9375,
                 candidate_ids: vec![review.representative_id],
             }
         );
@@ -461,32 +541,51 @@ mod tests {
         pool: PgPool,
     ) -> sqlx::Result<()> {
         let repo = EventRepository::new(pool.clone());
-        let original_member = evidence_with_shared_content(
-            "source-independent-original",
-            1,
+        let ingestor = crate::analysis::events::evidence::ManualEvidenceIngestor::new(
+            repo.clone(),
+            Arc::new(AShareTradingDateResolver),
+        );
+        let original_member = assert_inserted(
+            ingestor
+                .submit_at(
+                    crate::analysis::events::evidence::ManualSource::Rest,
+                    shared_content_input(
+                        "https://example.com/source-independent-original",
+                        "Shared duplicate title",
+                        "Shared duplicate body",
+                    ),
+                    dt(2026, 7, 10, 8, 0, 0),
+                )
+                .await
+                .unwrap(),
+        );
+        let duplicate_member = assert_existing(
+            ingestor
+                .submit_at(
+                    crate::analysis::events::evidence::ManualSource::Rest,
+                    shared_content_input(
+                        "https://example.com/source-independent-duplicate",
+                        "Shared duplicate title",
+                        "Shared duplicate body",
+                    ),
+                    dt(2026, 7, 10, 8, 0, 1),
+                )
+                .await
+                .unwrap(),
+        );
+        let reprocessed_member = shared_content_input(
+            "https://example.com/source-independent-reprocessed",
             "Shared duplicate title",
             "Shared duplicate body",
         );
-        let duplicate_member = evidence_with_shared_content(
-            "source-independent-duplicate",
-            1,
-            "Shared duplicate title",
-            "Shared duplicate body",
-        );
-        let reprocessed_member = evidence_with_shared_content(
-            "source-independent-reprocessed",
-            1,
-            "Shared duplicate title",
-            "Shared duplicate body",
-        );
-        repo.insert_evidence(&original_member).await.unwrap();
-        let inserted = repo
-            .insert_manual_evidence(&duplicate_member)
-            .await
-            .unwrap();
-        let group_id = inserted
-            .duplicate_group_id
-            .expect("duplicate insert should create the deterministic duplicate group");
+        let group_id: Uuid = sqlx::query_scalar(
+            r#"SELECT duplicate_group_id
+               FROM market_event_duplicate_members
+               WHERE evidence_id = $1"#,
+        )
+        .bind(duplicate_member.submitted.evidence_id)
+        .fetch_one(&pool)
+        .await?;
         let locked = DuplicateGroupRow {
             duplicate_group_id: group_id,
             relation_type: "independent".to_string(),
@@ -500,11 +599,19 @@ mod tests {
         };
         repo.save_duplicate_group(&locked).await.unwrap();
 
-        let reprocessed = repo
-            .insert_manual_evidence(&reprocessed_member)
+        let reprocessed = ingestor
+            .submit_at(
+                crate::analysis::events::evidence::ManualSource::Rest,
+                reprocessed_member,
+                dt(2026, 7, 10, 8, 0, 2),
+            )
             .await
             .unwrap();
-        assert_eq!(reprocessed.duplicate_group_id, Some(group_id));
+        let reprocessed = assert_existing(reprocessed);
+        assert_eq!(
+            reprocessed.existing.evidence_id,
+            original_member.evidence_id
+        );
 
         let stored: (bool, String, f64) = sqlx::query_as(
             r#"SELECT locked_by_user, relation_type, confidence::float8
@@ -535,32 +642,51 @@ mod tests {
         pool: PgPool,
     ) -> sqlx::Result<()> {
         let repo = EventRepository::new(pool.clone());
-        let original_member = evidence_with_shared_content(
-            "source-duplicate-original",
-            1,
+        let ingestor = crate::analysis::events::evidence::ManualEvidenceIngestor::new(
+            repo.clone(),
+            Arc::new(AShareTradingDateResolver),
+        );
+        let original_member = assert_inserted(
+            ingestor
+                .submit_at(
+                    crate::analysis::events::evidence::ManualSource::Rest,
+                    shared_content_input(
+                        "https://example.com/source-duplicate-original",
+                        "Shared duplicate title",
+                        "Shared duplicate body",
+                    ),
+                    dt(2026, 7, 10, 8, 0, 0),
+                )
+                .await
+                .unwrap(),
+        );
+        let duplicate_member = assert_existing(
+            ingestor
+                .submit_at(
+                    crate::analysis::events::evidence::ManualSource::Rest,
+                    shared_content_input(
+                        "https://example.com/source-duplicate-existing",
+                        "Shared duplicate title",
+                        "Shared duplicate body",
+                    ),
+                    dt(2026, 7, 10, 8, 0, 1),
+                )
+                .await
+                .unwrap(),
+        );
+        let reprocessed_member = shared_content_input(
+            "https://example.com/source-duplicate-reprocessed",
             "Shared duplicate title",
             "Shared duplicate body",
         );
-        let duplicate_member = evidence_with_shared_content(
-            "source-duplicate-existing",
-            1,
-            "Shared duplicate title",
-            "Shared duplicate body",
-        );
-        let reprocessed_member = evidence_with_shared_content(
-            "source-duplicate-reprocessed",
-            1,
-            "Shared duplicate title",
-            "Shared duplicate body",
-        );
-        repo.insert_evidence(&original_member).await.unwrap();
-        let inserted = repo
-            .insert_manual_evidence(&duplicate_member)
-            .await
-            .unwrap();
-        let group_id = inserted
-            .duplicate_group_id
-            .expect("duplicate insert should create the deterministic duplicate group");
+        let group_id: Uuid = sqlx::query_scalar(
+            r#"SELECT duplicate_group_id
+               FROM market_event_duplicate_members
+               WHERE evidence_id = $1"#,
+        )
+        .bind(duplicate_member.submitted.evidence_id)
+        .fetch_one(&pool)
+        .await?;
         let locked = DuplicateGroupRow {
             duplicate_group_id: group_id,
             relation_type: "exact".to_string(),
@@ -572,7 +698,7 @@ mod tests {
                     is_representative: true,
                 },
                 DuplicateGroupMemberRow {
-                    evidence_id: duplicate_member.evidence_id,
+                    evidence_id: duplicate_member.submitted.evidence_id,
                     is_representative: false,
                 },
             ],
@@ -580,11 +706,19 @@ mod tests {
         };
         repo.save_duplicate_group(&locked).await.unwrap();
 
-        let reprocessed = repo
-            .insert_manual_evidence(&reprocessed_member)
+        let reprocessed = ingestor
+            .submit_at(
+                crate::analysis::events::evidence::ManualSource::Rest,
+                reprocessed_member,
+                dt(2026, 7, 10, 8, 0, 2),
+            )
             .await
             .unwrap();
-        assert_eq!(reprocessed.duplicate_group_id, Some(group_id));
+        let reprocessed = assert_existing(reprocessed);
+        assert_eq!(
+            reprocessed.existing.evidence_id,
+            original_member.evidence_id
+        );
 
         let stored: (bool, String, f64) = sqlx::query_as(
             r#"SELECT locked_by_user, relation_type, confidence::float8
@@ -607,7 +741,7 @@ mod tests {
         .await?;
         assert_eq!(members.len(), 2);
         assert!(members.contains(&(original_member.evidence_id, true)));
-        assert!(members.contains(&(duplicate_member.evidence_id, false)));
+        assert!(members.contains(&(duplicate_member.submitted.evidence_id, false)));
 
         Ok(())
     }
@@ -651,37 +785,6 @@ mod tests {
         }
     }
 
-    fn evidence_with_shared_content(
-        source_item_id: &str,
-        version: i32,
-        title: &str,
-        content: &str,
-    ) -> EventEvidenceRow {
-        let content = Some(content.to_string());
-        EventEvidenceRow {
-            evidence_id: Uuid::new_v4(),
-            source_id: "manual:rest".to_string(),
-            source_item_id: source_item_id.to_string(),
-            source_url: Some(format!("https://example.com/{source_item_id}")),
-            source_tier: "manual".to_string(),
-            source_terms_version: "terms-v1".to_string(),
-            occurred_at: None,
-            published_at: None,
-            first_seen_at: dt(2026, 7, 10, 8, 0, 0),
-            available_at: dt(2026, 7, 10, 8, 0, 0),
-            effective_trade_date: dt(2026, 7, 10, 8, 0, 0).date_naive(),
-            title: title.to_string(),
-            content: content.clone(),
-            language: "und".to_string(),
-            content_hash: content_hash(&title, content.as_deref()),
-            raw_payload: serde_json::json!({ "source_item_id": source_item_id }),
-            version,
-            supersedes_evidence_id: None,
-            status: "publishable".to_string(),
-            created_at: dt(2026, 7, 10, 8, 0, 0),
-        }
-    }
-
     fn dt(
         year: i32,
         month: u32,
@@ -692,5 +795,43 @@ mod tests {
     ) -> chrono::DateTime<Utc> {
         Utc.with_ymd_and_hms(year, month, day, hour, minute, second)
             .unwrap()
+    }
+
+    fn shared_content_input(source_url: &str, title: &str, content: &str) -> ManualEventInput {
+        ManualEventInput {
+            title: title.to_string(),
+            content: Some(content.to_string()),
+            source_url: Some(source_url.to_string()),
+            submitted_by: "operator".to_string(),
+            published_at: None,
+        }
+    }
+
+    fn assert_inserted(
+        outcome: ManualEventSubmissionOutcome,
+    ) -> crate::analysis::events::EventEvidence {
+        match outcome {
+            ManualEventSubmissionOutcome::Inserted(evidence) => evidence,
+            ManualEventSubmissionOutcome::Existing(existing) => {
+                panic!(
+                    "expected inserted evidence, got duplicate relation for {}",
+                    existing.existing.evidence_id
+                )
+            }
+        }
+    }
+
+    fn assert_existing(
+        outcome: ManualEventSubmissionOutcome,
+    ) -> crate::analysis::events::ExistingEventEvidenceRelation {
+        match outcome {
+            ManualEventSubmissionOutcome::Inserted(evidence) => {
+                panic!(
+                    "expected duplicate relation, got inserted {}",
+                    evidence.evidence_id
+                )
+            }
+            ManualEventSubmissionOutcome::Existing(existing) => existing,
+        }
     }
 }
