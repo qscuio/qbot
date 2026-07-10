@@ -1473,17 +1473,17 @@ git commit -m "feat: expose point-in-time data status"
 
 ## Phase Completion Checklist
 
-- [ ] Migration `013` applies cleanly.
-- [ ] Historical unknown availability is not silently fabricated.
-- [ ] Daily ingestion records observed availability.
-- [ ] Security master history retains delisted names and dates.
-- [ ] Daily market-cap and valuation data are queryable by explicit `as_of`.
-- [ ] Corporate actions, adjustment factors, and status data are queryable by explicit `as_of`.
-- [ ] Historical sector membership has effective dates.
-- [ ] Index history is persisted.
-- [ ] Capability probe reports unsupported provider features.
-- [ ] Daily and weekly refresh jobs are scheduled before snapshot generation.
-- [ ] Market snapshot reports missing critical inputs.
-- [ ] Existing scanner output is unchanged.
-- [ ] No pattern or event candidate table exists yet.
-- [ ] Workspace is clean after verification.
+- [x] Migration `013` applies cleanly.
+- [x] Historical unknown availability is not silently fabricated.
+- [x] Daily ingestion records observed availability.
+- [x] Security master history retains delisted names and dates.
+- [x] Daily market-cap and valuation data are queryable by explicit `as_of`.
+- [x] Corporate actions, adjustment factors, and status data are queryable by explicit `as_of`.
+- [x] Historical sector membership has effective dates.
+- [x] Index history is persisted.
+- [x] Capability probe reports unsupported provider features.
+- [x] Daily and weekly refresh jobs are scheduled before snapshot generation.
+- [x] Market snapshot reports missing critical inputs.
+- [x] Existing scanner output is unchanged.
+- [x] No pattern or event candidate table exists yet.
+- [x] Workspace is clean after verification.

@@ -10,6 +10,8 @@ Task 7: complete (commits 6c9275e..4d7ee59, review clean after coverage and dupl
 Task 8: complete (commits f77fa4f..b673980, review clean after PIT rebuild/upsert, provenance, completeness, tie-break, and null-field fixes; verification: analysis::market_snapshot 24/24 passed with DATABASE_URL, security_statuses_as_of tie test 1/1 passed, scheduler::tests 2/2 passed, fmt check passed, diff check passed)
 Task 9: complete (commits 05a965e..98a68f3, review clean after data-status completeness, missing-probe, and repository-boundary fixes; verification: api::analysis_routes::tests 6/6 passed, repository boundary tests 2/2 passed, scheduler::tests 3/3 passed, full suite split 148/148 + config 1/1 passed, fmt check passed, diff check passed)
 
+Final branch review: complete (commits 811e16c..f090cad, final review clean after legacy-backfill, reference-refresh, schedule, latestRuns tradeDate, and docs alignment fixes; verification: stock_history 1/1 passed, ingestion 11/11 passed, api::analysis_routes 6/6 passed, scheduler 3/3 passed, full suite split 150/150 + config 1/1 passed, fmt check passed, diff check passed)
+
 ## Final Review Fix
 
 ### Fix summary
