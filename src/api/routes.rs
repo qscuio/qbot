@@ -4097,37 +4097,27 @@ async fn get_analysis_data_status(
         ));
     }
 
-    let row: Option<(
-        String,
-        serde_json::Value,
-        Option<String>,
-        chrono::DateTime<chrono::Utc>,
-        Option<chrono::DateTime<chrono::Utc>>,
-    )> = sqlx::query_as(
-        r#"SELECT status, details, error_message, started_at, completed_at
-           FROM analysis_data_runs
-           WHERE run_type = 'point_in_time_capability_probe'
-           ORDER BY started_at DESC
-           LIMIT 1"#,
-    )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| api_error(&e.to_string()))?;
+    let repo = crate::storage::market_repository::MarketRepository::new(state.db.clone());
+    let status = repo
+        .latest_point_in_time_data_status()
+        .await
+        .map_err(|e| api_error(&e.to_string()))?;
 
-    match row {
-        Some((status, details, error_message, started_at, completed_at)) => {
-            let missing_capabilities = details
+    match status {
+        Some(status) => {
+            let missing_capabilities = status
+                .details
                 .get("missing_capabilities")
                 .cloned()
                 .unwrap_or_else(|| json!([]));
             Ok(Json(json!({
-                "run_type": "point_in_time_capability_probe",
-                "status": status,
+                "run_type": status.run_type,
+                "status": status.status,
                 "missing_capabilities": missing_capabilities,
-                "details": details,
-                "error_message": error_message,
-                "started_at": started_at,
-                "completed_at": completed_at,
+                "details": status.details,
+                "error_message": status.error_message,
+                "started_at": status.started_at,
+                "completed_at": status.completed_at,
             })))
         }
         None => Ok(Json(json!({

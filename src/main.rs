@@ -16,67 +16,6 @@ use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
-use uuid::Uuid;
-
-async fn persist_point_in_time_capability_probe(
-    db: &sqlx::PgPool,
-    result: &crate::error::Result<data::point_in_time_provider::PointInTimeCapabilities>,
-) -> Result<()> {
-    let (status, details, error_message) = match result {
-        Ok(capabilities) => {
-            let missing: Vec<&str> = [
-                (
-                    "security_master_history",
-                    capabilities.security_master_history,
-                ),
-                ("corporate_actions", capabilities.corporate_actions),
-                ("adjustment_factors", capabilities.adjustment_factors),
-                ("daily_basic", capabilities.daily_basic),
-                ("daily_security_status", capabilities.daily_security_status),
-                ("historical_index_bars", capabilities.historical_index_bars),
-                (
-                    "historical_sector_membership",
-                    capabilities.historical_sector_membership,
-                ),
-            ]
-            .into_iter()
-            .filter_map(|(name, supported)| (!supported).then_some(name))
-            .collect();
-            let status = if missing.is_empty() {
-                "ok"
-            } else {
-                "missing_prerequisites"
-            };
-            let details = serde_json::json!({
-                "capabilities": capabilities,
-                "missing_capabilities": missing,
-            });
-            (status, details, None)
-        }
-        Err(error) => (
-            "failed",
-            serde_json::json!({
-                "missing_capabilities": ["point_in_time_capability_probe"],
-                "error": error.to_string(),
-            }),
-            Some(error.to_string()),
-        ),
-    };
-
-    sqlx::query(
-        r#"INSERT INTO analysis_data_runs
-           (run_id, run_type, status, details, error_message, completed_at)
-           VALUES ($1, 'point_in_time_capability_probe', $2, $3, $4, NOW())"#,
-    )
-    .bind(Uuid::new_v4())
-    .bind(status)
-    .bind(details)
-    .bind(error_message)
-    .execute(db)
-    .await?;
-
-    Ok(())
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -132,41 +71,6 @@ async fn main() -> Result<()> {
             db_provider,
         ]));
     info!("Data providers configured: tushare -> eastmoney -> tencent -> db fallback");
-    let capability_probe = point_in_time_provider.probe_capabilities().await;
-    if let Err(e) = persist_point_in_time_capability_probe(&db, &capability_probe).await {
-        warn!("Failed to persist point-in-time capability probe: {}", e);
-    }
-    match &capability_probe {
-        Ok(capabilities) => {
-            let missing: Vec<&str> = [
-                (
-                    "security_master_history",
-                    capabilities.security_master_history,
-                ),
-                ("corporate_actions", capabilities.corporate_actions),
-                ("adjustment_factors", capabilities.adjustment_factors),
-                ("daily_basic", capabilities.daily_basic),
-                ("daily_security_status", capabilities.daily_security_status),
-                ("historical_index_bars", capabilities.historical_index_bars),
-                (
-                    "historical_sector_membership",
-                    capabilities.historical_sector_membership,
-                ),
-            ]
-            .into_iter()
-            .filter_map(|(name, supported)| (!supported).then_some(name))
-            .collect();
-            if missing.is_empty() {
-                info!("Point-in-time data capability probe completed");
-            } else {
-                warn!(
-                    "Point-in-time data prerequisites missing: {}",
-                    missing.join(", ")
-                );
-            }
-        }
-        Err(e) => warn!("Point-in-time data capability probe failed: {}", e),
-    }
     let pusher = Arc::new(telegram::TelegramPusher::new(
         config.telegram_bot_token.clone(),
     ));
@@ -220,6 +124,51 @@ async fn main() -> Result<()> {
         daily_report_job_lock: Arc::new(Mutex::new(())),
         weekly_report_job_lock: Arc::new(Mutex::new(())),
     });
+
+    {
+        let probe_provider = state.point_in_time_provider.clone();
+        let repo = storage::market_repository::MarketRepository::new(state.db.clone());
+        tokio::spawn(async move {
+            let capability_probe = probe_provider.probe_capabilities().await;
+            if let Err(e) = repo
+                .persist_point_in_time_capability_probe(&capability_probe)
+                .await
+            {
+                warn!("Failed to persist point-in-time capability probe: {}", e);
+            }
+            match &capability_probe {
+                Ok(capabilities) => {
+                    let missing: Vec<&str> = [
+                        (
+                            "security_master_history",
+                            capabilities.security_master_history,
+                        ),
+                        ("corporate_actions", capabilities.corporate_actions),
+                        ("adjustment_factors", capabilities.adjustment_factors),
+                        ("daily_basic", capabilities.daily_basic),
+                        ("daily_security_status", capabilities.daily_security_status),
+                        ("historical_index_bars", capabilities.historical_index_bars),
+                        (
+                            "historical_sector_membership",
+                            capabilities.historical_sector_membership,
+                        ),
+                    ]
+                    .into_iter()
+                    .filter_map(|(name, supported)| (!supported).then_some(name))
+                    .collect();
+                    if missing.is_empty() {
+                        info!("Point-in-time data capability probe completed");
+                    } else {
+                        warn!(
+                            "Point-in-time data prerequisites missing: {}",
+                            missing.join(", ")
+                        );
+                    }
+                }
+                Err(e) => warn!("Point-in-time data capability probe failed: {}", e),
+            }
+        });
+    }
 
     if let Some(base_url) = state.config.webhook_url.as_deref() {
         let endpoint = format!("{}/telegram/webhook", base_url.trim_end_matches('/'));

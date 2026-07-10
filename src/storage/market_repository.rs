@@ -1,11 +1,26 @@
 use chrono::{DateTime, NaiveDate, Utc};
+use serde_json::Value;
 use sqlx::PgPool;
+use uuid::Uuid;
 
 use crate::analysis::market_snapshot::{
     AdjustmentFactor, AvailabilityQuality, CorporateAction, DailyBasicSnapshot, IndexDailyBar,
     MarketSnapshot, SectorMembership, SecurityDailyStatus, SecurityMasterVersion,
 };
+use crate::data::point_in_time_provider::PointInTimeCapabilities;
 use crate::error::Result;
+
+pub const POINT_IN_TIME_CAPABILITY_PROBE_RUN_TYPE: &str = "point_in_time_capability_probe";
+
+#[derive(Debug, Clone)]
+pub struct AnalysisDataStatus {
+    pub run_type: String,
+    pub status: String,
+    pub details: Value,
+    pub error_message: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
 
 #[derive(Clone)]
 pub struct MarketRepository {
@@ -15,6 +30,99 @@ pub struct MarketRepository {
 impl MarketRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    pub async fn persist_point_in_time_capability_probe(
+        &self,
+        result: &crate::error::Result<PointInTimeCapabilities>,
+    ) -> Result<()> {
+        let (status, details, error_message) = match result {
+            Ok(capabilities) => {
+                let missing: Vec<&str> = [
+                    (
+                        "security_master_history",
+                        capabilities.security_master_history,
+                    ),
+                    ("corporate_actions", capabilities.corporate_actions),
+                    ("adjustment_factors", capabilities.adjustment_factors),
+                    ("daily_basic", capabilities.daily_basic),
+                    ("daily_security_status", capabilities.daily_security_status),
+                    ("historical_index_bars", capabilities.historical_index_bars),
+                    (
+                        "historical_sector_membership",
+                        capabilities.historical_sector_membership,
+                    ),
+                ]
+                .into_iter()
+                .filter_map(|(name, supported)| (!supported).then_some(name))
+                .collect();
+                let status = if missing.is_empty() { "ok" } else { "missing" };
+                let details = serde_json::json!({
+                    "capabilities": capabilities,
+                    "missing_capabilities": missing,
+                });
+                (status, details, None)
+            }
+            Err(error) => (
+                "failed",
+                serde_json::json!({
+                    "missing_capabilities": ["point_in_time_capability_probe"],
+                    "error": error.to_string(),
+                }),
+                Some(error.to_string()),
+            ),
+        };
+
+        sqlx::query(
+            r#"INSERT INTO analysis_data_runs
+               (run_id, run_type, status, details, error_message, completed_at)
+               VALUES ($1, $2, $3, $4, $5, NOW())"#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(POINT_IN_TIME_CAPABILITY_PROBE_RUN_TYPE)
+        .bind(status)
+        .bind(details)
+        .bind(error_message)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn latest_point_in_time_data_status(&self) -> Result<Option<AnalysisDataStatus>> {
+        let row = sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                Value,
+                Option<String>,
+                DateTime<Utc>,
+                Option<DateTime<Utc>>,
+            ),
+        >(
+            r#"SELECT run_type, status, details, error_message, started_at, completed_at
+               FROM analysis_data_runs
+               WHERE run_type = $1
+               ORDER BY started_at DESC
+               LIMIT 1"#,
+        )
+        .bind(POINT_IN_TIME_CAPABILITY_PROBE_RUN_TYPE)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(
+            |(run_type, status, details, error_message, started_at, completed_at)| {
+                AnalysisDataStatus {
+                    run_type,
+                    status,
+                    details,
+                    error_message,
+                    started_at,
+                    completed_at,
+                }
+            },
+        ))
     }
 
     pub async fn append_daily_basics(&self, rows: &[DailyBasicSnapshot]) -> Result<usize> {
@@ -817,6 +925,45 @@ mod tests {
         .await?;
 
         assert_eq!(tables.len(), 12);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn point_in_time_capability_probe_status_round_trips(pool: PgPool) -> sqlx::Result<()> {
+        let repo = MarketRepository::new(pool);
+        let mut details = std::collections::BTreeMap::new();
+        details.insert(
+            "daily_security_status".to_string(),
+            "unsupported: missing dependencies: stock_basic: unsupported: unauthorized".to_string(),
+        );
+        let capabilities = crate::data::point_in_time_provider::PointInTimeCapabilities {
+            security_master_history: true,
+            corporate_actions: true,
+            adjustment_factors: true,
+            daily_basic: true,
+            daily_security_status: false,
+            historical_index_bars: true,
+            historical_sector_membership: true,
+            details,
+        };
+
+        repo.persist_point_in_time_capability_probe(&Ok(capabilities))
+            .await
+            .unwrap();
+
+        let status = repo
+            .latest_point_in_time_data_status()
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(status.run_type, POINT_IN_TIME_CAPABILITY_PROBE_RUN_TYPE);
+        assert_eq!(status.status, "missing");
+        assert!(status.error_message.is_none());
+        assert_eq!(
+            status.details["missing_capabilities"],
+            json!(["daily_security_status"])
+        );
         Ok(())
     }
 

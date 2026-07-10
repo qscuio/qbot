@@ -4,6 +4,7 @@ use chrono::{DateTime, Duration, NaiveDate, Utc};
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
 use tokio::sync::RwLock;
 use tracing::warn;
 
@@ -231,6 +232,213 @@ impl TushareClient {
                     .insert(capability.to_string(), Self::unsupported_detail(&error));
             }
         }
+    }
+
+    fn record_endpoint_probe_result(
+        capabilities: &mut PointInTimeCapabilities,
+        capability: &str,
+        endpoint: &str,
+        result: Result<Value>,
+    ) {
+        match result {
+            Ok(_) => {
+                Self::set_capability(capabilities, capability, true);
+                capabilities
+                    .details
+                    .insert(capability.to_string(), format!("supported: {}", endpoint));
+            }
+            Err(error) => {
+                Self::set_capability(capabilities, capability, false);
+                capabilities.details.insert(
+                    capability.to_string(),
+                    format!("{}: {}", endpoint, Self::unsupported_detail(&error)),
+                );
+            }
+        }
+    }
+
+    fn record_compound_probe_result(
+        capabilities: &mut PointInTimeCapabilities,
+        capability: &str,
+        dependencies: &[(&str, Result<Value>)],
+    ) {
+        let missing: Vec<String> = dependencies
+            .iter()
+            .filter_map(|(endpoint, result)| match result {
+                Ok(_) => None,
+                Err(error) => Some(format!("{}: {}", endpoint, Self::unsupported_detail(error))),
+            })
+            .collect();
+
+        if missing.is_empty() {
+            Self::set_capability(capabilities, capability, true);
+            capabilities.details.insert(
+                capability.to_string(),
+                format!(
+                    "supported: {}",
+                    dependencies
+                        .iter()
+                        .map(|(endpoint, _)| *endpoint)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            );
+        } else {
+            Self::set_capability(capabilities, capability, false);
+            capabilities.details.insert(
+                capability.to_string(),
+                format!("unsupported: missing dependencies: {}", missing.join("; ")),
+            );
+        }
+    }
+
+    async fn probe_capabilities_with<C, Fut>(mut call: C) -> PointInTimeCapabilities
+    where
+        C: FnMut(&'static str, Value, &'static str) -> Fut,
+        Fut: Future<Output = Result<Value>>,
+    {
+        let mut capabilities = Self::empty_capabilities();
+        let today = Utc::now().date_naive();
+        let start = today - Duration::days(14);
+        let start_date = start.format("%Y%m%d").to_string();
+        let end_date = today.format("%Y%m%d").to_string();
+        let trade_date = end_date.clone();
+
+        Self::record_probe_result(
+            &mut capabilities,
+            "security_master_history",
+            call(
+                "stock_basic",
+                json!({ "exchange": "", "list_status": "L" }),
+                "ts_code,name,market,exchange,list_status,list_date,delist_date",
+            )
+            .await,
+        );
+        Self::record_probe_result(
+            &mut capabilities,
+            "corporate_actions",
+            call(
+                "dividend",
+                json!({ "start_date": start_date, "end_date": end_date }),
+                "ts_code,ann_date,record_date,ex_date,pay_date,cash_div,stk_div,stk_bo_rate,stk_co_rate",
+            )
+            .await,
+        );
+        Self::record_probe_result(
+            &mut capabilities,
+            "adjustment_factors",
+            call(
+                "adj_factor",
+                json!({
+                    "ts_code": "600000.SH",
+                    "start_date": start.format("%Y%m%d").to_string(),
+                    "end_date": today.format("%Y%m%d").to_string(),
+                }),
+                "ts_code,trade_date,adj_factor",
+            )
+            .await,
+        );
+        Self::record_probe_result(
+            &mut capabilities,
+            "daily_basic",
+            call(
+                "daily_basic",
+                json!({ "trade_date": trade_date }),
+                "ts_code,trade_date,turnover_rate,volume_ratio,pe,pb,ps,total_share,float_share,total_mv,circ_mv",
+            )
+            .await,
+        );
+
+        let daily_status_dependencies = [
+            (
+                "daily",
+                call(
+                    "daily",
+                    json!({ "trade_date": today.format("%Y%m%d").to_string() }),
+                    "ts_code,trade_date,close",
+                )
+                .await,
+            ),
+            (
+                "stk_limit",
+                call(
+                    "stk_limit",
+                    json!({ "trade_date": today.format("%Y%m%d").to_string() }),
+                    "ts_code,trade_date,up_limit,down_limit",
+                )
+                .await,
+            ),
+            (
+                "suspend_d",
+                call(
+                    "suspend_d",
+                    json!({ "suspend_date": today.format("%Y%m%d").to_string() }),
+                    "ts_code,suspend_date,suspend_type",
+                )
+                .await,
+            ),
+            (
+                "stock_basic",
+                call(
+                    "stock_basic",
+                    json!({ "exchange": "", "list_status": "L" }),
+                    "ts_code,list_date",
+                )
+                .await,
+            ),
+            (
+                "namechange",
+                call(
+                    "namechange",
+                    json!({ "ts_code": "600000.SH" }),
+                    "ts_code,name,start_date,end_date,change_reason",
+                )
+                .await,
+            ),
+        ];
+        Self::record_compound_probe_result(
+            &mut capabilities,
+            "daily_security_status",
+            &daily_status_dependencies,
+        );
+
+        Self::record_probe_result(
+            &mut capabilities,
+            "historical_index_bars",
+            call(
+                "index_daily",
+                json!({
+                    "ts_code": "000001.SH",
+                    "start_date": start.format("%Y%m%d").to_string(),
+                    "end_date": today.format("%Y%m%d").to_string(),
+                }),
+                "ts_code,trade_date,close,pct_chg,vol,amount",
+            )
+            .await,
+        );
+
+        let ths_member_probe = call(
+            "ths_member",
+            json!({ "ts_code": "885001.TI" }),
+            "ts_code,con_code,con_name",
+        )
+        .await;
+        if ths_member_probe.is_err() {
+            Self::record_endpoint_probe_result(
+                &mut capabilities,
+                "historical_sector_membership",
+                "ths_member",
+                ths_member_probe,
+            );
+        } else {
+            Self::mark_unsupported(
+                &mut capabilities,
+                "historical_sector_membership",
+                "Tushare ths_member is current membership and is not verified historical as_of membership",
+            );
+        }
+
+        capabilities
     }
 
     fn mark_unsupported(
@@ -538,126 +746,10 @@ impl TushareClient {
 #[async_trait]
 impl PointInTimeDataProvider for TushareClient {
     async fn probe_capabilities(&self) -> Result<PointInTimeCapabilities> {
-        let mut capabilities = Self::empty_capabilities();
-        let today = Utc::now().date_naive();
-        let start = today - Duration::days(14);
-        let start_date = start.format("%Y%m%d").to_string();
-        let end_date = today.format("%Y%m%d").to_string();
-        let trade_date = end_date.clone();
-
-        Self::record_probe_result(
-            &mut capabilities,
-            "security_master_history",
-            self.call(
-                "stock_basic",
-                json!({ "exchange": "", "list_status": "L" }),
-                "ts_code,name,market,exchange,list_status,list_date,delist_date",
-            )
-            .await,
-        );
-        Self::record_probe_result(
-            &mut capabilities,
-            "corporate_actions",
-            self.call(
-                "dividend",
-                json!({ "start_date": start_date, "end_date": end_date }),
-                "ts_code,ann_date,record_date,ex_date,pay_date,cash_div,stk_div,stk_bo_rate,stk_co_rate",
-            )
-            .await,
-        );
-        Self::record_probe_result(
-            &mut capabilities,
-            "adjustment_factors",
-            self.call(
-                "adj_factor",
-                json!({
-                    "ts_code": "600000.SH",
-                    "start_date": start.format("%Y%m%d").to_string(),
-                    "end_date": today.format("%Y%m%d").to_string(),
-                }),
-                "ts_code,trade_date,adj_factor",
-            )
-            .await,
-        );
-        Self::record_probe_result(
-            &mut capabilities,
-            "daily_basic",
-            self.call(
-                "daily_basic",
-                json!({ "trade_date": trade_date }),
-                "ts_code,trade_date,turnover_rate,volume_ratio,pe,pb,ps,total_share,float_share,total_mv,circ_mv",
-            )
-            .await,
-        );
-
-        let limit_probe = self
-            .call(
-                "stk_limit",
-                json!({ "trade_date": today.format("%Y%m%d").to_string() }),
-                "ts_code,trade_date,up_limit,down_limit",
-            )
-            .await;
-        let suspend_probe = match limit_probe {
-            Ok(_) => {
-                self.call(
-                    "suspend_d",
-                    json!({
-                        "suspend_date": today.format("%Y%m%d").to_string(),
-                    }),
-                    "ts_code,suspend_date,suspend_type",
-                )
-                .await
-            }
-            Err(error) => Err(error),
-        };
-        let namechange_probe = match suspend_probe {
-            Ok(_) => {
-                self.call(
-                    "namechange",
-                    json!({ "ts_code": "600000.SH" }),
-                    "ts_code,name,start_date,end_date,change_reason",
-                )
-                .await
-            }
-            Err(error) => Err(error),
-        };
-        Self::record_probe_result(&mut capabilities, "daily_security_status", namechange_probe);
-
-        Self::record_probe_result(
-            &mut capabilities,
-            "historical_index_bars",
-            self.call(
-                "index_daily",
-                json!({
-                    "ts_code": "000001.SH",
-                    "start_date": start.format("%Y%m%d").to_string(),
-                    "end_date": today.format("%Y%m%d").to_string(),
-                }),
-                "ts_code,trade_date,close,pct_chg,vol,amount",
-            )
-            .await,
-        );
-
-        match self
-            .call(
-                "ths_member",
-                json!({ "ts_code": "885001.TI" }),
-                "ts_code,con_code,con_name",
-            )
-            .await
-        {
-            Err(error) => Self::record_probe_result(
-                &mut capabilities,
-                "historical_sector_membership",
-                Err(error),
-            ),
-            Ok(_) => Self::mark_unsupported(
-                &mut capabilities,
-                "historical_sector_membership",
-                "Tushare ths_member is current membership and is not verified historical as_of membership",
-            ),
-        }
-
+        let capabilities = Self::probe_capabilities_with(|api_name, params, fields| async move {
+            self.call(api_name, params, fields).await
+        })
+        .await;
         *self.point_in_time_capabilities.write().await = Some(capabilities.clone());
         Ok(capabilities)
     }
@@ -1314,9 +1406,7 @@ impl DataProvider for TushareClient {
 mod tests {
     use super::*;
     use crate::analysis::market_snapshot::AvailabilityQuality;
-    use crate::data::point_in_time_provider::PointInTimeCapabilities;
     use chrono::{TimeZone, Utc};
-    use std::collections::BTreeMap;
 
     #[test]
     fn test_tushare_code_convert() {
@@ -1427,26 +1517,58 @@ mod tests {
 
     #[test]
     fn unauthorized_historical_sector_membership_is_reported_as_unsupported() {
-        let mut capabilities = PointInTimeCapabilities {
-            security_master_history: true,
-            corporate_actions: true,
-            adjustment_factors: true,
-            daily_basic: true,
-            daily_security_status: true,
-            historical_index_bars: true,
-            historical_sector_membership: true,
-            details: BTreeMap::new(),
-        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
 
-        TushareClient::record_probe_result(
-            &mut capabilities,
-            "historical_sector_membership",
-            Err(AppError::DataProvider(
-                "Tushare ths_member: unauthorized endpoint".to_string(),
-            )),
-        );
+        let capabilities = runtime.block_on({
+            let calls = calls.clone();
+            async move {
+                TushareClient::probe_capabilities_with(|api_name, _params, _fields| {
+                    let calls = calls.clone();
+                    async move {
+                        calls.lock().unwrap().push(api_name.to_string());
+                        if api_name == "ths_member" {
+                            Err(AppError::DataProvider(
+                                "Tushare ths_member: unauthorized endpoint".to_string(),
+                            ))
+                        } else {
+                            Ok(serde_json::json!({ "fields": [], "items": [] }))
+                        }
+                    }
+                })
+                .await
+            }
+        });
 
         assert!(!capabilities.historical_sector_membership);
         assert!(capabilities.details["historical_sector_membership"].contains("unauthorized"));
+        assert!(calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call == "ths_member"));
+    }
+
+    #[test]
+    fn daily_security_status_probe_requires_all_dependencies() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        let capabilities = runtime.block_on(async {
+            TushareClient::probe_capabilities_with(|api_name, _params, _fields| async move {
+                if api_name == "stock_basic" {
+                    Err(AppError::DataProvider(
+                        "Tushare stock_basic: unauthorized endpoint".to_string(),
+                    ))
+                } else {
+                    Ok(serde_json::json!({ "fields": [], "items": [] }))
+                }
+            })
+            .await
+        });
+
+        assert!(!capabilities.daily_security_status);
+        let detail = &capabilities.details["daily_security_status"];
+        assert!(detail.contains("stock_basic"));
+        assert!(detail.contains("unauthorized"));
     }
 }

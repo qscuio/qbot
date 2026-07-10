@@ -111,3 +111,35 @@ I fixed the parser to normalize summed stock ratios instead of weakening the fix
 - `historical_sector_membership` is expected to be reported missing unless the configured Tushare account exposes a verified historical membership endpoint; current `ths_member` data is deliberately not substituted.
 - Startup now performs bounded live probe requests to Tushare and records the result. Probe failure is persisted as a failed probe and logged, but does not change existing scanner/fallback behavior.
 - The daily security status method uses verified Tushare sources (`daily`, `stk_limit`, `suspend_d`, `stock_basic`, `namechange`) and does not infer ST status from current names; later tasks may want a more direct historical ST endpoint if available for the configured account.
+
+## Task 4 Review Fixes
+
+### What changed
+
+- Moved point-in-time capability probe persistence and latest status lookup SQL into `MarketRepository`.
+- Changed startup probing to run in a background task after `AppState` construction so live Tushare probes no longer block service startup or fallback provider availability.
+- Kept probe success and failure persistence through `analysis_data_runs`, with logging for both probe failures and persistence failures.
+- Replaced the fabricated historical membership probe test with a test that drives the factored probe path and verifies `ths_member` is called and unauthorized responses mark `historical_sector_membership` unsupported.
+- Made `daily_security_status` probe all endpoints required by `get_security_statuses()` (`daily`, `stk_limit`, `suspend_d`, `stock_basic`, `namechange`) and report missing/unauthorized dependencies in details.
+- Added a repository round-trip test for persisted probe status. The status value for missing capabilities is `missing` so it fits the existing `analysis_data_runs.status VARCHAR(20)` column.
+
+### Test results
+
+- `cargo test data::tushare -- --nocapture` - PASS, 9 passed.
+- `export DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot; cargo test storage::market_repository -- --nocapture` - PASS, 11 passed.
+- `cargo test config::tests::test_config_defaults` - PASS, 1 passed.
+- `cargo fmt --all -- --check` - PASS.
+- `git diff --check` - PASS.
+
+### Files changed
+
+- `src/data/tushare.rs`
+- `src/storage/market_repository.rs`
+- `src/main.rs`
+- `src/api/routes.rs`
+- `.superpowers/sdd/task-4-report.md`
+
+### Concerns
+
+- The required test commands still emit existing dead-code warnings from the binary test build.
+- `analysis_data_runs.status` is limited to 20 characters, so missing point-in-time prerequisites are persisted as status `missing`; exact missing capabilities remain in `details.missing_capabilities`.
