@@ -311,7 +311,7 @@ git commit -m "feat: scaffold independent research worker"
 - Reads only records whose `available_at <= cutoff`.
 - Writes Parquet and manifest.
 
-- [ ] **Step 1: Write fixture-based tests**
+- [x] **Step 1: Write fixture-based tests**
 
 Use DuckDB temporary tables to assert:
 
@@ -320,7 +320,7 @@ Use DuckDB temporary tables to assert:
 - a delisted stock remains in historical data.
 - rows missing critical adjustment/status data are excluded and counted.
 
-- [ ] **Step 2: Implement dataset query**
+- [x] **Step 2: Implement dataset query**
 
 Build a Polars frame with one row per `(trade_date, code)` and explicit columns for:
 
@@ -335,7 +335,7 @@ market breadth
 available_at_cutoff
 ```
 
-- [ ] **Step 3: Write partitioned Parquet**
+- [x] **Step 3: Write partitioned Parquet**
 
 Partition by:
 
@@ -347,11 +347,11 @@ year
 
 Compute SHA-256 for every file and save `manifest.json`.
 
-- [ ] **Step 4: Register the manifest in PostgreSQL**
+- [x] **Step 4: Register the manifest in PostgreSQL**
 
 Insert into `analysis_dataset_manifests` only after all files and checksums are complete.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 cd research
