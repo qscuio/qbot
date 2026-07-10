@@ -31,7 +31,7 @@
 - Produces tables used by all later tasks.
 - Does not change existing repository function signatures.
 
-- [ ] **Step 1: Create the migration**
+- [x] **Step 1: Create the migration**
 
 ```sql
 CREATE TABLE IF NOT EXISTS stock_daily_bar_versions (
@@ -262,7 +262,7 @@ CREATE INDEX IF NOT EXISTS idx_market_snapshot_date
     ON market_daily_snapshots(trade_date DESC, snapshot_version);
 ```
 
-- [ ] **Step 2: Add a migration smoke test**
+- [x] **Step 2: Add a migration smoke test**
 
 Append to the future `src/storage/market_repository.rs` test module:
 
@@ -298,7 +298,7 @@ async fn point_in_time_tables_exist(pool: PgPool) -> sqlx::Result<()> {
 }
 ```
 
-- [ ] **Step 3: Run the migration test**
+- [x] **Step 3: Run the migration test**
 
 Run:
 
@@ -308,7 +308,7 @@ cargo test point_in_time_tables_exist -- --nocapture
 
 Expected: PASS when SQLx can create the test database.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add migrations/013_point_in_time_market_data.sql src/storage/market_repository.rs
