@@ -100,3 +100,48 @@ Observed warning noise during test runs:
 
 - The brief’s combination of env-driven `official_event_source_id: String` and `EventSource::source_id() -> &'static str` requires process-lifetime ownership for the selected source id. The implementation uses a single `Box::leak` per constructed adapter instance to satisfy that contract.
 - Warning noise remains in the crate, but the required verification commands passed.
+
+## Fix subagent follow-up
+
+### Summary
+
+- Replaced the leaked dynamic `source_id` path in `src/analysis/adapters/official_event_source.rs` with explicit supported-ID validation that maps the configured string to the static adapter ID.
+- Added a regression test proving `OFFICIAL_EVENT_SOURCE_ID=official:unsupported` is rejected with a clear config error while the supported configured ID still yields `official:market_event`.
+- Confirmed no `Box::leak` remains in the adapter implementation.
+
+### RED
+
+- Added `from_config_rejects_unsupported_source_ids` in `src/analysis/adapters/official_event_source.rs`.
+- Ran `cargo test from_config_rejects_unsupported_source_ids -- --nocapture`.
+- First run failed for test-shape reasons (`unwrap_err()` required `Debug` on the adapter type), so the test was corrected without touching production code.
+- Reran `cargo test from_config_rejects_unsupported_source_ids -- --nocapture`.
+- Observed intended RED failure:
+  - panic: `expected config error, got Ok result`
+
+### GREEN
+
+- Implemented `supported_source_id()` with explicit validation for:
+  - `official:market_event`
+- Reran `cargo test analysis::adapters::official_event_source -- --nocapture`.
+- Result: `6 passed; 0 failed`.
+
+### Final verification
+
+- `cargo fmt --all -- --check` -> pass
+- `cargo test analysis::adapters::official_event_source -- --nocapture` -> pass (`6 passed; 0 failed`)
+- `cargo test --all --locked config::tests::test_config_defaults -- --nocapture` -> pass (`1 passed; 0 failed`)
+- `git diff --check` -> pass
+- `rg -n "Box::leak" src/analysis/adapters/official_event_source.rs` -> no matches
+
+### Files changed
+
+- `src/analysis/adapters/official_event_source.rs`
+- `.superpowers/sdd/gate2-task-5-report.md`
+
+### Commit hash
+
+- Final commit hash is reported in the subagent handoff response. This report section cannot embed the final self-referential hash because amending the report changes the commit ID.
+
+### Concerns
+
+- Existing crate warning noise remains during test runs, but the required commands passed and the adapter leak path is removed.

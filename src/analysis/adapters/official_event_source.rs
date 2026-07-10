@@ -8,6 +8,8 @@ use crate::analysis::adapters::{ContentRetentionPolicy, EventSource, FetchBatch,
 use crate::config::Config;
 use crate::error::{AppError, Result};
 
+const OFFICIAL_MARKET_EVENT_SOURCE_ID: &str = "official:market_event";
+
 pub struct OfficialEventSource {
     source_id: &'static str,
     feed_url: Url,
@@ -36,11 +38,12 @@ impl OfficialEventSource {
     }
 
     pub fn new(
-        source_id: impl Into<String>,
+        source_id: impl AsRef<str>,
         feed_url: String,
         api_key: Option<String>,
         retention_policy: ContentRetentionPolicy,
     ) -> Result<Self> {
+        let source_id = supported_source_id(source_id.as_ref())?;
         let feed_url = Url::parse(&feed_url).map_err(|error| {
             AppError::Config(format!(
                 "OFFICIAL_EVENT_FEED_URL must be a valid URL: {error}"
@@ -48,7 +51,7 @@ impl OfficialEventSource {
         })?;
 
         Ok(Self {
-            source_id: Box::leak(source_id.into().into_boxed_str()),
+            source_id,
             feed_url,
             api_key,
             retention_policy,
@@ -138,6 +141,15 @@ impl EventSource for OfficialEventSource {
 struct OfficialFeedResponse {
     next_cursor: Option<String>,
     items: Vec<Value>,
+}
+
+fn supported_source_id(source_id: &str) -> Result<&'static str> {
+    match source_id {
+        OFFICIAL_MARKET_EVENT_SOURCE_ID => Ok(OFFICIAL_MARKET_EVENT_SOURCE_ID),
+        unsupported => Err(AppError::Config(format!(
+            "OFFICIAL_EVENT_SOURCE_ID `{unsupported}` is not supported; expected one of: {OFFICIAL_MARKET_EVENT_SOURCE_ID}"
+        ))),
+    }
 }
 
 fn required_string(payload: &Map<String, Value>, field: &str) -> Result<String> {
@@ -289,6 +301,23 @@ mod tests {
             source.retention_policy(),
             ContentRetentionPolicy::StoreSummaryOnly
         );
+    }
+
+    #[test]
+    fn from_config_rejects_unsupported_source_ids() {
+        let mut config = base_config();
+        config.official_event_source_id = "official:unsupported".to_string();
+
+        match OfficialEventSource::from_config(&config) {
+            Err(AppError::Config(message)) => {
+                assert_eq!(
+                    message,
+                    "OFFICIAL_EVENT_SOURCE_ID `official:unsupported` is not supported; expected one of: official:market_event"
+                );
+            }
+            Ok(_) => panic!("expected config error, got Ok result"),
+            Err(other) => panic!("expected config error, got {other:?}"),
+        }
     }
 
     #[test]
