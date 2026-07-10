@@ -423,7 +423,7 @@ git commit -m "feat: deduplicate event evidence conservatively"
 - The selected source configuration is environment-driven.
 - Content retention policy is explicit.
 
-- [ ] **Step 1: Define `EventSource`**
+- [x] **Step 1: Define `EventSource`**
 
 ```rust
 #[async_trait::async_trait]
@@ -438,7 +438,7 @@ pub trait EventSource: Send + Sync {
 }
 ```
 
-- [ ] **Step 2: Add configuration**
+- [x] **Step 2: Add configuration**
 
 ```rust
 pub official_event_feed_url: Option<String>,
@@ -456,7 +456,7 @@ OFFICIAL_EVENT_SOURCE_ID
 OFFICIAL_EVENT_STORE_FULL_CONTENT
 ```
 
-- [ ] **Step 3: Implement adapter parsing**
+- [x] **Step 3: Implement adapter parsing**
 
 The adapter must map:
 
@@ -471,11 +471,11 @@ raw_payload
 
 When full content retention is disabled, discard full content before persistence.
 
-- [ ] **Step 4: Add fixture tests**
+- [x] **Step 4: Add fixture tests**
 
 No live network calls in tests. Parse a local JSON fixture and assert retention behavior.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 cargo test analysis::adapters::official_event_source
@@ -779,8 +779,8 @@ git commit -m "feat: publish daily evidence-backed market facts"
 ## Phase Completion Checklist
 
 - [ ] Manual input works.
-- [ ] One official source works through an adapter.
-- [ ] Retention policy is enforced.
+- [x] One official source works through an adapter.
+- [x] Retention policy is enforced.
 - [ ] Evidence versions are immutable.
 - [x] Exact and near duplicates are conservative and auditable.
 - [ ] Every published fact has evidence.
