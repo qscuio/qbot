@@ -193,6 +193,28 @@ impl ValidationPayload {
                 ));
             }
         }
+        validate_nested_numeric("yearly_results", &self.yearly_results)?;
+        validate_nested_numeric("regime_results", &self.regime_results)?;
         Ok(())
     }
+}
+
+fn validate_nested_numeric(
+    field_name: &str,
+    payload: &BTreeMap<String, BTreeMap<String, Value>>,
+) -> Result<()> {
+    for (group, metrics) in payload {
+        for (metric, value) in metrics {
+            match value.as_f64() {
+                Some(number) if number.is_finite() => {}
+                _ => {
+                    return Err(AppError::Internal(format!(
+                        "{}.{}.{} must be numeric and finite",
+                        field_name, group, metric
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
