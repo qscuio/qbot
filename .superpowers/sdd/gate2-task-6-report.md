@@ -223,3 +223,71 @@ GREEN results:
 ### Follow-up concerns
 
 - The required verification commands pass, but cargo still emits pre-existing warning noise and future-incompatibility notices from unrelated crate areas and dependencies.
+
+## Re-review follow-up fix: strict direct stock-code validation
+
+Addressed the re-review issue without changing the Task 6 design:
+
+1. `StockCodeDirectory::resolve()` now validates exact stock codes only.
+2. Known stock codes are stored exactly as provided, with no trim or uppercase normalization.
+3. Entity validation now requires the exact extracted `stock_code` string to appear in extraction input source text.
+4. Added regressions for lowercase codes, whitespace-padded codes, exact-known-but-not-present-in-source, and the exact valid direct case.
+
+### Re-review RED evidence
+
+Command:
+
+```bash
+cargo test analysis::events::extraction -- --nocapture
+```
+
+RED output excerpt before the fix:
+
+```text
+thread 'analysis::events::extraction::tests::exact_known_stock_codes_must_appear_in_source_text' panicked:
+  left: []
+ right: [ValidationIssue { path: "entities[0].stock_code", message: "stock code `600519.SH` does not appear in the extraction input content" }]
+
+thread 'analysis::events::extraction::tests::lowercase_stock_codes_do_not_pass_direct_validation' panicked:
+  left: []
+ right: [ValidationIssue { path: "entities[0].stock_code", message: "stock code `600519.sh` does not appear in the extraction input content" }, ValidationIssue { path: "entities[0].stock_code", message: "stock code `600519.sh` does not map to a known stock_info entry" }]
+
+thread 'analysis::events::extraction::tests::whitespace_padded_stock_codes_do_not_pass_direct_validation' panicked:
+  left: []
+ right: [ValidationIssue { path: "entities[0].stock_code", message: "stock code ` 600519.SH ` does not appear in the extraction input content" }, ValidationIssue { path: "entities[0].stock_code", message: "stock code ` 600519.SH ` does not map to a known stock_info entry" }]
+```
+
+### Re-review GREEN evidence
+
+Commands:
+
+```bash
+cargo fmt --all -- --check
+cargo test analysis::events::extraction -- --nocapture
+cargo test analysis::adapters::llm_event_extractor -- --nocapture
+git diff --check
+```
+
+GREEN results:
+
+- `cargo fmt --all -- --check`
+  - Passed.
+- `cargo test analysis::events::extraction -- --nocapture`
+  - Passed: 13 tests.
+- `cargo test analysis::adapters::llm_event_extractor -- --nocapture`
+  - Passed: 4 tests.
+- `git diff --check`
+  - Passed.
+
+### Re-review files changed
+
+- `src/analysis/events/extraction.rs`
+- `.superpowers/sdd/gate2-task-6-report.md`
+
+### Re-review commit hash
+
+- Fix commit: pending
+
+### Re-review concerns
+
+- The required verification commands pass, but cargo still emits pre-existing warning noise and future-incompatibility notices from unrelated crate areas and dependencies.

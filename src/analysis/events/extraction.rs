@@ -79,6 +79,15 @@ impl EventExtractionV1 {
                         ),
                     ));
                 }
+
+                if !context.source_contains(stock_code) {
+                    issues.push(ValidationIssue::new(
+                        format!("entities[{entity_index}].stock_code"),
+                        format!(
+                            "stock code `{stock_code}` does not appear in the extraction input content"
+                        ),
+                    ));
+                }
             }
         }
 
@@ -224,12 +233,12 @@ impl StockCodeDirectory {
         let mut known_codes = BTreeSet::new();
 
         for code in codes {
-            let exact_code = code.as_ref().trim().to_uppercase();
+            let exact_code = code.as_ref();
             if exact_code.is_empty() {
                 continue;
             }
 
-            known_codes.insert(exact_code);
+            known_codes.insert(exact_code.to_string());
         }
 
         Self { known_codes }
@@ -238,8 +247,9 @@ impl StockCodeDirectory {
 
 impl StockCodeLookup for StockCodeDirectory {
     fn resolve(&self, raw_code: &str) -> Option<String> {
-        let exact_code = raw_code.trim().to_uppercase();
-        self.known_codes.contains(&exact_code).then_some(exact_code)
+        self.known_codes
+            .contains(raw_code)
+            .then(|| raw_code.to_string())
     }
 }
 
@@ -446,10 +456,16 @@ mod tests {
 
         assert_eq!(
             errors,
-            vec![ValidationIssue::new(
-                "entities[0].stock_code",
-                "stock code `123456` does not map to a known stock_info entry",
-            )]
+            vec![
+                ValidationIssue::new(
+                    "entities[0].stock_code",
+                    "stock code `123456` does not appear in the extraction input content",
+                ),
+                ValidationIssue::new(
+                    "entities[0].stock_code",
+                    "stock code `123456` does not map to a known stock_info entry",
+                ),
+            ]
         );
     }
 
@@ -488,6 +504,128 @@ mod tests {
             stock_codes.resolve("600519.SH").as_deref(),
             Some("600519.SH")
         );
+    }
+
+    #[test]
+    fn lowercase_stock_codes_do_not_pass_direct_validation() {
+        let extraction = EventExtractionV1 {
+            entities: vec![ExtractedEntity {
+                text: "Kweichow Moutai".to_string(),
+                entity_type: "issuer".to_string(),
+                role: "subject".to_string(),
+                stock_code: Some("600519.sh".to_string()),
+            }],
+            ..base_extraction(vec![ExtractedClaim {
+                claim_type: ClaimType::Fact,
+                text: "Kweichow Moutai raised guidance.".to_string(),
+                evidence_ids: vec![primary_evidence_id()],
+                confidence: 0.95,
+            }])
+        };
+
+        let stock_codes = StockCodeDirectory::from_known_codes(["600519.SH"]);
+        let errors = extraction.validate(&ExtractionValidationContext::new(
+            &sample_evidence(),
+            &stock_codes,
+        ));
+
+        assert_eq!(
+            errors,
+            vec![
+                ValidationIssue::new(
+                    "entities[0].stock_code",
+                    "stock code `600519.sh` does not appear in the extraction input content",
+                ),
+                ValidationIssue::new(
+                    "entities[0].stock_code",
+                    "stock code `600519.sh` does not map to a known stock_info entry",
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn whitespace_padded_stock_codes_do_not_pass_direct_validation() {
+        let extraction = EventExtractionV1 {
+            entities: vec![ExtractedEntity {
+                text: "Kweichow Moutai".to_string(),
+                entity_type: "issuer".to_string(),
+                role: "subject".to_string(),
+                stock_code: Some(" 600519.SH ".to_string()),
+            }],
+            ..base_extraction(vec![ExtractedClaim {
+                claim_type: ClaimType::Fact,
+                text: "Kweichow Moutai raised guidance.".to_string(),
+                evidence_ids: vec![primary_evidence_id()],
+                confidence: 0.95,
+            }])
+        };
+
+        let stock_codes = StockCodeDirectory::from_known_codes(["600519.SH"]);
+        let errors = extraction.validate(&ExtractionValidationContext::new(
+            &sample_evidence(),
+            &stock_codes,
+        ));
+
+        assert_eq!(
+            errors,
+            vec![
+                ValidationIssue::new(
+                    "entities[0].stock_code",
+                    "stock code ` 600519.SH ` does not appear in the extraction input content",
+                ),
+                ValidationIssue::new(
+                    "entities[0].stock_code",
+                    "stock code ` 600519.SH ` does not map to a known stock_info entry",
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn exact_known_stock_codes_must_appear_in_source_text() {
+        let extraction = base_extraction(vec![ExtractedClaim {
+            claim_type: ClaimType::Fact,
+            text: "Kweichow Moutai raised guidance.".to_string(),
+            evidence_ids: vec![primary_evidence_id()],
+            confidence: 0.95,
+        }]);
+
+        let stock_codes = StockCodeDirectory::from_known_codes(["600519.SH"]);
+        let evidence_without_code = vec![ExtractionEvidence::new(
+            primary_evidence_id(),
+            "Kweichow Moutai raised guidance on 2026-07-10 and expects CNY 2 billion in incremental revenue.".to_string(),
+        )];
+        let errors = extraction.validate(&ExtractionValidationContext::new(
+            &evidence_without_code,
+            &stock_codes,
+        ));
+
+        assert_eq!(
+            errors,
+            vec![ValidationIssue::new(
+                "entities[0].stock_code",
+                "stock code `600519.SH` does not appear in the extraction input content",
+            )]
+        );
+    }
+
+    #[test]
+    fn exact_known_stock_codes_pass_when_the_exact_string_appears_in_source_text() {
+        let extraction = base_extraction(vec![ExtractedClaim {
+            claim_type: ClaimType::Fact,
+            text: "Kweichow Moutai raised guidance.".to_string(),
+            evidence_ids: vec![primary_evidence_id()],
+            confidence: 0.95,
+        }]);
+
+        let stock_codes = StockCodeDirectory::from_known_codes(["600519.SH"]);
+        let errors = extraction.validate(&ExtractionValidationContext::new(
+            &sample_evidence(),
+            &stock_codes,
+        ));
+
+        assert_eq!(errors, Vec::new());
     }
 
     #[test]
