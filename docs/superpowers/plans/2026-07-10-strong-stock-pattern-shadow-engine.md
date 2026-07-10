@@ -183,7 +183,7 @@ git commit -m "feat: add pattern research and shadow schema"
 - Python is independently deployable.
 - No Rust subprocess integration.
 
-- [ ] **Step 1: Define dependencies**
+- [x] **Step 1: Define dependencies**
 
 ```toml
 [project]
@@ -222,7 +222,7 @@ line-length = 100
 strict = true
 ```
 
-- [ ] **Step 2: Define Pydantic contracts**
+- [x] **Step 2: Define Pydantic contracts**
 
 ```python
 from datetime import date, datetime
@@ -271,11 +271,11 @@ class ValidationPayload(BaseModel):
     baseline_comparison: dict[str, float]
 ```
 
-- [ ] **Step 3: Add validation tests**
+- [x] **Step 3: Add validation tests**
 
 Assert invalid horizons, negative row counts, and missing model features fail.
 
-- [ ] **Step 4: Add independent service files**
+- [x] **Step 4: Add independent service files**
 
 `qbot-research.service` must run:
 
@@ -285,7 +285,7 @@ ExecStart=/opt/qbot/research/.venv/bin/qbot-research train-all --config /etc/qbo
 
 `qbot-research.timer` runs weekly and must not depend on `qbot.service` beyond network/database availability.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 cd research

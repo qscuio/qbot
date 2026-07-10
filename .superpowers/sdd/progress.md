@@ -44,3 +44,4 @@ Final branch review: complete (commits 811e16c..f090cad, final review clean afte
 ## Gate 1: Strong-Stock Pattern Shadow Engine
 
 Gate 1 Task 1: complete (commits 34dd225..2f55ba1, review clean after publication-contract and duplicate-batch coverage fixes; verification: storage::pattern_repository 10/10 passed, fmt check passed, diff check passed)
+Gate 1 Task 2: complete (commits 26089ac..05734ab, review clean after CLI scaffold fix; verification: research pytest 8/8 passed, ruff passed, mypy passed, installed qbot-research train-all scaffold command booted, diff check passed)
