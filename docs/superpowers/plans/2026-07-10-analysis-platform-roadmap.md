@@ -179,9 +179,9 @@ Database integration tests require a valid `DATABASE_URL` or SQLx test database 
 - Consumes Gate 0 time and security contracts.
 - Produces evidence-backed facts and ClaimGraph; event score remains zero.
 
-- [ ] Execute every checkbox in the linked plan.
-- [ ] Confirm every published fact has evidence.
-- [ ] Confirm no indirect beneficiary stock list is produced.
+- [x] Execute every checkbox in the linked plan.
+- [x] Confirm every published fact has evidence.
+- [x] Confirm no indirect beneficiary stock list is produced.
 
 ### Task 4: Complete Gate 3
 
