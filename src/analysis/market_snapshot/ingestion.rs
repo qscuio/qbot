@@ -84,6 +84,8 @@ pub struct PointInTimeRefreshResult {
     pub estimated_rows: usize,
     pub excluded_estimated_rows: usize,
     pub sensitivity_excludes_estimated: bool,
+    pub availability_estimation_limitation: String,
+    pub weekday_estimated_next_trade_dates: BTreeMap<String, String>,
     pub categories: BTreeMap<String, PointInTimeCategoryResult>,
 }
 
@@ -95,6 +97,8 @@ impl PointInTimeRefreshResult {
             estimated_rows: 0,
             excluded_estimated_rows: 0,
             sensitivity_excludes_estimated: false,
+            availability_estimation_limitation: String::new(),
+            weekday_estimated_next_trade_dates: BTreeMap::new(),
             categories: BTreeMap::new(),
         }
     }
@@ -113,6 +117,18 @@ impl PointInTimeRefreshResult {
         self.inserted_rows += category.inserted_rows;
         self.excluded_estimated_rows += category.excluded_rows;
         self.categories.insert(name.to_string(), category);
+    }
+
+    fn use_weekday_estimated_availability(&mut self) {
+        self.availability_estimation_limitation =
+            "weekday-only estimate; no exchange holiday calendar is available".to_string();
+    }
+
+    fn add_weekday_estimated_next_trade_date(&mut self, trade_date: NaiveDate) {
+        self.weekday_estimated_next_trade_dates.insert(
+            trade_date.to_string(),
+            weekday_estimated_next_trade_date(trade_date).to_string(),
+        );
     }
 }
 
@@ -134,6 +150,15 @@ impl PointInTimeIngestion {
         &self,
         as_of: DateTime<Utc>,
     ) -> Result<PointInTimeRefreshResult> {
+        let result = self.refresh_reference_data_inner(as_of).await;
+        self.finish_run(POINT_IN_TIME_REFERENCE_REFRESH_RUN_TYPE, None, result)
+            .await
+    }
+
+    async fn refresh_reference_data_inner(
+        &self,
+        as_of: DateTime<Utc>,
+    ) -> Result<PointInTimeRefreshResult> {
         let mut result = PointInTimeRefreshResult::new();
         let capabilities = match self.provider.probe_capabilities().await {
             Ok(capabilities) => capabilities,
@@ -143,8 +168,6 @@ impl PointInTimeIngestion {
                     "capability_probe",
                     PointInTimeCategoryResult::failed(error.to_string()),
                 );
-                self.record_run(POINT_IN_TIME_REFERENCE_REFRESH_RUN_TYPE, None, &result)
-                    .await?;
                 return Ok(result);
             }
         };
@@ -158,8 +181,6 @@ impl PointInTimeIngestion {
                     &["security_master_history", "historical_sector_membership"],
                 )),
             );
-            self.record_run(POINT_IN_TIME_REFERENCE_REFRESH_RUN_TYPE, None, &result)
-                .await?;
             return Ok(result);
         }
 
@@ -280,12 +301,24 @@ impl PointInTimeIngestion {
             }
         }
 
-        self.record_run(POINT_IN_TIME_REFERENCE_REFRESH_RUN_TYPE, None, &result)
-            .await?;
         Ok(result)
     }
 
     pub async fn refresh_trade_date(
+        &self,
+        trade_date: NaiveDate,
+        as_of: DateTime<Utc>,
+    ) -> Result<PointInTimeRefreshResult> {
+        let result = self.refresh_trade_date_inner(trade_date, as_of).await;
+        self.finish_run(
+            POINT_IN_TIME_TRADE_DATE_REFRESH_RUN_TYPE,
+            Some(trade_date),
+            result,
+        )
+        .await
+    }
+
+    async fn refresh_trade_date_inner(
         &self,
         trade_date: NaiveDate,
         as_of: DateTime<Utc>,
@@ -299,12 +332,6 @@ impl PointInTimeIngestion {
                     "capability_probe",
                     PointInTimeCategoryResult::failed(error.to_string()),
                 );
-                self.record_run(
-                    POINT_IN_TIME_TRADE_DATE_REFRESH_RUN_TYPE,
-                    Some(trade_date),
-                    &result,
-                )
-                .await?;
                 return Ok(result);
             }
         };
@@ -321,12 +348,6 @@ impl PointInTimeIngestion {
                 "readiness",
                 PointInTimeCategoryResult::failed(missing_capabilities(&capabilities, &required)),
             );
-            self.record_run(
-                POINT_IN_TIME_TRADE_DATE_REFRESH_RUN_TYPE,
-                Some(trade_date),
-                &result,
-            )
-            .await?;
             return Ok(result);
         }
 
@@ -437,12 +458,6 @@ impl PointInTimeIngestion {
             );
         }
 
-        self.record_run(
-            POINT_IN_TIME_TRADE_DATE_REFRESH_RUN_TYPE,
-            Some(trade_date),
-            &result,
-        )
-        .await?;
         Ok(result)
     }
 
@@ -459,7 +474,19 @@ impl PointInTimeIngestion {
             )));
         }
 
+        let result = self.backfill_range_inner(start, end, observed_at).await;
+        self.finish_run(POINT_IN_TIME_BACKFILL_RUN_TYPE, None, result)
+            .await
+    }
+
+    async fn backfill_range_inner(
+        &self,
+        start: NaiveDate,
+        end: NaiveDate,
+        observed_at: DateTime<Utc>,
+    ) -> Result<PointInTimeRefreshResult> {
         let mut result = PointInTimeRefreshResult::new();
+        result.use_weekday_estimated_availability();
         let capabilities = match self.provider.probe_capabilities().await {
             Ok(capabilities) => capabilities,
             Err(error) => {
@@ -468,8 +495,6 @@ impl PointInTimeIngestion {
                     "capability_probe",
                     PointInTimeCategoryResult::failed(error.to_string()),
                 );
-                self.record_run(POINT_IN_TIME_BACKFILL_RUN_TYPE, None, &result)
-                    .await?;
                 return Ok(result);
             }
         };
@@ -488,12 +513,13 @@ impl PointInTimeIngestion {
                 "readiness",
                 PointInTimeCategoryResult::failed(missing_capabilities(&capabilities, &required)),
             );
-            self.record_run(POINT_IN_TIME_BACKFILL_RUN_TYPE, None, &result)
-                .await?;
             return Ok(result);
         }
 
         for trade_date in date_range(start, end) {
+            result.add_weekday_estimated_next_trade_date(trade_date);
+            let available_at = conservative_estimated_availability(trade_date);
+
             if capabilities.daily_basic {
                 match self.provider.get_daily_basics(trade_date).await {
                     Ok(rows) => {
@@ -512,6 +538,40 @@ impl PointInTimeIngestion {
                             PointInTimeCategoryResult::failed(error.to_string()),
                         );
                     }
+                }
+            }
+
+            match self.repo.current_daily_bars_for_date(trade_date).await {
+                Ok(rows) if rows.is_empty() => {
+                    result.mark_partial();
+                    result.add_category(
+                        &format!("stock_daily_bar_versions:{}", trade_date),
+                        PointInTimeCategoryResult::excluded(0, 0, 1),
+                    );
+                }
+                Ok(rows) => {
+                    result.estimated_rows += rows.len();
+                    let inserted = self
+                        .repo
+                        .append_daily_bar_versions_with_ingested_at(
+                            &rows,
+                            available_at,
+                            "estimated",
+                            "current_state",
+                            observed_at,
+                        )
+                        .await?;
+                    result.add_category(
+                        &format!("stock_daily_bar_versions:{}", trade_date),
+                        PointInTimeCategoryResult::ok(rows.len(), inserted, 0),
+                    );
+                }
+                Err(error) => {
+                    result.mark_failed();
+                    result.add_category(
+                        &format!("stock_daily_bar_versions:{}", trade_date),
+                        PointInTimeCategoryResult::failed(error.to_string()),
+                    );
                 }
             }
 
@@ -559,6 +619,74 @@ impl PointInTimeIngestion {
                             PointInTimeCategoryResult::failed(error.to_string()),
                         );
                     }
+                }
+            }
+
+            match self.repo.current_sector_data_for_date(trade_date).await {
+                Ok(rows) if rows.is_empty() => {
+                    result.mark_partial();
+                    result.add_category(
+                        &format!("sector_daily_versions:{}", trade_date),
+                        PointInTimeCategoryResult::excluded(0, 0, 1),
+                    );
+                }
+                Ok(rows) => {
+                    result.estimated_rows += rows.len();
+                    let inserted = self
+                        .repo
+                        .append_sector_versions_with_ingested_at(
+                            &rows,
+                            available_at,
+                            "estimated",
+                            "current_state",
+                            observed_at,
+                        )
+                        .await?;
+                    result.add_category(
+                        &format!("sector_daily_versions:{}", trade_date),
+                        PointInTimeCategoryResult::ok(rows.len(), inserted, 0),
+                    );
+                }
+                Err(error) => {
+                    result.mark_failed();
+                    result.add_category(
+                        &format!("sector_daily_versions:{}", trade_date),
+                        PointInTimeCategoryResult::failed(error.to_string()),
+                    );
+                }
+            }
+
+            match self.repo.current_limit_up_stocks_for_date(trade_date).await {
+                Ok(rows) if rows.is_empty() => {
+                    result.mark_partial();
+                    result.add_category(
+                        &format!("limit_up_stock_versions:{}", trade_date),
+                        PointInTimeCategoryResult::excluded(0, 0, 1),
+                    );
+                }
+                Ok(rows) => {
+                    result.estimated_rows += rows.len();
+                    let inserted = self
+                        .repo
+                        .append_limit_up_versions_with_ingested_at(
+                            &rows,
+                            available_at,
+                            "estimated",
+                            "current_state",
+                            observed_at,
+                        )
+                        .await?;
+                    result.add_category(
+                        &format!("limit_up_stock_versions:{}", trade_date),
+                        PointInTimeCategoryResult::ok(rows.len(), inserted, 0),
+                    );
+                }
+                Err(error) => {
+                    result.mark_failed();
+                    result.add_category(
+                        &format!("limit_up_stock_versions:{}", trade_date),
+                        PointInTimeCategoryResult::failed(error.to_string()),
+                    );
                 }
             }
 
@@ -651,12 +779,43 @@ impl PointInTimeIngestion {
                     );
                 }
             }
+        } else {
+            result.mark_partial();
+            result.add_category(
+                "corporate_action_versions",
+                PointInTimeCategoryResult::failed(missing_capabilities(
+                    &capabilities,
+                    &["corporate_actions"],
+                )),
+            );
         }
 
         result.sensitivity_excludes_estimated = result.estimated_rows > 0;
-        self.record_run(POINT_IN_TIME_BACKFILL_RUN_TYPE, None, &result)
-            .await?;
         Ok(result)
+    }
+
+    async fn finish_run(
+        &self,
+        run_type: &str,
+        trade_date: Option<NaiveDate>,
+        result: Result<PointInTimeRefreshResult>,
+    ) -> Result<PointInTimeRefreshResult> {
+        match result {
+            Ok(result) => {
+                self.record_run(run_type, trade_date, &result).await?;
+                Ok(result)
+            }
+            Err(error) => {
+                let mut failed = PointInTimeRefreshResult::new();
+                failed.mark_failed();
+                failed.add_category(
+                    "repository_write",
+                    PointInTimeCategoryResult::failed(error.to_string()),
+                );
+                self.record_run(run_type, trade_date, &failed).await?;
+                Err(error)
+            }
+        }
     }
 
     async fn record_run(
@@ -879,13 +1038,13 @@ fn estimate_sector_memberships(
 }
 
 fn conservative_estimated_availability(source_date: NaiveDate) -> DateTime<Utc> {
-    let next = next_trading_day(source_date);
+    let next = weekday_estimated_next_trade_date(source_date);
     Utc.with_ymd_and_hms(next.year(), next.month(), next.day(), 1, 0, 0)
         .single()
         .expect("09:00 Asia/Shanghai maps to a valid UTC timestamp")
 }
 
-fn next_trading_day(date: NaiveDate) -> NaiveDate {
+fn weekday_estimated_next_trade_date(date: NaiveDate) -> NaiveDate {
     let mut candidate = date + Duration::days(1);
     while candidate.weekday().number_from_monday() > 5 {
         candidate += Duration::days(1);
@@ -1197,7 +1356,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.status, PointInTimeRefreshStatus::Ok);
+        assert_eq!(result.status, PointInTimeRefreshStatus::Partial);
         assert!(result.estimated_rows > 0);
         assert!(result.excluded_estimated_rows > 0);
         assert!(result.sensitivity_excludes_estimated);
@@ -1213,6 +1372,144 @@ mod tests {
         assert_eq!(row.0, dt(2026, 7, 13, 1));
         assert_eq!(row.1, dt(2026, 7, 12, 12));
         assert_eq!(row.2, "estimated");
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn backfill_records_missing_corporate_actions_capability_as_partial(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let provider = FakeProvider::new();
+        provider.update(|state| state.capabilities.corporate_actions = false);
+        let ingestion = PointInTimeIngestion::new(Arc::new(provider), pool.clone());
+
+        let result = ingestion
+            .backfill_range(date(2026, 7, 10), date(2026, 7, 10), dt(2026, 7, 12, 12))
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, PointInTimeRefreshStatus::Partial);
+        assert!(result
+            .categories
+            .get("corporate_action_versions")
+            .and_then(|category| category.error.as_deref())
+            .is_some_and(|error| error.contains("corporate_actions")));
+        assert_eq!(
+            latest_run_status(&pool, "point_in_time_backfill").await?,
+            "partial"
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn backfill_versions_existing_daily_bar_sector_and_limit_up_current_rows(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        seed_current_task5_rows(&pool, date(2026, 7, 10)).await?;
+        let ingestion = PointInTimeIngestion::new(Arc::new(FakeProvider::new()), pool.clone());
+
+        let result = ingestion
+            .backfill_range(date(2026, 7, 10), date(2026, 7, 10), dt(2026, 7, 12, 12))
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, PointInTimeRefreshStatus::Ok);
+        assert_eq!(
+            result
+                .categories
+                .get("stock_daily_bar_versions:2026-07-10")
+                .map(|category| category.inserted_rows),
+            Some(1)
+        );
+        assert_eq!(
+            result
+                .categories
+                .get("sector_daily_versions:2026-07-10")
+                .map(|category| category.inserted_rows),
+            Some(1)
+        );
+        assert_eq!(
+            result
+                .categories
+                .get("limit_up_stock_versions:2026-07-10")
+                .map(|category| category.inserted_rows),
+            Some(1)
+        );
+
+        let counts: (i64, i64, i64) = sqlx::query_as(
+            r#"SELECT
+                   (SELECT COUNT(*) FROM stock_daily_bar_versions
+                    WHERE trade_date = '2026-07-10'
+                      AND available_at = '2026-07-13 01:00:00+00'
+                      AND availability_quality = 'estimated'
+                      AND ingested_at = '2026-07-12 12:00:00+00'),
+                   (SELECT COUNT(*) FROM sector_daily_versions
+                    WHERE trade_date = '2026-07-10'
+                      AND available_at = '2026-07-13 01:00:00+00'
+                      AND availability_quality = 'estimated'
+                      AND ingested_at = '2026-07-12 12:00:00+00'),
+                   (SELECT COUNT(*) FROM limit_up_stock_versions
+                    WHERE trade_date = '2026-07-10'
+                      AND available_at = '2026-07-13 01:00:00+00'
+                      AND availability_quality = 'estimated'
+                      AND ingested_at = '2026-07-12 12:00:00+00')"#,
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(counts, (1, 1, 1));
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn append_failure_records_failed_backfill_run(pool: PgPool) -> sqlx::Result<()> {
+        let provider = FakeProvider::new();
+        provider.update(|state| {
+            state.daily_basics[0].source =
+                "source-name-that-is-too-long-for-version-source-column".to_string();
+        });
+        let ingestion = PointInTimeIngestion::new(Arc::new(provider), pool.clone());
+
+        let result = ingestion
+            .backfill_range(date(2026, 7, 10), date(2026, 7, 10), dt(2026, 7, 12, 12))
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            latest_run_status(&pool, "point_in_time_backfill").await?,
+            "failed"
+        );
+        let details = latest_run_details(&pool, "point_in_time_backfill").await?;
+        assert!(details["categories"]["repository_write"].is_object());
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn backfill_surfaces_weekday_only_availability_limitation(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let ingestion = PointInTimeIngestion::new(Arc::new(FakeProvider::new()), pool.clone());
+
+        let result = ingestion
+            .backfill_range(date(2026, 7, 10), date(2026, 7, 10), dt(2026, 7, 12, 12))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.weekday_estimated_next_trade_dates.get("2026-07-10"),
+            Some(&"2026-07-13".to_string())
+        );
+        assert!(result
+            .availability_estimation_limitation
+            .contains("weekday-only"));
+
+        let details = latest_run_details(&pool, "point_in_time_backfill").await?;
+        assert_eq!(
+            details["weekday_estimated_next_trade_dates"]["2026-07-10"],
+            "2026-07-13"
+        );
+        assert!(details["availability_estimation_limitation"]
+            .as_str()
+            .is_some_and(|limitation| limitation.contains("weekday-only")));
         Ok(())
     }
 
@@ -1380,5 +1677,52 @@ mod tests {
         .fetch_one(pool)
         .await?;
         Ok(status)
+    }
+
+    async fn latest_run_details(pool: &PgPool, run_type: &str) -> sqlx::Result<serde_json::Value> {
+        let (details,): (serde_json::Value,) = sqlx::query_as(
+            r#"SELECT details
+               FROM analysis_data_runs
+               WHERE run_type = $1
+               ORDER BY started_at DESC
+               LIMIT 1"#,
+        )
+        .bind(run_type)
+        .fetch_one(pool)
+        .await?;
+        Ok(details)
+    }
+
+    async fn seed_current_task5_rows(pool: &PgPool, trade_date: NaiveDate) -> sqlx::Result<()> {
+        sqlx::query(
+            r#"INSERT INTO stock_daily_bars
+               (code, trade_date, open, high, low, close, volume, amount, turnover, pe, pb)
+               VALUES ('600000.SH', $1, 10.0, 11.0, 9.5, 10.5, 1000, 10500.0, 1.1, 12.2, 1.3)"#,
+        )
+        .bind(trade_date)
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            r#"INSERT INTO sector_daily
+               (code, name, sector_type, change_pct, amount, trade_date)
+               VALUES ('BK0477', 'Semiconductors', 'industry', 2.34, 123456789.0, $1)"#,
+        )
+        .bind(trade_date)
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            r#"INSERT INTO limit_up_stocks
+               (code, trade_date, name, limit_time, seal_amount, burst_count,
+                close, pct_chg, strth)
+               VALUES ('600000.SH', $1, 'Alpha', '09:35', 987654321.0, 2,
+                       10.5, 10.01, 88.8)"#,
+        )
+        .bind(trade_date)
+        .execute(pool)
+        .await?;
+
+        Ok(())
     }
 }

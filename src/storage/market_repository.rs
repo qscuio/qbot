@@ -276,6 +276,149 @@ impl MarketRepository {
         Ok((daily_bars, sector_versions, limit_up_versions))
     }
 
+    pub async fn current_daily_bars_for_date(
+        &self,
+        trade_date: NaiveDate,
+    ) -> Result<Vec<(String, Candle)>> {
+        let rows: Vec<(
+            String,
+            NaiveDate,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+            Option<i64>,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+        )> = sqlx::query_as(
+            r#"SELECT code, trade_date, open::float8, high::float8, low::float8,
+                      close::float8, volume, amount::float8, turnover::float8,
+                      pe::float8, pb::float8
+               FROM stock_daily_bars
+               WHERE trade_date = $1
+               ORDER BY code"#,
+        )
+        .bind(trade_date)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(code, trade_date, open, high, low, close, volume, amount, turnover, pe, pb)| {
+                    (
+                        code,
+                        Candle {
+                            trade_date,
+                            open: open.unwrap_or(0.0),
+                            high: high.unwrap_or(0.0),
+                            low: low.unwrap_or(0.0),
+                            close: close.unwrap_or(0.0),
+                            volume: volume.unwrap_or(0),
+                            amount: amount.unwrap_or(0.0),
+                            turnover,
+                            pe,
+                            pb,
+                        },
+                    )
+                },
+            )
+            .collect())
+    }
+
+    pub async fn current_sector_data_for_date(
+        &self,
+        trade_date: NaiveDate,
+    ) -> Result<Vec<SectorData>> {
+        let rows: Vec<(
+            String,
+            Option<String>,
+            Option<String>,
+            Option<f64>,
+            Option<f64>,
+            NaiveDate,
+        )> = sqlx::query_as(
+            r#"SELECT code, name, sector_type, change_pct::float8, amount::float8, trade_date
+               FROM sector_daily
+               WHERE trade_date = $1
+               ORDER BY code"#,
+        )
+        .bind(trade_date)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(code, name, sector_type, change_pct, amount, trade_date)| SectorData {
+                    code,
+                    name: name.unwrap_or_default(),
+                    sector_type: sector_type.unwrap_or_else(|| "unknown".to_string()),
+                    change_pct: change_pct.unwrap_or(0.0),
+                    amount: amount.unwrap_or(0.0),
+                    trade_date,
+                },
+            )
+            .collect())
+    }
+
+    pub async fn current_limit_up_stocks_for_date(
+        &self,
+        trade_date: NaiveDate,
+    ) -> Result<Vec<LimitUpStock>> {
+        let rows: Vec<(
+            String,
+            Option<String>,
+            NaiveDate,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+            Option<String>,
+            Option<i32>,
+            Option<f64>,
+        )> = sqlx::query_as(
+            r#"SELECT code, name, trade_date, close::float8, pct_chg::float8,
+                      seal_amount::float8, limit_time, burst_count, strth::float8
+               FROM limit_up_stocks
+               WHERE trade_date = $1
+               ORDER BY code"#,
+        )
+        .bind(trade_date)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    code,
+                    name,
+                    trade_date,
+                    close,
+                    pct_chg,
+                    seal_amount,
+                    first_time,
+                    open_times,
+                    strth,
+                )| LimitUpStock {
+                    code,
+                    name: name.unwrap_or_default(),
+                    trade_date,
+                    close: close.unwrap_or(0.0),
+                    pct_chg: pct_chg.unwrap_or(0.0),
+                    fd_amount: seal_amount.unwrap_or(0.0),
+                    first_time,
+                    last_time: None,
+                    open_times: open_times.unwrap_or(0),
+                    strth: strth.unwrap_or(0.0),
+                    limit: "U".to_string(),
+                },
+            )
+            .collect())
+    }
+
     pub async fn append_daily_bar_versions(
         &self,
         bars: &[(String, Candle)],
@@ -292,6 +435,47 @@ impl MarketRepository {
             source,
         )
         .await?;
+        tx.commit().await?;
+        Ok(inserted)
+    }
+
+    pub async fn append_daily_bar_versions_with_ingested_at(
+        &self,
+        bars: &[(String, Candle)],
+        available_at: DateTime<Utc>,
+        availability_quality: &str,
+        source: &str,
+        ingested_at: DateTime<Utc>,
+    ) -> Result<usize> {
+        let mut tx = self.pool.begin().await?;
+        let mut inserted = 0;
+        for (code, bar) in bars {
+            inserted += sqlx::query(
+                r#"INSERT INTO stock_daily_bar_versions
+                   (code, trade_date, open, high, low, close, volume, amount,
+                    turnover, pe, pb, available_at, availability_quality, source, ingested_at)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                   ON CONFLICT (code, trade_date, available_at) DO NOTHING"#,
+            )
+            .bind(code)
+            .bind(bar.trade_date)
+            .bind(bar.open)
+            .bind(bar.high)
+            .bind(bar.low)
+            .bind(bar.close)
+            .bind(bar.volume)
+            .bind(bar.amount)
+            .bind(bar.turnover)
+            .bind(bar.pe)
+            .bind(bar.pb)
+            .bind(available_at)
+            .bind(availability_quality)
+            .bind(source)
+            .bind(ingested_at)
+            .execute(tx.as_mut())
+            .await?
+            .rows_affected() as usize;
+        }
         tx.commit().await?;
         Ok(inserted)
     }
@@ -333,6 +517,42 @@ impl MarketRepository {
         Ok(inserted)
     }
 
+    pub async fn append_sector_versions_with_ingested_at(
+        &self,
+        rows: &[SectorData],
+        available_at: DateTime<Utc>,
+        availability_quality: &str,
+        source: &str,
+        ingested_at: DateTime<Utc>,
+    ) -> Result<usize> {
+        let mut tx = self.pool.begin().await?;
+        let mut inserted = 0;
+        for row in rows {
+            inserted += sqlx::query(
+                r#"INSERT INTO sector_daily_versions
+                   (code, name, sector_type, change_pct, amount, trade_date,
+                    available_at, availability_quality, source, ingested_at)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                   ON CONFLICT (code, trade_date, available_at) DO NOTHING"#,
+            )
+            .bind(&row.code)
+            .bind(&row.name)
+            .bind(&row.sector_type)
+            .bind(row.change_pct)
+            .bind(row.amount)
+            .bind(row.trade_date)
+            .bind(available_at)
+            .bind(availability_quality)
+            .bind(source)
+            .bind(ingested_at)
+            .execute(tx.as_mut())
+            .await?
+            .rows_affected() as usize;
+        }
+        tx.commit().await?;
+        Ok(inserted)
+    }
+
     pub async fn append_sector_versions(
         &self,
         rows: &[SectorData],
@@ -349,6 +569,45 @@ impl MarketRepository {
             source,
         )
         .await?;
+        tx.commit().await?;
+        Ok(inserted)
+    }
+
+    pub async fn append_limit_up_versions_with_ingested_at(
+        &self,
+        rows: &[LimitUpStock],
+        available_at: DateTime<Utc>,
+        availability_quality: &str,
+        source: &str,
+        ingested_at: DateTime<Utc>,
+    ) -> Result<usize> {
+        let mut tx = self.pool.begin().await?;
+        let mut inserted = 0;
+        for row in rows {
+            inserted += sqlx::query(
+                r#"INSERT INTO limit_up_stock_versions
+                   (code, trade_date, name, limit_time, seal_amount, burst_count,
+                    close, pct_chg, strth, available_at, availability_quality, source, ingested_at)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                   ON CONFLICT (code, trade_date, available_at) DO NOTHING"#,
+            )
+            .bind(&row.code)
+            .bind(row.trade_date)
+            .bind(&row.name)
+            .bind(&row.first_time)
+            .bind(row.fd_amount)
+            .bind(row.open_times)
+            .bind(row.close)
+            .bind(row.pct_chg)
+            .bind(row.strth)
+            .bind(available_at)
+            .bind(availability_quality)
+            .bind(source)
+            .bind(ingested_at)
+            .execute(tx.as_mut())
+            .await?
+            .rows_affected() as usize;
+        }
         tx.commit().await?;
         Ok(inserted)
     }
