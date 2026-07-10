@@ -390,3 +390,49 @@
 ### Commit hash
 
 - code fix: `c6521205fe4ede9ef8e7860998c42b13e34abf6b`
+
+## Fix follow-up: stale duplicate barrier rereview addressed on 2026-07-10
+
+### Review issue and what changed
+
+- Issue: `ManualEvidenceIngestor::submit_at()` no longer used the old ingestor-local duplicate lookup barrier, but `clone_with_duplicate_lookup_barrier_for_test()` and the two moved concurrency tests still depended on it.
+- Removed the dead ingestor-local barrier hook from `src/analysis/events/evidence.rs`, including the test-only preflight `find_by_content_hash()` call and the stale barrier helper types.
+- Added a repository-owned candidate-discovery gate hook in `src/storage/event_repository.rs` that pauses after real duplicate candidate discovery inside the locked manual-ingestion transaction and before the insert/effect commit path continues.
+- Rewrote `concurrent_identical_manual_submissions_report_one_insert_and_one_existing` in `src/analysis/events/evidence_duplicate_ingestion_tests.rs` to block on that repository transaction hook, prove the second identical submission stays blocked while the first transaction is paused, then prove the pair resolves to exactly one `Inserted` and one `Existing`.
+- Replaced the stale unrelated-ingestor barrier test with `candidate_discovery_gate_does_not_coordinate_unrelated_ingestors`, which now proves a second ingestor does not consume or release the repository-owned gate even when it submits the same content hash; it remains blocked by the shared manual duplicate discovery lock until the gated transaction is explicitly released.
+
+### Red test evidence
+
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test concurrent_identical_manual_submissions_report_one_insert_and_one_existing -- --nocapture`
+  - failed before the repository hook existed
+  - compile error: `no method named clone_with_manual_insert_candidate_discovery_gate_for_test found for struct EventRepository`
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test duplicate_lookup_barrier_does_not_accept_same_hash_from_unrelated_ingestor -- --nocapture`
+  - failed before the repository hook existed
+  - compile error: `no method named clone_with_manual_insert_candidate_discovery_gate_for_test found for struct EventRepository`
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test candidate_discovery_gate_does_not_coordinate_unrelated_ingestors -- --nocapture`
+  - failed on the first replacement attempt
+  - `unrelated ingestor should complete while the gated repository transaction is paused: Elapsed(())`
+  - this showed the repository now serializes all manual duplicate discovery through one conservative lock, so the replacement test needed to prove gate isolation without expecting concurrent completion
+
+### Green verification
+
+- `cargo fmt --all -- --check`
+  - passed
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test analysis::events::dedup -- --nocapture`
+  - passed, `10 passed; 0 failed`
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test analysis::events -- --nocapture`
+  - passed, `35 passed; 0 failed`
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test storage::event_repository -- --nocapture`
+  - passed, `15 passed; 0 failed`
+- `cargo test --all --locked config::tests::test_config_defaults`
+  - passed, `1 passed; 0 failed`
+- `git diff --check`
+  - passed
+- `cargo check --tests --locked`
+  - passed
+  - pre-existing unused/dead-code warnings remain outside this Task 4 fix surface
+
+### Commit hash
+
+- code fix: `bdf6b0e8d6eb2545b529176e2caef37d4b6fbdb7`
+- docs/report follow-up: recorded in the next commit for this appended report section
