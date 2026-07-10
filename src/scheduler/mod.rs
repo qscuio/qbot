@@ -547,8 +547,8 @@ fn production_job_crons_in_registration_order() -> Vec<&'static str> {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use chrono::{DateTime, NaiveDate, TimeZone};
-    use serde_json::json;
+    use chrono::{DateTime, Duration, NaiveDate, TimeZone};
+    use serde_json::{json, Value};
     use sqlx::PgPool;
     use std::collections::BTreeMap;
     use tokio::sync::Mutex;
@@ -631,11 +631,17 @@ mod tests {
             .unwrap();
 
         let scan_count_before = count_rows(&pool, "scan_results").await?;
+        let strategy_candidate_count_before =
+            count_rows(&pool, "signal_strategy_candidates").await?;
 
         run_pattern_shadow_job(state).await;
 
         assert_eq!(count_rows(&pool, "scan_results").await?, scan_count_before);
         assert_eq!(count_rows(&pool, "analysis_shadow_candidates").await?, 0);
+        assert_eq!(
+            count_rows(&pool, "signal_strategy_candidates").await?,
+            strategy_candidate_count_before
+        );
         Ok(())
     }
 
@@ -662,19 +668,78 @@ mod tests {
             .unwrap();
 
         let scan_count_before = count_rows(&pool, "scan_results").await?;
+        let strategy_candidate_count_before =
+            count_rows(&pool, "signal_strategy_candidates").await?;
 
         run_pattern_shadow_job(state).await;
 
         assert_eq!(count_rows(&pool, "scan_results").await?, scan_count_before);
         assert_eq!(count_rows(&pool, "analysis_shadow_candidates").await?, 0);
+        assert_eq!(
+            count_rows(&pool, "signal_strategy_candidates").await?,
+            strategy_candidate_count_before
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn pattern_shadow_job_persists_shadow_candidates_without_strategy_candidates_or_scan_changes(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let state = test_state(pool.clone()).await;
+        let trade_date = date(2026, 7, 10);
+        let code = "600001.SH";
+        seed_stock_daily_bar(&pool, trade_date, code).await?;
+        seed_pattern_market_inputs(&pool, trade_date, code).await?;
+        seed_scan_result(&pool).await?;
+        seed_published_pattern_set(&pool).await?;
+        MarketRepository::new(pool.clone())
+            .save_market_snapshot(&MarketSnapshot {
+                trade_date,
+                snapshot_version: MARKET_SNAPSHOT_VERSION.to_string(),
+                available_at: dt(2026, 7, 10, 10),
+                data_complete: true,
+                metrics: json!({
+                    "breadth": {
+                        "up_count": 1,
+                        "down_count": 0,
+                        "flat_count": 0,
+                        "above_ma20_count": 1
+                    }
+                }),
+                missing_inputs: Vec::new(),
+                input_fingerprint: "complete-pattern-snapshot".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let scan_count_before = count_rows(&pool, "scan_results").await?;
+        let shadow_count_before = count_rows(&pool, "analysis_shadow_candidates").await?;
+        let strategy_candidate_count_before =
+            count_rows(&pool, "signal_strategy_candidates").await?;
+
+        run_pattern_shadow_job(state).await;
+
+        let shadow_count_after = count_rows(&pool, "analysis_shadow_candidates").await?;
+        assert!(shadow_count_after > shadow_count_before);
+        assert_eq!(count_rows(&pool, "scan_results").await?, scan_count_before);
+        assert_eq!(
+            count_rows(&pool, "signal_strategy_candidates").await?,
+            strategy_candidate_count_before
+        );
+        assert_eq!(strategy_candidate_count_before, 0);
         Ok(())
     }
 
     #[test]
     fn scheduler_does_not_reference_auto_trading_candidate_table() {
         let source = include_str!("mod.rs");
+        let implementation_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("scheduler source includes implementation before tests");
         let forbidden_table = concat!("signal", "_strategy", "_candidates");
-        assert!(!source.contains(forbidden_table));
+        assert!(!implementation_source.contains(forbidden_table));
     }
 
     fn date(year: i32, month: u32, day: u32) -> NaiveDate {
@@ -714,20 +779,200 @@ mod tests {
     }
 
     async fn seed_published_pattern_set(pool: &PgPool) -> sqlx::Result<()> {
+        let dataset_version = format!("dataset-{}", Uuid::new_v4());
+        sqlx::query(
+            r#"INSERT INTO analysis_dataset_manifests
+               (dataset_version, schema_version, feature_version, horizon, data_cutoff,
+                available_at_cutoff, row_count, date_from, date_to, manifest, input_fingerprint)
+               VALUES ($1, '1', 'feature-v1', 'week', '2026-06-30', '2026-07-01T00:00:00Z',
+                       21, '2026-01-01', '2026-06-30', '{"files":["pattern-fixture.parquet"]}', 'pattern-fp')"#,
+        )
+        .bind(&dataset_version)
+        .execute(pool)
+        .await?;
+
+        let pattern_version_id = Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO analysis_pattern_versions
+               (pattern_version_id, pattern_id, horizon, pattern_type, status,
+                schema_version, feature_version, logic_version, dataset_version,
+                model_payload, validation_payload, trained_from, trained_until,
+                available_at_cutoff, approved_by, published_at)
+               VALUES ($1, $2, 'week', 'trend', 'published',
+                       '1', 'feature-v1', 'logic-v1', $3,
+                       $4, $5,
+                       '2026-01-01', '2026-06-30', '2026-07-01T00:00:00Z',
+                       'reviewer', '2026-07-10T08:00:00Z')"#,
+        )
+        .bind(pattern_version_id)
+        .bind(format!("pattern-{dataset_version}"))
+        .bind(&dataset_version)
+        .bind(pattern_model_payload())
+        .bind(pattern_validation_payload())
+        .execute(pool)
+        .await?;
+
+        let pattern_set_id = Uuid::new_v4();
         sqlx::query(
             r#"INSERT INTO analysis_pattern_sets (pattern_set_id, name, status, published_at)
                VALUES ($1, 'published-set', 'published', '2026-07-10T09:00:00Z')"#,
         )
-        .bind(Uuid::new_v4())
+        .bind(pattern_set_id)
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            r#"INSERT INTO analysis_pattern_set_members
+               (pattern_set_id, pattern_version_id, member_order)
+               VALUES ($1, $2, 1)"#,
+        )
+        .bind(pattern_set_id)
+        .bind(pattern_version_id)
         .execute(pool)
         .await?;
         Ok(())
+    }
+
+    async fn seed_pattern_market_inputs(
+        pool: &PgPool,
+        trade_date: NaiveDate,
+        code: &str,
+    ) -> sqlx::Result<()> {
+        let available_at = dt(2026, 7, 10, 12);
+        for offset in 0..=20 {
+            let bar_date = trade_date - Duration::days(i64::from(20 - offset));
+            let close = if offset == 20 {
+                120.0
+            } else {
+                100.0 + f64::from(offset)
+            };
+            sqlx::query(
+                r#"INSERT INTO stock_daily_bar_versions
+                   (code, trade_date, open, high, low, close, volume, amount,
+                    turnover, pe, pb, available_at, availability_quality, source)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
+                           1.2, 12.0, 1.4, $9, 'observed', 'test')"#,
+            )
+            .bind(code)
+            .bind(bar_date)
+            .bind(close)
+            .bind(close + 1.0)
+            .bind(close - 1.0)
+            .bind(close)
+            .bind(10_000_i64 + i64::from(offset))
+            .bind(1_000_000.0 + f64::from(offset))
+            .bind(available_at)
+            .execute(pool)
+            .await?;
+            sqlx::query(
+                r#"INSERT INTO stock_adjustment_factors
+                   (code, trade_date, adj_factor, available_at, availability_quality, source)
+                   VALUES ($1, $2, 1.0, $3, 'observed', 'test')"#,
+            )
+            .bind(code)
+            .bind(bar_date)
+            .bind(available_at)
+            .execute(pool)
+            .await?;
+        }
+
+        sqlx::query(
+            r#"INSERT INTO security_master_versions
+               (code, name, market, exchange, list_status, list_date,
+                available_at, availability_quality, source)
+               VALUES ($1, 'Alpha Bank', 'A', 'SH', 'L', '2020-01-01',
+                       $2, 'observed', 'test')"#,
+        )
+        .bind(code)
+        .bind(available_at)
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            r#"INSERT INTO security_daily_status
+               (code, trade_date, listed_days, is_st, is_suspended, price_limit_pct,
+                available_at, availability_quality, source)
+               VALUES ($1, $2, 1000, false, false, 10.0, $3, 'observed', 'test')"#,
+        )
+        .bind(code)
+        .bind(trade_date)
+        .bind(available_at)
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            r#"INSERT INTO stock_daily_basic_versions
+               (code, trade_date, turnover_rate, volume_ratio, pe, pb, ps,
+                total_share, float_share, total_mv, circ_mv,
+                available_at, availability_quality, source)
+               VALUES ($1, $2, 1.2, 1.4, 12.0, 1.4, 2.0,
+                       100000000, 80000000, 1200000000, 960000000,
+                       $3, 'observed', 'test')"#,
+        )
+        .bind(code)
+        .bind(trade_date)
+        .bind(available_at)
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            r#"INSERT INTO stock_sector_membership
+               (code, sector_code, sector_name, sector_type, valid_from,
+                available_at, availability_quality, source)
+               VALUES ($1, 'BK001', 'Banking', 'industry', '2020-01-01',
+                       $2, 'observed', 'test')"#,
+        )
+        .bind(code)
+        .bind(available_at)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    fn pattern_model_payload() -> Value {
+        serde_json::from_str(include_str!("../../tests/fixtures/pattern_model_v1.json")).unwrap()
+    }
+
+    fn pattern_validation_payload() -> Value {
+        json!({
+            "candidate_id": "trend:kmeans:k2:c0",
+            "positive_sample_count": 12,
+            "control_sample_count": 18,
+            "effective_sample_count": 8.0,
+            "base_rate": 0.40,
+            "precision": 0.75,
+            "lift": 2.0,
+            "lift_over_base_rate": 2.0,
+            "coverage": 0.27,
+            "false_positive_rate": 0.11,
+            "precision_at_10": 0.70,
+            "precision_at_50": 0.62,
+            "cost_adjusted_return": 0.032,
+            "max_drawdown": -0.045,
+            "turnover": 0.20,
+            "yearly_results": {"2026": {"sample_count": 30, "precision": 0.75}},
+            "regime_results": {"bull": {"sample_count": 18, "precision": 0.80}},
+            "top_stock_contribution": 0.20,
+            "top_period_contribution": 0.25,
+            "mean_excess_return": 0.024,
+            "median_excess_return": 0.020,
+            "win_rate": 0.72,
+            "profit_factor": 2.40,
+            "max_losing_streak": 2,
+            "capacity_estimate": 1000000.0,
+            "cluster_stability": 0.86,
+            "calibration_error": 0.05,
+            "majority_windows_positive_lift": true,
+            "baseline_comparison": {
+                "best_required_baseline_return": 0.01,
+                "cost_adjusted_return_delta": 0.022
+            },
+            "release_gate_passed": true,
+            "candidate_status": "validated"
+        })
     }
 
     async fn count_rows(pool: &PgPool, table: &str) -> sqlx::Result<i64> {
         let query = match table {
             "scan_results" => "SELECT COUNT(*) FROM scan_results",
             "analysis_shadow_candidates" => "SELECT COUNT(*) FROM analysis_shadow_candidates",
+            "signal_strategy_candidates" => "SELECT COUNT(*) FROM signal_strategy_candidates",
             _ => panic!("unexpected table {table}"),
         };
         let (count,): (i64,) = sqlx::query_as(query).fetch_one(pool).await?;
