@@ -56,3 +56,4 @@ Gate 1 Task 9: complete (commits 18c603c..e6372a7, review clean after trading-ta
 ## Gate 2: Event Evidence MVP
 
 Gate 2 Task 1: complete (commits 80b62a6..d2b0298, review clean after immutability, locked duplicate, published-claim evidence, duplicate-member replacement, and lookup-index fixes; verification: storage::event_repository 11/11 passed with DATABASE_URL, full suite split 211/211 + config 1/1 passed, fmt check passed, diff check passed)
+Gate 2 Task 2: complete (commits ad20abe..ee01b59, review clean after public API boundary fix; verification: analysis::events::contracts 3/3 passed, analysis::events 5/5 passed, config test 1/1 passed, fmt check passed, diff check passed)

@@ -205,7 +205,7 @@ git commit -m "feat: add event evidence MVP schema"
 - Produces the public `EventIntelligence` types.
 - Keeps internal dedup/extraction details private.
 
-- [ ] **Step 1: Define contracts**
+- [x] **Step 1: Define contracts**
 
 ```rust
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -251,7 +251,7 @@ pub trait TradingDateResolver: Send + Sync {
 }
 ```
 
-- [ ] **Step 2: Test time classification**
+- [x] **Step 2: Test time classification**
 
 Tests must cover:
 
@@ -259,7 +259,7 @@ Tests must cover:
 - 15:30 maps to the next trading date.
 - Saturday maps to Monday or the next open date.
 
-- [ ] **Step 3: Add public module interface**
+- [x] **Step 3: Add public module interface**
 
 ```rust
 pub struct EventIntelligence {
@@ -286,7 +286,7 @@ impl EventIntelligence {
 }
 ```
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ```bash
 cargo test analysis::events::contracts
