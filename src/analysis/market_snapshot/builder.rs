@@ -747,6 +747,174 @@ mod tests {
         Ok(())
     }
 
+    #[sqlx::test(migrations = "./migrations")]
+    async fn build_trade_date_uses_deterministic_equal_available_at_versions(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        allow_duplicate_available_at_versions(&pool).await?;
+        seed_security_history(&pool, "600050.SH", 1..=19, true).await?;
+
+        seed_daily_bar_version(
+            &pool,
+            "600050.SH",
+            20,
+            20.0,
+            dt(20, 17, 0),
+            dt(20, 17, 5),
+            "z-bars",
+        )
+        .await?;
+        seed_daily_bar_version(
+            &pool,
+            "600050.SH",
+            20,
+            35.0,
+            dt(20, 17, 0),
+            dt(20, 17, 6),
+            "z-bars",
+        )
+        .await?;
+        seed_daily_bar_version(
+            &pool,
+            "600050.SH",
+            20,
+            30.0,
+            dt(20, 17, 0),
+            dt(20, 17, 6),
+            "a-bars",
+        )
+        .await?;
+
+        seed_adjustment_factor_version(
+            &pool,
+            "600050.SH",
+            20,
+            2.0,
+            dt(20, 17, 10),
+            dt(20, 17, 15),
+            "z-adjustments",
+        )
+        .await?;
+        seed_adjustment_factor_version(
+            &pool,
+            "600050.SH",
+            20,
+            3.0,
+            dt(20, 17, 10),
+            dt(20, 17, 16),
+            "z-adjustments",
+        )
+        .await?;
+        seed_adjustment_factor_version(
+            &pool,
+            "600050.SH",
+            20,
+            1.0,
+            dt(20, 17, 10),
+            dt(20, 17, 16),
+            "a-adjustments",
+        )
+        .await?;
+
+        seed_status_version(
+            &pool,
+            "600050.SH",
+            1.0,
+            dt(20, 17, 20),
+            dt(20, 17, 25),
+            "z-status",
+        )
+        .await?;
+        seed_status_version(
+            &pool,
+            "600050.SH",
+            5.0,
+            dt(20, 17, 20),
+            dt(20, 17, 26),
+            "z-status",
+        )
+        .await?;
+        seed_status_version(
+            &pool,
+            "600050.SH",
+            10.0,
+            dt(20, 17, 20),
+            dt(20, 17, 26),
+            "a-status",
+        )
+        .await?;
+
+        seed_index(&pool, "000001.SH", 2900.0, dt(20, 18, 0), dt(20, 18, 5)).await?;
+        seed_index(&pool, "000001.SH", 3100.0, dt(20, 18, 0), dt(20, 18, 6)).await?;
+        seed_index_with_source(
+            &pool,
+            "000001.SH",
+            3001.0,
+            dt(20, 18, 0),
+            dt(20, 18, 6),
+            "a-index",
+        )
+        .await?;
+        seed_index_version(&pool, "399001.SZ", 12000.0, dt(20, 18, 1), dt(20, 18, 5)).await?;
+        seed_index_version(&pool, "399006.SZ", 2500.0, dt(20, 18, 2), dt(20, 18, 5)).await?;
+        seed_index_version(&pool, "000688.SH", 900.0, dt(20, 18, 3), dt(20, 18, 5)).await?;
+
+        let snapshot = MarketSnapshotModule::new(pool)
+            .build_trade_date(date(20), dt(20, 19, 0))
+            .await
+            .unwrap()
+            .snapshot;
+
+        assert_eq!(snapshot.metrics["breadth"]["up_count"], json!(1));
+        assert_eq!(snapshot.metrics["breadth"]["down_count"], json!(0));
+        assert_eq!(snapshot.metrics["breadth"]["limit_up_count"], json!(0));
+        assert_eq!(snapshot.metrics["indices"][0]["close"], json!(3001.0));
+
+        let mut entries = expected_security_fingerprint_entries("600050.SH", true);
+        entries.pop();
+        entries.pop();
+        entries.pop();
+        entries.push(fingerprint_component(
+            "stock_daily_bar_versions",
+            "600050.SH",
+            date(20),
+            "a-bars",
+            dt(20, 17, 0),
+            dt(20, 17, 6),
+        ));
+        entries.push(fingerprint_component(
+            "stock_adjustment_factors",
+            "600050.SH",
+            date(20),
+            "a-adjustments",
+            dt(20, 17, 10),
+            dt(20, 17, 16),
+        ));
+        entries.push(fingerprint_component(
+            "security_daily_status",
+            "600050.SH",
+            date(20),
+            "a-status",
+            dt(20, 17, 20),
+            dt(20, 17, 26),
+        ));
+        entries.push(fingerprint_component(
+            "index_daily_bars",
+            "000001.SH",
+            date(20),
+            "a-index",
+            dt(20, 18, 0),
+            dt(20, 18, 6),
+        ));
+        entries.extend(expected_index_fingerprint_entries().into_iter().skip(1));
+
+        assert_eq!(
+            snapshot.input_fingerprint,
+            calculate_input_fingerprint(&entries)
+        );
+        Ok(())
+    }
+
     async fn seed_security(
         pool: &PgPool,
         code: &str,
@@ -811,6 +979,100 @@ mod tests {
         Ok(())
     }
 
+    async fn allow_duplicate_available_at_versions(pool: &PgPool) -> sqlx::Result<()> {
+        for (table, constraint) in [
+            ("stock_daily_bar_versions", "stock_daily_bar_versions_pkey"),
+            ("stock_adjustment_factors", "stock_adjustment_factors_pkey"),
+            ("security_daily_status", "security_daily_status_pkey"),
+            ("index_daily_bars", "index_daily_bars_pkey"),
+        ] {
+            sqlx::query(&format!("ALTER TABLE {table} DROP CONSTRAINT {constraint}"))
+                .execute(pool)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn seed_daily_bar_version(
+        pool: &PgPool,
+        code: &str,
+        day: u32,
+        close: f64,
+        available_at: DateTime<Utc>,
+        ingested_at: DateTime<Utc>,
+        source: &str,
+    ) -> sqlx::Result<()> {
+        sqlx::query(
+            r#"INSERT INTO stock_daily_bar_versions
+               (code, trade_date, open, high, low, close, volume, amount, turnover, pe, pb,
+                available_at, availability_quality, source, ingested_at)
+               VALUES ($1, $2, $3, $4, $5, $6, 1000, 1000.0, NULL, NULL, NULL,
+                       $7, 'observed', $8, $9)"#,
+        )
+        .bind(code)
+        .bind(date(day))
+        .bind(close - 0.2)
+        .bind(close + 0.4)
+        .bind(close - 0.6)
+        .bind(close)
+        .bind(available_at)
+        .bind(source)
+        .bind(ingested_at)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn seed_adjustment_factor_version(
+        pool: &PgPool,
+        code: &str,
+        day: u32,
+        adj_factor: f64,
+        available_at: DateTime<Utc>,
+        ingested_at: DateTime<Utc>,
+        source: &str,
+    ) -> sqlx::Result<()> {
+        sqlx::query(
+            r#"INSERT INTO stock_adjustment_factors
+               (code, trade_date, adj_factor, available_at, availability_quality, source, ingested_at)
+               VALUES ($1, $2, $3, $4, 'observed', $5, $6)"#,
+        )
+        .bind(code)
+        .bind(date(day))
+        .bind(adj_factor)
+        .bind(available_at)
+        .bind(source)
+        .bind(ingested_at)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn seed_status_version(
+        pool: &PgPool,
+        code: &str,
+        price_limit_pct: f64,
+        available_at: DateTime<Utc>,
+        ingested_at: DateTime<Utc>,
+        source: &str,
+    ) -> sqlx::Result<()> {
+        sqlx::query(
+            r#"INSERT INTO security_daily_status
+               (code, trade_date, listed_days, is_st, is_suspended, price_limit_pct,
+                available_at, availability_quality, source, ingested_at)
+               VALUES ($1, $2, 120, FALSE, FALSE, $3, $4, 'observed', $5, $6)"#,
+        )
+        .bind(code)
+        .bind(date(20))
+        .bind(price_limit_pct)
+        .bind(available_at)
+        .bind(source)
+        .bind(ingested_at)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
     async fn seed_index(
         pool: &PgPool,
         code: &str,
@@ -818,16 +1080,28 @@ mod tests {
         available_at: DateTime<Utc>,
         ingested_at: DateTime<Utc>,
     ) -> sqlx::Result<()> {
+        seed_index_with_source(pool, code, close, available_at, ingested_at, "index").await
+    }
+
+    async fn seed_index_with_source(
+        pool: &PgPool,
+        code: &str,
+        close: f64,
+        available_at: DateTime<Utc>,
+        ingested_at: DateTime<Utc>,
+        source: &str,
+    ) -> sqlx::Result<()> {
         sqlx::query(
             r#"INSERT INTO index_daily_bars
                (code, trade_date, close, change_pct, volume, amount, available_at,
                 availability_quality, source, ingested_at)
-               VALUES ($1, $2, $3, 1.0, 1000, 10000.0, $4, 'observed', 'index', $5)"#,
+               VALUES ($1, $2, $3, 1.0, 1000, 10000.0, $4, 'observed', $5, $6)"#,
         )
         .bind(code)
         .bind(date(20))
         .bind(close)
         .bind(available_at)
+        .bind(source)
         .bind(ingested_at)
         .execute(pool)
         .await?;

@@ -19,6 +19,7 @@
   - `save_market_snapshot` now upserts the single `(trade_date, snapshot_version)` row so a rebuilt `market-v1` snapshot replaces stale metrics, completeness, missing-inputs, and fingerprint fields.
   - Snapshot fingerprints now include loaded bar, adjustment, status, and index provenance even for securities later excluded from breadth because a critical input is missing.
   - Trade-date status rows now act as the known-universe signal for current-day bar completeness. A code with a trade-date status row but no current trade-date bar available as-of records `stock_daily_bar_versions:<code>:<trade_date>` without guessing securities that have neither bars nor status.
+  - Point-in-time repository helpers now break equal-`available_at` ties deterministically with `ingested_at DESC, source ASC` in the Task 8 window queries for daily bars, adjustment factors, security statuses, status universe, and index bars.
 - Added `run_market_snapshot_job` in [`src/scheduler/mod.rs`](/home/ubuntu/work/qbot/.worktrees/point-in-time-data-foundation/src/scheduler/mod.rs).
 - Inserted market snapshot execution into `--run-now` in [`src/main.rs`](/home/ubuntu/work/qbot/.worktrees/point-in-time-data-foundation/src/main.rs) after the point-in-time refreshes and before the scan.
 - Added `sha2` in [`Cargo.toml`](/home/ubuntu/work/qbot/.worktrees/point-in-time-data-foundation/Cargo.toml) and updated [`Cargo.lock`](/home/ubuntu/work/qbot/.worktrees/point-in-time-data-foundation/Cargo.lock) for deterministic `input_fingerprint` hashing.
@@ -38,6 +39,8 @@
       - Failed as expected because `data_complete` stayed true when a trade-date status row existed without a current trade-date bar.
     - `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test market_snapshot_save_upserts_latest_snapshot -- --nocapture`
       - Failed as expected because the original persisted snapshot was kept instead of upserting the rebuilt row.
+    - `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test build_trade_date_uses_deterministic_equal_available_at_versions -- --nocapture`
+      - Failed as expected before the SQL tie-breaker fix because the snapshot selected the wrong equal-`available_at` status version and produced `limit_up_count = 1` instead of the expected `0`.
 - Green:
   - Implemented `MarketBreadthMetrics` and `calculate_market_breadth`.
   - Implemented `MarketSnapshotModule::build_trade_date` and repository helpers.
@@ -47,19 +50,20 @@
     - same trade date with different `as_of` rebuild/upsert behavior
     - fingerprint completeness for excluded securities
     - trade-date status universe missing-current-bar completeness
+    - equal-`available_at` duplicate candidates selecting the later `ingested_at` and source-ascending point-in-time winners, with deterministic snapshot metrics and fingerprint
 
 ## Verification results
 
-- `cargo test analysis::market_snapshot -- --nocapture`
-  - PASS
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test analysis::market_snapshot -- --nocapture`
+  - PASS: 23 passed, 0 failed
 - `cargo test scheduler::tests -- --nocapture`
-  - PASS
+  - PASS: 2 passed, 0 failed
 - `cargo fmt --all -- --check`
-  - PASS after running `cargo fmt --all`
+  - PASS
 - `git diff --check`
   - PASS
 
-`DATABASE_URL` was exported as `postgresql://qbot:qbot@127.0.0.1:5432/qbot` in the verification shell so the SQLx tests could run.
+The equal-`available_at` regression was run first in isolation to capture RED evidence, then rerun after the SQL fix and passed.
 
 ## Files changed
 
@@ -70,6 +74,12 @@
 - `src/storage/market_repository.rs`
 - `src/scheduler/mod.rs`
 - `src/main.rs`
+- `.superpowers/sdd/task-8-report.md`
+
+Additional Task 8 re-review fix changed only:
+
+- `src/analysis/market_snapshot/builder.rs`
+- `src/storage/market_repository.rs`
 - `.superpowers/sdd/task-8-report.md`
 
 ## Concerns

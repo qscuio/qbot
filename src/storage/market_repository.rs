@@ -1074,7 +1074,7 @@ impl MarketRepository {
                           turnover, pe, pb, available_at, ingested_at, source,
                           ROW_NUMBER() OVER (
                               PARTITION BY code, trade_date
-                              ORDER BY available_at DESC
+                              ORDER BY available_at DESC, ingested_at DESC, source ASC
                           ) AS version_rank
                    FROM stock_daily_bar_versions
                    WHERE trade_date <= $1
@@ -1215,7 +1215,7 @@ impl MarketRepository {
                           availability_quality, source,
                           ROW_NUMBER() OVER (
                               PARTITION BY code, trade_date
-                              ORDER BY available_at DESC
+                              ORDER BY available_at DESC, ingested_at DESC, source ASC
                           ) AS version_rank
                    FROM stock_adjustment_factors
                    WHERE code = ANY($1)
@@ -1428,7 +1428,7 @@ impl MarketRepository {
                           availability_quality, source,
                           ROW_NUMBER() OVER (
                               PARTITION BY code, trade_date
-                              ORDER BY available_at DESC
+                              ORDER BY available_at DESC, ingested_at DESC, source ASC
                           ) AS version_rank
                    FROM security_daily_status
                    WHERE code = ANY($1)
@@ -1500,7 +1500,7 @@ impl MarketRepository {
                           availability_quality, source,
                           ROW_NUMBER() OVER (
                               PARTITION BY code, trade_date
-                              ORDER BY available_at DESC
+                              ORDER BY available_at DESC, ingested_at DESC, source ASC
                           ) AS version_rank
                    FROM security_daily_status
                    WHERE trade_date = $1
@@ -1713,7 +1713,7 @@ impl MarketRepository {
                           available_at, ingested_at, availability_quality, source,
                           ROW_NUMBER() OVER (
                               PARTITION BY code, trade_date
-                              ORDER BY available_at DESC
+                              ORDER BY available_at DESC, ingested_at DESC, source ASC
                           ) AS version_rank
                    FROM index_daily_bars
                    WHERE code = ANY($1)
