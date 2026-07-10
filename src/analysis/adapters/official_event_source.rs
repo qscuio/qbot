@@ -214,6 +214,7 @@ mod tests {
 
     use super::*;
     use crate::analysis::adapters::{EventSource, FetchedEvent};
+    use crate::config::test_env::ScopedEnvGuard;
 
     const OFFICIAL_FIXTURE: &str = r#"{
       "next_cursor": "cursor-2",
@@ -366,13 +367,22 @@ mod tests {
 
     #[test]
     fn from_config_treats_blank_data_proxy_from_env_as_no_proxy() {
-        std::env::set_var("TUSHARE_TOKEN", "test_token");
-        std::env::set_var("TELEGRAM_BOT_TOKEN", "123:abc");
-        std::env::set_var("OFFICIAL_EVENT_FEED_URL", "https://example.test/feed");
-        std::env::set_var("DATA_PROXY", "   ");
-        std::env::remove_var("OFFICIAL_EVENT_FEED_API_KEY");
-        std::env::remove_var("OFFICIAL_EVENT_SOURCE_ID");
-        std::env::remove_var("OFFICIAL_EVENT_STORE_FULL_CONTENT");
+        let env = ScopedEnvGuard::lock(&[
+            "TUSHARE_TOKEN",
+            "TELEGRAM_BOT_TOKEN",
+            "OFFICIAL_EVENT_FEED_URL",
+            "DATA_PROXY",
+            "OFFICIAL_EVENT_FEED_API_KEY",
+            "OFFICIAL_EVENT_SOURCE_ID",
+            "OFFICIAL_EVENT_STORE_FULL_CONTENT",
+        ]);
+        env.set_var("TUSHARE_TOKEN", "test_token");
+        env.set_var("TELEGRAM_BOT_TOKEN", "123:abc");
+        env.set_var("OFFICIAL_EVENT_FEED_URL", "https://example.test/feed");
+        env.set_var("DATA_PROXY", "   ");
+        env.remove_var("OFFICIAL_EVENT_FEED_API_KEY");
+        env.remove_var("OFFICIAL_EVENT_SOURCE_ID");
+        env.remove_var("OFFICIAL_EVENT_STORE_FULL_CONTENT");
 
         let config = Config::from_env().unwrap();
         assert_eq!(config.data_proxy, None);
@@ -382,25 +392,28 @@ mod tests {
             .expect("configured official source");
 
         assert_eq!(source.source_id(), "official:market_event");
-
-        std::env::remove_var("DATA_PROXY");
-        std::env::remove_var("OFFICIAL_EVENT_FEED_URL");
     }
 
     #[test]
     fn from_config_treats_blank_feed_url_from_env_as_disabled() {
-        std::env::set_var("TUSHARE_TOKEN", "test_token");
-        std::env::set_var("TELEGRAM_BOT_TOKEN", "123:abc");
-        std::env::set_var("OFFICIAL_EVENT_FEED_URL", "   ");
-        std::env::remove_var("OFFICIAL_EVENT_FEED_API_KEY");
-        std::env::remove_var("OFFICIAL_EVENT_SOURCE_ID");
-        std::env::remove_var("OFFICIAL_EVENT_STORE_FULL_CONTENT");
+        let env = ScopedEnvGuard::lock(&[
+            "TUSHARE_TOKEN",
+            "TELEGRAM_BOT_TOKEN",
+            "OFFICIAL_EVENT_FEED_URL",
+            "OFFICIAL_EVENT_FEED_API_KEY",
+            "OFFICIAL_EVENT_SOURCE_ID",
+            "OFFICIAL_EVENT_STORE_FULL_CONTENT",
+        ]);
+        env.set_var("TUSHARE_TOKEN", "test_token");
+        env.set_var("TELEGRAM_BOT_TOKEN", "123:abc");
+        env.set_var("OFFICIAL_EVENT_FEED_URL", "   ");
+        env.remove_var("OFFICIAL_EVENT_FEED_API_KEY");
+        env.remove_var("OFFICIAL_EVENT_SOURCE_ID");
+        env.remove_var("OFFICIAL_EVENT_STORE_FULL_CONTENT");
 
         let config = Config::from_env().unwrap();
         assert_eq!(config.official_event_feed_url, None);
         assert!(OfficialEventSource::from_config(&config).unwrap().is_none());
-
-        std::env::remove_var("OFFICIAL_EVENT_FEED_URL");
     }
 
     #[test]

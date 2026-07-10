@@ -101,21 +101,76 @@ fn optional_nonblank_env_var(name: &str) -> Option<String> {
 }
 
 #[cfg(test)]
+pub(crate) mod test_env {
+    use std::sync::{LazyLock, Mutex, MutexGuard};
+
+    static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    pub(crate) struct ScopedEnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl ScopedEnvGuard {
+        pub(crate) fn lock(names: &[&'static str]) -> Self {
+            let lock = ENV_MUTEX.lock().unwrap();
+            let saved = names
+                .iter()
+                .map(|name| (*name, std::env::var(name).ok()))
+                .collect();
+
+            Self { _lock: lock, saved }
+        }
+
+        pub(crate) fn set_var(&self, name: &str, value: &str) {
+            std::env::set_var(name, value);
+        }
+
+        pub(crate) fn remove_var(&self, name: &str) {
+            std::env::remove_var(name);
+        }
+    }
+
+    impl Drop for ScopedEnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in &self.saved {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use super::test_env::ScopedEnvGuard;
     use super::*;
 
     #[test]
     fn test_config_defaults() {
+        let env = ScopedEnvGuard::lock(&[
+            "TUSHARE_TOKEN",
+            "TELEGRAM_BOT_TOKEN",
+            "DATABASE_URL",
+            "REDIS_URL",
+            "OFFICIAL_EVENT_FEED_URL",
+            "OFFICIAL_EVENT_FEED_API_KEY",
+            "OFFICIAL_EVENT_SOURCE_ID",
+            "OFFICIAL_EVENT_STORE_FULL_CONTENT",
+        ]);
+
         // Only TUSHARE_TOKEN and TELEGRAM_BOT_TOKEN are required
         // DATABASE_URL and REDIS_URL have internal defaults
-        std::env::set_var("TUSHARE_TOKEN", "test_token");
-        std::env::set_var("TELEGRAM_BOT_TOKEN", "123:abc");
-        std::env::remove_var("DATABASE_URL");
-        std::env::remove_var("REDIS_URL");
-        std::env::remove_var("OFFICIAL_EVENT_FEED_URL");
-        std::env::remove_var("OFFICIAL_EVENT_FEED_API_KEY");
-        std::env::remove_var("OFFICIAL_EVENT_SOURCE_ID");
-        std::env::remove_var("OFFICIAL_EVENT_STORE_FULL_CONTENT");
+        env.set_var("TUSHARE_TOKEN", "test_token");
+        env.set_var("TELEGRAM_BOT_TOKEN", "123:abc");
+        env.remove_var("DATABASE_URL");
+        env.remove_var("REDIS_URL");
+        env.remove_var("OFFICIAL_EVENT_FEED_URL");
+        env.remove_var("OFFICIAL_EVENT_FEED_API_KEY");
+        env.remove_var("OFFICIAL_EVENT_SOURCE_ID");
+        env.remove_var("OFFICIAL_EVENT_STORE_FULL_CONTENT");
 
         let cfg = Config::from_env().unwrap();
         assert_eq!(cfg.tushare_token, "test_token");
@@ -130,10 +185,16 @@ mod tests {
 
     #[test]
     fn test_config_normalizes_blank_official_event_api_key() {
-        std::env::set_var("TUSHARE_TOKEN", "test_token");
-        std::env::set_var("TELEGRAM_BOT_TOKEN", "123:abc");
-        std::env::set_var("OFFICIAL_EVENT_FEED_URL", "https://example.test/feed");
-        std::env::set_var("OFFICIAL_EVENT_FEED_API_KEY", "   ");
+        let env = ScopedEnvGuard::lock(&[
+            "TUSHARE_TOKEN",
+            "TELEGRAM_BOT_TOKEN",
+            "OFFICIAL_EVENT_FEED_URL",
+            "OFFICIAL_EVENT_FEED_API_KEY",
+        ]);
+        env.set_var("TUSHARE_TOKEN", "test_token");
+        env.set_var("TELEGRAM_BOT_TOKEN", "123:abc");
+        env.set_var("OFFICIAL_EVENT_FEED_URL", "https://example.test/feed");
+        env.set_var("OFFICIAL_EVENT_FEED_API_KEY", "   ");
 
         let cfg = Config::from_env().unwrap();
 
@@ -142,8 +203,5 @@ mod tests {
             Some("https://example.test/feed")
         );
         assert_eq!(cfg.official_event_feed_api_key, None);
-
-        std::env::remove_var("OFFICIAL_EVENT_FEED_URL");
-        std::env::remove_var("OFFICIAL_EVENT_FEED_API_KEY");
     }
 }
