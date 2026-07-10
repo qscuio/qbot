@@ -53,7 +53,7 @@ A-share stock analysis bot. Fetches daily market data from Tushare, runs 24 sign
 | Path | Purpose |
 |------|---------|
 | `src/main.rs` | Boot sequence, `--run-now` flag |
-| `src/scheduler/mod.rs` | 5 cron jobs + reusable job functions |
+| `src/scheduler/mod.rs` | 8 cron jobs + reusable job functions |
 | `src/api/routes.rs` | REST API routes incl. job trigger endpoints |
 | `src/signals/` | All 24 signal detectors |
 | `src/services/` | Business logic (scanner, reports, limit-up, etc.) |

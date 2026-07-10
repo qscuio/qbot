@@ -14,7 +14,7 @@ use crate::data::types::Candle;
 use crate::error::{AppError, Result};
 use crate::storage::market_repository::{MarketRepository, PointInTimeDailyBarVersion};
 
-const MARKET_SNAPSHOT_VERSION: &str = "market-v1";
+pub const MARKET_SNAPSHOT_VERSION: &str = "market-v1";
 const MARKET_BREADTH_LOOKBACK: usize = 20;
 const MARKET_INDEX_CODES: &[&str] = &["000001.SH", "399001.SZ", "399006.SZ", "000688.SH"];
 

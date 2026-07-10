@@ -10,6 +10,7 @@ use axum::{
 use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::{json, Value};
 
+use crate::analysis::market_snapshot::MARKET_SNAPSHOT_VERSION;
 use crate::state::AppState;
 use crate::storage::market_repository::{
     POINT_IN_TIME_BACKFILL_RUN_TYPE, POINT_IN_TIME_CAPABILITY_PROBE_RUN_TYPE,
@@ -17,7 +18,6 @@ use crate::storage::market_repository::{
 };
 
 type ApiResult = std::result::Result<Json<Value>, (StatusCode, Json<Value>)>;
-const MARKET_SNAPSHOT_VERSION: &str = "market-v1";
 
 pub fn analysis_router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -59,43 +59,52 @@ async fn get_analysis_data_status(
 
     let capability_failures = capability_failures(capability_status.as_ref());
     let estimated_counts = estimated_row_counts(&refresh_runs);
-    let refresh_complete = refresh_runs
-        .iter()
-        .any(|run| run.run_type == POINT_IN_TIME_TRADE_DATE_REFRESH_RUN_TYPE && run.status == "ok");
 
     let (
         trade_date,
+        snapshot_trade_date,
         snapshot_version,
         data_complete,
         missing_inputs,
+        missing_input_count,
         available_at,
         input_fingerprint,
         snapshot_present,
     ) = match snapshot {
         Some(snapshot) => (
             json!(snapshot.trade_date),
+            Some(snapshot.trade_date),
             json!(snapshot.snapshot_version),
             snapshot.data_complete,
             json!(snapshot.missing_inputs),
+            json!(snapshot.missing_inputs.len()),
             json!(snapshot.available_at),
             json!(snapshot.input_fingerprint),
             true,
         ),
         None => (
             Value::Null,
+            None,
             json!(MARKET_SNAPSHOT_VERSION),
             false,
-            json!([]),
+            Value::Null,
+            Value::Null,
             Value::Null,
             Value::Null,
             false,
         ),
     };
 
+    let refresh_complete = snapshot_trade_date.is_some_and(|snapshot_trade_date| {
+        refresh_runs.iter().any(|run| {
+            run.run_type == POINT_IN_TIME_TRADE_DATE_REFRESH_RUN_TYPE
+                && run.status == "ok"
+                && run.trade_date == Some(snapshot_trade_date)
+        })
+    });
     let capabilities_complete = capability_status
         .as_ref()
         .is_some_and(|status| status.status == "ok" && capability_failures.is_empty());
-    let missing_input_count = missing_inputs.as_array().map_or(0, |items| items.len());
 
     Ok(Json(json!({
         "tradeDate": trade_date,
@@ -183,6 +192,7 @@ struct DataStatusSnapshot {
 #[derive(Debug)]
 struct AnalysisRunSummary {
     run_type: String,
+    trade_date: Option<NaiveDate>,
     status: String,
     details: Value,
     error_message: Option<String>,
@@ -257,13 +267,14 @@ async fn latest_analysis_runs(
     for run_type in run_types {
         let row: Option<(
             String,
+            Option<NaiveDate>,
             String,
             Value,
             Option<String>,
             DateTime<Utc>,
             Option<DateTime<Utc>>,
         )> = sqlx::query_as(
-            r#"SELECT run_type, status, details, error_message, started_at, completed_at
+            r#"SELECT run_type, trade_date, status, details, error_message, started_at, completed_at
                FROM analysis_data_runs
                WHERE run_type = $1
                ORDER BY started_at DESC
@@ -273,9 +284,19 @@ async fn latest_analysis_runs(
         .fetch_optional(&state.db)
         .await?;
 
-        if let Some((run_type, status, details, error_message, started_at, completed_at)) = row {
+        if let Some((
+            run_type,
+            trade_date,
+            status,
+            details,
+            error_message,
+            started_at,
+            completed_at,
+        )) = row
+        {
             runs.push(AnalysisRunSummary {
                 run_type,
+                trade_date,
                 status,
                 details,
                 error_message,
@@ -475,6 +496,103 @@ mod tests {
             payload["estimatedRowCounts"]["sensitivityExcludesEstimated"],
             true
         );
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn data_status_does_not_guess_missing_inputs_without_snapshot(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let state = test_state(pool.clone()).await;
+        let repo = MarketRepository::new(pool.clone());
+        repo.record_analysis_data_run(
+            POINT_IN_TIME_TRADE_DATE_REFRESH_RUN_TYPE,
+            Some(date(2026, 7, 10)),
+            "ok",
+            json!({"estimated_rows": 7}),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut router = analysis_router(state);
+        let response = router
+            .call(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/analysis/data-status")
+                    .header(header::AUTHORIZATION, "Bearer test-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(payload["tradeDate"], Value::Null);
+        assert_eq!(payload["missingInputs"], Value::Null);
+        assert_eq!(payload["completeness"]["snapshotPresent"], false);
+        assert_eq!(payload["completeness"]["pointInTimeRefreshComplete"], false);
+        assert_eq!(payload["completeness"]["missingInputCount"], Value::Null);
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn data_status_scopes_refresh_completeness_to_snapshot_trade_date(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let state = test_state(pool.clone()).await;
+        let repo = MarketRepository::new(pool.clone());
+        let snapshot_trade_date = date(2026, 7, 10);
+        repo.save_market_snapshot(&MarketSnapshot {
+            trade_date: snapshot_trade_date,
+            snapshot_version: "market-v1".to_string(),
+            available_at: Utc.with_ymd_and_hms(2026, 7, 10, 9, 30, 0).unwrap(),
+            data_complete: true,
+            metrics: json!({"breadth": {"up_count": 12}}),
+            missing_inputs: Vec::new(),
+            input_fingerprint: "abc123".to_string(),
+        })
+        .await
+        .unwrap();
+        repo.record_analysis_data_run(
+            POINT_IN_TIME_TRADE_DATE_REFRESH_RUN_TYPE,
+            Some(date(2026, 7, 11)),
+            "ok",
+            json!({"estimated_rows": 7}),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut router = analysis_router(state);
+        let response = router
+            .call(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/analysis/data-status")
+                    .header(header::AUTHORIZATION, "Bearer test-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(payload["tradeDate"], "2026-07-10");
+        assert_eq!(payload["completeness"]["pointInTimeRefreshComplete"], false);
 
         Ok(())
     }

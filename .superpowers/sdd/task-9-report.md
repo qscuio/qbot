@@ -58,3 +58,41 @@
 
 **Concerns**
 - The exact full-test command fails because `config::tests::test_config_defaults` removes `DATABASE_URL` from the shared process environment, after which SQLx tests cannot create test databases. This was left unchanged because it is outside Task 9 scope. Focused Task 9 tests and formatting/diff verification pass.
+
+---
+
+### Task 9 Review Fix Follow-up
+
+**Fix summary**
+- Scoped `completeness.pointInTimeRefreshComplete` to a successful latest trade-date refresh run whose `analysis_data_runs.trade_date` matches the returned snapshot `tradeDate`.
+- Returned explicit JSON `null` for `missingInputs` and `completeness.missingInputCount` when no persisted market snapshot exists.
+- Reused the exported `MARKET_SNAPSHOT_VERSION` from the market snapshot builder.
+- Updated the README key-file summary from 5 scheduler cron jobs to 8.
+
+**RED evidence**
+- Command: `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test --locked api::analysis_routes::tests -- --nocapture`
+- Result: FAIL as expected, 2 passed and 2 failed:
+  - `data_status_does_not_guess_missing_inputs_without_snapshot` saw `missingInputs: []` instead of `null`.
+  - `data_status_scopes_refresh_completeness_to_snapshot_trade_date` saw `pointInTimeRefreshComplete: true` for a latest refresh run with a different `trade_date`.
+
+**GREEN evidence**
+- Command: `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test --locked api::analysis_routes::tests -- --nocapture`
+  - Result: PASS, 4 passed.
+- Command: `cargo test --locked scheduler::tests -- --nocapture`
+  - Result: PASS, 3 passed.
+
+**Verification results**
+- Command: `cargo fmt --all -- --check`
+  - Result: PASS.
+- Command: `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test --all --locked -- --skip config::tests::test_config_defaults`
+  - Result: PASS, 144 passed and 1 filtered out.
+- Command: `cargo test --all --locked config::tests::test_config_defaults`
+  - Result: PASS, 1 passed and 144 filtered out.
+- Command: `git diff --check`
+  - Result: PASS.
+
+**Files changed**
+- `.superpowers/sdd/task-9-report.md`
+- `README.md`
+- `src/analysis/market_snapshot/builder.rs`
+- `src/api/analysis_routes.rs`
