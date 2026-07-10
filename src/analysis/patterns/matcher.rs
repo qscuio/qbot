@@ -688,22 +688,28 @@ pub fn evaluate_pattern(
         .filter(|_| invalidations.is_empty())
         .map(final_score)
         .unwrap_or(0.0);
-    let base_shadow_tier = match (
+    let (base_shadow_tier, base_pattern_match_satisfied) = match (
         model.similarity_thresholds.get("shadow_a").copied(),
         model.similarity_thresholds.get("shadow_b").copied(),
     ) {
-        (Some(shadow_a_threshold), Some(shadow_b_threshold)) => rank_candidate(
-            similarity_score,
-            validation,
-            shadow_a_threshold,
-            shadow_b_threshold,
-            !invalidations.is_empty(),
-            score_evaluation.context_complete,
-            score_evaluation.market_state_satisfied,
+        (Some(shadow_a_threshold), Some(shadow_b_threshold)) => (
+            rank_candidate(
+                similarity_score,
+                validation,
+                shadow_a_threshold,
+                !invalidations.is_empty(),
+                score_evaluation.context_complete,
+                score_evaluation.market_state_satisfied,
+            ),
+            invalidations.is_empty() && similarity_score >= shadow_b_threshold,
         ),
-        _ => ShadowTier::Reject,
+        _ => (ShadowTier::Reject, false),
     };
-    let shadow_tier = apply_risk_tier(base_shadow_tier, &risk_conditions);
+    let shadow_tier = apply_risk_tier(
+        base_shadow_tier,
+        &risk_conditions,
+        base_pattern_match_satisfied,
+    );
 
     PatternEvaluation {
         similarity_score,
@@ -790,7 +796,6 @@ fn evaluate_score_components(
             extension_penalty,
             liquidity_penalty,
             data_quality_penalty,
-            risk_adjustment: risk_multiplier,
         }),
         _ => None,
     };
@@ -983,20 +988,39 @@ fn risk_score_multiplier(risk_conditions: &[ConditionEvaluation]) -> f64 {
     }
 }
 
-fn apply_risk_tier(shadow_tier: ShadowTier, risk_conditions: &[ConditionEvaluation]) -> ShadowTier {
-    match (
-        has_triggered_or_unevaluable_risk(risk_conditions),
-        shadow_tier,
-    ) {
-        (true, ShadowTier::ShadowA | ShadowTier::ShadowB) => ShadowTier::Watch,
-        _ => shadow_tier,
+fn apply_risk_tier(
+    shadow_tier: ShadowTier,
+    risk_conditions: &[ConditionEvaluation],
+    base_pattern_match_satisfied: bool,
+) -> ShadowTier {
+    if shadow_tier == ShadowTier::Reject {
+        return ShadowTier::Reject;
     }
+    if has_triggered_risk(risk_conditions) && base_pattern_match_satisfied {
+        return ShadowTier::ShadowB;
+    }
+    if has_unevaluable_risk(risk_conditions) && shadow_tier == ShadowTier::ShadowA {
+        return ShadowTier::Watch;
+    }
+    shadow_tier
 }
 
 fn has_triggered_or_unevaluable_risk(risk_conditions: &[ConditionEvaluation]) -> bool {
     risk_conditions
         .iter()
         .any(|condition| condition.passed == Some(true) || condition.passed.is_none())
+}
+
+fn has_triggered_risk(risk_conditions: &[ConditionEvaluation]) -> bool {
+    risk_conditions
+        .iter()
+        .any(|condition| condition.passed == Some(true))
+}
+
+fn has_unevaluable_risk(risk_conditions: &[ConditionEvaluation]) -> bool {
+    risk_conditions
+        .iter()
+        .any(|condition| condition.passed.is_none())
 }
 
 fn set_supporting_shadow_tier(payload: &mut Value, shadow_tier: ShadowTier) {
@@ -2195,11 +2219,21 @@ mod tests {
     }
 
     #[test]
-    fn high_similarity_without_release_gate_is_not_shadow_a() {
-        let model = PatternModelPayload::from_value(fixture_payload()).unwrap();
+    fn high_similarity_without_release_gate_is_watch_without_observable_risk() {
+        let mut payload = fixture_payload();
+        payload["required_features"] = json!([
+            "return_20d",
+            "relative_strength_20d",
+            "distance_from_20d_low"
+        ]);
+        payload["scaler_mean"]["distance_from_20d_low"] = json!(0.0);
+        payload["scaler_scale"]["distance_from_20d_low"] = json!(1.0);
+        payload["centroid"]["distance_from_20d_low"] = json!(0.10);
+        let model = PatternModelPayload::from_value(payload).unwrap();
         let features = BTreeMap::from([
             ("return_20d".to_string(), 0.20),
             ("relative_strength_20d".to_string(), 1.30),
+            ("distance_from_20d_low".to_string(), 0.15),
         ]);
         let validation = validation_payload(false, 2.0);
 
@@ -2210,16 +2244,25 @@ mod tests {
             &complete_score_context("600000.SH", 21),
         );
 
-        assert_ne!(candidate.shadow_tier, ShadowTier::ShadowA);
-        assert_eq!(candidate.shadow_tier, ShadowTier::ShadowB);
+        assert_eq!(candidate.shadow_tier, ShadowTier::Watch);
     }
 
     #[test]
-    fn high_similarity_with_inadequate_lift_is_not_shadow_a() {
-        let model = PatternModelPayload::from_value(fixture_payload()).unwrap();
+    fn high_similarity_with_inadequate_lift_is_watch_without_observable_risk() {
+        let mut payload = fixture_payload();
+        payload["required_features"] = json!([
+            "return_20d",
+            "relative_strength_20d",
+            "distance_from_20d_low"
+        ]);
+        payload["scaler_mean"]["distance_from_20d_low"] = json!(0.0);
+        payload["scaler_scale"]["distance_from_20d_low"] = json!(1.0);
+        payload["centroid"]["distance_from_20d_low"] = json!(0.10);
+        let model = PatternModelPayload::from_value(payload).unwrap();
         let features = BTreeMap::from([
             ("return_20d".to_string(), 0.20),
             ("relative_strength_20d".to_string(), 1.30),
+            ("distance_from_20d_low".to_string(), 0.15),
         ]);
         let validation = validation_payload(true, 1.0);
 
@@ -2230,8 +2273,7 @@ mod tests {
             &complete_score_context("600000.SH", 21),
         );
 
-        assert_ne!(candidate.shadow_tier, ShadowTier::ShadowA);
-        assert_eq!(candidate.shadow_tier, ShadowTier::ShadowB);
+        assert_eq!(candidate.shadow_tier, ShadowTier::Watch);
     }
 
     #[test]
@@ -2447,14 +2489,13 @@ mod tests {
         assert_eq!(components["context_complete"], json!(true));
         assert_eq!(components["market_state_satisfied"], json!(true));
         let expected = components["validated_pattern_strength"].as_f64().unwrap()
-            * components["current_similarity"].as_f64().unwrap()
-            * components["relative_strength"].as_f64().unwrap()
-            * components["sector_confirmation"].as_f64().unwrap()
-            * components["market_regime"].as_f64().unwrap()
-            * (1.0 - components["extension_penalty"].as_f64().unwrap())
-            * (1.0 - components["liquidity_penalty"].as_f64().unwrap())
-            * (1.0 - components["data_quality_penalty"].as_f64().unwrap())
-            * components["risk_adjustment"].as_f64().unwrap();
+            + components["current_similarity"].as_f64().unwrap()
+            + components["relative_strength"].as_f64().unwrap()
+            + components["sector_confirmation"].as_f64().unwrap()
+            + components["market_regime"].as_f64().unwrap()
+            - components["extension_penalty"].as_f64().unwrap()
+            - components["liquidity_penalty"].as_f64().unwrap()
+            - components["data_quality_penalty"].as_f64().unwrap();
         assert_close(candidate.final_score, expected);
     }
 
@@ -2841,8 +2882,16 @@ mod tests {
     }
 
     #[test]
-    fn triggered_risk_condition_demotes_shadow_a_to_watch_and_reduces_score() {
+    fn triggered_risk_condition_classifies_otherwise_shadow_a_as_shadow_b_without_reducing_score() {
         let mut payload = fixture_payload();
+        payload["required_features"] = json!([
+            "return_20d",
+            "relative_strength_20d",
+            "distance_from_20d_low"
+        ]);
+        payload["scaler_mean"]["distance_from_20d_low"] = json!(0.0);
+        payload["scaler_scale"]["distance_from_20d_low"] = json!(1.0);
+        payload["centroid"]["distance_from_20d_low"] = json!(0.10);
         payload["risk_conditions"] = json!([
             {"column": "return_20d", "operator": ">=", "value": 0.1}
         ]);
@@ -2850,6 +2899,7 @@ mod tests {
         let features = BTreeMap::from([
             ("return_20d".to_string(), 0.20),
             ("relative_strength_20d".to_string(), 1.30),
+            ("distance_from_20d_low".to_string(), 0.15),
         ]);
         let validation = validation_payload(true, 2.0);
 
@@ -2860,8 +2910,17 @@ mod tests {
             &complete_score_context("600000.SH", 21),
         );
 
-        assert_eq!(candidate.shadow_tier, ShadowTier::Watch);
-        assert!(candidate.final_score < 2.0);
+        assert_eq!(candidate.shadow_tier, ShadowTier::ShadowB);
+        let components = &candidate.supporting_signals["score_components"];
+        let expected = components["validated_pattern_strength"].as_f64().unwrap()
+            + components["current_similarity"].as_f64().unwrap()
+            + components["relative_strength"].as_f64().unwrap()
+            + components["sector_confirmation"].as_f64().unwrap()
+            + components["market_regime"].as_f64().unwrap()
+            - components["extension_penalty"].as_f64().unwrap()
+            - components["liquidity_penalty"].as_f64().unwrap()
+            - components["data_quality_penalty"].as_f64().unwrap();
+        assert_close(candidate.final_score, expected);
         assert_eq!(
             candidate.risk_flags["triggered"][0]["status"],
             Value::String("evaluated".to_string())
@@ -2876,8 +2935,16 @@ mod tests {
     }
 
     #[test]
-    fn unevaluable_risk_condition_demotes_shadow_a_reduces_score_and_is_explicit_in_payloads() {
+    fn unevaluable_risk_condition_demotes_shadow_a_to_watch_without_reducing_score() {
         let mut payload = fixture_payload();
+        payload["required_features"] = json!([
+            "return_20d",
+            "relative_strength_20d",
+            "distance_from_20d_low"
+        ]);
+        payload["scaler_mean"]["distance_from_20d_low"] = json!(0.0);
+        payload["scaler_scale"]["distance_from_20d_low"] = json!(1.0);
+        payload["centroid"]["distance_from_20d_low"] = json!(0.10);
         payload["risk_conditions"] = json!([
             {"column": "missing_feature", "operator": ">=", "value": 0.1}
         ]);
@@ -2885,6 +2952,7 @@ mod tests {
         let features = BTreeMap::from([
             ("return_20d".to_string(), 0.20),
             ("relative_strength_20d".to_string(), 1.30),
+            ("distance_from_20d_low".to_string(), 0.15),
         ]);
         let validation = validation_payload(true, 2.0);
 
@@ -2897,7 +2965,16 @@ mod tests {
 
         assert_ne!(candidate.shadow_tier, ShadowTier::ShadowA);
         assert_eq!(candidate.shadow_tier, ShadowTier::Watch);
-        assert!(candidate.final_score < 2.0);
+        let components = &candidate.supporting_signals["score_components"];
+        let expected = components["validated_pattern_strength"].as_f64().unwrap()
+            + components["current_similarity"].as_f64().unwrap()
+            + components["relative_strength"].as_f64().unwrap()
+            + components["sector_confirmation"].as_f64().unwrap()
+            + components["market_regime"].as_f64().unwrap()
+            - components["extension_penalty"].as_f64().unwrap()
+            - components["liquidity_penalty"].as_f64().unwrap()
+            - components["data_quality_penalty"].as_f64().unwrap();
+        assert_close(candidate.final_score, expected);
         assert_eq!(
             candidate.supporting_signals["score_components"]["risk_adjustment"],
             json!(0.5)

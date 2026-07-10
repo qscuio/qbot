@@ -14,7 +14,6 @@ pub struct ScoreComponents {
     pub extension_penalty: f64,
     pub liquidity_penalty: f64,
     pub data_quality_penalty: f64,
-    pub risk_adjustment: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,21 +38,19 @@ impl ShadowTier {
 
 pub fn final_score(components: &ScoreComponents) -> f64 {
     components.validated_pattern_strength
-        * components.current_similarity
-        * components.relative_strength
-        * components.sector_confirmation
-        * components.market_regime
-        * (1.0 - components.extension_penalty)
-        * (1.0 - components.liquidity_penalty)
-        * (1.0 - components.data_quality_penalty)
-        * components.risk_adjustment
+        + components.current_similarity
+        + components.relative_strength
+        + components.sector_confirmation
+        + components.market_regime
+        - components.extension_penalty
+        - components.liquidity_penalty
+        - components.data_quality_penalty
 }
 
 pub fn rank_candidate(
     similarity: f64,
     validation: &ValidationPayload,
     shadow_a_threshold: f64,
-    shadow_b_threshold: f64,
     has_invalidations: bool,
     score_context_complete: bool,
     market_state_satisfied: bool,
@@ -69,9 +66,6 @@ pub fn rank_candidate(
         && market_state_satisfied
     {
         return ShadowTier::ShadowA;
-    }
-    if similarity >= shadow_b_threshold {
-        return ShadowTier::ShadowB;
     }
     ShadowTier::Watch
 }
