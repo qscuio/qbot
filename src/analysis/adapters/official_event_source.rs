@@ -9,6 +9,7 @@ use crate::config::Config;
 use crate::error::{AppError, Result};
 
 const OFFICIAL_MARKET_EVENT_SOURCE_ID: &str = "official:market_event";
+const OFFICIAL_EVENT_SOURCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 pub struct OfficialEventSource {
     source_id: &'static str,
@@ -33,6 +34,7 @@ impl OfficialEventSource {
             } else {
                 ContentRetentionPolicy::StoreSummaryOnly
             },
+            config.data_proxy.as_deref(),
         )
         .map(Some)
     }
@@ -42,6 +44,7 @@ impl OfficialEventSource {
         feed_url: String,
         api_key: Option<String>,
         retention_policy: ContentRetentionPolicy,
+        data_proxy: Option<&str>,
     ) -> Result<Self> {
         let source_id = supported_source_id(source_id.as_ref())?;
         let feed_url = Url::parse(&feed_url).map_err(|error| {
@@ -55,7 +58,7 @@ impl OfficialEventSource {
             feed_url,
             api_key,
             retention_policy,
-            client: Client::new(),
+            client: build_client(data_proxy)?,
         })
     }
 
@@ -143,6 +146,25 @@ struct OfficialFeedResponse {
     items: Vec<Value>,
 }
 
+fn build_client(data_proxy: Option<&str>) -> Result<Client> {
+    let mut builder = Client::builder().timeout(OFFICIAL_EVENT_SOURCE_TIMEOUT);
+
+    if let Some(proxy_url) = data_proxy {
+        let proxy = reqwest::Proxy::all(proxy_url).map_err(|error| {
+            AppError::Config(format!(
+                "DATA_PROXY must be a valid proxy URL for official event source: {error}"
+            ))
+        })?;
+        builder = builder.proxy(proxy);
+    }
+
+    builder.build().map_err(|error| {
+        AppError::Config(format!(
+            "failed to build official event source HTTP client: {error}"
+        ))
+    })
+}
+
 fn supported_source_id(source_id: &str) -> Result<&'static str> {
     match source_id {
         OFFICIAL_MARKET_EVENT_SOURCE_ID => Ok(OFFICIAL_MARKET_EVENT_SOURCE_ID),
@@ -186,7 +208,9 @@ mod tests {
     use axum::{http::header, routing::get, Router};
     use chrono::{TimeZone, Utc};
     use serde_json::Value;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::{net::TcpListener, task::JoinHandle};
+    use tokio::{net::TcpStream, sync::oneshot};
 
     use super::*;
     use crate::analysis::adapters::{EventSource, FetchedEvent};
@@ -213,6 +237,7 @@ mod tests {
             "https://example.test/feed".to_string(),
             Some("secret".to_string()),
             ContentRetentionPolicy::StoreFullContent,
+            None,
         )
         .unwrap();
 
@@ -257,6 +282,7 @@ mod tests {
             "https://example.test/feed".to_string(),
             None,
             ContentRetentionPolicy::StoreSummaryOnly,
+            None,
         )
         .unwrap();
 
@@ -321,12 +347,31 @@ mod tests {
     }
 
     #[test]
+    fn from_config_rejects_invalid_data_proxy() {
+        let mut config = base_config();
+        config.data_proxy = Some("not a proxy url".to_string());
+
+        match OfficialEventSource::from_config(&config) {
+            Err(AppError::Config(message)) => {
+                assert!(
+                    message
+                        .contains("DATA_PROXY must be a valid proxy URL for official event source"),
+                    "unexpected config error: {message}"
+                );
+            }
+            Ok(_) => panic!("expected config error, got Ok result"),
+            Err(other) => panic!("expected config error, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_response_body_filters_items_after_until_cutoff() {
         let source = OfficialEventSource::new(
             "official:market_event",
             "https://example.test/feed".to_string(),
             None,
             ContentRetentionPolicy::StoreFullContent,
+            None,
         )
         .unwrap();
 
@@ -349,6 +394,7 @@ mod tests {
             feed_url,
             Some("secret".to_string()),
             ContentRetentionPolicy::StoreSummaryOnly,
+            None,
         )
         .unwrap();
 
@@ -366,6 +412,38 @@ mod tests {
 
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn fetch_uses_data_proxy_from_config() {
+        let (proxy_url, captured_request, server) = spawn_proxy_server().await;
+        let mut config = base_config();
+        config.data_proxy = Some(proxy_url);
+        config.official_event_feed_url = Some("http://official-feed.invalid/feed".to_string());
+        config.official_event_store_full_content = false;
+
+        let source = OfficialEventSource::from_config(&config)
+            .unwrap()
+            .expect("configured official source");
+
+        let batch = source
+            .fetch(None, Utc.with_ymd_and_hms(2026, 7, 10, 9, 0, 0).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(batch.items.len(), 1);
+        assert_eq!(
+            batch.items[0].content.as_deref(),
+            Some("Exchange confirms normal trading conditions.")
+        );
+
+        let request = captured_request.await.unwrap();
+        assert!(
+            request.starts_with("GET http://official-feed.invalid/feed?until="),
+            "expected absolute-form proxy request, got: {request}"
+        );
+
+        server.await.unwrap();
     }
 
     fn base_config() -> Config {
@@ -414,5 +492,46 @@ mod tests {
         });
 
         (format!("http://{addr}/feed"), server)
+    }
+
+    async fn spawn_proxy_server() -> (String, oneshot::Receiver<String>, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = oneshot::channel();
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut socket).await;
+            request_tx.send(request.clone()).unwrap();
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                OFFICIAL_FIXTURE.len(),
+                OFFICIAL_FIXTURE
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+
+        (format!("http://{addr}"), request_rx, server)
+    }
+
+    async fn read_http_request(socket: &mut TcpStream) -> String {
+        let mut buffer = Vec::new();
+
+        loop {
+            let mut chunk = [0_u8; 1024];
+            let bytes_read = socket.read(&mut chunk).await.unwrap();
+            if bytes_read == 0 {
+                break;
+            }
+
+            buffer.extend_from_slice(&chunk[..bytes_read]);
+            if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        String::from_utf8(buffer).unwrap()
     }
 }
