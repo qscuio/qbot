@@ -113,7 +113,7 @@ impl ManualEvidenceIngestor {
         }
 
         let representative = insert_result.existing_rows[0].clone();
-        let duplicate_group_id = insert_result
+        insert_result
             .duplicate_group_id
             .expect("duplicate submissions must record a duplicate group");
 
@@ -121,7 +121,6 @@ impl ManualEvidenceIngestor {
             ExistingEventEvidenceRelation {
                 submitted,
                 existing: event_evidence_from_row(&representative),
-                duplicate_group_id,
             },
         ))
     }
@@ -341,13 +340,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(same_hash.len(), 2);
+        let duplicate_group_id: Uuid = sqlx::query_scalar(
+            r#"SELECT duplicate_group_id
+               FROM market_event_duplicate_members
+               WHERE evidence_id = $1"#,
+        )
+        .bind(duplicate.submitted.evidence_id)
+        .fetch_one(&pool)
+        .await?;
 
         let group: (String, f64) = sqlx::query_as(
             r#"SELECT relation_type, confidence::float8
                FROM market_event_duplicate_groups
                WHERE duplicate_group_id = $1"#,
         )
-        .bind(duplicate.duplicate_group_id)
+        .bind(duplicate_group_id)
         .fetch_one(&pool)
         .await?;
         assert_eq!(group.0, "exact");
@@ -359,7 +366,7 @@ mod tests {
                WHERE duplicate_group_id = $1
                ORDER BY is_representative DESC, evidence_id ASC"#,
         )
-        .bind(duplicate.duplicate_group_id)
+        .bind(duplicate_group_id)
         .fetch_all(&pool)
         .await?;
         assert_eq!(members.len(), 2);
@@ -447,6 +454,35 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].title, "REST submitted event");
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn event_intelligence_public_constructor_wires_manual_event_submission(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let intelligence = EventIntelligence::new(pool.clone());
+
+        let evidence = assert_public_inserted(
+            intelligence
+                .submit_manual_event(ManualEventInput {
+                    title: " Public constructor event ".to_string(),
+                    content: Some("normalized  body".to_string()),
+                    source_url: Some("https://example.com/public-constructor".to_string()),
+                    submitted_by: "api-user".to_string(),
+                    published_at: None,
+                })
+                .await
+                .unwrap(),
+        );
+
+        let rows = EventRepository::new(pool)
+            .find_existing_source_item(&evidence.source_id, &evidence.source_item_id)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].title, "Public constructor event");
 
         Ok(())
     }

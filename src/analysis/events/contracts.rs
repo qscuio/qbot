@@ -33,7 +33,6 @@ pub struct EventEvidence {
 pub struct ExistingEventEvidenceRelation {
     pub submitted: EventEvidence,
     pub existing: EventEvidence,
-    pub duplicate_group_id: Uuid,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -134,6 +133,8 @@ fn next_open_weekday(mut date: NaiveDate) -> NaiveDate {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::PathBuf};
+
     use chrono::{NaiveDate, TimeZone, Utc};
 
     use super::{AShareTradingDateResolver, TradingDateResolver};
@@ -166,5 +167,21 @@ mod tests {
         let trade_date = resolver.effective_trade_date(available_at).unwrap();
 
         assert_eq!(trade_date, NaiveDate::from_ymd_opt(2026, 7, 13).unwrap());
+    }
+
+    #[test]
+    fn existing_event_evidence_relation_public_contract_hides_duplicate_group_id() {
+        let contracts_source = fs::read_to_string(contracts_source_path()).unwrap();
+        let struct_body = contracts_source
+            .split("pub struct ExistingEventEvidenceRelation {")
+            .nth(1)
+            .and_then(|body| body.split('}').next())
+            .expect("existing relation struct body");
+
+        assert!(!struct_body.contains("duplicate_group_id"));
+    }
+
+    fn contracts_source_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(file!())
     }
 }

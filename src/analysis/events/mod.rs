@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDate, Utc};
+use sqlx::PgPool;
 
 use self::evidence::{ManualEvidenceIngestor, ManualSource};
 use crate::error::{AppError, Result};
@@ -24,8 +25,11 @@ pub struct EventIntelligence {
 }
 
 impl EventIntelligence {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(pool: PgPool) -> Self {
+        Self::with_repository_and_resolver(
+            EventRepository::new(pool),
+            Arc::new(AShareTradingDateResolver),
+        )
     }
 
     pub async fn submit_manual_event(
@@ -65,13 +69,8 @@ impl EventIntelligence {
     }
 
     fn manual_ingestor(&self) -> Result<ManualEvidenceIngestor> {
-        let repo = self
-            .deps
-            .repo
-            .clone()
-            .ok_or_else(task_two_not_wired_error)?;
         Ok(ManualEvidenceIngestor::new(
-            repo,
+            self.deps.repo.clone(),
             Arc::clone(&self.deps.resolver),
         ))
     }
@@ -81,32 +80,16 @@ fn task_two_not_wired_error() -> AppError {
     AppError::Internal("event intelligence Task 2 interface is not wired yet".to_string())
 }
 
-impl Default for EventIntelligence {
-    fn default() -> Self {
-        Self {
-            deps: EventIntelligenceDependencies::unwired(),
-        }
-    }
-}
-
 struct EventIntelligenceDependencies {
-    repo: Option<EventRepository>,
+    repo: EventRepository,
     resolver: Arc<dyn TradingDateResolver>,
     _extractor: Arc<dyn EventExtractor>,
 }
 
 impl EventIntelligenceDependencies {
-    fn unwired() -> Self {
-        Self {
-            repo: None,
-            resolver: Arc::new(AShareTradingDateResolver),
-            _extractor: Arc::new(NoopEventExtractor),
-        }
-    }
-
     fn wired(event_repo: EventRepository, resolver: Arc<dyn TradingDateResolver>) -> Self {
         Self {
-            repo: Some(event_repo),
+            repo: event_repo,
             resolver,
             _extractor: Arc::new(NoopEventExtractor),
         }
@@ -126,7 +109,7 @@ mod tests {
 
     #[test]
     fn event_intelligence_exposes_a_small_public_constructor() {
-        let _ = EventIntelligence::new();
+        let _constructor: fn(sqlx::PgPool) -> EventIntelligence = EventIntelligence::new;
     }
 
     #[test]
@@ -135,13 +118,13 @@ mod tests {
 
         assert!(module_source
             .lines()
-            .any(|line| line.trim() == "pub fn new() -> Self {"));
+            .any(|line| line.trim() == "pub fn new(pool: PgPool) -> Self {"));
         assert!(!module_source
             .lines()
             .any(|line| line.trim_start().starts_with("pub trait EventExtractor")));
         assert!(!module_source
             .lines()
-            .any(|line| line.trim() == "repo: EventRepository,"));
+            .any(|line| line.trim() == "pub repo: EventRepository,"));
     }
 
     fn module_source_path() -> PathBuf {
