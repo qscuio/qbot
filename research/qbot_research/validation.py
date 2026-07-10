@@ -4,7 +4,7 @@ import calendar
 import statistics
 from dataclasses import dataclass
 from datetime import date
-from typing import Any, Literal, Sequence, cast
+from typing import Any, Sequence, cast
 
 import polars as pl
 
@@ -32,6 +32,7 @@ class ValidationConfig:
     code_column: str = "code"
     signal_column: str = "candidate_signal"
     score_column: str = "candidate_score"
+    validation_window_column: str = "validation_window"
     label_column: str = "is_positive"
     return_column: str = "future_return"
     market_excess_column: str = "future_market_excess"
@@ -42,9 +43,6 @@ class ValidationConfig:
     best_required_baseline_return: float = 0.0
     max_single_stock_contribution: float = 0.35
     max_single_period_contribution: float = 0.35
-
-
-ConditionOperator = Literal[">=", ">", "<=", "<", "==", "!="]
 
 
 def purged_walk_forward_splits(
@@ -125,14 +123,14 @@ def validate_archetype(
     candidate: dict[str, Any],
     config: ValidationConfig,
 ) -> dict[str, Any]:
-    working = _with_candidate_signal_and_score(frame, candidate, config)
     _require_columns(
-        working,
+        frame,
         (
             config.date_column,
             config.code_column,
             config.signal_column,
             config.score_column,
+            config.validation_window_column,
             config.label_column,
             config.return_column,
             config.market_excess_column,
@@ -143,7 +141,7 @@ def validate_archetype(
         "validate_archetype",
     )
 
-    rows = list(working.iter_rows(named=True))
+    rows = list(frame.iter_rows(named=True))
     metrics = _metrics_for_rows(rows, config)
     metrics["cluster_stability"] = _optional_float(candidate.get("stability_score"))
     majority_windows_positive_lift = _majority_windows_positive_lift(rows, config)
@@ -174,87 +172,6 @@ def validate_archetype(
         "candidate_status": "validated" if release_gate_passed else "draft",
     }
     return result
-
-
-def _with_candidate_signal_and_score(
-    frame: pl.DataFrame,
-    candidate: dict[str, Any],
-    config: ValidationConfig,
-) -> pl.DataFrame:
-    has_signal = config.signal_column in frame.columns
-    has_score = config.score_column in frame.columns
-    if has_signal and has_score:
-        return frame
-
-    expressions: list[pl.Series] = []
-    if not has_signal:
-        conditions = candidate.get("necessary_conditions")
-        if not isinstance(conditions, list) or not conditions:
-            raise ValueError(
-                f"validate_archetype missing required columns: {config.signal_column}"
-            )
-        expressions.append(pl.Series(config.signal_column, _evaluate_conditions(frame, conditions)))
-
-    if not has_score:
-        candidate_score_column = candidate.get("score_column")
-        if not isinstance(candidate_score_column, str):
-            raise ValueError(f"validate_archetype missing required columns: {config.score_column}")
-        _require_columns(frame, (candidate_score_column,), "validate_archetype")
-        expressions.append(
-            pl.Series(
-                config.score_column,
-                [_float_value(row, candidate_score_column) for row in frame.iter_rows(named=True)],
-            )
-        )
-
-    return frame.with_columns(expressions)
-
-
-def _evaluate_conditions(
-    frame: pl.DataFrame,
-    conditions: Sequence[Any],
-) -> list[bool]:
-    parsed_conditions: list[tuple[str, ConditionOperator, float | str | bool]] = []
-    for raw_condition in conditions:
-        if not isinstance(raw_condition, dict):
-            raise ValueError("candidate necessary_conditions must contain objects")
-        column = raw_condition.get("column")
-        operator = raw_condition.get("operator")
-        value = raw_condition.get("value")
-        if not isinstance(column, str) or not isinstance(operator, str):
-            raise ValueError("candidate condition requires column and operator")
-        if operator not in {">=", ">", "<=", "<", "==", "!="}:
-            raise ValueError(f"Unsupported candidate condition operator: {operator}")
-        _require_columns(frame, (column,), "validate_archetype")
-        parsed_conditions.append((column, cast(ConditionOperator, operator), cast(Any, value)))
-
-    signals: list[bool] = []
-    for row in frame.iter_rows(named=True):
-        signals.append(
-            all(
-                _condition_matches(row[column], operator, value)
-                for column, operator, value in parsed_conditions
-            )
-        )
-    return signals
-
-
-def _condition_matches(value: Any, operator: ConditionOperator, target: float | str | bool) -> bool:
-    if value is None:
-        raise ValueError("candidate condition columns must be non-null")
-    if operator == "==":
-        return bool(value == target)
-    if operator == "!=":
-        return bool(value != target)
-    numeric_value = float(value)
-    numeric_target = float(target)
-    if operator == ">=":
-        return numeric_value >= numeric_target
-    if operator == ">":
-        return numeric_value > numeric_target
-    if operator == "<=":
-        return numeric_value <= numeric_target
-    return numeric_value < numeric_target
 
 
 def _metrics_for_rows(rows: list[dict[str, Any]], config: ValidationConfig) -> dict[str, Any]:
@@ -365,17 +282,22 @@ def _group_results(
 
 
 def _majority_windows_positive_lift(rows: list[dict[str, Any]], config: ValidationConfig) -> bool:
-    by_date: dict[date, list[dict[str, Any]]] = {}
+    by_window: dict[Any, list[dict[str, Any]]] = {}
     for row in rows:
-        by_date.setdefault(_date_value(row, config.date_column), []).append(row)
-    if not by_date:
+        window = row[config.validation_window_column]
+        if window is None:
+            raise ValueError(
+                f"validate_archetype requires non-null values in '{config.validation_window_column}'"
+            )
+        by_window.setdefault(window, []).append(row)
+    if not by_window:
         return False
     positive_lift_count = 0
-    for group_rows in by_date.values():
+    for group_rows in by_window.values():
         metrics = _group_results(group_rows, config, lambda _: "window")["window"]
         if float(metrics["lift"]) > 1.0:
             positive_lift_count += 1
-    return positive_lift_count > len(by_date) / 2.0
+    return positive_lift_count > len(by_window) / 2.0
 
 
 def _precision_at(rows: list[dict[str, Any]], config: ValidationConfig, count: int) -> float:
@@ -489,7 +411,9 @@ def _bool_value(row: dict[str, Any], column: str) -> bool:
     value = row[column]
     if value is None:
         raise ValueError(f"validate_archetype requires non-null values in '{column}'")
-    return bool(value)
+    if not isinstance(value, bool):
+        raise ValueError(f"validate_archetype requires bool values in '{column}'")
+    return value
 
 
 def _date_value(row: dict[str, Any], column: str) -> date:

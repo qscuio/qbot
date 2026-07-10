@@ -140,7 +140,9 @@ def _scan_ranker_a(frame: pl.DataFrame) -> pl.DataFrame:
     signals: list[bool] = []
     scores: list[float] = []
     for row in frame.iter_rows(named=True):
-        pool_id = str(row["scan_ranker_pool_id"])
+        pool_id = row["scan_ranker_pool_id"]
+        if pool_id is None:
+            raise ValueError("scan_ranker_pool_id must be non-null")
         score = _float_value(row, "scan_ranker_score")
         signals.append(pool_id in SCAN_RANKER_A_POOLS)
         scores.append(score)

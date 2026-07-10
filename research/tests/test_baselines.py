@@ -38,6 +38,7 @@ def _baseline_frame() -> pl.DataFrame:
                     "prior_20d_high": 11.5 + index,
                     "scan_ranker_pool_id": "pool_mid_a" if strong else "pool_mid_b",
                     "scan_ranker_score": 88.0 if strong else 61.0,
+                    "validation_window": f"window-{trade_date.month}",
                     "is_positive": strong,
                     "future_return": 0.050 if strong else -0.010,
                     "future_market_excess": 0.040 if strong else -0.020,
@@ -156,3 +157,15 @@ def test_baseline_metrics_share_validation_result_schema() -> None:
 def test_baselines_reject_missing_required_columns() -> None:
     with pytest.raises(ValueError, match="scan_ranker_a missing required columns.*scan_ranker_score"):
         apply_baseline(_baseline_frame().drop("scan_ranker_score"), "scan_ranker_a")
+
+
+def test_scan_ranker_a_rejects_null_pool_ids() -> None:
+    frame = _baseline_frame().with_columns(
+        pl.when(pl.col("code") == "S00")
+        .then(pl.lit(None))
+        .otherwise(pl.col("scan_ranker_pool_id"))
+        .alias("scan_ranker_pool_id")
+    )
+
+    with pytest.raises(ValueError, match="scan_ranker_pool_id must be non-null"):
+        apply_baseline(frame, "scan_ranker_a")

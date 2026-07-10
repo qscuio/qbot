@@ -35,6 +35,7 @@ def _validation_frame() -> pl.DataFrame:
                     "code": code,
                     "candidate_signal": signal,
                     "candidate_score": score,
+                    "validation_window": f"window-{trade_date.month}",
                     "is_positive": is_positive,
                     "future_return": future_return,
                     "future_market_excess": future_return - 0.005,
@@ -68,19 +69,20 @@ def test_purged_walk_forward_splits_remove_overlapping_labels_and_add_embargo() 
     )
 
     assert splits
-    first_split = splits[0]
     date_positions = {trade_date: index for index, trade_date in enumerate(dates)}
-    validation_start_position = date_positions[first_split.validation_start]
 
-    assert first_split.train_dates
-    assert first_split.validation_dates
-    assert first_split.purge_dates
-    assert first_split.embargo_dates
-    assert len(first_split.embargo_dates) >= 20
-    assert first_split.embargo_dates[0] > first_split.validation_end
+    for split in splits:
+        validation_start_position = date_positions[split.validation_start]
 
-    for train_date in first_split.train_dates:
-        assert date_positions[train_date] + 20 < validation_start_position
+        assert split.train_dates
+        assert split.validation_dates
+        assert split.purge_dates
+        assert split.embargo_dates
+        assert len(split.embargo_dates) >= 20
+        assert split.embargo_dates[0] > split.validation_end
+
+        for train_date in split.train_dates:
+            assert date_positions[train_date] + 20 < validation_start_position
 
 
 def test_validate_archetype_returns_full_metric_payload_and_validates_release_gate() -> None:
@@ -164,7 +166,7 @@ def test_validate_archetype_rejects_missing_required_columns() -> None:
         )
 
 
-def test_validate_archetype_can_score_serializable_candidate_payload_conditions() -> None:
+def test_validate_archetype_requires_explicit_signal_and_score_columns() -> None:
     frame = _validation_frame().with_columns(pl.lit(1.5).alias("relative_strength_20d"))
     candidate: dict[str, Any] = {
         "archetype_id": "condition-only",
@@ -173,15 +175,109 @@ def test_validate_archetype_can_score_serializable_candidate_payload_conditions(
             {"column": "relative_strength_20d", "operator": ">=", "value": 1.0}
         ],
     }
+
+    with pytest.raises(
+        ValueError,
+        match="validate_archetype missing required columns.*candidate_signal.*candidate_score",
+    ):
+        validate_archetype(
+            frame.drop("candidate_signal").drop("candidate_score"),
+            candidate,
+            ValidationConfig(
+                best_required_baseline_return=-1.0,
+                max_single_stock_contribution=1.0,
+                max_single_period_contribution=1.0,
+            ),
+        )
+
+
+def test_validate_archetype_release_gate_uses_validation_windows_not_trade_dates() -> None:
+    rows: list[dict[str, object]] = []
+    for trade_date in [date(2026, 1, 2), date(2026, 1, 3), date(2026, 1, 4)]:
+        rows.extend(
+            [
+                {
+                    "trade_date": trade_date,
+                    "validation_window": "split_0",
+                    "code": "AAA",
+                    "candidate_signal": True,
+                    "candidate_score": 0.90,
+                    "is_positive": True,
+                    "future_return": 0.040,
+                    "future_market_excess": 0.035,
+                    "future_max_drawdown": -0.020,
+                    "amount": 100_000_000.0,
+                    "regime": "bull",
+                },
+                {
+                    "trade_date": trade_date,
+                    "validation_window": "split_0",
+                    "code": "BBB",
+                    "candidate_signal": False,
+                    "candidate_score": 0.10,
+                    "is_positive": False,
+                    "future_return": -0.010,
+                    "future_market_excess": -0.015,
+                    "future_max_drawdown": -0.050,
+                    "amount": 100_000_000.0,
+                    "regime": "bull",
+                },
+            ]
+        )
+    rows.extend(
+        [
+            {
+                "trade_date": date(2026, 2, 2),
+                "validation_window": "split_1",
+                "code": "AAA",
+                "candidate_signal": True,
+                "candidate_score": 0.90,
+                "is_positive": False,
+                "future_return": 0.040,
+                "future_market_excess": 0.035,
+                "future_max_drawdown": -0.020,
+                "amount": 100_000_000.0,
+                "regime": "bear",
+            },
+            {
+                "trade_date": date(2026, 2, 2),
+                "validation_window": "split_1",
+                "code": "BBB",
+                "candidate_signal": False,
+                "candidate_score": 0.10,
+                "is_positive": True,
+                "future_return": -0.010,
+                "future_market_excess": -0.015,
+                "future_max_drawdown": -0.050,
+                "amount": 100_000_000.0,
+                "regime": "bear",
+            },
+        ]
+    )
+
     result = validate_archetype(
-        frame.drop("candidate_signal").drop("candidate_score"),
-        candidate,
+        pl.DataFrame(rows),
+        {"archetype_id": "day-majority-window-minority"},
         ValidationConfig(
-            best_required_baseline_return=-1.0,
+            best_required_baseline_return=0.0,
             max_single_stock_contribution=1.0,
             max_single_period_contribution=1.0,
         ),
     )
 
-    assert result["candidate_id"] == "condition-only"
-    assert result["coverage"] == pytest.approx(1.0)
+    assert result["cost_adjusted_return"] > 0.0
+    assert result["majority_windows_positive_lift"] is False
+    assert result["release_gate_passed"] is False
+    assert result["candidate_status"] == "draft"
+
+
+def test_validate_archetype_rejects_string_encoded_booleans() -> None:
+    with pytest.raises(
+        ValueError,
+        match="validate_archetype requires bool values in 'candidate_signal'",
+    ):
+        validate_archetype(
+            _validation_frame().with_columns(pl.lit("false").alias("candidate_signal")),
+            {"archetype_id": "string-signal"},
+            _validation_config(),
+        )
