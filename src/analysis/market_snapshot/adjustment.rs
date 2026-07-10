@@ -9,10 +9,15 @@ pub fn adjust_candles(bars: &[Candle], factors: &[AdjustmentFactor]) -> Result<V
         .ok_or_else(|| AppError::Internal("missing adjustment factors".into()))?
         .adj_factor;
 
-    let by_date: std::collections::HashMap<_, _> = factors
-        .iter()
-        .map(|row| (row.trade_date, row.adj_factor))
-        .collect();
+    let mut by_date = std::collections::HashMap::with_capacity(factors.len());
+    for row in factors {
+        if by_date.insert(row.trade_date, row.adj_factor).is_some() {
+            return Err(AppError::Internal(format!(
+                "ambiguous adjustment factors: multiple rows for trade date {}",
+                row.trade_date
+            )));
+        }
+    }
 
     bars.iter()
         .map(|bar| {
@@ -114,5 +119,17 @@ mod tests {
         assert!(error
             .to_string()
             .contains("missing adjustment factor for 2026-07-08"));
+    }
+
+    #[test]
+    fn rejects_duplicate_adjustment_factors_for_same_trade_date() {
+        let error = adjust_candles(
+            &[candle("2026-07-08", 10.0, 11.0, 9.0, 10.5, 1000)],
+            &[factor("2026-07-08", 1.0), factor("2026-07-08", 2.0)],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("ambiguous adjustment factors"));
+        assert!(error.to_string().contains("2026-07-08"));
     }
 }
