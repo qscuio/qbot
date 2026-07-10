@@ -130,10 +130,15 @@ def discover_archetypes(
 
     for cluster_count in config.cluster_counts:
         if cluster_count >= candidates.height:
-            raise ValueError(
-                "cluster_counts must be smaller than the candidate family row count "
-                "for silhouette scoring"
-            )
+            for model_type in ("kmeans", "gmm"):
+                _reject_unsupported_cluster_count(
+                    pattern_type=pattern_type,
+                    model_type=model_type,
+                    cluster_count=cluster_count,
+                    candidate_row_count=candidates.height,
+                    result=result,
+                )
+            continue
         _fit_kmeans(
             pattern_type=pattern_type,
             scaled_matrix=scaled_matrix,
@@ -181,7 +186,26 @@ def _fit_kmeans(
     result: dict[str, Any],
 ) -> None:
     model = KMeans(n_clusters=cluster_count, random_state=config.random_seed, n_init=10)
-    labels = cast(IntVector, model.fit_predict(scaled_matrix))
+    labels = _labels(model.fit_predict(scaled_matrix))
+    if _reject_degenerate_labels(
+        pattern_type=pattern_type,
+        model_type="kmeans",
+        cluster_count=cluster_count,
+        labels=labels,
+        sample_count=scaled_matrix.shape[0],
+        result=result,
+    ):
+        return
+    cluster_sample_counts = _cluster_sample_counts(labels, cluster_count)
+    if _reject_tiny_clusters(
+        pattern_type=pattern_type,
+        model_type="kmeans",
+        cluster_count=cluster_count,
+        cluster_sample_counts=cluster_sample_counts,
+        config=config,
+        result=result,
+    ):
+        return
     silhouette = _silhouette(scaled_matrix, labels)
     stability_score = _kmeans_stability(scaled_matrix, labels, cluster_count, config)
     if _reject_unstable(
@@ -197,17 +221,7 @@ def _fit_kmeans(
     centers_scaled = cast(FloatMatrix, model.cluster_centers_)
     centers = _inverse_scale(centers_scaled, scaler, config.feature_columns)
     for cluster_id in range(cluster_count):
-        sample_count = int(np.count_nonzero(labels == cluster_id))
-        if _reject_tiny_cluster(
-            pattern_type=pattern_type,
-            model_type="kmeans",
-            cluster_count=cluster_count,
-            cluster_id=cluster_id,
-            sample_count=sample_count,
-            config=config,
-            result=result,
-        ):
-            continue
+        sample_count = cluster_sample_counts[cluster_id]
         center_scaled = centers_scaled[cluster_id]
         cast(list[dict[str, Any]], result["archetypes"]).append(
             {
@@ -247,7 +261,26 @@ def _fit_gmm(
         covariance_type="full",
         reg_covar=config.covariance_regularization,
     )
-    labels = cast(IntVector, model.fit_predict(scaled_matrix))
+    labels = _labels(model.fit_predict(scaled_matrix))
+    if _reject_degenerate_labels(
+        pattern_type=pattern_type,
+        model_type="gmm",
+        cluster_count=cluster_count,
+        labels=labels,
+        sample_count=scaled_matrix.shape[0],
+        result=result,
+    ):
+        return
+    cluster_sample_counts = _cluster_sample_counts(labels, cluster_count)
+    if _reject_tiny_clusters(
+        pattern_type=pattern_type,
+        model_type="gmm",
+        cluster_count=cluster_count,
+        cluster_sample_counts=cluster_sample_counts,
+        config=config,
+        result=result,
+    ):
+        return
     silhouette = _silhouette(scaled_matrix, labels)
     bic = _finite_float(model.bic(scaled_matrix), "bic")
     stability_score = _gmm_stability(scaled_matrix, labels, cluster_count, config)
@@ -266,17 +299,7 @@ def _fit_gmm(
     weights = cast(FloatMatrix, model.weights_)
     covariances = cast(npt.NDArray[np.float64], model.covariances_)
     for cluster_id in range(cluster_count):
-        sample_count = int(np.count_nonzero(labels == cluster_id))
-        if _reject_tiny_cluster(
-            pattern_type=pattern_type,
-            model_type="gmm",
-            cluster_count=cluster_count,
-            cluster_id=cluster_id,
-            sample_count=sample_count,
-            config=config,
-            result=result,
-        ):
-            continue
+        sample_count = cluster_sample_counts[cluster_id]
         mean_scaled = means_scaled[cluster_id]
         cast(list[dict[str, Any]], result["archetypes"]).append(
             {
@@ -300,7 +323,79 @@ def _fit_gmm(
                     config.high_contribution_feature_count,
                 ),
             }
+    )
+
+
+def _reject_unsupported_cluster_count(
+    *,
+    pattern_type: PatternType,
+    model_type: ModelType,
+    cluster_count: int,
+    candidate_row_count: int,
+    result: dict[str, Any],
+) -> None:
+    cast(list[dict[str, Any]], result["rejections"]).append(
+        {
+            "pattern_type": pattern_type,
+            "model_type": model_type,
+            "cluster_count": int(cluster_count),
+            "reason": "unsupported_cluster_count",
+            "candidate_row_count": int(candidate_row_count),
+            "max_supported_cluster_count": max(0, int(candidate_row_count) - 1),
+        }
+    )
+
+
+def _reject_degenerate_labels(
+    *,
+    pattern_type: PatternType,
+    model_type: ModelType,
+    cluster_count: int,
+    labels: IntVector,
+    sample_count: int,
+    result: dict[str, Any],
+) -> bool:
+    distinct_label_count = int(np.unique(labels).size)
+    if labels.shape[0] == sample_count and distinct_label_count == cluster_count:
+        return False
+    cast(list[dict[str, Any]], result["rejections"]).append(
+        {
+            "pattern_type": pattern_type,
+            "model_type": model_type,
+            "cluster_count": int(cluster_count),
+            "reason": "degenerate_labels",
+            "sample_count": int(sample_count),
+            "label_count": int(labels.shape[0]),
+            "distinct_label_count": distinct_label_count,
+        }
+    )
+    return True
+
+
+def _reject_tiny_clusters(
+    *,
+    pattern_type: PatternType,
+    model_type: ModelType,
+    cluster_count: int,
+    cluster_sample_counts: dict[int, int],
+    config: ArchetypeDiscoveryConfig,
+    result: dict[str, Any],
+) -> bool:
+    rejected = False
+    for cluster_id, sample_count in cluster_sample_counts.items():
+        rejected = (
+            _reject_tiny_cluster(
+                pattern_type=pattern_type,
+                model_type=model_type,
+                cluster_count=cluster_count,
+                cluster_id=cluster_id,
+                sample_count=sample_count,
+                config=config,
+                result=result,
+            )
+            or rejected
         )
+    return rejected
 
 
 def _reject_unstable(
@@ -401,8 +496,8 @@ def _validate_config(config: ArchetypeDiscoveryConfig) -> None:
         raise ValueError("min_cluster_size must be positive")
     if config.high_contribution_feature_count <= 0:
         raise ValueError("high_contribution_feature_count must be positive")
-    if config.stability_iterations <= 0:
-        raise ValueError("stability_iterations must be positive")
+    if config.stability_iterations < 2:
+        raise ValueError("stability_iterations must be at least 2")
     if not 0.0 <= config.min_stability_score <= 1.0:
         raise ValueError("min_stability_score must be between 0.0 and 1.0")
     if config.covariance_regularization <= 0.0:
@@ -467,6 +562,17 @@ def _inverse_scale(
 
 def _silhouette(scaled_matrix: FloatMatrix, labels: IntVector) -> float:
     return _finite_float(silhouette_score(scaled_matrix, labels), "silhouette")
+
+
+def _labels(labels: object) -> IntVector:
+    return np.asarray(labels, dtype=np.int_)
+
+
+def _cluster_sample_counts(labels: IntVector, cluster_count: int) -> dict[int, int]:
+    return {
+        cluster_id: int(np.count_nonzero(labels == cluster_id))
+        for cluster_id in range(cluster_count)
+    }
 
 
 def _feature_dict(values: npt.NDArray[np.float64], feature_columns: Sequence[str]) -> dict[str, float]:
