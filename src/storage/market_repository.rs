@@ -1474,6 +1474,76 @@ impl MarketRepository {
             .collect())
     }
 
+    pub async fn security_status_universe_as_of(
+        &self,
+        trade_date: NaiveDate,
+        as_of: DateTime<Utc>,
+    ) -> Result<Vec<SecurityDailyStatus>> {
+        let rows: Vec<(
+            String,
+            NaiveDate,
+            Option<i32>,
+            bool,
+            bool,
+            Option<f64>,
+            DateTime<Utc>,
+            DateTime<Utc>,
+            String,
+            String,
+        )> = sqlx::query_as(
+            r#"SELECT code, trade_date, listed_days, is_st, is_suspended,
+                      price_limit_pct::float8, available_at, ingested_at,
+                      availability_quality, source
+               FROM (
+                   SELECT code, trade_date, listed_days, is_st, is_suspended,
+                          price_limit_pct, available_at, ingested_at,
+                          availability_quality, source,
+                          ROW_NUMBER() OVER (
+                              PARTITION BY code, trade_date
+                              ORDER BY available_at DESC
+                          ) AS version_rank
+                   FROM security_daily_status
+                   WHERE trade_date = $1
+                     AND available_at <= $2
+               ) latest
+               WHERE version_rank = 1
+               ORDER BY code"#,
+        )
+        .bind(trade_date)
+        .bind(as_of)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    code,
+                    trade_date,
+                    listed_days,
+                    is_st,
+                    is_suspended,
+                    price_limit_pct,
+                    available_at,
+                    ingested_at,
+                    quality,
+                    source,
+                )| SecurityDailyStatus {
+                    code,
+                    trade_date,
+                    listed_days,
+                    is_st,
+                    is_suspended,
+                    price_limit_pct,
+                    available_at,
+                    ingested_at,
+                    availability_quality: parse_quality(&quality),
+                    source,
+                },
+            )
+            .collect())
+    }
+
     pub async fn active_sector_memberships(
         &self,
         code: &str,
@@ -1696,7 +1766,12 @@ impl MarketRepository {
                (trade_date, snapshot_version, available_at, data_complete, metrics,
                 missing_inputs, input_fingerprint)
                VALUES ($1, $2, $3, $4, $5, $6, $7)
-               ON CONFLICT (trade_date, snapshot_version) DO NOTHING"#,
+               ON CONFLICT (trade_date, snapshot_version) DO UPDATE
+               SET available_at = EXCLUDED.available_at,
+                   data_complete = EXCLUDED.data_complete,
+                   metrics = EXCLUDED.metrics,
+                   missing_inputs = EXCLUDED.missing_inputs,
+                   input_fingerprint = EXCLUDED.input_fingerprint"#,
         )
         .bind(snapshot.trade_date)
         .bind(&snapshot.snapshot_version)
@@ -2490,9 +2565,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn market_snapshot_save_is_idempotent_and_reads_original_snapshot(
-        pool: PgPool,
-    ) -> sqlx::Result<()> {
+    async fn market_snapshot_save_upserts_latest_snapshot(pool: PgPool) -> sqlx::Result<()> {
         let repo = MarketRepository::new(pool);
         let snapshot = MarketSnapshot {
             trade_date: date(2026, 7, 10),
@@ -2519,10 +2592,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(!saved.data_complete);
-        assert_eq!(saved.metrics, json!({"advancers": 123, "decliners": 456}));
-        assert_eq!(saved.missing_inputs, vec!["index_history".to_string()]);
-        assert_eq!(saved.input_fingerprint, "fingerprint-a");
+        assert!(saved.data_complete);
+        assert_eq!(saved.metrics, json!({"advancers": 999}));
+        assert!(saved.missing_inputs.is_empty());
+        assert_eq!(saved.input_fingerprint, "fingerprint-b");
 
         assert!(repo
             .market_snapshot(date(2026, 7, 10), "missing")

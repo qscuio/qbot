@@ -60,14 +60,6 @@ impl MarketSnapshotModule {
         trade_date: NaiveDate,
         as_of: DateTime<Utc>,
     ) -> Result<MarketSnapshotBuildResult> {
-        if let Some(snapshot) = self
-            .repo
-            .market_snapshot(trade_date, MARKET_SNAPSHOT_VERSION)
-            .await?
-        {
-            return Ok(MarketSnapshotBuildResult { snapshot });
-        }
-
         let bar_rows = self
             .repo
             .daily_bar_history_as_of(trade_date, as_of, MARKET_BREADTH_LOOKBACK as i64)
@@ -76,14 +68,27 @@ impl MarketSnapshotModule {
         for row in bar_rows {
             bars_by_code.entry(row.code.clone()).or_default().push(row);
         }
-        bars_by_code.retain(|_, rows| {
-            rows.last()
-                .is_some_and(|row| row.bar.trade_date == trade_date)
-        });
+        let current_bar_codes: BTreeSet<String> = bars_by_code
+            .iter()
+            .filter(|(_, rows)| {
+                rows.last()
+                    .is_some_and(|row| row.bar.trade_date == trade_date)
+            })
+            .map(|(code, _)| code.clone())
+            .collect();
 
-        if bars_by_code.is_empty() {
+        let status_rows = self
+            .repo
+            .security_status_universe_as_of(trade_date, as_of)
+            .await?;
+        let status_by_code: BTreeMap<String, SecurityDailyStatus> = status_rows
+            .into_iter()
+            .map(|row| (row.code.clone(), row))
+            .collect();
+
+        if current_bar_codes.is_empty() && status_by_code.is_empty() {
             return Err(AppError::NotFound(format!(
-                "no point-in-time daily bar versions for {} as of {}",
+                "no point-in-time daily bar versions or statuses for {} as of {}",
                 trade_date, as_of
             )));
         }
@@ -108,15 +113,6 @@ impl MarketSnapshotModule {
                 .insert(row.trade_date, row);
         }
 
-        let status_rows = self
-            .repo
-            .security_statuses_as_of(&codes, trade_date, as_of)
-            .await?;
-        let status_by_code: BTreeMap<String, SecurityDailyStatus> = status_rows
-            .into_iter()
-            .map(|row| (row.code.clone(), row))
-            .collect();
-
         let index_rows = self
             .repo
             .index_bars_as_of(
@@ -137,10 +133,56 @@ impl MarketSnapshotModule {
         let mut fingerprint_inputs = BTreeSet::new();
         let mut breadth_inputs = Vec::new();
 
+        for status in status_by_code.values() {
+            fingerprint_inputs.insert(fingerprint_component(
+                "security_daily_status",
+                &status.code,
+                status.trade_date,
+                &status.source,
+                status.available_at,
+                status.ingested_at,
+            ));
+
+            if !current_bar_codes.contains(&status.code) {
+                missing_inputs.insert(format!(
+                    "stock_daily_bar_versions:{}:{}",
+                    status.code, trade_date
+                ));
+            }
+        }
+
         for (code, rows) in &bars_by_code {
+            for row in rows {
+                fingerprint_inputs.insert(fingerprint_component(
+                    "stock_daily_bar_versions",
+                    &row.code,
+                    row.bar.trade_date,
+                    &row.source,
+                    row.available_at,
+                    row.ingested_at,
+                ));
+            }
+
+            if let Some(factors) = adjustments_by_code.get(code) {
+                for factor in factors.values() {
+                    fingerprint_inputs.insert(fingerprint_component(
+                        "stock_adjustment_factors",
+                        &factor.code,
+                        factor.trade_date,
+                        &factor.source,
+                        factor.available_at,
+                        factor.ingested_at,
+                    ));
+                }
+            }
+
             let status = status_by_code.get(code);
             if status.is_none() {
                 missing_inputs.insert(format!("security_daily_status:{code}:{trade_date}"));
+            }
+
+            if !current_bar_codes.contains(code) {
+                continue;
             }
 
             let mut factors = Vec::with_capacity(rows.len());
@@ -185,35 +227,6 @@ impl MarketSnapshotModule {
             let raw_bars: Vec<Candle> = rows.iter().map(|row| row.bar.clone()).collect();
             let adjusted_bars = adjust_candles(&raw_bars, &factors)?;
 
-            for row in rows {
-                fingerprint_inputs.insert(fingerprint_component(
-                    "stock_daily_bar_versions",
-                    &row.code,
-                    row.bar.trade_date,
-                    &row.source,
-                    row.available_at,
-                    row.ingested_at,
-                ));
-            }
-            for factor in &factors {
-                fingerprint_inputs.insert(fingerprint_component(
-                    "stock_adjustment_factors",
-                    &factor.code,
-                    factor.trade_date,
-                    &factor.source,
-                    factor.available_at,
-                    factor.ingested_at,
-                ));
-            }
-            fingerprint_inputs.insert(fingerprint_component(
-                "security_daily_status",
-                &status.code,
-                status.trade_date,
-                &status.source,
-                status.available_at,
-                status.ingested_at,
-            ));
-
             breadth_inputs.push(SecurityBreadthInput {
                 code: code.clone(),
                 bars: adjusted_bars,
@@ -256,17 +269,6 @@ impl MarketSnapshotModule {
         };
 
         self.repo.save_market_snapshot(&snapshot).await?;
-
-        let snapshot = self
-            .repo
-            .market_snapshot(trade_date, MARKET_SNAPSHOT_VERSION)
-            .await?
-            .ok_or_else(|| {
-                AppError::Internal(format!(
-                    "market snapshot missing after save for {} {}",
-                    trade_date, MARKET_SNAPSHOT_VERSION
-                ))
-            })?;
 
         Ok(MarketSnapshotBuildResult { snapshot })
     }
@@ -659,13 +661,117 @@ mod tests {
         Ok(())
     }
 
+    #[sqlx::test(migrations = "./migrations")]
+    async fn build_trade_date_rebuilds_for_later_as_of_and_updates_saved_snapshot(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        seed_security(&pool, "600020.SH", true, true).await?;
+        seed_all_indices(&pool).await?;
+
+        let module = MarketSnapshotModule::new(pool.clone());
+        let first = module
+            .build_trade_date(date(20), dt(20, 18, 30))
+            .await
+            .unwrap()
+            .snapshot;
+        assert_eq!(first.available_at, dt(20, 18, 30));
+        assert_eq!(first.metrics["indices"][0]["close"], json!(3000.0));
+
+        seed_index_version(&pool, "000001.SH", 3100.0, dt(20, 19, 0), dt(20, 19, 5)).await?;
+
+        let rebuilt = module
+            .build_trade_date(date(20), dt(20, 19, 30))
+            .await
+            .unwrap()
+            .snapshot;
+
+        assert_eq!(rebuilt.available_at, dt(20, 19, 30));
+        assert_eq!(rebuilt.metrics["indices"][0]["close"], json!(3100.0));
+        assert_ne!(rebuilt.input_fingerprint, first.input_fingerprint);
+
+        let saved = MarketRepository::new(pool)
+            .market_snapshot(date(20), MARKET_SNAPSHOT_VERSION)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.available_at, dt(20, 19, 30));
+        assert_eq!(saved.metrics["indices"][0]["close"], json!(3100.0));
+        assert_eq!(saved.input_fingerprint, rebuilt.input_fingerprint);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn build_trade_date_fingerprint_includes_loaded_inputs_for_excluded_security(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        seed_security(&pool, "600030.SH", true, true).await?;
+        seed_security(&pool, "600031.SH", false, true).await?;
+        seed_all_indices(&pool).await?;
+
+        let snapshot = MarketSnapshotModule::new(pool)
+            .build_trade_date(date(20), dt(20, 19, 0))
+            .await
+            .unwrap()
+            .snapshot;
+
+        let mut entries = expected_security_fingerprint_entries("600030.SH", true);
+        entries.extend(expected_security_fingerprint_entries("600031.SH", false));
+        entries.extend(expected_index_fingerprint_entries());
+
+        assert_eq!(
+            snapshot.input_fingerprint,
+            calculate_input_fingerprint(&entries)
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn build_trade_date_marks_status_universe_codes_missing_current_bar(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        seed_security(&pool, "600040.SH", true, true).await?;
+        seed_security_history(&pool, "600041.SH", 1..=19, true).await?;
+        seed_status(&pool, "600041.SH", dt(20, 17, 20), dt(20, 17, 25)).await?;
+        seed_all_indices(&pool).await?;
+
+        let snapshot = MarketSnapshotModule::new(pool)
+            .build_trade_date(date(20), dt(20, 19, 0))
+            .await
+            .unwrap()
+            .snapshot;
+
+        assert!(!snapshot.data_complete);
+        assert!(snapshot
+            .missing_inputs
+            .contains(&"stock_daily_bar_versions:600041.SH:2026-07-20".to_string()));
+        Ok(())
+    }
+
     async fn seed_security(
         pool: &PgPool,
         code: &str,
         complete_adjustments: bool,
         include_status: bool,
     ) -> sqlx::Result<()> {
-        for day in 1..=20 {
+        seed_security_history(pool, code, 1..=20, complete_adjustments).await?;
+
+        if include_status {
+            seed_status(pool, code, dt(20, 17, 20), dt(20, 17, 25)).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn seed_security_history<I>(
+        pool: &PgPool,
+        code: &str,
+        days: I,
+        complete_adjustments: bool,
+    ) -> sqlx::Result<()>
+    where
+        I: IntoIterator<Item = u32>,
+    {
+        for day in days {
             let close = 10.0 + day as f64;
             sqlx::query(
                 r#"INSERT INTO stock_daily_bar_versions
@@ -702,21 +808,6 @@ mod tests {
             }
         }
 
-        if include_status {
-            sqlx::query(
-                r#"INSERT INTO security_daily_status
-                   (code, trade_date, listed_days, is_st, is_suspended, price_limit_pct,
-                    available_at, availability_quality, source, ingested_at)
-                   VALUES ($1, $2, 120, FALSE, FALSE, 10.0, $3, 'observed', 'status', $4)"#,
-            )
-            .bind(code)
-            .bind(date(20))
-            .bind(dt(20, 17, 20))
-            .bind(dt(20, 17, 25))
-            .execute(pool)
-            .await?;
-        }
-
         Ok(())
     }
 
@@ -741,5 +832,118 @@ mod tests {
         .execute(pool)
         .await?;
         Ok(())
+    }
+
+    async fn seed_status(
+        pool: &PgPool,
+        code: &str,
+        available_at: DateTime<Utc>,
+        ingested_at: DateTime<Utc>,
+    ) -> sqlx::Result<()> {
+        sqlx::query(
+            r#"INSERT INTO security_daily_status
+               (code, trade_date, listed_days, is_st, is_suspended, price_limit_pct,
+                available_at, availability_quality, source, ingested_at)
+               VALUES ($1, $2, 120, FALSE, FALSE, 10.0, $3, 'observed', 'status', $4)"#,
+        )
+        .bind(code)
+        .bind(date(20))
+        .bind(available_at)
+        .bind(ingested_at)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn seed_all_indices(pool: &PgPool) -> sqlx::Result<()> {
+        seed_index_version(pool, "000001.SH", 3000.0, dt(20, 18, 0), dt(20, 18, 5)).await?;
+        seed_index_version(pool, "399001.SZ", 12000.0, dt(20, 18, 1), dt(20, 18, 5)).await?;
+        seed_index_version(pool, "399006.SZ", 2500.0, dt(20, 18, 2), dt(20, 18, 5)).await?;
+        seed_index_version(pool, "000688.SH", 900.0, dt(20, 18, 3), dt(20, 18, 5)).await?;
+        Ok(())
+    }
+
+    async fn seed_index_version(
+        pool: &PgPool,
+        code: &str,
+        close: f64,
+        available_at: DateTime<Utc>,
+        ingested_at: DateTime<Utc>,
+    ) -> sqlx::Result<()> {
+        seed_index(pool, code, close, available_at, ingested_at).await
+    }
+
+    fn expected_security_fingerprint_entries(
+        code: &str,
+        complete_adjustments: bool,
+    ) -> Vec<String> {
+        let mut entries = Vec::new();
+        for day in 1..=20 {
+            entries.push(fingerprint_component(
+                "stock_daily_bar_versions",
+                code,
+                date(day),
+                "bars",
+                dt(20, 17, 0),
+                dt(20, 17, 5),
+            ));
+
+            if complete_adjustments || day != 19 {
+                entries.push(fingerprint_component(
+                    "stock_adjustment_factors",
+                    code,
+                    date(day),
+                    "adjustments",
+                    dt(20, 17, 10),
+                    dt(20, 17, 15),
+                ));
+            }
+        }
+        entries.push(fingerprint_component(
+            "security_daily_status",
+            code,
+            date(20),
+            "status",
+            dt(20, 17, 20),
+            dt(20, 17, 25),
+        ));
+        entries
+    }
+
+    fn expected_index_fingerprint_entries() -> Vec<String> {
+        vec![
+            fingerprint_component(
+                "index_daily_bars",
+                "000001.SH",
+                date(20),
+                "index",
+                dt(20, 18, 0),
+                dt(20, 18, 5),
+            ),
+            fingerprint_component(
+                "index_daily_bars",
+                "399001.SZ",
+                date(20),
+                "index",
+                dt(20, 18, 1),
+                dt(20, 18, 5),
+            ),
+            fingerprint_component(
+                "index_daily_bars",
+                "399006.SZ",
+                date(20),
+                "index",
+                dt(20, 18, 2),
+                dt(20, 18, 5),
+            ),
+            fingerprint_component(
+                "index_daily_bars",
+                "000688.SH",
+                date(20),
+                "index",
+                dt(20, 18, 3),
+                dt(20, 18, 5),
+            ),
+        ]
     }
 }
