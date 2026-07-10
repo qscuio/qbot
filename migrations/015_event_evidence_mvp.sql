@@ -120,6 +120,23 @@ CREATE INDEX idx_event_claims_review
 CREATE INDEX idx_event_entities_canonical
     ON market_event_entities(canonical_type, canonical_id, review_status);
 
+CREATE OR REPLACE FUNCTION market_event_reject_evidence_mutation()
+RETURNS TRIGGER AS $$
+BEGIN
+    RAISE EXCEPTION 'market_event_evidence is append-only; % is not allowed', TG_OP;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_market_event_evidence_reject_update
+BEFORE UPDATE ON market_event_evidence
+FOR EACH ROW
+EXECUTE FUNCTION market_event_reject_evidence_mutation();
+
+CREATE TRIGGER trg_market_event_evidence_reject_delete
+BEFORE DELETE ON market_event_evidence
+FOR EACH ROW
+EXECUTE FUNCTION market_event_reject_evidence_mutation();
+
 CREATE OR REPLACE FUNCTION market_event_assert_published_claim_has_evidence()
 RETURNS TRIGGER AS $$
 DECLARE

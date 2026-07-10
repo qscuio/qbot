@@ -179,6 +179,22 @@ impl EventRepository {
     pub async fn save_duplicate_group(&self, group: &DuplicateGroupRow) -> Result<Uuid> {
         let mut tx = self.pool.begin().await?;
 
+        let existing_locked = sqlx::query_scalar::<_, bool>(
+            r#"SELECT locked_by_user
+               FROM market_event_duplicate_groups
+               WHERE duplicate_group_id = $1
+               FOR UPDATE"#,
+        )
+        .bind(group.duplicate_group_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .unwrap_or(false);
+
+        if existing_locked {
+            tx.commit().await?;
+            return Ok(group.duplicate_group_id);
+        }
+
         sqlx::query(
             r#"INSERT INTO market_event_duplicate_groups
                (duplicate_group_id, relation_type, confidence, locked_by_user, created_at)
@@ -513,6 +529,38 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn evidence_rows_reject_direct_update_and_delete(pool: PgPool) -> sqlx::Result<()> {
+        let repo = EventRepository::new(pool.clone());
+        let row = evidence("source-a-immutable", 1, "publishable");
+        repo.insert_evidence(&row).await.unwrap();
+
+        let update_error = sqlx::query(
+            r#"UPDATE market_event_evidence
+               SET title = 'mutated title'
+               WHERE evidence_id = $1"#,
+        )
+        .bind(row.evidence_id)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+        let update_message = update_error.to_string();
+        assert!(update_message.contains("append-only"));
+
+        let delete_error = sqlx::query(
+            r#"DELETE FROM market_event_evidence
+               WHERE evidence_id = $1"#,
+        )
+        .bind(row.evidence_id)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+        let delete_message = delete_error.to_string();
+        assert!(delete_message.contains("append-only"));
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn published_claims_require_joinable_evidence(pool: PgPool) -> sqlx::Result<()> {
         let repo = EventRepository::new(pool.clone());
         let row = evidence("source-published-claim", 1, "publishable");
@@ -546,12 +594,14 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn user_locked_duplicate_groups_remain_locked_after_upsert(
+    async fn user_locked_duplicate_groups_are_not_overwritten_by_reprocessing(
         pool: PgPool,
     ) -> sqlx::Result<()> {
         let repo = EventRepository::new(pool.clone());
-        let row = evidence("source-duplicate", 1, "publishable");
-        save_evidence(&pool, &row).await;
+        let original_member = evidence("source-duplicate-original", 1, "publishable");
+        let reprocessed_member = evidence("source-duplicate-reprocessed", 1, "publishable");
+        save_evidence(&pool, &original_member).await;
+        save_evidence(&pool, &reprocessed_member).await;
 
         let group_id = Uuid::new_v4();
         let locked = DuplicateGroupRow {
@@ -560,7 +610,7 @@ mod tests {
             confidence: 1.0,
             locked_by_user: true,
             members: vec![DuplicateGroupMemberRow {
-                evidence_id: row.evidence_id,
+                evidence_id: original_member.evidence_id,
                 is_representative: true,
             }],
             created_at: dt(2026, 7, 10, 12),
@@ -571,6 +621,16 @@ mod tests {
             locked_by_user: false,
             confidence: 0.8,
             relation_type: "near".to_string(),
+            members: vec![
+                DuplicateGroupMemberRow {
+                    evidence_id: original_member.evidence_id,
+                    is_representative: false,
+                },
+                DuplicateGroupMemberRow {
+                    evidence_id: reprocessed_member.evidence_id,
+                    is_representative: true,
+                },
+            ],
             ..locked
         };
         repo.save_duplicate_group(&unlocked_update).await.unwrap();
@@ -584,8 +644,96 @@ mod tests {
         .fetch_one(&pool)
         .await?;
         assert!(stored.0);
+        assert_eq!(stored.1, "exact");
+        assert_eq!(stored.2, 1.0);
+
+        let members: Vec<(Uuid, bool)> = sqlx::query_as(
+            r#"SELECT evidence_id, is_representative
+               FROM market_event_duplicate_members
+               WHERE duplicate_group_id = $1
+               ORDER BY evidence_id ASC"#,
+        )
+        .bind(group_id)
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(members, vec![(original_member.evidence_id, true)]);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn unlocked_duplicate_groups_can_update_relation_metadata_and_members(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = EventRepository::new(pool.clone());
+        let first_member = evidence("source-duplicate-unlocked-1", 1, "publishable");
+        let second_member = evidence("source-duplicate-unlocked-2", 1, "publishable");
+        save_evidence(&pool, &first_member).await;
+        save_evidence(&pool, &second_member).await;
+
+        let group_id = Uuid::new_v4();
+        let original = DuplicateGroupRow {
+            duplicate_group_id: group_id,
+            relation_type: "exact".to_string(),
+            confidence: 0.55,
+            locked_by_user: false,
+            members: vec![
+                DuplicateGroupMemberRow {
+                    evidence_id: first_member.evidence_id,
+                    is_representative: true,
+                },
+                DuplicateGroupMemberRow {
+                    evidence_id: second_member.evidence_id,
+                    is_representative: false,
+                },
+            ],
+            created_at: dt(2026, 7, 10, 12),
+        };
+        repo.save_duplicate_group(&original).await.unwrap();
+
+        let updated = DuplicateGroupRow {
+            relation_type: "near".to_string(),
+            confidence: 0.85,
+            members: vec![
+                DuplicateGroupMemberRow {
+                    evidence_id: first_member.evidence_id,
+                    is_representative: false,
+                },
+                DuplicateGroupMemberRow {
+                    evidence_id: second_member.evidence_id,
+                    is_representative: true,
+                },
+            ],
+            ..original
+        };
+        repo.save_duplicate_group(&updated).await.unwrap();
+
+        let stored: (bool, String, f64) = sqlx::query_as(
+            r#"SELECT locked_by_user, relation_type, confidence::float8
+               FROM market_event_duplicate_groups
+               WHERE duplicate_group_id = $1"#,
+        )
+        .bind(group_id)
+        .fetch_one(&pool)
+        .await?;
+        assert!(!stored.0);
         assert_eq!(stored.1, "near");
-        assert_eq!(stored.2, 0.8);
+        assert_eq!(stored.2, 0.85);
+
+        let members: Vec<(Uuid, bool)> = sqlx::query_as(
+            r#"SELECT evidence_id, is_representative
+               FROM market_event_duplicate_members
+               WHERE duplicate_group_id = $1
+               ORDER BY evidence_id ASC"#,
+        )
+        .bind(group_id)
+        .fetch_all(&pool)
+        .await?;
+        let mut expected_members = vec![
+            (first_member.evidence_id, false),
+            (second_member.evidence_id, true),
+        ];
+        expected_members.sort_by_key(|member| member.0);
+        assert_eq!(members, expected_members);
         Ok(())
     }
 
