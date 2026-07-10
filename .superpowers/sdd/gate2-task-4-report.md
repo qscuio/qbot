@@ -202,3 +202,52 @@
 ### Commit hash
 
 - `acabc7a2c5bdb0facf3565ec6244492be4069e0b`
+
+## Fix follow-up: canonical URL candidate discovery rereview addressed on 2026-07-10
+
+### Review issues and changes
+
+- Issue 1: global canonical-URL exact-duplicate discovery now runs under a repository-owned canonical URL invariant.
+  - `src/storage/event_repository.rs` now canonicalizes `source_url` on every evidence insert and on the manual duplicate lookup input before candidate discovery runs.
+  - the repository lookup still uses exact equality in SQL, but it now operates on canonical URL values at the storage boundary instead of raw caller-provided strings.
+  - `src/analysis/events/evidence.rs` now delegates its manual-ingestion URL canonicalization to the shared repository helper so the live path and storage path cannot drift.
+  - added a repository regression proving cross-trade exact duplicate candidate discovery works when the stored URL and submitted URL differ syntactically but canonicalize to the same value.
+  - added a live manual-ingestion regression proving canonical-URL exact duplicates still resolve to `Existing` across trade dates in that same scenario.
+- Issue 2: the brittle `duplicate_decision_public_shape_matches_task_brief` source parser was replaced with a type-level shape assertion.
+  - `src/analysis/events/dedup.rs` no longer parses Rust source with a nonexistent `impl DuplicateDecision` delimiter.
+  - the test now constructs and destructures each public variant directly, so extra/missing fields fail at compile time instead of relying on string parsing boundaries.
+
+### Red test evidence
+
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test manual_insert_surfaces_cross_trade_date_canonical_url_exact_duplicate_candidates -- --nocapture`
+  - failed before the fix
+  - `left: []`
+  - `right: [existing evidence id]`
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test exact_duplicate_manual_submission_detects_matching_canonical_url_across_trade_dates -- --nocapture`
+  - failed before the fix
+  - `expected duplicate relation, got inserted <submitted evidence id>`
+- `cargo test duplicate_decision_public_shape_matches_task_brief -- --nocapture`
+  - no red behavior failure was applicable
+  - the public enum shape already matched the brief; the defect was that the old test parsed past a nonexistent source boundary and could silently keep passing for the wrong reason
+
+### Green verification
+
+- `cargo fmt --all -- --check`
+  - passed
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test analysis::events::dedup -- --nocapture`
+  - passed, `10 passed; 0 failed`
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test analysis::events -- --nocapture`
+  - passed, `33 passed; 0 failed`
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test storage::event_repository -- --nocapture`
+  - passed, `14 passed; 0 failed`
+- `cargo test --all --locked config::tests::test_config_defaults`
+  - passed, `1 passed; 0 failed`
+- `git diff --check`
+  - passed
+- `cargo check --tests --locked`
+  - passed
+  - remaining warnings are the same pre-existing unused/dead-code warnings outside this Task 4 touch surface
+
+### Commit hash
+
+- `e48af44a3d3b2485f65e94ef4748c7c348534a37`
