@@ -50,6 +50,11 @@ pub fn event_router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+struct ManualSubmissionResponseFacts {
+    source_readable: Option<bool>,
+    manual_review_needed: Option<bool>,
+}
+
 pub(crate) async fn handle_telegram_submit_event(
     state: Arc<AppState>,
     chat_id: i64,
@@ -68,16 +73,18 @@ pub(crate) async fn handle_telegram_submit_event(
 
     let intelligence = EventIntelligence::new(state.db.clone());
     let source_url = looks_like_absolute_url(title).then(|| title.to_string());
+    let content = (!looks_like_absolute_url(title)).then(|| title.to_string());
+    let response_facts = manual_submission_response_facts(content.as_deref());
     let outcome = intelligence
         .submit_manual_event(ManualEventInput {
             title: title.to_string(),
-            content: (!looks_like_absolute_url(title)).then(|| title.to_string()),
+            content,
             source_url,
             submitted_by: format!("telegram:{user_id}"),
             published_at: None,
         })
         .await?;
-    let response = manual_submission_response(&outcome, title);
+    let response = manual_submission_response(&outcome, &response_facts);
 
     telegram_send(
         &state,
@@ -125,7 +132,7 @@ pub(crate) async fn handle_telegram_event_detail(
     chat_id: i64,
     args: &str,
 ) -> crate::error::Result<()> {
-    let event_id = match parse_event_id(args) {
+    let event_id = match parse_event_id(args, "event_detail") {
         Ok(id) => id,
         Err(message) => return telegram_send(&state, chat_id, message).await,
     };
@@ -164,7 +171,7 @@ pub(crate) async fn handle_telegram_review_event(
     user_id: i64,
     args: &str,
 ) -> crate::error::Result<()> {
-    let event_id = match parse_event_id(args) {
+    let event_id = match parse_event_id(args, "event_review") {
         Ok(id) => id,
         Err(message) => return telegram_send(&state, chat_id, message).await,
     };
@@ -238,6 +245,7 @@ async fn submit_manual_event(
     if title.trim().is_empty() && content.is_none() {
         return Err(bad_request("title or content is required"));
     }
+    let response_facts = manual_submission_response_facts(content.as_deref());
 
     let outcome = EventIntelligence::new(state.db.clone())
         .submit_manual_event(ManualEventInput {
@@ -253,10 +261,7 @@ async fn submit_manual_event(
         .await
         .map_err(map_event_error)?;
 
-    Ok(Json(manual_submission_response(
-        &outcome,
-        outcome_title_hint(&outcome),
-    )))
+    Ok(Json(manual_submission_response(&outcome, &response_facts)))
 }
 
 async fn list_events(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult {
@@ -293,21 +298,13 @@ async fn review_event(
     Json(request): Json<EventReviewRequest>,
 ) -> ApiResult {
     require_auth(&headers, &state)?;
-    if let Some(action) = request.action.as_deref() {
-        if !action.eq_ignore_ascii_case("publish") && !action.eq_ignore_ascii_case("reject") {
-            return Err(bad_request("unauthorized review action"));
-        }
-    }
+    let action = parse_review_action(request.action.as_deref())?;
 
     let event_id = parse_event_uuid(&id)?;
     let reviewed_by = request
         .reviewed_by
         .and_then(non_empty_trimmed)
         .unwrap_or_else(|| "api-reviewer".to_string());
-    let action = match request.action.as_deref() {
-        Some(action) if action.eq_ignore_ascii_case("reject") => EventReviewAction::Reject,
-        _ => EventReviewAction::Publish,
-    };
     let reviewed = EventIntelligence::new(state.db.clone())
         .review_event(event_id, reviewed_by, action)
         .await
@@ -338,36 +335,25 @@ async fn get_daily_brief(
 
 fn manual_submission_response(
     outcome: &crate::analysis::events::ManualEventSubmissionOutcome,
-    title_hint: &str,
+    facts: &ManualSubmissionResponseFacts,
 ) -> Value {
     match outcome {
         crate::analysis::events::ManualEventSubmissionOutcome::Inserted(evidence) => json!({
             "evidenceId": evidence.evidence_id,
             "duplicateStatus": "independent",
-            "processingStatus": evidence.status,
+            "processingStatus": external_manual_processing_status(),
             "effectiveTradeDate": evidence.effective_trade_date,
-            "sourceReadable": source_readable_hint(title_hint),
-            "manualReviewNeeded": false,
+            "sourceReadable": facts.source_readable,
+            "manualReviewNeeded": facts.manual_review_needed,
         }),
         crate::analysis::events::ManualEventSubmissionOutcome::Existing(existing) => json!({
             "evidenceId": existing.submitted.evidence_id,
             "duplicateStatus": "duplicate",
-            "processingStatus": existing.submitted.status,
+            "processingStatus": external_manual_processing_status(),
             "effectiveTradeDate": existing.submitted.effective_trade_date,
-            "sourceReadable": source_readable_hint(title_hint),
-            "manualReviewNeeded": Value::Null,
+            "sourceReadable": facts.source_readable,
+            "manualReviewNeeded": facts.manual_review_needed,
         }),
-    }
-}
-
-fn outcome_title_hint(outcome: &crate::analysis::events::ManualEventSubmissionOutcome) -> &str {
-    match outcome {
-        crate::analysis::events::ManualEventSubmissionOutcome::Inserted(evidence) => {
-            &evidence.title
-        }
-        crate::analysis::events::ManualEventSubmissionOutcome::Existing(existing) => {
-            &existing.submitted.title
-        }
     }
 }
 
@@ -375,12 +361,30 @@ fn parse_event_uuid(raw: &str) -> std::result::Result<Uuid, (StatusCode, Json<Va
     Uuid::parse_str(raw).map_err(|_| bad_request("invalid evidence ID"))
 }
 
-fn parse_event_id(args: &str) -> std::result::Result<Uuid, &'static str> {
+fn parse_event_id(args: &str, command: &'static str) -> std::result::Result<Uuid, &'static str> {
     let raw = args.trim();
     if raw.is_empty() {
-        return Err("用法: <code>/event_detail &lt;事件ID&gt;</code>");
+        return Err(command_usage(command));
     }
     Uuid::parse_str(raw).map_err(|_| "❌ 无效的事件 ID")
+}
+
+fn command_usage(command: &'static str) -> &'static str {
+    match command {
+        "event_detail" => "用法: <code>/event_detail &lt;事件ID&gt;</code>",
+        "event_review" => "用法: <code>/event_review &lt;事件ID&gt;</code>",
+        _ => "❌ 无效命令",
+    }
+}
+
+fn parse_review_action(
+    action: Option<&str>,
+) -> std::result::Result<EventReviewAction, (StatusCode, Json<Value>)> {
+    match action.map(str::trim) {
+        Some(action) if action.eq_ignore_ascii_case("publish") => Ok(EventReviewAction::Publish),
+        Some(action) if action.eq_ignore_ascii_case("reject") => Ok(EventReviewAction::Reject),
+        _ => Err(bad_request("unauthorized review action")),
+    }
 }
 
 fn require_auth(
@@ -421,12 +425,17 @@ fn looks_like_absolute_url(value: &str) -> bool {
     reqwest::Url::parse(value).is_ok()
 }
 
-fn source_readable_hint(title_hint: &str) -> Value {
-    if looks_like_absolute_url(title_hint) {
-        Value::Null
-    } else {
-        json!(true)
+fn manual_submission_response_facts(content: Option<&str>) -> ManualSubmissionResponseFacts {
+    ManualSubmissionResponseFacts {
+        source_readable: content
+            .map(str::trim)
+            .and_then(|value| (!value.is_empty()).then_some(true)),
+        manual_review_needed: None,
     }
+}
+
+fn external_manual_processing_status() -> &'static str {
+    "collected"
 }
 
 fn bool_label(value: Option<bool>) -> &'static str {
@@ -590,7 +599,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn manual_event_submission_returns_pending_status_and_known_flags(
+    async fn manual_event_submission_returns_collected_status_for_content_submission(
         pool: PgPool,
     ) -> sqlx::Result<()> {
         let state = test_state(pool).await;
@@ -621,10 +630,47 @@ mod tests {
         let payload = response_json(response).await;
         assert!(Uuid::parse_str(payload["evidenceId"].as_str().unwrap()).is_ok());
         assert_eq!(payload["duplicateStatus"], "independent");
-        assert_eq!(payload["processingStatus"], "pending");
+        assert_eq!(payload["processingStatus"], "collected");
         assert_eq!(payload["effectiveTradeDate"], "2026-07-13");
         assert_eq!(payload["sourceReadable"], true);
-        assert_eq!(payload["manualReviewNeeded"], false);
+        assert_eq!(payload["manualReviewNeeded"], Value::Null);
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn manual_event_submission_with_url_only_source_leaves_readability_unknown(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let state = test_state(pool).await;
+        let mut router = event_router(state);
+
+        let response = router
+            .call(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/analysis/events/manual")
+                    .header(header::AUTHORIZATION, "Bearer test-key")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "title": "Issuer disclosure without pasted body",
+                            "sourceUrl": "https://example.com/disclosure",
+                            "submittedBy": "rest-user",
+                            "publishedAt": "2026-07-10T07:30:00Z",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert_eq!(payload["processingStatus"], "collected");
+        assert_eq!(payload["sourceReadable"], Value::Null);
+        assert_eq!(payload["manualReviewNeeded"], Value::Null);
 
         Ok(())
     }
@@ -752,6 +798,52 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn review_event_requires_explicit_publish_or_reject_action(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let state = test_state(pool.clone()).await;
+        let repo = EventRepository::new(pool.clone());
+        let row = evidence_row(
+            &Uuid::new_v4().to_string(),
+            1,
+            "pending",
+            "Pending explicit action",
+            dt(2026, 7, 10, 8, 0, 0),
+        );
+        repo.insert_evidence(&row).await.unwrap();
+
+        for request_body in [
+            json!({
+                "reviewedBy": "reviewer",
+            }),
+            json!({
+                "action": "   ",
+                "reviewedBy": "reviewer",
+            }),
+        ] {
+            let mut router = event_router(state.clone());
+            let response = router
+                .call(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!("/api/analysis/events/{}/review", row.evidence_id))
+                        .header(header::AUTHORIZATION, "Bearer test-key")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(request_body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let payload = response_json(response).await;
+            assert_eq!(payload["error"], "unauthorized review action");
+        }
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn review_event_rejects_invalid_evidence_id(pool: PgPool) -> sqlx::Result<()> {
         let state = test_state(pool).await;
         let mut router = event_router(state);
@@ -765,6 +857,7 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         json!({
+                            "action": "publish",
                             "reviewedBy": "reviewer",
                         })
                         .to_string(),
@@ -924,6 +1017,18 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&body).unwrap()
+    }
+
+    #[test]
+    fn parse_event_id_reports_command_specific_usage_for_missing_arguments() {
+        assert_eq!(
+            parse_event_id("", "event_detail").unwrap_err(),
+            "用法: <code>/event_detail &lt;事件ID&gt;</code>"
+        );
+        assert_eq!(
+            parse_event_id("", "event_review").unwrap_err(),
+            "用法: <code>/event_review &lt;事件ID&gt;</code>"
+        );
     }
 
     fn evidence_row(

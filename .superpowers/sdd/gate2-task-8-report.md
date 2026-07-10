@@ -36,10 +36,12 @@ Added:
 
 ## Behavior Notes
 
-- Manual submissions return actual `processingStatus: "pending"` because current ingestion persists immutable evidence in `pending` state. This follows the implementation note instead of inventing a later processing state.
+- Manual submissions keep the persisted internal status at `pending`, but the external Task 8 response translates just-submitted evidence to `processingStatus: "collected"`.
+- Manual submission `sourceReadable` is only returned as known when trimmed content is actually present; URL-only/manual title submissions return `null` until content is fetched or read.
+- Manual submission `manualReviewNeeded` remains `null` unless the domain exposes a concrete review-required outcome.
 - Review appends a new immutable evidence version with `status = "publishable"` or `status = "rejected"` and `supersedes_evidence_id` set to the reviewed version.
+- HTTP review now requires an explicit `action` of `publish` or `reject`; missing, blank, and unsupported actions are rejected as `unauthorized review action`.
 - Daily brief reads persisted brief rows only; no synthetic brief generation was added in Task 8.
-- Unsupported review actions are rejected as `unauthorized review action`.
 
 ## Verification
 
