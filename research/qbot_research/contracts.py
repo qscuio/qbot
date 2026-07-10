@@ -6,9 +6,12 @@ from typing import Literal, TypeAlias
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 Horizon: TypeAlias = Literal["week", "month", "quarter", "year"]
+ModelExportHorizon: TypeAlias = Literal["week", "month"]
 PatternType: TypeAlias = Literal["trend", "vcp_breakout", "oversold_reversal"]
 DistanceMetric: TypeAlias = Literal["euclidean", "mahalanobis", "gmm_probability"]
 ConditionPayload: TypeAlias = dict[str, object]
+PatternVersionStatus: TypeAlias = Literal["draft", "validated"]
+ExampleType: TypeAlias = Literal["typical_positive", "failed"]
 
 
 class ContractModel(BaseModel):
@@ -76,15 +79,71 @@ class PatternModelPayload(ContractModel):
 
 
 class ValidationPayload(ContractModel):
+    candidate_id: str
     positive_sample_count: int
     control_sample_count: int
     effective_sample_count: float
     base_rate: float
     precision: float
+    lift: float
     lift_over_base_rate: float
     coverage: float
     false_positive_rate: float
+    precision_at_10: float
+    precision_at_50: float
     cost_adjusted_return: float
     max_drawdown: float
+    turnover: float
+    yearly_results: dict[str, dict[str, float | int]]
+    regime_results: dict[str, dict[str, float | int]]
+    top_stock_contribution: float
+    top_period_contribution: float
+    mean_excess_return: float
+    median_excess_return: float
+    win_rate: float
+    profit_factor: float
+    max_losing_streak: int
+    capacity_estimate: float
+    cluster_stability: float | None
+    calibration_error: float
     majority_windows_positive_lift: bool
     baseline_comparison: dict[str, float]
+    release_gate_passed: bool
+    candidate_status: PatternVersionStatus
+
+
+class AnalysisPatternVersionPayload(ContractModel):
+    pattern_version_id: str
+    pattern_id: str
+    horizon: ModelExportHorizon
+    pattern_type: PatternType
+    status: PatternVersionStatus
+    schema_version: str
+    feature_version: str
+    logic_version: str
+    dataset_version: str
+    model_payload: PatternModelPayload
+    validation_payload: ValidationPayload
+    trained_from: date
+    trained_until: date
+    available_at_cutoff: datetime
+    approved_by: None = None
+    published_at: None = None
+    created_at: datetime
+
+    @model_validator(mode="after")
+    def validate_pattern_version_consistency(self) -> AnalysisPatternVersionPayload:
+        if self.trained_from > self.trained_until:
+            raise ValueError("trained_from must be on or before trained_until")
+        if self.status != self.validation_payload.candidate_status:
+            raise ValueError("status must match validation_payload.candidate_status")
+        return self
+
+
+class AnalysisPatternExamplePayload(ContractModel):
+    pattern_version_id: str
+    example_type: ExampleType
+    code: str
+    trade_date: date
+    similarity: float | None
+    metadata: dict[str, object]

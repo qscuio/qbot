@@ -99,9 +99,8 @@ def test_cli_exports_importable_typer_app() -> None:
     assert isinstance(app, typer.Typer)
 
 
-def test_cli_train_all_scaffold_boots_without_crashing() -> None:
-    result = RUNNER.invoke(app, ["train-all", "--config", "/tmp/research.toml"])
+def test_cli_train_all_requires_explicit_plan_json() -> None:
+    result = RUNNER.invoke(app, ["train-all", "--as-of", "2026-07-10"])
 
-    assert result.exit_code == 0, result.stdout
-    assert "scaffold" in result.stdout.lower()
-    assert "--config" not in result.stdout
+    assert result.exit_code != 0
+    assert "--plan-json" in result.stdout
