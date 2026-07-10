@@ -27,6 +27,12 @@ pub struct Config {
     // Data proxy (optional)
     pub data_proxy: Option<String>,
 
+    // Official event source (optional)
+    pub official_event_feed_url: Option<String>,
+    pub official_event_feed_api_key: Option<String>,
+    pub official_event_source_id: String,
+    pub official_event_store_full_content: bool,
+
     // Feature flags
     pub enable_burst_monitor: bool,
     pub enable_daban_live: bool,
@@ -62,6 +68,13 @@ impl Config {
                 .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
             ai_model: std::env::var("AI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string()),
             data_proxy: std::env::var("DATA_PROXY").ok(),
+            official_event_feed_url: std::env::var("OFFICIAL_EVENT_FEED_URL").ok(),
+            official_event_feed_api_key: std::env::var("OFFICIAL_EVENT_FEED_API_KEY").ok(),
+            official_event_source_id: std::env::var("OFFICIAL_EVENT_SOURCE_ID")
+                .unwrap_or_else(|_| "official:market_event".to_string()),
+            official_event_store_full_content: std::env::var("OFFICIAL_EVENT_STORE_FULL_CONTENT")
+                .unwrap_or_else(|_| "false".to_string())
+                == "true",
             enable_burst_monitor: std::env::var("ENABLE_BURST_MONITOR")
                 .unwrap_or_else(|_| "true".to_string())
                 == "true",
@@ -93,11 +106,19 @@ mod tests {
         std::env::set_var("TELEGRAM_BOT_TOKEN", "123:abc");
         std::env::remove_var("DATABASE_URL");
         std::env::remove_var("REDIS_URL");
+        std::env::remove_var("OFFICIAL_EVENT_FEED_URL");
+        std::env::remove_var("OFFICIAL_EVENT_FEED_API_KEY");
+        std::env::remove_var("OFFICIAL_EVENT_SOURCE_ID");
+        std::env::remove_var("OFFICIAL_EVENT_STORE_FULL_CONTENT");
 
         let cfg = Config::from_env().unwrap();
         assert_eq!(cfg.tushare_token, "test_token");
         assert_eq!(cfg.database_url, "postgresql://qbot:qbot@127.0.0.1/qbot");
         assert_eq!(cfg.redis_url, "redis://127.0.0.1:6379");
         assert_eq!(cfg.api_port, 8080); // default
+        assert_eq!(cfg.official_event_feed_url, None);
+        assert_eq!(cfg.official_event_feed_api_key, None);
+        assert_eq!(cfg.official_event_source_id, "official:market_event");
+        assert!(!cfg.official_event_store_full_content);
     }
 }
