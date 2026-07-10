@@ -176,19 +176,21 @@ pub fn link_entities_at(
                 }
             }
 
-            if let Some(industry) = catalog.industries_by_name.get(&entity.text) {
-                return EntityLink {
-                    entity_link_id: Uuid::new_v4(),
-                    evidence_id,
-                    raw_name: entity.text.clone(),
-                    canonical_type: "industry".to_string(),
-                    canonical_id: Some(industry.canonical_id.clone()),
-                    role: entity.role.clone(),
-                    match_method: ENTITY_MATCH_METHOD_EXACT_OFFICIAL_INDUSTRY_NAME.to_string(),
-                    confidence: 0.92,
-                    review_status: ENTITY_REVIEW_STATUS_LINKED.to_string(),
-                    created_at,
-                };
+            if is_official_industry_entity_type(&entity.entity_type) {
+                if let Some(industry) = catalog.industries_by_name.get(&entity.text) {
+                    return EntityLink {
+                        entity_link_id: Uuid::new_v4(),
+                        evidence_id,
+                        raw_name: entity.text.clone(),
+                        canonical_type: "industry".to_string(),
+                        canonical_id: Some(industry.canonical_id.clone()),
+                        role: entity.role.clone(),
+                        match_method: ENTITY_MATCH_METHOD_EXACT_OFFICIAL_INDUSTRY_NAME.to_string(),
+                        confidence: 0.92,
+                        review_status: ENTITY_REVIEW_STATUS_LINKED.to_string(),
+                        created_at,
+                    };
+                }
             }
 
             EntityLink {
@@ -227,6 +229,10 @@ fn company_link(
         review_status: ENTITY_REVIEW_STATUS_LINKED.to_string(),
         created_at,
     }
+}
+
+fn is_official_industry_entity_type(entity_type: &str) -> bool {
+    matches!(entity_type, "industry" | "sector")
 }
 
 #[cfg(test)]
@@ -341,6 +347,22 @@ mod tests {
             ENTITY_MATCH_METHOD_EXACT_OFFICIAL_INDUSTRY_NAME
         );
         assert_eq!(links[0].review_status, ENTITY_REVIEW_STATUS_LINKED);
+    }
+
+    #[test]
+    fn official_industry_name_does_not_remap_organization_entities() {
+        let links = link_entities_at(
+            evidence_id(),
+            &[entity("半导体", "organization", "issuer", None)],
+            &catalog(),
+            created_at(),
+        );
+
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].canonical_type, "organization");
+        assert_eq!(links[0].canonical_id, None);
+        assert_eq!(links[0].match_method, ENTITY_MATCH_METHOD_UNRESOLVED);
+        assert_eq!(links[0].review_status, ENTITY_REVIEW_STATUS_UNMAPPED);
     }
 
     fn catalog() -> EntityCatalog {
