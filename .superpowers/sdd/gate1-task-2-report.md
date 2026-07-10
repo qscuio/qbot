@@ -173,3 +173,74 @@ Local-only environment/workflow changes:
 
 1. `deploy/qbot-research.service` intentionally references `qbot-research train-all`, but Task 2 does not implement that command. This matches the revised task boundary and preserves Task 3 as the place where the command surface is created, but the service should not be activated before Task 3 lands.
 2. `qbot-research.timer` is scaffolded correctly for weekly scheduling, but end-to-end service execution is deferred until the Task 3 CLI commands exist.
+
+## Review fix
+
+### RED evidence
+
+Added the review-driven tests first in `research/tests/test_contracts.py`:
+
+- a `typer.testing.CliRunner` test that invokes `qbot-research train-all --config /tmp/research.toml`
+- parametrized negative coverage for missing required features across `scaler_mean`, `scaler_scale`, and `centroid`
+
+Ran:
+
+```bash
+cd research
+.venv/bin/python -m pytest -q tests/test_contracts.py
+```
+
+Observed failure against the pre-fix CLI scaffold:
+
+- `RuntimeError: Could not get a command for this Typer instance`
+- `1 failed, 7 passed`
+
+This reproduces the blocking review finding that the console entry point targeted a bare `Typer()` object without a callable command surface.
+
+### GREEN evidence
+
+Implemented a minimal `train-all` scaffold in `research/qbot_research/cli.py` that:
+
+- keeps the CLI deployable as a Typer group
+- parses `--config`
+- exits successfully with an explicit scaffold message
+- does not perform dataset export, training, DB access, or model publishing
+
+Re-ran the targeted test file:
+
+```bash
+cd research
+.venv/bin/python -m pytest -q tests/test_contracts.py
+```
+
+Result:
+
+- `8 passed in 0.11s`
+
+Ran the required full verification:
+
+```bash
+cd research
+.venv/bin/python -m pytest -q
+.venv/bin/python -m ruff check .
+.venv/bin/python -m mypy qbot_research
+cd ..
+git diff --check
+```
+
+Results:
+
+- `pytest`: `8 passed in 0.11s`
+- `ruff`: `All checks passed!`
+- `mypy`: `Success: no issues found in 3 source files`
+- `git diff --check`: clean
+
+### Files changed
+
+- `research/qbot_research/cli.py`
+- `research/tests/test_contracts.py`
+- `.superpowers/sdd/gate1-task-2-report.md`
+
+### Concerns
+
+- The `train-all` command is intentionally a no-op scaffold for Task 2. It proves the CLI boot path is deployable and non-crashing, but it does not claim that training ran.

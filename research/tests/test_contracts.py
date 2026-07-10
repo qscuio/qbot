@@ -3,9 +3,12 @@ from datetime import date, datetime, timezone
 import pytest
 import typer
 from pydantic import ValidationError
+from typer.testing import CliRunner
 
 from qbot_research.cli import app
 from qbot_research.contracts import DatasetManifest, PatternModelPayload
+
+RUNNER = CliRunner()
 
 
 def test_dataset_manifest_accepts_valid_values() -> None:
@@ -64,13 +67,27 @@ def test_dataset_manifest_rejects_negative_row_count() -> None:
         )
 
 
-def test_pattern_model_payload_rejects_missing_required_feature_payload() -> None:
+@pytest.mark.parametrize("missing_payload_field", ["scaler_mean", "scaler_scale", "centroid"])
+def test_pattern_model_payload_rejects_missing_required_feature_payload(
+    missing_payload_field: str,
+) -> None:
+    scaler_mean = {"close_strength": 1.5, "volume_ratio": 2.5}
+    scaler_scale = {"close_strength": 0.4, "volume_ratio": 0.6}
+    centroid = {"close_strength": 1.1, "volume_ratio": 3.1}
+
+    if missing_payload_field == "scaler_mean":
+        del scaler_mean["volume_ratio"]
+    elif missing_payload_field == "scaler_scale":
+        del scaler_scale["volume_ratio"]
+    else:
+        del centroid["volume_ratio"]
+
     with pytest.raises(ValidationError, match="required_features"):
         PatternModelPayload(
             required_features=["close_strength", "volume_ratio"],
-            scaler_mean={"close_strength": 1.5, "volume_ratio": 2.5},
-            scaler_scale={"close_strength": 0.4},
-            centroid={"close_strength": 1.1, "volume_ratio": 3.1},
+            scaler_mean=scaler_mean,
+            scaler_scale=scaler_scale,
+            centroid=centroid,
             distance_metric="euclidean",
             similarity_thresholds={"shadow_a": 0.9},
             necessary_conditions=[{"field": "trend", "operator": "gte", "value": 1.0}],
@@ -80,3 +97,11 @@ def test_pattern_model_payload_rejects_missing_required_feature_payload() -> Non
 
 def test_cli_exports_importable_typer_app() -> None:
     assert isinstance(app, typer.Typer)
+
+
+def test_cli_train_all_scaffold_boots_without_crashing() -> None:
+    result = RUNNER.invoke(app, ["train-all", "--config", "/tmp/research.toml"])
+
+    assert result.exit_code == 0, result.stdout
+    assert "scaffold" in result.stdout.lower()
+    assert "--config" not in result.stdout
