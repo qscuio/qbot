@@ -170,7 +170,7 @@ pub(crate) fn content_hash(title: &str, content: Option<&str>) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn canonicalize_source_url(value: &str) -> Result<String> {
+pub(crate) fn canonicalize_source_url(value: &str) -> Result<String> {
     let trimmed = value.trim();
     let mut url = Url::parse(trimmed).map_err(|error| {
         AppError::Internal(format!("manual event source URL is invalid: {error}"))

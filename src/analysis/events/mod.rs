@@ -8,6 +8,7 @@ use crate::error::{AppError, Result};
 use crate::storage::event_repository::EventRepository;
 
 pub mod contracts;
+mod dedup;
 mod evidence;
 mod time;
 
@@ -17,6 +18,7 @@ pub use contracts::{
     ExistingEventEvidenceRelation, ManualEventInput, ManualEventSubmissionOutcome,
     TradingDateResolver,
 };
+pub use dedup::DuplicateDecision;
 
 trait EventExtractor: Send + Sync {}
 
