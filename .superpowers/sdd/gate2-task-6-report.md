@@ -152,3 +152,74 @@ test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 271 filtered out; fi
 ## Issues / concerns
 
 - Focused test runs emit existing dead-code and unused-item warnings from unrelated parts of the crate. The required commands passed, but the output is not warning-free.
+
+## Review follow-up fix
+
+Addressed the post-review issues without changing the Task 6 design:
+
+1. Deterministic validation now requires amount/date `value` strings, not `raw_text`, to appear in source content.
+2. `StockCodeDirectory` now validates only exact known stock codes; alias/canonical fallback behavior was removed.
+3. The LLM extraction prompt now instructs the model that amount/date `value` fields must match source text verbatim.
+
+### Follow-up RED evidence
+
+Commands:
+
+```bash
+cargo test analysis::events::extraction -- --nocapture
+cargo test analysis::adapters::llm_event_extractor -- --nocapture
+```
+
+RED output excerpts before the fix:
+
+```text
+thread 'analysis::events::extraction::tests::date_and_amount_values_must_appear_in_source_content' panicked:
+  left: []
+ right: [ValidationIssue { path: "amounts[0].value", ... }, ValidationIssue { path: "dates[0].value", ... }]
+
+thread 'analysis::events::extraction::tests::stock_codes_must_match_known_directory_exactly' panicked:
+  left: []
+ right: [ValidationIssue { path: "entities[0].stock_code", message: "stock code `600519` does not map to a known stock_info entry" }]
+
+thread 'analysis::adapters::llm_event_extractor::tests::extracts_valid_json_with_zero_temperature_and_prompt_metadata' panicked:
+assertion failed: ... contains(\"For amounts and dates, value must match text that appears verbatim in the evidence.\")
+```
+
+### Follow-up GREEN evidence
+
+Commands:
+
+```bash
+cargo fmt --all -- --check
+cargo test analysis::events::extraction -- --nocapture
+cargo test analysis::adapters::llm_event_extractor -- --nocapture
+git diff --check
+```
+
+GREEN results:
+
+- `cargo fmt --all -- --check`
+  - Passed.
+- `cargo test analysis::events::extraction -- --nocapture`
+  - Passed: 9 tests.
+  - Warning noise present from existing unused/dead-code items in unrelated modules.
+- `cargo test analysis::adapters::llm_event_extractor -- --nocapture`
+  - Passed: 4 tests.
+  - Warning noise present from existing unused/dead-code items in unrelated modules.
+- `git diff --check`
+  - Passed.
+
+### Follow-up files changed
+
+- `src/analysis/events/extraction.rs`
+- `src/analysis/adapters/llm_event_extractor.rs`
+- `tests/fixtures/event_extraction_v1.json`
+- `.superpowers/sdd/gate2-task-6-report.md`
+
+### Follow-up commit
+
+- `369ea20f32b33832ec9a35beca2cd654d7bc495c`
+
+### Follow-up concerns
+
+- The required verification commands pass, but cargo still emits pre-existing warning noise and future-incompatibility notices from unrelated crate areas and dependencies.

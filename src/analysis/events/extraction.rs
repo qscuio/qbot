@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -83,24 +83,24 @@ impl EventExtractionV1 {
         }
 
         for (amount_index, amount) in self.amounts.iter().enumerate() {
-            if !context.source_contains(&amount.raw_text) {
+            if !context.source_contains(&amount.value) {
                 issues.push(ValidationIssue::new(
-                    format!("amounts[{amount_index}].raw_text"),
+                    format!("amounts[{amount_index}].value"),
                     format!(
-                        "amount text `{}` does not appear in the extraction input content",
-                        amount.raw_text
+                        "amount value `{}` does not appear in the extraction input content",
+                        amount.value
                     ),
                 ));
             }
         }
 
         for (date_index, date) in self.dates.iter().enumerate() {
-            if !context.source_contains(&date.raw_text) {
+            if !context.source_contains(&date.value) {
                 issues.push(ValidationIssue::new(
-                    format!("dates[{date_index}].raw_text"),
+                    format!("dates[{date_index}].value"),
                     format!(
-                        "date text `{}` does not appear in the extraction input content",
-                        date.raw_text
+                        "date value `{}` does not appear in the extraction input content",
+                        date.value
                     ),
                 ));
             }
@@ -212,7 +212,7 @@ pub(crate) trait StockCodeLookup: Send + Sync {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct StockCodeDirectory {
-    aliases_to_canonical: BTreeMap<String, String>,
+    known_codes: BTreeSet<String>,
 }
 
 impl StockCodeDirectory {
@@ -221,44 +221,25 @@ impl StockCodeDirectory {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let mut aliases_to_canonical = BTreeMap::new();
-        let mut ambiguous_aliases = BTreeSet::new();
+        let mut known_codes = BTreeSet::new();
 
         for code in codes {
-            let canonical = code.as_ref().trim().to_uppercase();
-            if canonical.is_empty() {
+            let exact_code = code.as_ref().trim().to_uppercase();
+            if exact_code.is_empty() {
                 continue;
             }
 
-            aliases_to_canonical.insert(canonical.clone(), canonical.clone());
-            if let Some((prefix, _)) = canonical.split_once('.') {
-                match aliases_to_canonical.get(prefix) {
-                    Some(existing) if existing != &canonical => {
-                        ambiguous_aliases.insert(prefix.to_string());
-                    }
-                    None => {
-                        aliases_to_canonical.insert(prefix.to_string(), canonical.clone());
-                    }
-                    Some(_) => {}
-                }
-            }
+            known_codes.insert(exact_code);
         }
 
-        for alias in ambiguous_aliases {
-            aliases_to_canonical.remove(&alias);
-        }
-
-        Self {
-            aliases_to_canonical,
-        }
+        Self { known_codes }
     }
 }
 
 impl StockCodeLookup for StockCodeDirectory {
     fn resolve(&self, raw_code: &str) -> Option<String> {
-        self.aliases_to_canonical
-            .get(&raw_code.trim().to_uppercase())
-            .cloned()
+        let exact_code = raw_code.trim().to_uppercase();
+        self.known_codes.contains(&exact_code).then_some(exact_code)
     }
 }
 
@@ -405,12 +386,12 @@ mod tests {
     fn date_and_amount_values_must_appear_in_source_content() {
         let extraction = EventExtractionV1 {
             amounts: vec![ExtractedAmount {
-                raw_text: "CNY 9 billion".to_string(),
-                value: "9000000000".to_string(),
+                raw_text: "CNY 2 billion".to_string(),
+                value: "2000000000".to_string(),
                 unit: Some("CNY".to_string()),
             }],
             dates: vec![ExtractedDate {
-                raw_text: "2026-07-15".to_string(),
+                raw_text: "July 10, 2026".to_string(),
                 value: "2026-07-15".to_string(),
             }],
             ..base_extraction(vec![ExtractedClaim {
@@ -421,18 +402,24 @@ mod tests {
             }])
         };
 
-        let errors = extraction.validate(&validation_context());
+        let evidence = vec![ExtractionEvidence::new(
+            primary_evidence_id(),
+            "Kweichow Moutai (600519.SH) raised guidance on July 10, 2026 and expects CNY 2 billion in incremental revenue.".to_string(),
+        )];
+        let stock_codes = StockCodeDirectory::from_known_codes(["600519.SH", "000001.SZ"]);
+        let errors =
+            extraction.validate(&ExtractionValidationContext::new(&evidence, &stock_codes));
 
         assert_eq!(
             errors,
             vec![
                 ValidationIssue::new(
-                    "amounts[0].raw_text",
-                    "amount text `CNY 9 billion` does not appear in the extraction input content",
+                    "amounts[0].value",
+                    "amount value `2000000000` does not appear in the extraction input content",
                 ),
                 ValidationIssue::new(
-                    "dates[0].raw_text",
-                    "date text `2026-07-15` does not appear in the extraction input content",
+                    "dates[0].value",
+                    "date value `2026-07-15` does not appear in the extraction input content",
                 ),
             ]
         );
@@ -467,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn flexible_stock_codes_resolve_against_known_directory() {
+    fn stock_codes_must_match_known_directory_exactly() {
         let extraction = EventExtractionV1 {
             entities: vec![ExtractedEntity {
                 text: "Kweichow Moutai".to_string(),
@@ -489,8 +476,18 @@ mod tests {
             &stock_codes,
         ));
 
-        assert!(errors.is_empty());
-        assert_eq!(stock_codes.resolve("600519").as_deref(), Some("600519.SH"));
+        assert_eq!(
+            errors,
+            vec![ValidationIssue::new(
+                "entities[0].stock_code",
+                "stock code `600519` does not map to a known stock_info entry",
+            )]
+        );
+        assert_eq!(stock_codes.resolve("600519"), None);
+        assert_eq!(
+            stock_codes.resolve("600519.SH").as_deref(),
+            Some("600519.SH")
+        );
     }
 
     #[test]
@@ -563,7 +560,7 @@ mod tests {
             }],
             amounts: vec![ExtractedAmount {
                 raw_text: "CNY 2 billion".to_string(),
-                value: "2000000000".to_string(),
+                value: "CNY 2 billion".to_string(),
                 unit: Some("CNY".to_string()),
             }],
             dates: vec![ExtractedDate {

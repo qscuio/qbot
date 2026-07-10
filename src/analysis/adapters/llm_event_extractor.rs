@@ -132,7 +132,7 @@ impl LlmEventExtractor {
                 "- claim_type must be one of: fact, direct_quote, third_party_claim, journalist_interpretation, rumor, unknown.\n",
                 "- Candidate claims only. Nothing is published, ranked, or promoted.\n",
                 "- Use only evidence ids present in the provided evidence set.\n",
-                "- For amounts and dates, raw_text must match text that appears verbatim in the evidence.\n",
+                "- For amounts and dates, value must match text that appears verbatim in the evidence.\n",
                 "- Provide stock_code only when the source text contains it directly.\n",
                 "- Keep rumors and journalist interpretations distinct from facts.\n",
                 "Evidence set:\n{evidence}\n"
@@ -295,11 +295,11 @@ mod tests {
         assert!(requests[0]
             .get("messages")
             .and_then(Value::as_array)
-            .and_then(|messages| messages.first())
+            .and_then(|messages| messages.get(1))
             .and_then(|message| message.get("content"))
             .and_then(Value::as_str)
             .unwrap()
-            .contains("candidate market-event claims"));
+            .contains("For amounts and dates, value must match text that appears verbatim in the evidence."));
         assert_eq!(
             output.metadata.schema_version,
             EVENT_EXTRACTION_SCHEMA_VERSION
