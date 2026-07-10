@@ -297,3 +297,49 @@
 ### Commit hash
 
 - code fix: `c0fbd6020f3aa231349ef299ecf1b2b7d5047cd0`
+
+## Fix follow-up: overlapping duplicate-group rereview addressed on 2026-07-10
+
+### Review issues and what changed
+
+- Issue 1: a new submission could match candidates from multiple existing duplicate groups, and ingestion would persist those matched rows into the chosen representative group without removing them from their prior groups.
+  - `src/analysis/events/evidence.rs` now detects when the matched candidate set spans more than one representative.
+  - in that case, ingestion downgrades the persisted relation to a single `review_required` representation and only stages members from the chosen representative cluster plus the submitted row
+  - this preserves one auditable group update without creating overlapping duplicate-group membership for rows that already belong to other groups
+- Issue 2: the concurrency regression gate was outside the repository transaction, so it did not hold the stale-state boundary the rereview was concerned about.
+  - moved the duplicate-group persistence gate into `EventRepository::insert_manual_evidence_with_effect()` after effect construction and inserted-row staging, but before duplicate-group append and commit
+  - `src/analysis/events/evidence.rs` now uses the repository-owned gate in the concurrency regression, which proves the second writer stays blocked until the first transaction releases
+- Storage/analysis separation remains intact:
+  - analysis still classifies duplicates and constructs the duplicate-group effect
+  - storage still owns locking, transaction scope, candidate lookup, evidence insert, and duplicate-group persistence
+
+### Red test evidence
+
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test matching_multiple_existing_duplicate_groups_persists_one_auditable_review_group_without_overlap -- --nocapture`
+  - failed before the fix
+  - persisted relation type was `"exact"` instead of the required auditable downgrade to `"review_required"`
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test concurrent_different_hash_near_duplicates_share_one_duplicate_group_and_representative -- --nocapture`
+  - failed before the fix
+  - the second submission completed while the first was paused, proving the gate was still outside the repository transaction
+
+### Green verification
+
+- `cargo fmt --all -- --check`
+  - passed
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test analysis::events::dedup -- --nocapture`
+  - passed, `10 passed; 0 failed`
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test analysis::events -- --nocapture`
+  - passed, `35 passed; 0 failed`
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test storage::event_repository -- --nocapture`
+  - passed, `14 passed; 0 failed`
+- `cargo test --all --locked config::tests::test_config_defaults`
+  - passed, `1 passed; 0 failed`
+- `git diff --check`
+  - passed
+- `cargo check --tests --locked`
+  - passed
+  - remaining warnings are the same pre-existing unused/dead-code warnings outside this Task 4 fix surface
+
+### Commit hash
+
+- code fix: `550c6433c0adecc2526adaccdbaaa4a611d60e15`
