@@ -166,9 +166,9 @@ Database integration tests require a valid `DATABASE_URL` or SQLx test database 
 - Consumes Gate 0 datasets.
 - Produces manually published pattern versions and shadow candidates only.
 
-- [ ] Execute every checkbox in the linked plan.
-- [ ] Run Rust and Python verification.
-- [ ] Confirm `signal_strategy_candidates` contains no shadow-model writes.
+- [x] Execute every checkbox in the linked plan.
+- [x] Run Rust and Python verification.
+- [x] Confirm `signal_strategy_candidates` contains no shadow-model writes.
 
 ### Task 3: Complete Gate 2
 

@@ -706,7 +706,7 @@ git commit -m "feat: match published patterns in shadow mode"
 - Adds shadow read endpoints.
 - Adds a 17:40 job after market snapshot and scan.
 
-- [ ] **Step 1: Add endpoints**
+- [x] **Step 1: Add endpoints**
 
 ```text
 GET  /api/analysis/patterns/shadow
@@ -714,7 +714,7 @@ GET  /api/analysis/patterns/shadow/:code
 POST /api/jobs/analysis/pattern-match
 ```
 
-- [ ] **Step 2: Add scheduler function**
+- [x] **Step 2: Add scheduler function**
 
 ```rust
 pub async fn run_pattern_shadow_job(state: Arc<AppState>) {
@@ -724,13 +724,13 @@ pub async fn run_pattern_shadow_job(state: Arc<AppState>) {
 }
 ```
 
-- [ ] **Step 3: Add cron**
+- [x] **Step 3: Add cron**
 
 ```rust
 const PATTERN_SHADOW_JOB_CRON: &str = "0 40 17 * * Mon,Tue,Wed,Thu,Fri";
 ```
 
-- [ ] **Step 4: Add safety tests**
+- [x] **Step 4: Add safety tests**
 
 Assert:
 
@@ -739,7 +739,7 @@ Assert:
 - missing published model skips safely.
 - incomplete snapshot skips safely.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 cargo fmt --all -- --check
@@ -754,13 +754,13 @@ git commit -m "feat: report strong-stock shadow candidates"
 
 ## Phase Completion Checklist
 
-- [ ] Week and month datasets are point-in-time safe.
-- [ ] Controls are matched and persisted.
-- [ ] Purge and embargo tests pass.
-- [ ] All four baselines run.
-- [ ] Pattern validation reports Lift and effective sample size.
-- [ ] Python exports only draft/validated models.
-- [ ] Publishing remains manual.
-- [ ] Rust loads only published models.
-- [ ] Shadow candidates never reach auto trading.
-- [ ] Existing `scan_ranker` remains unchanged and comparable.
+- [x] Week and month datasets are point-in-time safe.
+- [x] Controls are matched and persisted.
+- [x] Purge and embargo tests pass.
+- [x] All four baselines run.
+- [x] Pattern validation reports Lift and effective sample size.
+- [x] Python exports only draft/validated models.
+- [x] Publishing remains manual.
+- [x] Rust loads only published models.
+- [x] Shadow candidates never reach auto trading.
+- [x] Existing `scan_ranker` remains unchanged and comparable.
