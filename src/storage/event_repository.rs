@@ -646,10 +646,10 @@ async fn find_manual_duplicate_candidates_in_tx(
 
 async fn lock_manual_duplicate_discovery_scope(
     tx: &mut Transaction<'_, Postgres>,
-    row: &EventEvidenceRow,
+    _row: &EventEvidenceRow,
 ) -> Result<()> {
     sqlx::query(r#"SELECT pg_advisory_xact_lock($1::bigint)"#)
-        .bind(manual_duplicate_scope_lock_key(row))
+        .bind(manual_duplicate_scope_lock_key())
         .fetch_one(&mut **tx)
         .await?;
 
@@ -819,16 +819,10 @@ async fn append_duplicate_group_in_tx(
     Ok(())
 }
 
-fn manual_duplicate_scope_lock_key(row: &EventEvidenceRow) -> i64 {
+fn manual_duplicate_scope_lock_key() -> i64 {
     use sha2::{Digest, Sha256};
 
-    let digest = Sha256::digest(
-        format!(
-            "market-event-manual-duplicate-scope:{}:{}",
-            row.source_tier, row.effective_trade_date
-        )
-        .as_bytes(),
-    );
+    let digest = Sha256::digest("market-event-manual-duplicate-discovery".as_bytes());
     let mut bytes = [0_u8; 8];
     bytes.copy_from_slice(&digest[..8]);
     i64::from_be_bytes(bytes)
@@ -972,10 +966,14 @@ mod tests {
     use super::{
         ClaimEvidenceRow, ClaimGraphRow, ClaimRow, DailyEventBriefRow, DuplicateGroupMemberRow,
         DuplicateGroupRow, EventEvidenceRow, EventRepository, ExtractionRow,
+        ManualEvidenceInsertEffect,
     };
+    use crate::error::Result;
     use chrono::{DateTime, NaiveDate, TimeZone, Utc};
     use serde_json::{json, Value};
     use sqlx::PgPool;
+    use std::time::Duration;
+    use tokio::task::yield_now;
     use uuid::Uuid;
 
     fn date(year: i32, month: u32, day: u32) -> NaiveDate {
@@ -1045,6 +1043,30 @@ mod tests {
             .insert_evidence(row)
             .await
             .unwrap();
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ManualDuplicateDiscoveryOutcome {
+        InsertedWithoutExisting,
+        ExistingFound,
+    }
+
+    async fn classify_manual_insert(
+        repo: EventRepository,
+        row: EventEvidenceRow,
+    ) -> Result<ManualDuplicateDiscoveryOutcome> {
+        repo.insert_manual_evidence_with_effect(&row, |context| async move {
+            let result = if context.existing_rows.is_empty() {
+                ManualDuplicateDiscoveryOutcome::InsertedWithoutExisting
+            } else {
+                ManualDuplicateDiscoveryOutcome::ExistingFound
+            };
+            Ok(ManualEvidenceInsertEffect {
+                result,
+                duplicate_group: None,
+            })
+        })
+        .await
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -1418,6 +1440,76 @@ mod tests {
             inserted.existing_rows[0].source_url.as_deref(),
             Some("https://example.test/contracts/acme")
         );
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn concurrent_mixed_tier_exact_duplicates_share_one_discovery_lock(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = EventRepository::new(pool.clone())
+            .clone_with_manual_insert_sleep_after_candidate_discovery_for_test(
+                Duration::from_millis(250),
+            );
+        let shared_hash = "shared-cross-tier-duplicate-hash".to_string();
+
+        let mut first = evidence("mixed-tier-first", 1, "pending");
+        first.source_id = "manual:rest".to_string();
+        first.source_tier = "manual".to_string();
+        first.title = "Cross-tier duplicate candidate".to_string();
+        first.content = Some("Shared duplicate payload across tiers.".to_string());
+        first.content_hash = shared_hash.clone();
+        first.source_url = Some("https://example.test/mixed-tier-first".to_string());
+        first.available_at = dt(2026, 7, 10, 12);
+        first.first_seen_at = dt(2026, 7, 10, 12);
+        first.created_at = dt(2026, 7, 10, 12);
+
+        let mut second = evidence("mixed-tier-second", 1, "pending");
+        second.source_id = "feed:wire".to_string();
+        second.source_tier = "wire".to_string();
+        second.title = "Cross-tier duplicate candidate from another tier".to_string();
+        second.content = Some("Shared duplicate payload across tiers.".to_string());
+        second.content_hash = shared_hash.clone();
+        second.source_url = Some("https://example.test/mixed-tier-second".to_string());
+        second.available_at = dt(2026, 7, 10, 13);
+        second.first_seen_at = dt(2026, 7, 10, 13);
+        second.created_at = dt(2026, 7, 10, 13);
+
+        let first_worker = tokio::spawn({
+            let repo = repo.clone();
+            let first = first.clone();
+            async move { classify_manual_insert(repo, first).await }
+        });
+        yield_now().await;
+        let second_worker = tokio::spawn(async move { classify_manual_insert(repo, second).await });
+
+        let outcomes = [
+            first_worker.await.unwrap().unwrap(),
+            second_worker.await.unwrap().unwrap(),
+        ];
+        let inserted_without_existing = outcomes
+            .iter()
+            .filter(|outcome| {
+                matches!(
+                    outcome,
+                    ManualDuplicateDiscoveryOutcome::InsertedWithoutExisting
+                )
+            })
+            .count();
+        let existing_found = outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, ManualDuplicateDiscoveryOutcome::ExistingFound))
+            .count();
+
+        assert_eq!(inserted_without_existing, 1);
+        assert_eq!(existing_found, 1);
+
+        let stored = EventRepository::new(pool)
+            .find_by_content_hash(&shared_hash)
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 2);
 
         Ok(())
     }
