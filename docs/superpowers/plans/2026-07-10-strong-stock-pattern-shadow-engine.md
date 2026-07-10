@@ -441,7 +441,7 @@ git commit -m "feat: add strong-stock labels and matched controls"
 - Produces `discover_archetypes(train_frame, pattern_type, config)`.
 - Outputs serializable candidate archetypes.
 
-- [ ] **Step 1: Define deterministic pattern-family gates**
+- [x] **Step 1: Define deterministic pattern-family gates**
 
 Implement three pure masks:
 
@@ -451,11 +451,11 @@ def vcp_breakout_family(frame: pl.DataFrame) -> pl.Expr: ...
 def oversold_reversal_family(frame: pl.DataFrame) -> pl.Expr: ...
 ```
 
-- [ ] **Step 2: Test unclassified behavior**
+- [x] **Step 2: Test unclassified behavior**
 
 Samples not satisfying any family remain unclassified; do not force assignment.
 
-- [ ] **Step 3: Implement K-Means and GMM comparison**
+- [x] **Step 3: Implement K-Means and GMM comparison**
 
 Use only training-window data. Save:
 
@@ -465,11 +465,11 @@ Use only training-window data. Save:
 - random seed.
 - high-contribution features.
 
-- [ ] **Step 4: Reject unstable or tiny clusters**
+- [x] **Step 4: Reject unstable or tiny clusters**
 
 Candidate archetypes below configured sample size are not exported.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 cd research
