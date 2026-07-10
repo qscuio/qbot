@@ -631,7 +631,6 @@ async fn concurrent_identical_manual_submissions_report_one_insert_and_one_exist
     pool: PgPool,
 ) -> sqlx::Result<()> {
     let repo = EventRepository::new(pool.clone());
-    let ingestor = ManualEvidenceIngestor::new(repo.clone(), Arc::new(AShareTradingDateResolver));
     let input = ManualEventInput {
         title: " ACME   wins   contract ".to_string(),
         content: Some("Order value\n exceeds guidance".to_string()),
@@ -640,13 +639,51 @@ async fn concurrent_identical_manual_submissions_report_one_insert_and_one_exist
         published_at: Some(dt(2026, 7, 10, 7, 30, 0)),
     };
     let expected_hash = content_hash(&input.title, input.content.as_deref());
-    let ingestor = ingestor.clone_with_duplicate_lookup_barrier_for_test(expected_hash, 2);
+    let (gated_repo, gate) =
+        repo.clone_with_manual_insert_candidate_discovery_gate_for_test(expected_hash.clone());
+    let ingestor = ManualEvidenceIngestor::new(gated_repo, Arc::new(AShareTradingDateResolver));
 
-    let (left, right) = tokio::join!(
-        ingestor.submit_at(ManualSource::Rest, input.clone(), dt(2026, 7, 10, 8, 0, 0)),
-        ingestor.submit_at(ManualSource::Rest, input, dt(2026, 7, 10, 8, 0, 1)),
+    let left_worker = tokio::spawn({
+        let ingestor = ingestor.clone();
+        let input = input.clone();
+        async move {
+            ingestor
+                .submit_at(ManualSource::Rest, input, dt(2026, 7, 10, 8, 0, 0))
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), gate.wait_until_blocked())
+        .await
+        .expect("first identical submission should reach the repository candidate-discovery gate");
+
+    let mut right_worker = tokio::spawn({
+        let ingestor = ingestor.clone();
+        async move {
+            ingestor
+                .submit_at(ManualSource::Rest, input, dt(2026, 7, 10, 8, 0, 1))
+                .await
+        }
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut right_worker)
+            .await
+            .is_err(),
+        "second identical submission should stay blocked on the repository transaction while the first is paused",
     );
-    let outcomes = [left.unwrap(), right.unwrap()];
+
+    gate.release();
+    let outcomes = [
+        tokio::time::timeout(Duration::from_secs(5), left_worker)
+            .await
+            .expect("first identical submission should finish after the gate releases")
+            .unwrap()
+            .unwrap(),
+        tokio::time::timeout(Duration::from_secs(5), right_worker)
+            .await
+            .expect("second identical submission should finish after the gate releases")
+            .unwrap()
+            .unwrap(),
+    ];
 
     let inserted_count = outcomes
         .iter()
@@ -889,7 +926,7 @@ async fn concurrent_different_hash_near_duplicates_share_one_duplicate_group_and
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn duplicate_lookup_barrier_does_not_accept_same_hash_from_unrelated_ingestor(
+async fn candidate_discovery_gate_does_not_coordinate_unrelated_ingestors(
     pool: PgPool,
 ) -> sqlx::Result<()> {
     let repo = EventRepository::new(pool.clone());
@@ -904,19 +941,22 @@ async fn duplicate_lookup_barrier_does_not_accept_same_hash_from_unrelated_inges
         published_at: Some(dt(2026, 7, 10, 7, 30, 0)),
     };
     let expected_hash = content_hash(&input.title, input.content.as_deref());
-    let barrier_ingestor =
-        base_ingestor.clone_with_duplicate_lookup_barrier_for_test(expected_hash, 2);
+    let (gated_repo, gate) =
+        repo.clone_with_manual_insert_candidate_discovery_gate_for_test(expected_hash);
+    let gated_ingestor = ManualEvidenceIngestor::new(gated_repo, resolver);
 
-    let mut first_barrier_worker = tokio::spawn({
-        let barrier_ingestor = barrier_ingestor.clone();
+    let mut first_gated_worker = tokio::spawn({
+        let gated_ingestor = gated_ingestor.clone();
         let input = input.clone();
         async move {
-            barrier_ingestor
+            gated_ingestor
                 .submit_at(ManualSource::Rest, input, dt(2026, 7, 10, 8, 0, 0))
                 .await
         }
     });
-    yield_now().await;
+    tokio::time::timeout(Duration::from_secs(5), gate.wait_until_blocked())
+        .await
+        .expect("gated submission should reach the repository candidate-discovery gate");
 
     let unrelated = tokio::spawn(async move {
         unrelated_ingestor
@@ -925,30 +965,37 @@ async fn duplicate_lookup_barrier_does_not_accept_same_hash_from_unrelated_inges
     });
 
     if let Ok(first) =
-        tokio::time::timeout(Duration::from_millis(200), &mut first_barrier_worker).await
+        tokio::time::timeout(Duration::from_millis(200), &mut first_gated_worker).await
     {
         first.unwrap().unwrap();
         unrelated.await.unwrap().unwrap();
-        panic!("unrelated ingestor with the same content hash consumed the barrier");
+        panic!("unrelated ingestor with the same content hash released the repository gate");
     }
 
-    let second_barrier_worker = barrier_ingestor.submit_at(
-        ManualSource::Rest,
-        ManualEventInput {
-            title: " ACME   wins   contract ".to_string(),
-            content: Some("Order value\n exceeds guidance".to_string()),
-            source_url: Some("https://example.com/contracts/acme".to_string()),
-            submitted_by: "operator".to_string(),
-            published_at: Some(dt(2026, 7, 10, 7, 30, 0)),
-        },
-        dt(2026, 7, 10, 8, 0, 2),
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut first_gated_worker)
+            .await
+            .is_err(),
+        "unrelated ingestor must not consume or release the repository candidate-discovery gate",
     );
 
-    let (first, second, unrelated) =
-        tokio::join!(first_barrier_worker, second_barrier_worker, unrelated);
-    first.unwrap().unwrap();
-    second.unwrap();
-    unrelated.unwrap().unwrap();
+    gate.release();
+    let (gated_outcome, unrelated_outcome) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(5), first_gated_worker),
+        tokio::time::timeout(Duration::from_secs(5), unrelated),
+    );
+    assert_inserted(
+        gated_outcome
+            .expect("gated submission should complete after the gate releases")
+            .unwrap()
+            .unwrap(),
+    );
+    assert_existing(
+        unrelated_outcome
+            .expect("unrelated submission should complete after the gated transaction commits")
+            .unwrap()
+            .unwrap(),
+    );
 
     Ok(())
 }

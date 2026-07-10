@@ -45,8 +45,6 @@ pub(crate) struct ManualEvidenceIngestor {
     repo: EventRepository,
     resolver: Arc<dyn TradingDateResolver>,
     auto_near_duplicate_threshold: f64,
-    #[cfg(test)]
-    duplicate_lookup_barrier: Option<test_support::DuplicateLookupBarrier>,
 }
 
 impl ManualEvidenceIngestor {
@@ -67,8 +65,6 @@ impl ManualEvidenceIngestor {
             repo,
             resolver,
             auto_near_duplicate_threshold,
-            #[cfg(test)]
-            duplicate_lookup_barrier: None,
         }
     }
 
@@ -99,11 +95,6 @@ impl ManualEvidenceIngestor {
         let available_at = manual_available_at(input.published_at, first_seen_at);
         let effective_trade_date =
             effective_trade_date_for_manual(self.resolver.as_ref(), available_at)?;
-        #[cfg(test)]
-        {
-            let _ = self.repo.find_by_content_hash(&content_hash).await?;
-            self.wait_after_duplicate_lookup(&content_hash).await;
-        }
 
         let row = EventEvidenceRow {
             evidence_id: Uuid::new_v4(),
@@ -143,26 +134,6 @@ impl ManualEvidenceIngestor {
             .await?;
 
         Ok(outcome)
-    }
-
-    #[cfg(test)]
-    fn clone_with_duplicate_lookup_barrier_for_test(
-        &self,
-        content_hash: impl Into<String>,
-        parties: usize,
-    ) -> Self {
-        let mut clone = self.clone();
-        clone.duplicate_lookup_barrier = Some(
-            test_support::DuplicateLookupBarrier::for_content_hash(content_hash, parties),
-        );
-        clone
-    }
-
-    #[cfg(test)]
-    async fn wait_after_duplicate_lookup(&self, content_hash: &str) {
-        if let Some(barrier) = &self.duplicate_lookup_barrier {
-            barrier.wait(content_hash).await;
-        }
     }
 }
 
@@ -350,43 +321,6 @@ fn duplicate_group_id(representative_id: Uuid) -> Uuid {
     bytes[6] = (bytes[6] & 0x0f) | 0x50;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     Uuid::from_bytes(bytes)
-}
-
-#[cfg(test)]
-mod test_support {
-    use std::sync::Arc;
-
-    use tokio::sync::Barrier;
-
-    #[derive(Clone)]
-    pub(super) enum DuplicateLookupBarrierScope {
-        ContentHash(String),
-    }
-
-    #[derive(Clone)]
-    pub(super) struct DuplicateLookupBarrier {
-        scope: DuplicateLookupBarrierScope,
-        barrier: Arc<Barrier>,
-    }
-
-    impl DuplicateLookupBarrier {
-        pub(super) fn for_content_hash(content_hash: impl Into<String>, parties: usize) -> Self {
-            Self {
-                scope: DuplicateLookupBarrierScope::ContentHash(content_hash.into()),
-                barrier: Arc::new(Barrier::new(parties)),
-            }
-        }
-        pub(super) async fn wait(&self, content_hash: &str) {
-            let should_wait = match &self.scope {
-                DuplicateLookupBarrierScope::ContentHash(expected_hash) => {
-                    expected_hash == content_hash
-                }
-            };
-            if should_wait {
-                self.barrier.wait().await;
-            }
-        }
-    }
 }
 
 #[cfg(test)]

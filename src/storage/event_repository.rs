@@ -177,7 +177,8 @@ impl EventRepository {
 
         let existing_candidates = find_manual_duplicate_candidates_in_tx(&mut tx, &row).await?;
         #[cfg(test)]
-        self.run_manual_insert_test_hook(&existing_candidates).await;
+        self.run_manual_insert_test_hook(&row, &existing_candidates)
+            .await;
         let existing_rows = existing_candidates
             .iter()
             .map(|candidate| candidate.row.clone())
@@ -267,9 +268,24 @@ impl EventRepository {
     }
 
     #[cfg(test)]
-    async fn run_manual_insert_test_hook(&self, candidates: &[ManualDuplicateCandidateRow]) {
+    pub(crate) fn clone_with_manual_insert_candidate_discovery_gate_for_test(
+        &self,
+        content_hash: impl Into<String>,
+    ) -> (Self, CandidateDiscoveryGateHandle) {
+        let mut clone = self.clone();
+        let (hook, handle) = ManualInsertTestHook::with_candidate_discovery_gate(content_hash);
+        clone.manual_insert_test_hook = Some(hook);
+        (clone, handle)
+    }
+
+    #[cfg(test)]
+    async fn run_manual_insert_test_hook(
+        &self,
+        row: &EventEvidenceRow,
+        candidates: &[ManualDuplicateCandidateRow],
+    ) {
         if let Some(hook) = &self.manual_insert_test_hook {
-            hook.wait_after_candidate_discovery(candidates).await;
+            hook.wait_after_candidate_discovery(row, candidates).await;
         }
     }
 
@@ -857,6 +873,7 @@ fn event_evidence_from_row(row: sqlx::postgres::PgRow) -> EventEvidenceRow {
 #[derive(Clone)]
 struct ManualInsertTestHook {
     sleep_after_candidate_discovery: Option<std::time::Duration>,
+    candidate_discovery_gate: Option<CandidateDiscoveryGate>,
     duplicate_group_persistence_gate: Option<DuplicateGroupPersistenceGate>,
 }
 
@@ -865,8 +882,23 @@ impl ManualInsertTestHook {
     fn with_sleep_after_candidate_discovery(duration: std::time::Duration) -> Self {
         Self {
             sleep_after_candidate_discovery: Some(duration),
+            candidate_discovery_gate: None,
             duplicate_group_persistence_gate: None,
         }
+    }
+
+    fn with_candidate_discovery_gate(
+        content_hash: impl Into<String>,
+    ) -> (Self, CandidateDiscoveryGateHandle) {
+        let (gate, handle) = CandidateDiscoveryGate::for_content_hash(content_hash);
+        (
+            Self {
+                sleep_after_candidate_discovery: None,
+                candidate_discovery_gate: Some(gate),
+                duplicate_group_persistence_gate: None,
+            },
+            handle,
+        )
     }
 
     fn with_duplicate_group_persistence_gate(
@@ -876,15 +908,23 @@ impl ManualInsertTestHook {
         (
             Self {
                 sleep_after_candidate_discovery: None,
+                candidate_discovery_gate: None,
                 duplicate_group_persistence_gate: Some(gate),
             },
             handle,
         )
     }
 
-    async fn wait_after_candidate_discovery(&self, _candidates: &[ManualDuplicateCandidateRow]) {
+    async fn wait_after_candidate_discovery(
+        &self,
+        row: &EventEvidenceRow,
+        _candidates: &[ManualDuplicateCandidateRow],
+    ) {
         if let Some(duration) = self.sleep_after_candidate_discovery {
             tokio::time::sleep(duration).await;
+        }
+        if let Some(gate) = &self.candidate_discovery_gate {
+            gate.wait(&row.content_hash).await;
         }
     }
 
@@ -900,6 +940,62 @@ impl ManualInsertTestHook {
         if let Some(gate) = &self.duplicate_group_persistence_gate {
             gate.wait(&row.content_hash).await;
         }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct CandidateDiscoveryGateHandle {
+    blocked: std::sync::Arc<tokio::sync::Notify>,
+    release: std::sync::Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct CandidateDiscoveryGate {
+    content_hash: String,
+    blocked: std::sync::Arc<tokio::sync::Notify>,
+    release: std::sync::Arc<tokio::sync::Notify>,
+    triggered: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(test)]
+impl CandidateDiscoveryGate {
+    fn for_content_hash(content_hash: impl Into<String>) -> (Self, CandidateDiscoveryGateHandle) {
+        let blocked = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+
+        (
+            Self {
+                content_hash: content_hash.into(),
+                blocked: blocked.clone(),
+                release: release.clone(),
+                triggered: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+            CandidateDiscoveryGateHandle { blocked, release },
+        )
+    }
+
+    async fn wait(&self, content_hash: &str) {
+        if self.content_hash == content_hash
+            && !self
+                .triggered
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.blocked.notify_one();
+            self.release.notified().await;
+        }
+    }
+}
+
+#[cfg(test)]
+impl CandidateDiscoveryGateHandle {
+    pub(crate) async fn wait_until_blocked(&self) {
+        self.blocked.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.release.notify_one();
     }
 }
 
