@@ -330,7 +330,7 @@ git commit -m "feat: add point-in-time market data schema"
 - Produces shared Rust types for repository, provider, and snapshot tasks.
 - No database calls in contract files.
 
-- [ ] **Step 1: Write contract unit tests**
+- [x] **Step 1: Write contract unit tests**
 
 Create `src/analysis/market_snapshot/contracts.rs` with tests first:
 
@@ -353,7 +353,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Verify the test fails**
+- [x] **Step 2: Verify the test fails**
 
 Run:
 
@@ -363,7 +363,7 @@ cargo test point_in_time_context_rejects_data_available_after_cutoff
 
 Expected: FAIL because the module and types do not exist.
 
-- [ ] **Step 3: Implement the contracts**
+- [x] **Step 3: Implement the contracts**
 
 ```rust
 use chrono::{DateTime, NaiveDate, Utc};
@@ -524,7 +524,7 @@ Add to `src/main.rs`:
 mod analysis;
 ```
 
-- [ ] **Step 4: Run unit tests**
+- [x] **Step 4: Run unit tests**
 
 Run:
 
@@ -534,7 +534,7 @@ cargo test point_in_time_context_rejects_data_available_after_cutoff
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/analysis src/main.rs
