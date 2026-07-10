@@ -40,11 +40,18 @@ impl ManualSource {
 pub(crate) struct ManualEvidenceIngestor {
     repo: EventRepository,
     resolver: Arc<dyn TradingDateResolver>,
+    #[cfg(test)]
+    duplicate_lookup_barrier: Option<test_support::DuplicateLookupBarrier>,
 }
 
 impl ManualEvidenceIngestor {
     pub(crate) fn new(repo: EventRepository, resolver: Arc<dyn TradingDateResolver>) -> Self {
-        Self { repo, resolver }
+        Self {
+            repo,
+            resolver,
+            #[cfg(test)]
+            duplicate_lookup_barrier: None,
+        }
     }
 
     pub(crate) async fn submit_at(
@@ -77,7 +84,7 @@ impl ManualEvidenceIngestor {
         #[cfg(test)]
         {
             let _ = self.repo.find_by_content_hash(&content_hash).await?;
-            wait_after_duplicate_lookup(&content_hash).await;
+            self.wait_after_duplicate_lookup(&content_hash).await;
         }
 
         let row = EventEvidenceRow {
@@ -123,6 +130,27 @@ impl ManualEvidenceIngestor {
                 existing: event_evidence_from_row(&representative),
             },
         ))
+    }
+
+    #[cfg(test)]
+    fn clone_with_duplicate_lookup_barrier_for_test(
+        &self,
+        content_hash: impl Into<String>,
+        parties: usize,
+    ) -> Self {
+        let mut clone = self.clone();
+        clone.duplicate_lookup_barrier = Some(test_support::DuplicateLookupBarrier::new(
+            content_hash,
+            parties,
+        ));
+        clone
+    }
+
+    #[cfg(test)]
+    async fn wait_after_duplicate_lookup(&self, content_hash: &str) {
+        if let Some(barrier) = &self.duplicate_lookup_barrier {
+            barrier.wait(content_hash).await;
+        }
     }
 }
 
@@ -178,62 +206,30 @@ fn event_evidence_from_row(row: &EventEvidenceRow) -> EventEvidence {
 }
 
 #[cfg(test)]
-async fn wait_after_duplicate_lookup(content_hash: &str) {
-    test_support::wait_after_duplicate_lookup(content_hash).await;
-}
-
-#[cfg(test)]
 mod test_support {
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::Arc;
 
     use tokio::sync::Barrier;
 
-    static AFTER_DUPLICATE_LOOKUP_BARRIER: OnceLock<Mutex<Option<DuplicateLookupBarrier>>> =
-        OnceLock::new();
-
     #[derive(Clone)]
-    struct DuplicateLookupBarrier {
+    pub(super) struct DuplicateLookupBarrier {
         content_hash: String,
         barrier: Arc<Barrier>,
     }
 
-    pub(super) struct DuplicateLookupBarrierGuard;
-
-    pub(super) fn install_duplicate_lookup_barrier(
-        content_hash: impl Into<String>,
-        parties: usize,
-    ) -> DuplicateLookupBarrierGuard {
-        let barrier = DuplicateLookupBarrier {
-            content_hash: content_hash.into(),
-            barrier: Arc::new(Barrier::new(parties)),
-        };
-        let mut slot = barrier_slot().lock().unwrap();
-        assert!(slot.replace(barrier).is_none());
-        DuplicateLookupBarrierGuard
-    }
-
-    pub(super) async fn wait_after_duplicate_lookup(content_hash: &str) {
-        let barrier = {
-            let slot = barrier_slot().lock().unwrap();
-            slot.clone()
-        };
-
-        if let Some(barrier) = barrier {
-            if barrier.content_hash == content_hash {
-                barrier.barrier.wait().await;
+    impl DuplicateLookupBarrier {
+        pub(super) fn new(content_hash: impl Into<String>, parties: usize) -> Self {
+            Self {
+                content_hash: content_hash.into(),
+                barrier: Arc::new(Barrier::new(parties)),
             }
         }
-    }
 
-    impl Drop for DuplicateLookupBarrierGuard {
-        fn drop(&mut self) {
-            let mut slot = barrier_slot().lock().unwrap();
-            *slot = None;
+        pub(super) async fn wait(&self, content_hash: &str) {
+            if self.content_hash == content_hash {
+                self.barrier.wait().await;
+            }
         }
-    }
-
-    fn barrier_slot() -> &'static Mutex<Option<DuplicateLookupBarrier>> {
-        AFTER_DUPLICATE_LOOKUP_BARRIER.get_or_init(|| Mutex::new(None))
     }
 }
 
@@ -249,8 +245,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        content_hash, test_support::install_duplicate_lookup_barrier, wait_after_duplicate_lookup,
-        ManualEvidenceIngestor, ManualSource, MANUAL_SOURCE_REST, MANUAL_SOURCE_TELEGRAM,
+        content_hash, ManualEvidenceIngestor, ManualSource, MANUAL_SOURCE_REST,
+        MANUAL_SOURCE_TELEGRAM,
     };
     use crate::analysis::events::{
         AShareTradingDateResolver, EventIntelligence, ExistingEventEvidenceRelation,
@@ -410,7 +406,7 @@ mod tests {
             published_at: Some(dt(2026, 7, 10, 7, 30, 0)),
         };
         let expected_hash = content_hash(&input.title, input.content.as_deref());
-        let _barrier = install_duplicate_lookup_barrier(expected_hash, 2);
+        let ingestor = ingestor.clone_with_duplicate_lookup_barrier_for_test(expected_hash, 2);
 
         let (left, right) = tokio::join!(
             ingestor.submit_at(ManualSource::Rest, input.clone(), dt(2026, 7, 10, 8, 0, 0)),
@@ -442,16 +438,69 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn duplicate_lookup_barrier_does_not_block_unrelated_waiters() {
-        let waiting = tokio::spawn(wait_after_duplicate_lookup("other-hash"));
-        yield_now().await;
-        let _barrier = install_duplicate_lookup_barrier("expected-hash", 2);
+    #[sqlx::test(migrations = "./migrations")]
+    async fn duplicate_lookup_barrier_does_not_accept_same_hash_from_unrelated_ingestor(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = EventRepository::new(pool.clone());
+        let resolver = Arc::new(AShareTradingDateResolver);
+        let base_ingestor = ManualEvidenceIngestor::new(repo.clone(), resolver.clone());
+        let unrelated_ingestor = base_ingestor.clone();
+        let input = ManualEventInput {
+            title: " ACME   wins   contract ".to_string(),
+            content: Some("Order value\n exceeds guidance".to_string()),
+            source_url: Some("https://example.com/contracts/acme".to_string()),
+            submitted_by: "operator".to_string(),
+            published_at: Some(dt(2026, 7, 10, 7, 30, 0)),
+        };
+        let expected_hash = content_hash(&input.title, input.content.as_deref());
+        let barrier_ingestor =
+            base_ingestor.clone_with_duplicate_lookup_barrier_for_test(expected_hash, 2);
 
-        tokio::time::timeout(Duration::from_millis(50), waiting)
-            .await
-            .expect("unrelated waiter should not block on the duplicate lookup barrier")
-            .expect("wait task should complete cleanly");
+        let mut first_barrier_worker = tokio::spawn({
+            let barrier_ingestor = barrier_ingestor.clone();
+            let input = input.clone();
+            async move {
+                barrier_ingestor
+                    .submit_at(ManualSource::Rest, input, dt(2026, 7, 10, 8, 0, 0))
+                    .await
+            }
+        });
+        yield_now().await;
+
+        let unrelated = tokio::spawn(async move {
+            unrelated_ingestor
+                .submit_at(ManualSource::Rest, input, dt(2026, 7, 10, 8, 0, 1))
+                .await
+        });
+
+        if let Ok(first) =
+            tokio::time::timeout(Duration::from_millis(200), &mut first_barrier_worker).await
+        {
+            first.unwrap().unwrap();
+            unrelated.await.unwrap().unwrap();
+            panic!("unrelated ingestor with the same content hash consumed the barrier");
+        }
+
+        let second_barrier_worker = barrier_ingestor.submit_at(
+            ManualSource::Rest,
+            ManualEventInput {
+                title: " ACME   wins   contract ".to_string(),
+                content: Some("Order value\n exceeds guidance".to_string()),
+                source_url: Some("https://example.com/contracts/acme".to_string()),
+                submitted_by: "operator".to_string(),
+                published_at: Some(dt(2026, 7, 10, 7, 30, 0)),
+            },
+            dt(2026, 7, 10, 8, 0, 2),
+        );
+
+        let (first, second, unrelated) =
+            tokio::join!(first_barrier_worker, second_barrier_worker, unrelated);
+        first.unwrap().unwrap();
+        second.unwrap();
+        unrelated.unwrap().unwrap();
+
+        Ok(())
     }
 
     #[sqlx::test(migrations = "./migrations")]
