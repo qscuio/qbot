@@ -555,7 +555,7 @@ git commit -m "feat: add point-in-time analysis contracts"
 - Produces point-in-time reads and upserts.
 - Consumes contracts from Task 2.
 
-- [ ] **Step 1: Write a failing point-in-time query test**
+- [x] **Step 1: Write a failing point-in-time query test**
 
 ```rust
 #[sqlx::test(migrations = "./migrations")]
@@ -587,7 +587,7 @@ async fn latest_adjustment_factor_respects_as_of(pool: PgPool) -> sqlx::Result<(
 }
 ```
 
-- [ ] **Step 2: Verify the test fails**
+- [x] **Step 2: Verify the test fails**
 
 Run:
 
@@ -597,7 +597,7 @@ cargo test latest_adjustment_factor_respects_as_of
 
 Expected: FAIL because `MarketRepository` does not exist.
 
-- [ ] **Step 3: Implement the repository skeleton**
+- [x] **Step 3: Implement the repository skeleton**
 
 ```rust
 use chrono::{DateTime, NaiveDate, Utc};
@@ -680,7 +680,7 @@ Add:
 pub mod market_repository;
 ```
 
-- [ ] **Step 4: Add remaining repository methods**
+- [x] **Step 4: Add remaining repository methods**
 
 Implement:
 
@@ -704,7 +704,7 @@ pub async fn market_snapshot(&self, trade_date: NaiveDate, version: &str) -> Res
 
 Version tables are append-only by `(entity, trade_date, available_at)`. Use `ON CONFLICT ... DO NOTHING`; never update an earlier observation. The legacy current-state tables continue to use their existing upsert behavior.
 
-- [ ] **Step 5: Run repository tests**
+- [x] **Step 5: Run repository tests**
 
 Run:
 
@@ -714,7 +714,7 @@ cargo test storage::market_repository -- --nocapture
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/storage/market_repository.rs src/storage/mod.rs
