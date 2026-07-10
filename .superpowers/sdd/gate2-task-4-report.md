@@ -343,3 +343,50 @@
 ### Commit hash
 
 - code fix: `550c6433c0adecc2526adaccdbaaa4a611d60e15`
+
+## Fix follow-up: duplicate discovery lock scope rereview addressed on 2026-07-10
+
+### Review issues and what changed
+
+- Issue 1: `find_manual_duplicate_candidates_in_tx()` read a broader set than the advisory lock covered.
+  - `src/storage/event_repository.rs` now acquires one conservative transaction-scoped advisory lock for all manual duplicate discovery, instead of hashing `source_tier + effective_trade_date`.
+  - This matches the real read scope of manual candidate discovery, which can span same-trade-date rows plus global exact-match rows by content hash, canonical URL, and source item/version.
+  - Added `concurrent_mixed_tier_exact_duplicates_share_one_discovery_lock` to prove mixed-tier exact duplicates no longer bypass serialization and both report `Inserted` from stale candidate reads.
+- Issue 2: the duplicate-ingestion SQL regression suite was crowding `src/analysis/events/evidence.rs`.
+  - Moved the SQL-heavy duplicate-ingestion regressions into `src/analysis/events/evidence_duplicate_ingestion_tests.rs` as a dedicated child test module declared from `evidence.rs`.
+  - Kept the module relationship clean so the moved tests still use the private manual-ingestion helpers and test-only hooks through `super::...`, while production code in `evidence.rs` stays focused on ingestion logic.
+
+### Red test evidence
+
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test concurrent_mixed_tier_exact_duplicates_share_one_discovery_lock -- --nocapture`
+  - failed before the lock change
+  - assertion `left == right` failed
+  - left: `2`
+  - right: `1`
+  - meaning both mixed-tier submissions reported `InsertedWithoutExisting`, proving the old lock let them read the same stale candidate set concurrently
+
+### Green verification
+
+- `cargo fmt --all -- --check`
+  - passed
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test concurrent_mixed_tier_exact_duplicates_share_one_discovery_lock -- --nocapture`
+  - passed
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test repeated_manual_submission_returns_existing_evidence_relation -- --nocapture`
+  - passed from `analysis::events::evidence::duplicate_ingestion_tests`, confirming the moved duplicate-ingestion module still runs
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test analysis::events::dedup -- --nocapture`
+  - passed, `10 passed; 0 failed`
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test analysis::events -- --nocapture`
+  - passed, `35 passed; 0 failed`
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test storage::event_repository -- --nocapture`
+  - passed, `15 passed; 0 failed`
+- `cargo test --all --locked config::tests::test_config_defaults`
+  - passed, `1 passed; 0 failed`
+- `git diff --check`
+  - passed
+- `cargo check --tests --locked`
+  - passed
+  - pre-existing unused/dead-code warnings remain outside this Task 4 fix surface
+
+### Commit hash
+
+- code fix: `c6521205fe4ede9ef8e7860998c42b13e34abf6b`
