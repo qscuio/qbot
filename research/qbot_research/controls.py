@@ -30,6 +30,10 @@ EXPLICIT_MARKET_CAP_COLUMNS: Final[tuple[str, ...]] = (
     "free_float_market_cap",
 )
 PRICE_COLUMNS: Final[tuple[str, ...]] = ("adjusted_close", "close", "bar_close")
+MARKET_CAP_BUCKET_COLUMN: Final[str] = "market_cap_bucket"
+PRICE_BUCKET_COLUMN: Final[str] = "price_bucket"
+AMOUNT_BUCKET_COLUMN: Final[str] = "amount_20d_bucket"
+VOLATILITY_BUCKET_COLUMN: Final[str] = "volatility_20d_bucket"
 
 
 @dataclass(frozen=True)
@@ -144,18 +148,30 @@ def match_controls(
 
 def _enrich_candidates(frame: pl.DataFrame, config: ControlMatchConfig) -> pl.DataFrame:
     price_column = _first_present_column(frame, PRICE_COLUMNS)
-    if price_column is None:
+    if price_column is None and PRICE_BUCKET_COLUMN not in frame.columns:
         raise ValueError(
-            "match_controls requires one of the price columns: "
-            f"{', '.join(PRICE_COLUMNS)}"
+            "match_controls requires one of the price columns "
+            f"{', '.join(PRICE_COLUMNS)} or precomputed {PRICE_BUCKET_COLUMN}"
         )
     market_cap_column = _first_present_column(frame, EXPLICIT_MARKET_CAP_COLUMNS)
-    if market_cap_column is None and "turnover" not in frame.columns:
+    if market_cap_column is None and MARKET_CAP_BUCKET_COLUMN not in frame.columns:
         raise ValueError(
-            "match_controls requires a market cap column or the amount/turnover proxy inputs"
+            "match_controls requires a real market cap input: market_cap, "
+            "float_market_cap, free_float_market_cap, or market_cap_bucket"
         )
-    if "amount_20d_avg" not in frame.columns and "amount" not in frame.columns:
-        raise ValueError("match_controls requires amount or amount_20d_avg")
+    if "amount_20d_avg" not in frame.columns and "amount" not in frame.columns and AMOUNT_BUCKET_COLUMN not in frame.columns:
+        raise ValueError(
+            "match_controls requires amount, amount_20d_avg, or precomputed amount_20d_bucket"
+        )
+    if (
+        VOLATILITY_BUCKET_COLUMN not in frame.columns
+        and "volatility_20d" not in frame.columns
+        and price_column is None
+    ):
+        raise ValueError(
+            "match_controls requires volatility_20d, a price column, "
+            "or precomputed volatility_20d_bucket"
+        )
 
     indexed = frame.with_row_index("__row_id")
     sorted_frame = indexed.sort(["code", "trade_date", "__row_id"])
@@ -169,16 +185,15 @@ def _enrich_candidates(frame: pl.DataFrame, config: ControlMatchConfig) -> pl.Da
     rows_by_code: dict[str, list[int]] = defaultdict(list)
     for row_index, row in enumerate(rows):
         rows_by_code[str(row["code"])].append(row_index)
-        price_metric[row_index] = float(row[price_column])
+        if price_column is not None and row[price_column] is not None:
+            price_metric[row_index] = float(row[price_column])
+        else:
+            price_metric[row_index] = float(row[PRICE_BUCKET_COLUMN])
+
         if market_cap_column is not None and row[market_cap_column] is not None:
             market_cap_metric[row_index] = float(row[market_cap_column])
         else:
-            turnover_value = row.get("turnover")
-            if turnover_value is None or float(turnover_value) <= 0.0:
-                raise ValueError(
-                    "match_controls requires positive turnover when market cap is not present"
-                )
-            market_cap_metric[row_index] = float(row["amount"]) / float(turnover_value)
+            market_cap_metric[row_index] = float(row[MARKET_CAP_BUCKET_COLUMN])
 
     for code_indices in rows_by_code.values():
         amount_history: list[float] = []
@@ -188,23 +203,28 @@ def _enrich_candidates(frame: pl.DataFrame, config: ControlMatchConfig) -> pl.Da
             row = rows[row_index]
             if "amount_20d_avg" in row and row["amount_20d_avg"] is not None:
                 amount_20d_metric[row_index] = float(row["amount_20d_avg"])
-            else:
+            elif "amount" in row and row["amount"] is not None:
                 amount_history.append(float(row["amount"]))
                 amount_window = amount_history[-20:]
                 amount_20d_metric[row_index] = sum(amount_window) / len(amount_window)
+            else:
+                amount_20d_metric[row_index] = float(row[AMOUNT_BUCKET_COLUMN])
 
-            current_close = float(row[price_column])
-            if previous_close is not None and previous_close > 0.0:
-                return_history.append(current_close / previous_close - 1.0)
-            previous_close = current_close
+            if price_column is not None and row[price_column] is not None:
+                current_close = float(row[price_column])
+                if previous_close is not None and previous_close > 0.0:
+                    return_history.append(current_close / previous_close - 1.0)
+                previous_close = current_close
 
             if "volatility_20d" in row and row["volatility_20d"] is not None:
                 volatility_20d_metric[row_index] = float(row["volatility_20d"])
-            else:
+            elif price_column is not None:
                 return_window = return_history[-20:]
                 volatility_20d_metric[row_index] = (
                     float(pstdev(return_window)) if len(return_window) > 1 else 0.0
                 )
+            else:
+                volatility_20d_metric[row_index] = float(row[VOLATILITY_BUCKET_COLUMN])
 
     rows_by_trade_date: dict[Any, list[int]] = defaultdict(list)
     for row_index, row in enumerate(rows):
@@ -215,16 +235,39 @@ def _enrich_candidates(frame: pl.DataFrame, config: ControlMatchConfig) -> pl.Da
     amount_20d_bucket: list[int] = [0] * len(rows)
     volatility_20d_bucket: list[int] = [0] * len(rows)
 
+    if MARKET_CAP_BUCKET_COLUMN in frame.columns:
+        market_cap_bucket = [int(row[MARKET_CAP_BUCKET_COLUMN]) for row in rows]
+    if PRICE_BUCKET_COLUMN in frame.columns:
+        price_bucket = [int(row[PRICE_BUCKET_COLUMN]) for row in rows]
+    if AMOUNT_BUCKET_COLUMN in frame.columns:
+        amount_20d_bucket = [int(row[AMOUNT_BUCKET_COLUMN]) for row in rows]
+    if VOLATILITY_BUCKET_COLUMN in frame.columns:
+        volatility_20d_bucket = [int(row[VOLATILITY_BUCKET_COLUMN]) for row in rows]
+
     for group_indices in rows_by_trade_date.values():
-        _assign_buckets(market_cap_metric, group_indices, market_cap_bucket, config.bucket_count)
-        _assign_buckets(price_metric, group_indices, price_bucket, config.bucket_count)
-        _assign_buckets(amount_20d_metric, group_indices, amount_20d_bucket, config.bucket_count)
-        _assign_buckets(
-            volatility_20d_metric,
-            group_indices,
-            volatility_20d_bucket,
-            config.bucket_count,
-        )
+        if MARKET_CAP_BUCKET_COLUMN not in frame.columns:
+            _assign_buckets(
+                market_cap_metric,
+                group_indices,
+                market_cap_bucket,
+                config.bucket_count,
+            )
+        if PRICE_BUCKET_COLUMN not in frame.columns:
+            _assign_buckets(price_metric, group_indices, price_bucket, config.bucket_count)
+        if AMOUNT_BUCKET_COLUMN not in frame.columns:
+            _assign_buckets(
+                amount_20d_metric,
+                group_indices,
+                amount_20d_bucket,
+                config.bucket_count,
+            )
+        if VOLATILITY_BUCKET_COLUMN not in frame.columns:
+            _assign_buckets(
+                volatility_20d_metric,
+                group_indices,
+                volatility_20d_bucket,
+                config.bucket_count,
+            )
 
     return (
         sorted_frame.with_columns(

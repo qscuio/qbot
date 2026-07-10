@@ -30,6 +30,7 @@ def _make_candidate_frame() -> pl.DataFrame:
                     "trade_date": trade_date,
                     "code": code,
                     "adjusted_close": closes[idx],
+                    "market_cap": 5_000_000_000.0,
                     "amount": 1_000_000.0,
                     "turnover": 0.02,
                     "sector_code": "FIN" if code == "OFFSECTOR" else "TECH",
@@ -113,8 +114,22 @@ def test_match_controls_returns_deterministic_types_without_matching_self() -> N
     assert matches.select("tradable_sample").to_series().to_list() == [True, True, True]
 
 
-def test_match_controls_requires_market_cap_or_proxy_inputs() -> None:
-    candidates = _make_candidate_frame().drop("turnover")
+def test_match_controls_accepts_precomputed_market_cap_bucket_without_market_cap_metric() -> None:
+    candidates = _make_candidate_frame().drop("market_cap", "turnover").with_columns(
+        pl.lit(0).alias("market_cap_bucket")
+    )
+    samples = candidates.filter(
+        (pl.col("trade_date") == date(2026, 3, 3)) & (pl.col("code") == "POS")
+    )
+
+    matches = match_controls(samples, candidates, ControlMatchConfig(bucket_count=3))
+
+    assert matches.select("control_code").to_series().to_list() == ["ORD", "FAIL", "NEG"]
+    assert matches.select("market_cap_bucket").to_series().to_list() == [0, 0, 0]
+
+
+def test_match_controls_requires_real_market_cap_or_precomputed_bucket() -> None:
+    candidates = _make_candidate_frame().drop("market_cap")
     samples = candidates.filter(
         (pl.col("trade_date") == date(2026, 3, 3)) & (pl.col("code") == "POS")
     )
