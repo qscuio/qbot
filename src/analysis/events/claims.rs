@@ -3,6 +3,17 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 
+const FACT_NODE_TYPES: &[&str] = &[
+    "PolicyFact",
+    "CompanyFact",
+    "MacroDataFact",
+    "SupplyFact",
+    "DemandFact",
+    "PriceFact",
+    "OperationalFact",
+    "RegulatoryFact",
+];
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ClaimGraph {
     pub schema_version: String,
@@ -35,6 +46,15 @@ impl ClaimGraph {
         edges: Vec<ClaimEdge>,
     ) -> Result<Self> {
         for node in &nodes {
+            if !FACT_NODE_TYPES.contains(&node.node_type.as_str()) {
+                return Err(AppError::DataProvider(format!(
+                    "claim graph node `{}` has unsupported node type `{}`; expected one of: {}",
+                    node.node_id,
+                    node.node_type,
+                    FACT_NODE_TYPES.join(", ")
+                )));
+            }
+
             if node.evidence_ids.is_empty() {
                 return Err(AppError::DataProvider(format!(
                     "claim graph node `{}` must reference at least one evidence id",
@@ -155,6 +175,27 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "Data provider error: claim graph edge `policy-1->company-1:applies_to` must reference at least one evidence id"
+        );
+    }
+
+    #[test]
+    fn claim_graph_rejects_non_fact_node_types() {
+        let error = ClaimGraph::new(
+            "claim_graph_v1",
+            vec![node(
+                "hypothesis-1",
+                "ImpactHypothesis",
+                "Tariff may benefit exporters",
+                vec![evidence_id(1)],
+                0.72,
+            )],
+            Vec::new(),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Data provider error: claim graph node `hypothesis-1` has unsupported node type `ImpactHypothesis`; expected one of: PolicyFact, CompanyFact, MacroDataFact, SupplyFact, DemandFact, PriceFact, OperationalFact, RegulatoryFact"
         );
     }
 
