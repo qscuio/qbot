@@ -384,6 +384,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .with_state(state.clone())
         .merge(crate::api::analysis_routes::analysis_router(state.clone()))
+        .merge(crate::api::event_routes::event_router(state.clone()))
         .merge(crate::api::pattern_routes::pattern_router(state.clone()))
 }
 
@@ -503,6 +504,13 @@ fn telegram_help_text() -> String {
         "/daban sim      打板模拟交易",
         "/daban portfolio 打板持仓",
         "/daban stats    打板统计",
+        "",
+        "<b>Events</b>",
+        "/event <code>&lt;文本或链接&gt;</code>",
+        "/events",
+        "/event_detail <code>&lt;事件ID&gt;</code>",
+        "/event_review <code>&lt;事件ID&gt;</code>",
+        "/market_facts",
         "",
         "<b>Limit-Up</b>",
         "/limitup        涨停追踪概览",
@@ -3173,6 +3181,34 @@ async fn handle_telegram_command(
         }
         "start" | "help" => {
             send_help_with_menu(&state, chat_id).await?;
+        }
+        "event" => {
+            crate::api::event_routes::handle_telegram_submit_event(
+                state.clone(),
+                chat_id,
+                user_id,
+                &args,
+            )
+            .await?;
+        }
+        "events" => {
+            crate::api::event_routes::handle_telegram_list_events(state.clone(), chat_id).await?;
+        }
+        "event_detail" => {
+            crate::api::event_routes::handle_telegram_event_detail(state.clone(), chat_id, &args)
+                .await?;
+        }
+        "event_review" => {
+            crate::api::event_routes::handle_telegram_review_event(
+                state.clone(),
+                chat_id,
+                user_id,
+                &args,
+            )
+            .await?;
+        }
+        "market_facts" => {
+            crate::api::event_routes::handle_telegram_market_facts(state.clone(), chat_id).await?;
         }
         "watch" => {
             let code = args.split_whitespace().next().unwrap_or_default();

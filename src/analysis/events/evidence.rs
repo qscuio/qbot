@@ -76,8 +76,8 @@ impl ManualEvidenceIngestor {
     ) -> Result<ManualEventSubmissionOutcome> {
         let normalized_title = normalize_text(&input.title);
         if normalized_title.is_empty() {
-            return Err(AppError::Internal(
-                "manual event title cannot be empty after normalization".to_string(),
+            return Err(AppError::BadRequest(
+                "manual event title cannot be empty".to_string(),
             ));
         }
 

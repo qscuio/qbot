@@ -100,6 +100,18 @@ pub struct DailyEventBriefRow {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct EventRevisionRow {
+    pub revision_id: Uuid,
+    pub object_type: String,
+    pub object_id: Uuid,
+    pub previous_payload: Value,
+    pub revised_payload: Value,
+    pub revised_by: String,
+    pub reason: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ManualEvidenceInsertResult {
     pub existing_rows: Vec<EventEvidenceRow>,
     pub existing_candidates: Vec<ManualDuplicateCandidateRow>,
@@ -417,6 +429,134 @@ impl EventRepository {
         Ok(())
     }
 
+    pub async fn find_daily_brief(
+        &self,
+        trade_date: Option<NaiveDate>,
+    ) -> Result<Option<DailyEventBriefRow>> {
+        let row = match trade_date {
+            Some(trade_date) => {
+                sqlx::query(
+                    r#"SELECT trade_date, brief_version, content, structured_payload,
+                              input_fingerprint, generated_at
+                       FROM market_event_daily_briefs
+                       WHERE trade_date = $1"#,
+                )
+                .bind(trade_date)
+                .fetch_optional(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    r#"SELECT trade_date, brief_version, content, structured_payload,
+                              input_fingerprint, generated_at
+                       FROM market_event_daily_briefs
+                       ORDER BY generated_at DESC, trade_date DESC
+                       LIMIT 1"#,
+                )
+                .fetch_optional(&self.pool)
+                .await?
+            }
+        };
+
+        Ok(row.map(daily_event_brief_from_row))
+    }
+
+    pub async fn find_evidence_by_id(&self, evidence_id: Uuid) -> Result<Option<EventEvidenceRow>> {
+        let sql = evidence_select_sql("WHERE evidence_id = $1");
+        let row = sqlx::query(&sql)
+            .bind(evidence_id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        Ok(row.map(event_evidence_from_row))
+    }
+
+    pub async fn latest_evidence_for_source_item(
+        &self,
+        source_id: &str,
+        source_item_id: &str,
+    ) -> Result<Option<EventEvidenceRow>> {
+        let sql = evidence_select_sql(
+            r#"WHERE source_id = $1
+                 AND source_item_id = $2
+               ORDER BY version DESC, created_at DESC, evidence_id DESC
+               LIMIT 1"#,
+        );
+        let row = sqlx::query(&sql)
+            .bind(source_id)
+            .bind(source_item_id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        Ok(row.map(event_evidence_from_row))
+    }
+
+    pub async fn list_latest_evidence(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<Vec<EventEvidenceRow>> {
+        let rows = sqlx::query(
+            r#"SELECT e.evidence_id,
+                      e.source_id,
+                      e.source_item_id,
+                      e.source_url,
+                      e.source_tier,
+                      e.source_terms_version,
+                      e.occurred_at,
+                      e.published_at,
+                      e.first_seen_at,
+                      e.available_at,
+                      e.effective_trade_date,
+                      e.title,
+                      e.content,
+                      e.language,
+                      e.content_hash,
+                      e.raw_payload,
+                      e.version,
+                      e.supersedes_evidence_id,
+                      e.status,
+                      e.created_at
+               FROM market_event_evidence e
+               INNER JOIN (
+                   SELECT source_id, source_item_id, MAX(version) AS max_version
+                   FROM market_event_evidence
+                   GROUP BY source_id, source_item_id
+               ) latest
+                   ON latest.source_id = e.source_id
+                  AND latest.source_item_id = e.source_item_id
+                  AND latest.max_version = e.version
+               ORDER BY e.available_at DESC, e.first_seen_at DESC, e.created_at DESC, e.evidence_id DESC
+               LIMIT $1"#,
+        )
+        .bind(limit.unwrap_or(50) as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(event_evidence_from_row).collect())
+    }
+
+    pub async fn save_revision(&self, revision: &EventRevisionRow) -> Result<Uuid> {
+        sqlx::query(
+            r#"INSERT INTO market_event_revisions
+               (revision_id, object_type, object_id, previous_payload, revised_payload,
+                revised_by, reason, created_at)
+               VALUES ($1, $2, $3, $4, $5,
+                       $6, $7, $8)"#,
+        )
+        .bind(revision.revision_id)
+        .bind(&revision.object_type)
+        .bind(revision.object_id)
+        .bind(&revision.previous_payload)
+        .bind(&revision.revised_payload)
+        .bind(&revision.revised_by)
+        .bind(&revision.reason)
+        .bind(revision.created_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(revision.revision_id)
+    }
+
     pub async fn list_publishable_evidence(
         &self,
         trade_date: NaiveDate,
@@ -466,7 +606,7 @@ fn evidence_select_sql(where_and_order: &str) -> String {
 pub(crate) fn canonicalize_source_url(value: &str) -> Result<String> {
     let trimmed = value.trim();
     let mut url = Url::parse(trimmed).map_err(|error| {
-        AppError::Internal(format!("manual event source URL is invalid: {error}"))
+        AppError::BadRequest(format!("manual event source URL is invalid: {error}"))
     })?;
     url.set_fragment(None);
     if matches!(
@@ -493,6 +633,17 @@ fn canonicalized_evidence_row(row: &EventEvidenceRow) -> Result<EventEvidenceRow
         source_url,
         ..row.clone()
     })
+}
+
+fn daily_event_brief_from_row(row: sqlx::postgres::PgRow) -> DailyEventBriefRow {
+    DailyEventBriefRow {
+        trade_date: row.get("trade_date"),
+        brief_version: row.get("brief_version"),
+        content: row.get("content"),
+        structured_payload: row.get("structured_payload"),
+        input_fingerprint: row.get("input_fingerprint"),
+        generated_at: row.get("generated_at"),
+    }
 }
 
 async fn insert_evidence_in_txless(pool: &PgPool, row: &EventEvidenceRow) -> Result<()> {

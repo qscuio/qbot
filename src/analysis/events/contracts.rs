@@ -1,11 +1,13 @@
 use chrono::{DateTime, Datelike, NaiveDate, Timelike, Utc, Weekday};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::error::Result;
 use crate::market_time;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct ManualEventInput {
     pub title: String,
     pub content: Option<String>,
@@ -15,6 +17,7 @@ pub struct ManualEventInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct EventEvidence {
     pub evidence_id: Uuid,
     pub source_id: String,
@@ -30,18 +33,21 @@ pub struct EventEvidence {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct ExistingEventEvidenceRelation {
     pub submitted: EventEvidence,
     pub existing: EventEvidence,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub enum ManualEventSubmissionOutcome {
     Inserted(EventEvidence),
     Existing(ExistingEventEvidenceRelation),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct BriefFact {
     pub fact_id: Uuid,
     pub summary: String,
@@ -49,6 +55,7 @@ pub struct BriefFact {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct BriefRevision {
     pub revision_id: Uuid,
     pub previous_fact_id: Uuid,
@@ -57,6 +64,7 @@ pub struct BriefRevision {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct BriefUnconfirmed {
     pub item_id: Uuid,
     pub summary: String,
@@ -64,12 +72,14 @@ pub struct BriefUnconfirmed {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct BriefEntity {
     pub entity_id: String,
     pub display_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct BriefSource {
     pub evidence_id: Uuid,
     pub source_id: String,
@@ -80,6 +90,7 @@ pub struct BriefSource {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct DailyEventBrief {
     pub trade_date: NaiveDate,
     pub new_facts: Vec<BriefFact>,
@@ -91,10 +102,80 @@ pub struct DailyEventBrief {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct EventProcessingSummary {
     pub cutoff: DateTime<Utc>,
     pub pending_evidence_count: usize,
     pub processed_evidence_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EventListItem {
+    pub evidence_id: Uuid,
+    pub source_id: String,
+    pub source_item_id: String,
+    pub source_url: Option<String>,
+    pub source_tier: String,
+    pub published_at: Option<DateTime<Utc>>,
+    pub first_seen_at: DateTime<Utc>,
+    pub available_at: DateTime<Utc>,
+    pub effective_trade_date: NaiveDate,
+    pub title: String,
+    pub content: Option<String>,
+    pub processing_status: String,
+    pub version: i32,
+    pub supersedes_evidence_id: Option<Uuid>,
+    pub source_readable: Option<bool>,
+    pub manual_review_needed: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EventDetail {
+    pub evidence_id: Uuid,
+    pub source_id: String,
+    pub source_item_id: String,
+    pub source_url: Option<String>,
+    pub source_tier: String,
+    pub source_terms_version: String,
+    pub occurred_at: Option<DateTime<Utc>>,
+    pub published_at: Option<DateTime<Utc>>,
+    pub first_seen_at: DateTime<Utc>,
+    pub available_at: DateTime<Utc>,
+    pub effective_trade_date: NaiveDate,
+    pub title: String,
+    pub content: Option<String>,
+    pub language: String,
+    pub content_hash: String,
+    pub processing_status: String,
+    pub version: i32,
+    pub supersedes_evidence_id: Option<Uuid>,
+    pub source_readable: Option<bool>,
+    pub manual_review_needed: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedDailyEventBrief {
+    pub trade_date: NaiveDate,
+    pub brief_version: String,
+    pub content: String,
+    pub structured_payload: Value,
+    pub input_fingerprint: String,
+    pub generated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EventReviewResult {
+    pub evidence_id: Uuid,
+    pub supersedes_evidence_id: Uuid,
+    pub source_item_id: String,
+    pub processing_status: String,
+    pub effective_trade_date: NaiveDate,
+    pub version: i32,
+    pub reviewed_by: String,
 }
 
 pub trait TradingDateResolver: Send + Sync {

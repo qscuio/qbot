@@ -20,6 +20,9 @@ pub enum AppError {
     #[error("Data provider error: {0}")]
     DataProvider(String),
 
+    #[error("{0}")]
+    BadRequest(String),
+
     #[error("Not found: {0}")]
     NotFound(String),
 
@@ -37,6 +40,7 @@ impl axum::response::IntoResponse for AppError {
         use serde_json::json;
 
         let (status, message) = match &self {
+            AppError::BadRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
             AppError::NotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
             AppError::Config(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
