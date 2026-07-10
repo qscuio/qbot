@@ -240,4 +240,18 @@ Result: passed
 
 - `migrations/014_pattern_research_and_shadow.sql`
 - `src/storage/pattern_repository.rs`
+
+## Second review fix
+
+### What changed
+
+- Added `duplicate_shadow_candidate_upserts_within_one_batch_are_deterministic` in `src/storage/pattern_repository.rs`.
+- The new SQLx test exercises two duplicate shadow candidate rows in a single `upsert_shadow_candidates(&[...])` call and asserts that the second row wins deterministically.
+- No production code changed. The existing sequential transactional upsert already had the desired last-write-wins behavior, and the new test passed immediately.
+
+### Verification
+
+- `cargo fmt --all -- --check` - passed
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test --locked storage::pattern_repository -- --nocapture` - passed
+- `git diff --check` - passed
 - `.superpowers/sdd/gate1-task-1-report.md`

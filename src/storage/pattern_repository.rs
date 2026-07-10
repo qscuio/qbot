@@ -911,6 +911,81 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn duplicate_shadow_candidate_upserts_within_one_batch_are_deterministic(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        insert_dataset_manifest(&pool, "dataset-shadow-batch").await?;
+        let pattern_version_id = Uuid::new_v4();
+        let pattern_set_id = Uuid::new_v4();
+
+        insert_pattern_version(
+            &pool,
+            pattern_version_id,
+            "pattern-shadow-batch",
+            "dataset-shadow-batch",
+            "published",
+            "week",
+            "trend",
+            Some("reviewer"),
+            Some(dt(2026, 7, 10, 8)),
+        )
+        .await?;
+        insert_pattern_set(
+            &pool,
+            pattern_set_id,
+            "shadow-batch-set",
+            "published",
+            Some(dt(2026, 7, 10, 9)),
+        )
+        .await?;
+        insert_pattern_set_member(&pool, pattern_set_id, pattern_version_id, 1).await?;
+
+        let repo = PatternRepository::new(pool);
+        let trade_date = date(2026, 7, 10);
+        let first = ShadowCandidateRow {
+            trade_date,
+            code: "600003.SH".to_string(),
+            horizon: "week".to_string(),
+            pattern_version_id,
+            pattern_set_id,
+            pattern_type: "trend".to_string(),
+            similarity_score: 0.55,
+            validated_lift: 0.08,
+            final_score: 0.9876,
+            shadow_tier: "tier1".to_string(),
+            matched_features: json!({"close_strength": 0.9}),
+            risk_flags: json!(["extended"]),
+            supporting_signals: json!(["scan_ranker"]),
+            invalidations: json!([]),
+            input_fingerprint: "shadow-batch-fp-1".to_string(),
+            created_at: dt(2026, 7, 10, 10),
+        };
+        let mut second = first.clone();
+        second.similarity_score = 0.83;
+        second.validated_lift = 0.19;
+        second.final_score = 1.8765;
+        second.shadow_tier = "tier2".to_string();
+        second.matched_features = json!({"close_strength": 1.8});
+        second.risk_flags = json!(["none"]);
+        second.supporting_signals = json!(["scan_ranker", "pattern_engine"]);
+        second.invalidations = json!(["late_breakout"]);
+        second.input_fingerprint = "shadow-batch-fp-2".to_string();
+        second.created_at = dt(2026, 7, 10, 11);
+
+        assert_eq!(
+            repo.upsert_shadow_candidates(&[first.clone(), second.clone()])
+                .await
+                .unwrap(),
+            2
+        );
+
+        let rows = repo.list_shadow_candidates(trade_date).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], second);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn latest_published_set_returns_most_recent_publication(
         pool: PgPool,
     ) -> sqlx::Result<()> {
