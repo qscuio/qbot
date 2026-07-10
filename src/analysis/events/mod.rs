@@ -1,15 +1,18 @@
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::PgPool;
 
 use self::evidence::{ManualEvidenceIngestor, ManualSource};
+use self::extraction::{EventExtractionInput, EventExtractionOutput, EventExtractor};
 use crate::error::{AppError, Result};
 use crate::storage::event_repository::EventRepository;
 
 pub mod contracts;
 mod dedup;
 mod evidence;
+pub(crate) mod extraction;
 mod time;
 
 pub use contracts::{
@@ -18,8 +21,6 @@ pub use contracts::{
     ExistingEventEvidenceRelation, ManualEventInput, ManualEventSubmissionOutcome,
     TradingDateResolver,
 };
-
-trait EventExtractor: Send + Sync {}
 
 pub struct EventIntelligence {
     deps: EventIntelligenceDependencies,
@@ -100,7 +101,14 @@ impl EventIntelligenceDependencies {
 #[derive(Debug, Default)]
 struct NoopEventExtractor;
 
-impl EventExtractor for NoopEventExtractor {}
+#[async_trait]
+impl EventExtractor for NoopEventExtractor {
+    async fn extract(&self, _input: EventExtractionInput) -> Result<EventExtractionOutput> {
+        Err(AppError::Internal(
+            "event extraction is not wired yet".to_string(),
+        ))
+    }
+}
 
 #[cfg(test)]
 mod tests {

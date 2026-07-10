@@ -1,0 +1,49 @@
+{
+  "event_type": "earnings",
+  "event_subtype": "guidance",
+  "claims": [
+    {
+      "claim_type": "fact",
+      "text": "Kweichow Moutai raised guidance.",
+      "evidence_ids": [
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+      ],
+      "confidence": 0.95
+    },
+    {
+      "claim_type": "direct_quote",
+      "text": "\"The company expects stronger demand in the second half.\"",
+      "evidence_ids": [
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+      ],
+      "confidence": 0.82
+    }
+  ],
+  "entities": [
+    {
+      "text": "Kweichow Moutai",
+      "entity_type": "issuer",
+      "role": "subject",
+      "stock_code": "600519.SH"
+    }
+  ],
+  "amounts": [
+    {
+      "raw_text": "CNY 2 billion",
+      "value": "2000000000",
+      "unit": "CNY"
+    }
+  ],
+  "dates": [
+    {
+      "raw_text": "2026-07-10",
+      "value": "2026-07-10"
+    }
+  ],
+  "uncertainties": [
+    "Customer timing was not disclosed."
+  ],
+  "missing_information": [
+    "No margin guidance was provided."
+  ]
+}
