@@ -24,6 +24,7 @@ const MANUAL_SOURCE_TERMS_VERSION: &str = "terms-v1";
 const MANUAL_LANGUAGE: &str = "und";
 const MANUAL_STATUS_PENDING: &str = "pending";
 const MANUAL_AUTO_NEAR_DUPLICATE_THRESHOLD: f64 = 0.92;
+const DERIVED_TITLE_MAX_CHARS: usize = 120;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ManualSource {
@@ -74,18 +75,13 @@ impl ManualEvidenceIngestor {
         input: ManualEventInput,
         first_seen_at: DateTime<Utc>,
     ) -> Result<ManualEventSubmissionOutcome> {
-        let normalized_title = normalize_text(&input.title);
-        if normalized_title.is_empty() {
-            return Err(AppError::BadRequest(
-                "manual event title cannot be empty".to_string(),
-            ));
-        }
-
         let normalized_content = input
             .content
             .as_deref()
             .map(normalize_text)
             .and_then(|content| (!content.is_empty()).then_some(content));
+        let normalized_title =
+            normalized_manual_title(&input.title, normalized_content.as_deref())?;
         let canonical_source_url = input
             .source_url
             .as_deref()
@@ -139,6 +135,24 @@ impl ManualEvidenceIngestor {
 
 pub(crate) fn normalize_text(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn normalized_manual_title(title: &str, content: Option<&str>) -> Result<String> {
+    let normalized_title = normalize_text(title);
+    if !normalized_title.is_empty() {
+        return Ok(normalized_title);
+    }
+
+    content
+        .map(derive_title_from_content)
+        .ok_or_else(|| AppError::BadRequest("manual event title cannot be empty".to_string()))
+}
+
+fn derive_title_from_content(content: &str) -> String {
+    content
+        .chars()
+        .take(DERIVED_TITLE_MAX_CHARS)
+        .collect::<String>()
 }
 
 pub(crate) fn content_hash(title: &str, content: Option<&str>) -> String {
@@ -458,6 +472,58 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].title, "Public constructor event");
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn manual_ingestion_derives_title_from_content_when_title_is_blank(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = EventRepository::new(pool.clone());
+        let ingestor =
+            ManualEvidenceIngestor::new(repo.clone(), Arc::new(AShareTradingDateResolver));
+
+        let outcome = ingestor
+            .submit_at(
+                ManualSource::Rest,
+                ManualEventInput {
+                    title: " \n\t ".to_string(),
+                    content: Some(
+                        "  ACME   signs definitive merger agreement \n after board approval  "
+                            .to_string(),
+                    ),
+                    source_url: None,
+                    submitted_by: "api-user".to_string(),
+                    published_at: None,
+                },
+                dt(2026, 7, 10, 8, 30, 0),
+            )
+            .await
+            .unwrap();
+
+        let inserted = assert_public_inserted(outcome);
+        let expected_title = "ACME signs definitive merger agreement after board approval";
+        assert_eq!(inserted.title, expected_title);
+        assert_eq!(
+            inserted.content_hash,
+            expected_content_hash(
+                expected_title,
+                Some("ACME signs definitive merger agreement after board approval")
+            )
+        );
+
+        let rows = repo
+            .find_existing_source_item(&inserted.source_id, &inserted.source_item_id)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].title, expected_title);
+        assert_eq!(
+            rows[0].content.as_deref(),
+            Some("ACME signs definitive merger agreement after board approval")
+        );
+        assert_eq!(rows[0].content_hash, inserted.content_hash);
 
         Ok(())
     }

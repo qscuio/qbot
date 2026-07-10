@@ -43,6 +43,7 @@ Added:
 - Review persistence now saves the reviewed evidence row and revision row in one SQL transaction; repository coverage includes a rollback regression when revision persistence fails.
 - HTTP review now requires an explicit `action` of `publish` or `reject`; missing, blank, and unsupported actions are rejected as `unauthorized review action`.
 - Daily brief reads persisted brief rows only; default lookup now prefers the latest `trade_date` before `generated_at`, and no synthetic brief generation was added in Task 8.
+- Content-only REST manual submissions now derive a persisted non-empty title from normalized content, keep `sourceReadable: true`, and hash against the persisted normalized title/content pair.
 
 ## Verification
 

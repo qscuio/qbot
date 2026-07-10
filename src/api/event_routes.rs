@@ -639,6 +639,94 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn manual_event_submission_accepts_content_only_and_persists_derived_title(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let state = test_state(pool).await;
+        let mut router = event_router(state);
+        let expected_title = "ACME signs definitive merger agreement after board approval";
+
+        let create_response = router
+            .call(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/analysis/events/manual")
+                    .header(header::AUTHORIZATION, "Bearer test-key")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "title": " \n\t ",
+                            "content": "  ACME   signs definitive merger agreement \n after board approval  ",
+                            "submittedBy": "rest-user",
+                            "publishedAt": "2026-07-10T07:30:00Z",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(create_response.status(), StatusCode::OK);
+        let create_payload = response_json(create_response).await;
+        assert_eq!(create_payload["duplicateStatus"], "independent");
+        assert_eq!(create_payload["processingStatus"], "collected");
+        assert_eq!(create_payload["sourceReadable"], true);
+        let evidence_id = create_payload["evidenceId"].as_str().unwrap().to_string();
+
+        let list_response = router
+            .call(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/analysis/events")
+                    .header(header::AUTHORIZATION, "Bearer test-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list_payload = response_json(list_response).await;
+        let listed = list_payload["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["evidenceId"] == evidence_id)
+            .cloned()
+            .expect("submitted event should appear in list");
+        assert_eq!(listed["title"], expected_title);
+        assert_eq!(
+            listed["content"],
+            "ACME signs definitive merger agreement after board approval"
+        );
+        assert_eq!(listed["sourceReadable"], true);
+
+        let detail_response = router
+            .call(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/analysis/events/{evidence_id}"))
+                    .header(header::AUTHORIZATION, "Bearer test-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(detail_response.status(), StatusCode::OK);
+        let detail_payload = response_json(detail_response).await;
+        assert_eq!(detail_payload["title"], expected_title);
+        assert_eq!(
+            detail_payload["content"],
+            "ACME signs definitive merger agreement after board approval"
+        );
+        assert_eq!(detail_payload["sourceReadable"], true);
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn manual_event_submission_with_url_only_source_leaves_readability_unknown(
         pool: PgPool,
     ) -> sqlx::Result<()> {
