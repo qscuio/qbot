@@ -1,0 +1,16 @@
+[Unit]
+Description=qbot Research Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/opt/qbot/research
+ExecStart=/opt/qbot/research/.venv/bin/qbot-research train-all --config /etc/qbot/research.toml
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=qbot-research
+
+[Install]
+WantedBy=multi-user.target

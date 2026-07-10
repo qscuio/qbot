@@ -1,0 +1,10 @@
+[Unit]
+Description=Run qbot research worker weekly
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+Unit=qbot-research.service
+
+[Install]
+WantedBy=timers.target
