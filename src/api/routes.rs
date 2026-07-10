@@ -384,6 +384,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .with_state(state.clone())
         .merge(crate::api::analysis_routes::analysis_router(state.clone()))
+        .merge(crate::api::pattern_routes::pattern_router(state.clone()))
 }
 
 fn parse_optional_date(

@@ -175,6 +175,7 @@ Jobs are scheduled with fixed `UTC+08:00` in code (`Job::new_async_tz`).
 | 17:15 | Friday | Refresh point-in-time reference inputs |
 | 17:20 | Mon–Fri | Build point-in-time market snapshot |
 | 17:30 | Mon–Fri | Run full signal scan, cache to Redis |
+| 17:40 | Mon–Fri | Match latest published patterns against the latest complete market snapshot and persist shadow candidates |
 | 18:00 | Mon–Fri | Generate daily report, push to Telegram |
 | 20:00 | Friday | Generate weekly report, push to Telegram |
 | 20:05 | Mon–Fri | Run full signal scan and archive triggered hits to `daily_signal_scan_results` |
@@ -371,6 +372,8 @@ curl -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
 | GET | `/api/scan/prestart` | Yes | Pre-start candidate pool with A-tier `3/5` resonance and B-tier `core + auxiliary` setup from `ma_bullish/volume_price/slow_bull/small_bullish/triple_bullish` |
 | GET | `/api/scan/stats` | Yes | Forward-return stats by signal (`days`, optional `signal_id`, optional `limit`) |
 | GET | `/api/scan/daily-stats` | Yes | Forward-return stats from daily archived signal snapshots (`days`, optional `signal_id`, optional `limit`) |
+| GET | `/api/analysis/patterns/shadow` | Yes | Persisted pattern shadow candidates from `analysis_shadow_candidates` (`date=YYYY-MM-DD`, optional `limit`) |
+| GET | `/api/analysis/patterns/shadow/{code}` | Yes | Persisted pattern shadow candidates for one stock code (`date=YYYY-MM-DD`, optional `limit`) |
 | GET | `/api/report/daily` | Yes | Latest daily report from DB |
 | GET | `/api/report/signal_auto` | Yes | Latest signal auto-trading daily report from DB |
 | GET | `/api/report/limitup` | Yes | Latest standalone limit-up report from DB |
@@ -403,6 +406,7 @@ curl -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
 | POST | `/api/jobs/fetch` | Yes | Trigger data fetch job |
 | POST | `/api/jobs/scan` | Yes | Trigger signal scan job |
 | POST | `/api/jobs/scan/archive` | Yes | Trigger daily signal archive job |
+| POST | `/api/jobs/analysis/pattern-match` | Yes | Trigger shadow-only pattern matching job |
 | POST | `/api/jobs/report/daily` | Yes | Trigger daily report + push |
 | POST | `/api/jobs/report/weekly` | Yes | Trigger weekly report + push |
 
@@ -424,6 +428,7 @@ curl -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
 | `user_watchlist` | Watchlist stocks |
 | `trading_sim_positions` / `daban_sim_positions` / `sim_capital` | Trading simulation records |
 | `signal_strategy_accounts` / `signal_strategy_candidates` / `signal_strategy_positions` / `signal_strategy_events` | Auto paper-trading accounts, candidates, trades, and event logs. Includes pre-start signal accounts plus synthetic `auto_daban` and `auto_strong` accounts. Pre-start signals only buy `A`-tier setups and log `B`-tier setups as watch-only observations |
+| `analysis_shadow_candidates` | Shadow-only strong-stock pattern matches from manually published pattern sets. These rows are reporting-only and are not auto-trading candidates |
 | `startup_watchlist` | One-limit-up-in-30-days startup tracking |
 | `reports` | Generated daily/weekly/limitup/strong report content |
 

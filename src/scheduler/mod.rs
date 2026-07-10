@@ -3,7 +3,10 @@ use std::sync::Arc;
 use tokio_cron_scheduler::{Job, JobScheduler};
 use tracing::{info, warn};
 
-use crate::analysis::market_snapshot::{ingestion::PointInTimeIngestion, MarketSnapshotModule};
+use crate::analysis::market_snapshot::{
+    ingestion::PointInTimeIngestion, MarketSnapshotModule, MARKET_SNAPSHOT_VERSION,
+};
+use crate::analysis::patterns::matcher::PatternEngine;
 use crate::data::provider::DataProvider;
 use crate::market_time::{beijing_today, beijing_tz};
 use crate::services::{
@@ -12,6 +15,8 @@ use crate::services::{
     stock_history::StockHistoryService,
 };
 use crate::state::AppState;
+use crate::storage::market_repository::MarketRepository;
+use crate::storage::pattern_repository::PatternRepository;
 use crate::storage::postgres;
 use crate::telegram::pusher::TelegramPusher;
 
@@ -19,6 +24,7 @@ const FETCH_JOB_CRON: &str = "0 0 17 * * Mon,Tue,Wed,Thu,Fri";
 const POINT_IN_TIME_TRADE_DATE_JOB_CRON: &str = "0 10 17 * * Mon,Tue,Wed,Thu,Fri";
 const MARKET_SNAPSHOT_JOB_CRON: &str = "0 20 17 * * Mon,Tue,Wed,Thu,Fri";
 const SCAN_JOB_CRON: &str = "0 30 17 * * Mon,Tue,Wed,Thu,Fri";
+const PATTERN_SHADOW_JOB_CRON: &str = "0 40 17 * * Mon,Tue,Wed,Thu,Fri";
 const DAILY_SIGNAL_ARCHIVE_JOB_CRON: &str = "0 5 20 * * Mon,Tue,Wed,Thu,Fri";
 const DAILY_REPORT_JOB_CRON: &str = "0 0 18 * * Mon,Tue,Wed,Thu,Fri";
 const WEEKLY_REPORT_JOB_CRON: &str = "0 0 20 * * Fri";
@@ -124,6 +130,92 @@ pub async fn run_scan_job(state: Arc<AppState>) {
         Err(e) => {
             warn!("Scan failed: {}", e);
         }
+    }
+}
+
+/// Match latest published patterns against the latest complete market snapshot (17:40 job).
+pub async fn run_pattern_shadow_job(state: Arc<AppState>) {
+    let _guard = state.analysis_job_lock.lock().await;
+    let pattern_repo = PatternRepository::new(state.db.clone());
+    let market_repo = MarketRepository::new(state.db.clone());
+
+    let pattern_set = match pattern_repo.latest_published_set().await {
+        Ok(Some(pattern_set)) => pattern_set,
+        Ok(None) => {
+            info!("Pattern shadow job skipped: no latest published pattern set");
+            return;
+        }
+        Err(error) => {
+            warn!("Pattern shadow job skipped: latest published set lookup failed: {error}");
+            return;
+        }
+    };
+
+    let trade_date = match postgres::latest_stock_trade_date(&state.db).await {
+        Ok(Some(trade_date)) => trade_date,
+        Ok(None) => match market_repo
+            .latest_market_snapshot(MARKET_SNAPSHOT_VERSION)
+            .await
+        {
+            Ok(Some(snapshot)) if snapshot.data_complete => snapshot.trade_date,
+            Ok(Some(snapshot)) => {
+                warn!(
+                    "Pattern shadow job skipped: latest market snapshot is incomplete: trade_date={}, missing_inputs={}",
+                    snapshot.trade_date,
+                    snapshot.missing_inputs.len()
+                );
+                return;
+            }
+            Ok(None) => {
+                warn!("Pattern shadow job skipped: no stock trade date or market snapshot");
+                return;
+            }
+            Err(error) => {
+                warn!("Pattern shadow job skipped: latest market snapshot lookup failed: {error}");
+                return;
+            }
+        },
+        Err(error) => {
+            warn!("Pattern shadow job skipped: latest stock trade date lookup failed: {error}");
+            return;
+        }
+    };
+
+    let snapshot = match market_repo
+        .market_snapshot(trade_date, MARKET_SNAPSHOT_VERSION)
+        .await
+    {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => {
+            warn!("Pattern shadow job skipped: market snapshot missing for {trade_date}");
+            return;
+        }
+        Err(error) => {
+            warn!("Pattern shadow job skipped: market snapshot lookup failed: {error}");
+            return;
+        }
+    };
+    if !snapshot.data_complete {
+        warn!(
+            "Pattern shadow job skipped: market snapshot incomplete for {}, missing_inputs={}",
+            trade_date,
+            snapshot.missing_inputs.len()
+        );
+        return;
+    }
+
+    let engine = PatternEngine::new(pattern_repo, market_repo);
+    match engine
+        .match_market(trade_date, pattern_set.pattern_set_id)
+        .await
+    {
+        Ok(candidates) => info!(
+            "Pattern shadow job persisted candidates: trade_date={}, pattern_set_id={}, count={}",
+            trade_date,
+            pattern_set.pattern_set_id,
+            candidates.len()
+        ),
+        Err(error) => warn!("Pattern shadow job failed: {error}"),
     }
 }
 
@@ -364,6 +456,21 @@ pub async fn start_scheduler(
             .await?;
     }
 
+    // 17:40 weekdays
+    {
+        let s = state.clone();
+        sched
+            .add(Job::new_async_tz(
+                PATTERN_SHADOW_JOB_CRON,
+                beijing_tz(),
+                move |_, _| {
+                    let s = s.clone();
+                    Box::pin(async move { run_pattern_shadow_job(s).await })
+                },
+            )?)
+            .await?;
+    }
+
     // 18:00 weekdays
     {
         let s = state.clone();
@@ -418,7 +525,7 @@ pub async fn start_scheduler(
     }
 
     sched.start().await?;
-    info!("Scheduler started with 8 jobs");
+    info!("Scheduler started with 9 jobs");
     Ok(sched)
 }
 
@@ -429,6 +536,7 @@ fn production_job_crons_in_registration_order() -> Vec<&'static str> {
         POINT_IN_TIME_REFERENCE_JOB_CRON,
         MARKET_SNAPSHOT_JOB_CRON,
         SCAN_JOB_CRON,
+        PATTERN_SHADOW_JOB_CRON,
         DAILY_REPORT_JOB_CRON,
         WEEKLY_REPORT_JOB_CRON,
         DAILY_SIGNAL_ARCHIVE_JOB_CRON,
@@ -438,6 +546,23 @@ fn production_job_crons_in_registration_order() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use chrono::{DateTime, NaiveDate, TimeZone};
+    use serde_json::json;
+    use sqlx::PgPool;
+    use std::collections::BTreeMap;
+    use tokio::sync::Mutex;
+    use uuid::Uuid;
+
+    use crate::analysis::market_snapshot::{
+        AdjustmentFactor, CorporateAction, DailyBasicSnapshot, IndexDailyBar, MarketSnapshot,
+        SectorMembership, SecurityDailyStatus, SecurityMasterVersion, MARKET_SNAPSHOT_VERSION,
+    };
+    use crate::config::Config;
+    use crate::data::point_in_time_provider::{PointInTimeCapabilities, PointInTimeDataProvider};
+    use crate::data::types::{Candle, IndexData, LimitUpStock, SectorData, StockInfo};
+    use crate::error::Result;
+    use crate::storage::market_repository::MarketRepository;
 
     #[test]
     fn weekday_pipeline_runs_after_tushare_eod_window() {
@@ -456,6 +581,11 @@ mod tests {
     }
 
     #[test]
+    fn pattern_shadow_job_runs_after_scan_and_before_daily_report() {
+        assert_eq!(PATTERN_SHADOW_JOB_CRON, "0 40 17 * * Mon,Tue,Wed,Thu,Fri");
+    }
+
+    #[test]
     fn weekly_report_schedule_stays_on_friday_evening() {
         assert_eq!(WEEKLY_REPORT_JOB_CRON, "0 0 20 * * Fri");
         assert_eq!(POINT_IN_TIME_REFERENCE_JOB_CRON, "0 15 17 * * Fri");
@@ -471,10 +601,300 @@ mod tests {
                 "0 15 17 * * Fri",
                 "0 20 17 * * Mon,Tue,Wed,Thu,Fri",
                 "0 30 17 * * Mon,Tue,Wed,Thu,Fri",
+                "0 40 17 * * Mon,Tue,Wed,Thu,Fri",
                 "0 0 18 * * Mon,Tue,Wed,Thu,Fri",
                 "0 0 20 * * Fri",
                 "0 5 20 * * Mon,Tue,Wed,Thu,Fri",
             ]
         );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn pattern_shadow_job_skips_without_published_model_and_preserves_scan_results(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let state = test_state(pool.clone()).await;
+        let trade_date = date(2026, 7, 10);
+        seed_stock_daily_bar(&pool, trade_date, "600001.SH").await?;
+        seed_scan_result(&pool).await?;
+        MarketRepository::new(pool.clone())
+            .save_market_snapshot(&MarketSnapshot {
+                trade_date,
+                snapshot_version: MARKET_SNAPSHOT_VERSION.to_string(),
+                available_at: dt(2026, 7, 10, 10),
+                data_complete: true,
+                metrics: json!({"market_regime": "normal"}),
+                missing_inputs: Vec::new(),
+                input_fingerprint: "complete-snapshot".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let scan_count_before = count_rows(&pool, "scan_results").await?;
+
+        run_pattern_shadow_job(state).await;
+
+        assert_eq!(count_rows(&pool, "scan_results").await?, scan_count_before);
+        assert_eq!(count_rows(&pool, "analysis_shadow_candidates").await?, 0);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn pattern_shadow_job_skips_incomplete_snapshot_and_preserves_scan_results(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let state = test_state(pool.clone()).await;
+        let trade_date = date(2026, 7, 10);
+        seed_stock_daily_bar(&pool, trade_date, "600001.SH").await?;
+        seed_scan_result(&pool).await?;
+        seed_published_pattern_set(&pool).await?;
+        MarketRepository::new(pool.clone())
+            .save_market_snapshot(&MarketSnapshot {
+                trade_date,
+                snapshot_version: MARKET_SNAPSHOT_VERSION.to_string(),
+                available_at: dt(2026, 7, 10, 10),
+                data_complete: false,
+                metrics: json!({"market_regime": "normal"}),
+                missing_inputs: vec!["daily_basic:600001.SH:2026-07-10".to_string()],
+                input_fingerprint: "incomplete-snapshot".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let scan_count_before = count_rows(&pool, "scan_results").await?;
+
+        run_pattern_shadow_job(state).await;
+
+        assert_eq!(count_rows(&pool, "scan_results").await?, scan_count_before);
+        assert_eq!(count_rows(&pool, "analysis_shadow_candidates").await?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn scheduler_does_not_reference_auto_trading_candidate_table() {
+        let source = include_str!("mod.rs");
+        let forbidden_table = concat!("signal", "_strategy", "_candidates");
+        assert!(!source.contains(forbidden_table));
+    }
+
+    fn date(year: i32, month: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(year, month, day).unwrap()
+    }
+
+    fn dt(year: i32, month: u32, day: u32, hour: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(year, month, day, hour, 0, 0).unwrap()
+    }
+
+    async fn seed_stock_daily_bar(
+        pool: &PgPool,
+        trade_date: NaiveDate,
+        code: &str,
+    ) -> sqlx::Result<()> {
+        sqlx::query(
+            r#"INSERT INTO stock_daily_bars
+               (code, trade_date, open, high, low, close, volume, amount)
+               VALUES ($1, $2, 10, 11, 9, 10.5, 1000, 10000)"#,
+        )
+        .bind(code)
+        .bind(trade_date)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn seed_scan_result(pool: &PgPool) -> sqlx::Result<()> {
+        sqlx::query(
+            r#"INSERT INTO scan_results (run_id, code, name, signal_id, metadata)
+               VALUES ($1, '600001.SH', 'Alpha Bank', 'test_signal', '{"score":1}')"#,
+        )
+        .bind(Uuid::new_v4())
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn seed_published_pattern_set(pool: &PgPool) -> sqlx::Result<()> {
+        sqlx::query(
+            r#"INSERT INTO analysis_pattern_sets (pattern_set_id, name, status, published_at)
+               VALUES ($1, 'published-set', 'published', '2026-07-10T09:00:00Z')"#,
+        )
+        .bind(Uuid::new_v4())
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn count_rows(pool: &PgPool, table: &str) -> sqlx::Result<i64> {
+        let query = match table {
+            "scan_results" => "SELECT COUNT(*) FROM scan_results",
+            "analysis_shadow_candidates" => "SELECT COUNT(*) FROM analysis_shadow_candidates",
+            _ => panic!("unexpected table {table}"),
+        };
+        let (count,): (i64,) = sqlx::query_as(query).fetch_one(pool).await?;
+        Ok(count)
+    }
+
+    async fn test_state(pool: PgPool) -> Arc<AppState> {
+        let redis_url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        let redis_client = redis::Client::open(redis_url).unwrap();
+        let redis = redis::aio::ConnectionManager::new(redis_client)
+            .await
+            .unwrap();
+        Arc::new(AppState {
+            config: Arc::new(Config {
+                tushare_token: "test".to_string(),
+                database_url: "postgresql://qbot:qbot@127.0.0.1/qbot".to_string(),
+                redis_url: "redis://127.0.0.1:6379".to_string(),
+                telegram_bot_token: "test".to_string(),
+                telegram_webhook_secret: None,
+                webhook_url: None,
+                stock_alert_channel: None,
+                report_channel: None,
+                daban_channel: None,
+                api_port: 8080,
+                api_key: Some("test-key".to_string()),
+                ai_api_key: None,
+                ai_base_url: "https://api.openai.com/v1".to_string(),
+                ai_model: "gpt-4o-mini".to_string(),
+                data_proxy: None,
+                enable_burst_monitor: false,
+                enable_daban_live: false,
+                enable_ai_analysis: false,
+                enable_chip_dist: false,
+                enable_signal_auto_trading: false,
+            }),
+            db: pool,
+            redis,
+            provider: Arc::new(FakeProvider),
+            point_in_time_provider: Arc::new(FakePointInTimeProvider),
+            pusher: Arc::new(TelegramPusher::new("test".to_string())),
+            fetch_job_lock: Arc::new(Mutex::new(())),
+            analysis_job_lock: Arc::new(Mutex::new(())),
+            scan_job_lock: Arc::new(Mutex::new(())),
+            daily_report_job_lock: Arc::new(Mutex::new(())),
+            weekly_report_job_lock: Arc::new(Mutex::new(())),
+        })
+    }
+
+    struct FakeProvider;
+
+    #[async_trait]
+    impl DataProvider for FakeProvider {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+
+        async fn get_stock_list(&self) -> Result<Vec<StockInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_daily_bars_by_date(
+            &self,
+            _trade_date: NaiveDate,
+        ) -> Result<Vec<(String, Candle)>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_daily_bars_for_stock(
+            &self,
+            _code: &str,
+            _start_date: NaiveDate,
+            _end_date: NaiveDate,
+        ) -> Result<Vec<Candle>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_trading_dates(
+            &self,
+            _start: NaiveDate,
+            _end: NaiveDate,
+        ) -> Result<Vec<NaiveDate>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_limit_up_stocks(&self, _trade_date: NaiveDate) -> Result<Vec<LimitUpStock>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_index_daily(
+            &self,
+            _code: &str,
+            _trade_date: NaiveDate,
+        ) -> Result<Option<IndexData>> {
+            Ok(None)
+        }
+
+        async fn get_sector_data(&self, _trade_date: NaiveDate) -> Result<Vec<SectorData>> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct FakePointInTimeProvider;
+
+    #[async_trait]
+    impl PointInTimeDataProvider for FakePointInTimeProvider {
+        async fn probe_capabilities(&self) -> Result<PointInTimeCapabilities> {
+            Ok(PointInTimeCapabilities {
+                security_master_history: true,
+                corporate_actions: true,
+                adjustment_factors: true,
+                daily_basic: true,
+                daily_security_status: true,
+                historical_index_bars: true,
+                historical_sector_membership: true,
+                details: BTreeMap::new(),
+            })
+        }
+
+        async fn get_security_master_versions(&self) -> Result<Vec<SecurityMasterVersion>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_corporate_actions(
+            &self,
+            _start: NaiveDate,
+            _end: NaiveDate,
+        ) -> Result<Vec<CorporateAction>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_adjustment_factors(
+            &self,
+            _start: NaiveDate,
+            _end: NaiveDate,
+        ) -> Result<Vec<AdjustmentFactor>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_daily_basics(
+            &self,
+            _trade_date: NaiveDate,
+        ) -> Result<Vec<DailyBasicSnapshot>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_security_statuses(
+            &self,
+            _trade_date: NaiveDate,
+        ) -> Result<Vec<SecurityDailyStatus>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_index_daily_range(
+            &self,
+            _codes: &[String],
+            _start: NaiveDate,
+            _end: NaiveDate,
+        ) -> Result<Vec<IndexDailyBar>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_sector_memberships(
+            &self,
+            _as_of_date: NaiveDate,
+        ) -> Result<Vec<SectorMembership>> {
+            Ok(Vec::new())
+        }
     }
 }
