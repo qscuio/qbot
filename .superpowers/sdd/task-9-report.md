@@ -132,3 +132,47 @@
 **Files changed**
 - `.superpowers/sdd/task-9-report.md`
 - `src/api/analysis_routes.rs`
+
+---
+
+### Task 9 Repository Boundary Fix Follow-up
+
+**Fix summary**
+- Moved the `data-status` read SQL for market snapshots and analysis runs out of `src/api/analysis_routes.rs` and into `src/storage/market_repository.rs`.
+- Added repository-owned typed read models `DataStatusSnapshot` and `AnalysisRunSummary`.
+- Added `MarketRepository::latest_market_snapshot`, `MarketRepository::latest_analysis_run`, and `MarketRepository::latest_analysis_runs` using the existing endpoint SQL.
+- Kept `analysis_routes.rs` focused on auth, handler flow, completeness calculation, and JSON shaping, with no inline SQL.
+- Preserved the existing response behavior and JSON shape, including `missingInputs: null` when no snapshot exists, empty `capabilityFailures` when the capability probe is absent, snapshot-scoped `pointInTimeRefreshComplete`, and the shared `MARKET_SNAPSHOT_VERSION`.
+
+**RED evidence**
+- Added focused repository tests for the new read boundary.
+- Command: `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test --locked latest_market_snapshot_reads_latest_versioned_snapshot -- --nocapture`
+- Result: FAIL at compile as expected before the implementation. Rust reported missing `MarketRepository` methods:
+  - `latest_market_snapshot`
+  - `latest_analysis_run`
+  - `latest_analysis_runs`
+
+**GREEN evidence**
+- Command: `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test --locked latest_market_snapshot_reads_latest_versioned_snapshot -- --nocapture`
+  - Result: PASS, 1 passed.
+- Command: `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test --locked latest_analysis_run_queries_return_latest_requested_runs -- --nocapture`
+  - Result: PASS, 1 passed.
+
+**Verification results**
+- Command: `cargo fmt --all -- --check`
+  - Result: PASS.
+- Command: `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test --locked api::analysis_routes::tests -- --nocapture`
+  - Result: PASS, 6 passed.
+- Command: `cargo test --locked scheduler::tests -- --nocapture`
+  - Result: PASS, 3 passed.
+- Command: `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test --all --locked -- --skip config::tests::test_config_defaults`
+  - Result: PASS, 148 passed and 1 filtered out.
+- Command: `cargo test --all --locked config::tests::test_config_defaults`
+  - Result: PASS, 1 passed and 148 filtered out.
+- Command: `git diff --check`
+  - Result: PASS.
+
+**Files changed**
+- `.superpowers/sdd/task-9-report.md`
+- `src/api/analysis_routes.rs`
+- `src/storage/market_repository.rs`

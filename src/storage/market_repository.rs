@@ -26,6 +26,27 @@ pub struct AnalysisDataStatus {
     pub completed_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct DataStatusSnapshot {
+    pub trade_date: NaiveDate,
+    pub snapshot_version: String,
+    pub available_at: DateTime<Utc>,
+    pub data_complete: bool,
+    pub missing_inputs: Vec<String>,
+    pub input_fingerprint: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AnalysisRunSummary {
+    pub run_type: String,
+    pub trade_date: Option<NaiveDate>,
+    pub status: String,
+    pub details: Value,
+    pub error_message: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Clone)]
 pub struct MarketRepository {
     pool: PgPool,
@@ -163,6 +184,61 @@ impl MarketRepository {
         .await?;
 
         Ok(())
+    }
+
+    pub async fn latest_analysis_run(&self, run_type: &str) -> Result<Option<AnalysisRunSummary>> {
+        let mut runs = self.latest_analysis_runs(&[run_type]).await?;
+        Ok(runs.pop())
+    }
+
+    pub async fn latest_analysis_runs(
+        &self,
+        run_types: &[&str],
+    ) -> Result<Vec<AnalysisRunSummary>> {
+        let mut runs = Vec::new();
+        for run_type in run_types {
+            let row: Option<(
+                String,
+                Option<NaiveDate>,
+                String,
+                Value,
+                Option<String>,
+                DateTime<Utc>,
+                Option<DateTime<Utc>>,
+            )> = sqlx::query_as(
+                r#"SELECT run_type, trade_date, status, details, error_message, started_at, completed_at
+                   FROM analysis_data_runs
+                   WHERE run_type = $1
+                   ORDER BY started_at DESC
+                   LIMIT 1"#,
+            )
+            .bind(run_type)
+            .fetch_optional(&self.pool)
+            .await?;
+
+            if let Some((
+                run_type,
+                trade_date,
+                status,
+                details,
+                error_message,
+                started_at,
+                completed_at,
+            )) = row
+            {
+                runs.push(AnalysisRunSummary {
+                    run_type,
+                    trade_date,
+                    status,
+                    details,
+                    error_message,
+                    started_at,
+                    completed_at,
+                });
+            }
+        }
+
+        Ok(runs)
     }
 
     pub async fn latest_security_master_payload_unchanged(
@@ -1800,6 +1876,44 @@ impl MarketRepository {
         Ok(())
     }
 
+    pub async fn latest_market_snapshot(
+        &self,
+        version: &str,
+    ) -> Result<Option<DataStatusSnapshot>> {
+        let row: Option<(NaiveDate, String, DateTime<Utc>, bool, Value, String)> = sqlx::query_as(
+            r#"SELECT trade_date, snapshot_version, available_at, data_complete,
+                      missing_inputs, input_fingerprint
+               FROM market_daily_snapshots
+               WHERE snapshot_version = $1
+               ORDER BY trade_date DESC, available_at DESC
+               LIMIT 1"#,
+        )
+        .bind(version)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(
+            |(
+                trade_date,
+                snapshot_version,
+                available_at,
+                data_complete,
+                missing_inputs,
+                input_fingerprint,
+            )| {
+                Ok(DataStatusSnapshot {
+                    trade_date,
+                    snapshot_version,
+                    available_at,
+                    data_complete,
+                    missing_inputs: serde_json::from_value(missing_inputs)?,
+                    input_fingerprint,
+                })
+            },
+        )
+        .transpose()
+    }
+
     pub async fn market_snapshot(
         &self,
         trade_date: NaiveDate,
@@ -2675,6 +2789,133 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn latest_market_snapshot_reads_latest_versioned_snapshot(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = MarketRepository::new(pool);
+        repo.save_market_snapshot(&MarketSnapshot {
+            trade_date: date(2026, 7, 9),
+            snapshot_version: "market-v1".to_string(),
+            available_at: dt(2026, 7, 9, 8),
+            data_complete: false,
+            metrics: json!({"breadth": {"up_count": 9}}),
+            missing_inputs: vec!["stock_daily_basic:600000.SH:2026-07-09".to_string()],
+            input_fingerprint: "older".to_string(),
+        })
+        .await
+        .unwrap();
+        repo.save_market_snapshot(&MarketSnapshot {
+            trade_date: date(2026, 7, 10),
+            snapshot_version: "market-v1".to_string(),
+            available_at: dt(2026, 7, 10, 9),
+            data_complete: true,
+            metrics: json!({"breadth": {"up_count": 10}}),
+            missing_inputs: vec!["stock_adjustment_factors:600000.SH:2026-07-10".to_string()],
+            input_fingerprint: "latest".to_string(),
+        })
+        .await
+        .unwrap();
+        repo.save_market_snapshot(&MarketSnapshot {
+            trade_date: date(2026, 7, 11),
+            snapshot_version: "market-v2".to_string(),
+            available_at: dt(2026, 7, 11, 10),
+            data_complete: true,
+            metrics: json!({"breadth": {"up_count": 11}}),
+            missing_inputs: Vec::new(),
+            input_fingerprint: "other-version".to_string(),
+        })
+        .await
+        .unwrap();
+
+        let snapshot = repo
+            .latest_market_snapshot("market-v1")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(snapshot.trade_date, date(2026, 7, 10));
+        assert_eq!(snapshot.snapshot_version, "market-v1");
+        assert_eq!(snapshot.available_at, dt(2026, 7, 10, 9));
+        assert!(snapshot.data_complete);
+        assert_eq!(
+            snapshot.missing_inputs,
+            vec!["stock_adjustment_factors:600000.SH:2026-07-10".to_string()]
+        );
+        assert_eq!(snapshot.input_fingerprint, "latest");
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn latest_analysis_run_queries_return_latest_requested_runs(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = MarketRepository::new(pool.clone());
+        sqlx::query(
+            r#"INSERT INTO analysis_data_runs
+               (run_id, run_type, trade_date, status, details, error_message, started_at, completed_at)
+               VALUES
+               ($1, $2, $3, $4, $5, $6, $7, $8),
+               ($9, $10, $11, $12, $13, $14, $15, $16),
+               ($17, $18, $19, $20, $21, $22, $23, $24),
+               ($25, $26, $27, $28, $29, $30, $31, $32)"#,
+        )
+        .bind(Uuid::new_v4())
+        .bind("run-a")
+        .bind(Some(date(2026, 7, 9)))
+        .bind("missing")
+        .bind(json!({"estimated_rows": 5}))
+        .bind(None::<String>)
+        .bind(dt(2026, 7, 9, 8))
+        .bind(Some(dt(2026, 7, 9, 9)))
+        .bind(Uuid::new_v4())
+        .bind("run-a")
+        .bind(Some(date(2026, 7, 10)))
+        .bind("ok")
+        .bind(json!({"estimated_rows": 7}))
+        .bind(None::<String>)
+        .bind(dt(2026, 7, 10, 8))
+        .bind(Some(dt(2026, 7, 10, 9)))
+        .bind(Uuid::new_v4())
+        .bind("run-b")
+        .bind(Some(date(2026, 7, 11)))
+        .bind("failed")
+        .bind(json!({"excluded_estimated_rows": 2}))
+        .bind(Some("boom".to_string()))
+        .bind(dt(2026, 7, 11, 8))
+        .bind(Some(dt(2026, 7, 11, 9)))
+        .bind(Uuid::new_v4())
+        .bind("ignored")
+        .bind(Some(date(2026, 7, 12)))
+        .bind("ok")
+        .bind(json!({"estimated_rows": 99}))
+        .bind(None::<String>)
+        .bind(dt(2026, 7, 12, 8))
+        .bind(Some(dt(2026, 7, 12, 9)))
+        .execute(&pool)
+        .await?;
+
+        let latest_run_a = repo.latest_analysis_run("run-a").await.unwrap().unwrap();
+        assert_eq!(latest_run_a.trade_date, Some(date(2026, 7, 10)));
+        assert_eq!(latest_run_a.status, "ok");
+        assert_eq!(latest_run_a.details["estimated_rows"], 7);
+
+        let latest_runs = repo
+            .latest_analysis_runs(&["run-b", "run-a", "missing"])
+            .await
+            .unwrap();
+
+        assert_eq!(latest_runs.len(), 2);
+        assert_eq!(latest_runs[0].run_type, "run-b");
+        assert_eq!(latest_runs[0].trade_date, Some(date(2026, 7, 11)));
+        assert_eq!(latest_runs[0].status, "failed");
+        assert_eq!(latest_runs[0].error_message.as_deref(), Some("boom"));
+        assert_eq!(latest_runs[1].run_type, "run-a");
+        assert_eq!(latest_runs[1].trade_date, Some(date(2026, 7, 10)));
+        assert_eq!(latest_runs[1].status, "ok");
         Ok(())
     }
 }

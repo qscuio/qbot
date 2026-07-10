@@ -7,14 +7,14 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::{json, Value};
 
 use crate::analysis::market_snapshot::MARKET_SNAPSHOT_VERSION;
 use crate::state::AppState;
 use crate::storage::market_repository::{
-    POINT_IN_TIME_BACKFILL_RUN_TYPE, POINT_IN_TIME_CAPABILITY_PROBE_RUN_TYPE,
-    POINT_IN_TIME_REFERENCE_REFRESH_RUN_TYPE, POINT_IN_TIME_TRADE_DATE_REFRESH_RUN_TYPE,
+    AnalysisRunSummary, MarketRepository, POINT_IN_TIME_BACKFILL_RUN_TYPE,
+    POINT_IN_TIME_CAPABILITY_PROBE_RUN_TYPE, POINT_IN_TIME_REFERENCE_REFRESH_RUN_TYPE,
+    POINT_IN_TIME_TRADE_DATE_REFRESH_RUN_TYPE,
 };
 
 type ApiResult = std::result::Result<Json<Value>, (StatusCode, Json<Value>)>;
@@ -40,22 +40,24 @@ async fn get_analysis_data_status(
 ) -> ApiResult {
     require_auth(&headers, &state)?;
 
-    let snapshot = latest_market_snapshot(&state, MARKET_SNAPSHOT_VERSION)
+    let repo = MarketRepository::new(state.db.clone());
+
+    let snapshot = repo
+        .latest_market_snapshot(MARKET_SNAPSHOT_VERSION)
         .await
         .map_err(|e| crate::api::routes::api_error(&e.to_string()))?;
-    let capability_status = latest_analysis_run(&state, POINT_IN_TIME_CAPABILITY_PROBE_RUN_TYPE)
+    let capability_status = repo
+        .latest_analysis_run(POINT_IN_TIME_CAPABILITY_PROBE_RUN_TYPE)
         .await
         .map_err(|e| crate::api::routes::api_error(&e.to_string()))?;
-    let refresh_runs = latest_analysis_runs(
-        &state,
-        &[
+    let refresh_runs = repo
+        .latest_analysis_runs(&[
             POINT_IN_TIME_TRADE_DATE_REFRESH_RUN_TYPE,
             POINT_IN_TIME_REFERENCE_REFRESH_RUN_TYPE,
             POINT_IN_TIME_BACKFILL_RUN_TYPE,
-        ],
-    )
-    .await
-    .map_err(|e| crate::api::routes::api_error(&e.to_string()))?;
+        ])
+        .await
+        .map_err(|e| crate::api::routes::api_error(&e.to_string()))?;
 
     let capability_failures = capability_failures(capability_status.as_ref());
     let capability_probe = capability_probe_state(capability_status.as_ref());
@@ -116,7 +118,7 @@ async fn get_analysis_data_status(
         "inputFingerprint": input_fingerprint,
         "capabilityFailures": capability_failures,
         "capabilityProbe": capability_probe,
-        "capabilityStatus": capability_status.map(|status| status.to_json()),
+        "capabilityStatus": capability_status.as_ref().map(analysis_run_summary_json),
         "completeness": {
             "snapshotPresent": snapshot_present,
             "snapshotComplete": data_complete,
@@ -126,8 +128,8 @@ async fn get_analysis_data_status(
         },
         "estimatedRowCounts": estimated_counts,
         "latestRuns": refresh_runs
-            .into_iter()
-            .map(|run| run.to_json())
+            .iter()
+            .map(analysis_run_summary_json)
             .collect::<Vec<_>>(),
     })))
 }
@@ -181,134 +183,15 @@ fn require_auth(
     }
 }
 
-#[derive(Debug)]
-struct DataStatusSnapshot {
-    trade_date: NaiveDate,
-    snapshot_version: String,
-    available_at: DateTime<Utc>,
-    data_complete: bool,
-    missing_inputs: Vec<String>,
-    input_fingerprint: String,
-}
-
-#[derive(Debug)]
-struct AnalysisRunSummary {
-    run_type: String,
-    trade_date: Option<NaiveDate>,
-    status: String,
-    details: Value,
-    error_message: Option<String>,
-    started_at: DateTime<Utc>,
-    completed_at: Option<DateTime<Utc>>,
-}
-
-impl AnalysisRunSummary {
-    fn to_json(&self) -> Value {
-        json!({
-            "runType": self.run_type,
-            "status": self.status,
-            "details": self.details,
-            "errorMessage": self.error_message,
-            "startedAt": self.started_at,
-            "completedAt": self.completed_at,
-        })
-    }
-}
-
-async fn latest_market_snapshot(
-    state: &AppState,
-    version: &str,
-) -> crate::error::Result<Option<DataStatusSnapshot>> {
-    let row: Option<(NaiveDate, String, DateTime<Utc>, bool, Value, String)> = sqlx::query_as(
-        r#"SELECT trade_date, snapshot_version, available_at, data_complete,
-                  missing_inputs, input_fingerprint
-           FROM market_daily_snapshots
-           WHERE snapshot_version = $1
-           ORDER BY trade_date DESC, available_at DESC
-           LIMIT 1"#,
-    )
-    .bind(version)
-    .fetch_optional(&state.db)
-    .await?;
-
-    row.map(
-        |(
-            trade_date,
-            snapshot_version,
-            available_at,
-            data_complete,
-            missing_inputs,
-            input_fingerprint,
-        )| {
-            Ok(DataStatusSnapshot {
-                trade_date,
-                snapshot_version,
-                available_at,
-                data_complete,
-                missing_inputs: serde_json::from_value(missing_inputs)?,
-                input_fingerprint,
-            })
-        },
-    )
-    .transpose()
-}
-
-async fn latest_analysis_run(
-    state: &AppState,
-    run_type: &str,
-) -> crate::error::Result<Option<AnalysisRunSummary>> {
-    let mut runs = latest_analysis_runs(state, &[run_type]).await?;
-    Ok(runs.pop())
-}
-
-async fn latest_analysis_runs(
-    state: &AppState,
-    run_types: &[&str],
-) -> crate::error::Result<Vec<AnalysisRunSummary>> {
-    let mut runs = Vec::new();
-    for run_type in run_types {
-        let row: Option<(
-            String,
-            Option<NaiveDate>,
-            String,
-            Value,
-            Option<String>,
-            DateTime<Utc>,
-            Option<DateTime<Utc>>,
-        )> = sqlx::query_as(
-            r#"SELECT run_type, trade_date, status, details, error_message, started_at, completed_at
-               FROM analysis_data_runs
-               WHERE run_type = $1
-               ORDER BY started_at DESC
-               LIMIT 1"#,
-        )
-        .bind(run_type)
-        .fetch_optional(&state.db)
-        .await?;
-
-        if let Some((
-            run_type,
-            trade_date,
-            status,
-            details,
-            error_message,
-            started_at,
-            completed_at,
-        )) = row
-        {
-            runs.push(AnalysisRunSummary {
-                run_type,
-                trade_date,
-                status,
-                details,
-                error_message,
-                started_at,
-                completed_at,
-            });
-        }
-    }
-
-    Ok(runs)
+fn analysis_run_summary_json(run: &AnalysisRunSummary) -> Value {
+    json!({
+        "runType": run.run_type,
+        "status": run.status,
+        "details": run.details,
+        "errorMessage": run.error_message,
+        "startedAt": run.started_at,
+        "completedAt": run.completed_at,
+    })
 }
 
 fn capability_failures(status: Option<&AnalysisRunSummary>) -> Vec<String> {
