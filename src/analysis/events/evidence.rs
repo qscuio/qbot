@@ -77,7 +77,7 @@ impl ManualEvidenceIngestor {
         #[cfg(test)]
         {
             let _ = self.repo.find_by_content_hash(&content_hash).await?;
-            wait_after_duplicate_lookup().await;
+            wait_after_duplicate_lookup(&content_hash).await;
         }
 
         let row = EventEvidenceRow {
@@ -178,8 +178,8 @@ fn event_evidence_from_row(row: &EventEvidenceRow) -> EventEvidence {
 }
 
 #[cfg(test)]
-async fn wait_after_duplicate_lookup() {
-    test_support::wait_after_duplicate_lookup().await;
+async fn wait_after_duplicate_lookup(content_hash: &str) {
+    test_support::wait_after_duplicate_lookup(content_hash).await;
 }
 
 #[cfg(test)]
@@ -188,25 +188,40 @@ mod test_support {
 
     use tokio::sync::Barrier;
 
-    static AFTER_DUPLICATE_LOOKUP_BARRIER: OnceLock<Mutex<Option<Arc<Barrier>>>> = OnceLock::new();
+    static AFTER_DUPLICATE_LOOKUP_BARRIER: OnceLock<Mutex<Option<DuplicateLookupBarrier>>> =
+        OnceLock::new();
+
+    #[derive(Clone)]
+    struct DuplicateLookupBarrier {
+        content_hash: String,
+        barrier: Arc<Barrier>,
+    }
 
     pub(super) struct DuplicateLookupBarrierGuard;
 
-    pub(super) fn install_duplicate_lookup_barrier(parties: usize) -> DuplicateLookupBarrierGuard {
-        let barrier = Arc::new(Barrier::new(parties));
+    pub(super) fn install_duplicate_lookup_barrier(
+        content_hash: impl Into<String>,
+        parties: usize,
+    ) -> DuplicateLookupBarrierGuard {
+        let barrier = DuplicateLookupBarrier {
+            content_hash: content_hash.into(),
+            barrier: Arc::new(Barrier::new(parties)),
+        };
         let mut slot = barrier_slot().lock().unwrap();
         assert!(slot.replace(barrier).is_none());
         DuplicateLookupBarrierGuard
     }
 
-    pub(super) async fn wait_after_duplicate_lookup() {
+    pub(super) async fn wait_after_duplicate_lookup(content_hash: &str) {
         let barrier = {
             let slot = barrier_slot().lock().unwrap();
             slot.clone()
         };
 
         if let Some(barrier) = barrier {
-            barrier.wait().await;
+            if barrier.content_hash == content_hash {
+                barrier.barrier.wait().await;
+            }
         }
     }
 
@@ -217,7 +232,7 @@ mod test_support {
         }
     }
 
-    fn barrier_slot() -> &'static Mutex<Option<Arc<Barrier>>> {
+    fn barrier_slot() -> &'static Mutex<Option<DuplicateLookupBarrier>> {
         AFTER_DUPLICATE_LOOKUP_BARRIER.get_or_init(|| Mutex::new(None))
     }
 }
@@ -225,15 +240,17 @@ mod test_support {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use chrono::{DateTime, NaiveDate, TimeZone, Utc};
     use sha2::{Digest, Sha256};
     use sqlx::PgPool;
+    use tokio::task::yield_now;
     use uuid::Uuid;
 
     use super::{
-        test_support::install_duplicate_lookup_barrier, ManualEvidenceIngestor, ManualSource,
-        MANUAL_SOURCE_REST, MANUAL_SOURCE_TELEGRAM,
+        content_hash, test_support::install_duplicate_lookup_barrier, wait_after_duplicate_lookup,
+        ManualEvidenceIngestor, ManualSource, MANUAL_SOURCE_REST, MANUAL_SOURCE_TELEGRAM,
     };
     use crate::analysis::events::{
         AShareTradingDateResolver, EventIntelligence, ExistingEventEvidenceRelation,
@@ -392,7 +409,8 @@ mod tests {
             submitted_by: "operator".to_string(),
             published_at: Some(dt(2026, 7, 10, 7, 30, 0)),
         };
-        let _barrier = install_duplicate_lookup_barrier(2);
+        let expected_hash = content_hash(&input.title, input.content.as_deref());
+        let _barrier = install_duplicate_lookup_barrier(expected_hash, 2);
 
         let (left, right) = tokio::join!(
             ingestor.submit_at(ManualSource::Rest, input.clone(), dt(2026, 7, 10, 8, 0, 0)),
@@ -422,6 +440,18 @@ mod tests {
         assert_eq!(same_hash.len(), 2);
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn duplicate_lookup_barrier_does_not_block_unrelated_waiters() {
+        let waiting = tokio::spawn(wait_after_duplicate_lookup("other-hash"));
+        yield_now().await;
+        let _barrier = install_duplicate_lookup_barrier("expected-hash", 2);
+
+        tokio::time::timeout(Duration::from_millis(50), waiting)
+            .await
+            .expect("unrelated waiter should not block on the duplicate lookup barrier")
+            .expect("wait task should complete cleanly");
     }
 
     #[sqlx::test(migrations = "./migrations")]
