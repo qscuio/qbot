@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use reqwest::Client;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use tokio::sync::RwLock;
 use tracing::warn;
@@ -699,6 +699,157 @@ impl TushareClient {
             .collect()
     }
 
+    fn assemble_security_statuses(
+        trade_date: NaiveDate,
+        fetched_at: DateTime<Utc>,
+        daily: &Value,
+        limits: &Value,
+        suspensions: &Value,
+        masters: &Value,
+        namechanges: &Value,
+    ) -> Vec<SecurityDailyStatus> {
+        let daily_fields = daily["fields"].as_array().cloned().unwrap_or_default();
+        let i_daily_code = Self::field_index(&daily_fields, "ts_code");
+        let i_daily_close = Self::field_index(&daily_fields, "close");
+        let close_by_code = daily["items"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|row| {
+                let arr = row.as_array()?;
+                Some((
+                    Self::row_str(arr, i_daily_code)?.to_string(),
+                    Self::optional_f64(Self::row_value(arr, i_daily_close))?,
+                ))
+            })
+            .collect::<HashMap<_, _>>();
+
+        let limit_fields = limits["fields"].as_array().cloned().unwrap_or_default();
+        let i_limit_code = Self::field_index(&limit_fields, "ts_code");
+        let i_up_limit = Self::field_index(&limit_fields, "up_limit");
+        let i_down_limit = Self::field_index(&limit_fields, "down_limit");
+        let limit_by_code = limits["items"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|row| {
+                let arr = row.as_array()?;
+                Some((
+                    Self::row_str(arr, i_limit_code)?.to_string(),
+                    (
+                        Self::optional_f64(Self::row_value(arr, i_up_limit)),
+                        Self::optional_f64(Self::row_value(arr, i_down_limit)),
+                    ),
+                ))
+            })
+            .collect::<HashMap<_, _>>();
+
+        let suspension_fields = suspensions["fields"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let i_suspension_code = Self::field_index(&suspension_fields, "ts_code");
+        let suspended = suspensions["items"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|row| {
+                row.as_array()
+                    .and_then(|arr| Self::row_str(arr, i_suspension_code))
+                    .map(|v| v.to_string())
+            })
+            .collect::<HashSet<_>>();
+
+        let master_fields = masters["fields"].as_array().cloned().unwrap_or_default();
+        let i_master_code = Self::field_index(&master_fields, "ts_code");
+        let i_list_date = Self::field_index(&master_fields, "list_date");
+        let listed_by_code = masters["items"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|row| {
+                let arr = row.as_array()?;
+                Some((
+                    Self::row_str(arr, i_master_code)?.to_string(),
+                    Self::optional_date(Self::row_value(arr, i_list_date))?,
+                ))
+            })
+            .collect::<HashMap<_, _>>();
+
+        let namechange_fields = namechanges["fields"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let i_namechange_code = Self::field_index(&namechange_fields, "ts_code");
+        let i_name = Self::field_index(&namechange_fields, "name");
+        let i_start_date = Self::field_index(&namechange_fields, "start_date");
+        let i_end_date = Self::field_index(&namechange_fields, "end_date");
+        let i_change_reason = Self::field_index(&namechange_fields, "change_reason");
+        let mut st_codes = HashSet::new();
+        for row in namechanges["items"].as_array().cloned().unwrap_or_default() {
+            let Some(arr) = row.as_array() else { continue };
+            let Some(code) = Self::row_str(arr, i_namechange_code) else {
+                continue;
+            };
+            let name = Self::row_str(arr, i_name).unwrap_or("");
+            let start =
+                Self::optional_date(Self::row_value(arr, i_start_date)).unwrap_or(NaiveDate::MIN);
+            let end =
+                Self::optional_date(Self::row_value(arr, i_end_date)).unwrap_or(NaiveDate::MAX);
+            let reason = Self::row_str(arr, i_change_reason).unwrap_or("");
+            if start <= trade_date
+                && trade_date <= end
+                && (name.to_ascii_uppercase().contains("ST")
+                    || reason.to_ascii_uppercase().contains("ST"))
+            {
+                st_codes.insert(code.to_string());
+            }
+        }
+
+        let codes = close_by_code
+            .keys()
+            .chain(suspended.iter())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+
+        codes
+            .into_iter()
+            .map(|code| {
+                let price_limit_pct = close_by_code.get(&code).and_then(|close| {
+                    let (up, _down) = limit_by_code.get(&code)?;
+                    let up = (*up)?;
+                    if *close == 0.0 {
+                        None
+                    } else {
+                        Some(((up / close - 1.0) * 100.0 * 100.0).round() / 100.0)
+                    }
+                });
+                let listed_days = listed_by_code.get(&code).map(|list_date| {
+                    trade_date
+                        .signed_duration_since(*list_date)
+                        .num_days()
+                        .saturating_add(1) as i32
+                });
+                SecurityDailyStatus {
+                    code: code.clone(),
+                    trade_date,
+                    listed_days,
+                    is_st: st_codes.contains(&code),
+                    is_suspended: suspended.contains(&code),
+                    price_limit_pct,
+                    available_at: fetched_at,
+                    ingested_at: fetched_at,
+                    availability_quality: AvailabilityQuality::Observed,
+                    source: Self::source(),
+                }
+            })
+            .collect()
+    }
+
     fn parse_index_daily_bars(data: &Value, fetched_at: DateTime<Utc>) -> Vec<IndexDailyBar> {
         let items = data["items"].as_array().cloned().unwrap_or_default();
         let fields = data["fields"].as_array().cloned().unwrap_or_default();
@@ -868,109 +1019,15 @@ impl PointInTimeDataProvider for TushareClient {
             )
             .await?;
 
-        let close_by_code = daily["items"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|row| {
-                let arr = row.as_array()?;
-                Some((
-                    arr.first()?.as_str()?.to_string(),
-                    Self::optional_f64(arr.get(2))?,
-                ))
-            })
-            .collect::<HashMap<_, _>>();
-
-        let limit_by_code = limits["items"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|row| {
-                let arr = row.as_array()?;
-                Some((
-                    arr.first()?.as_str()?.to_string(),
-                    (
-                        Self::optional_f64(arr.get(2)),
-                        Self::optional_f64(arr.get(3)),
-                    ),
-                ))
-            })
-            .collect::<HashMap<_, _>>();
-
-        let suspended = suspensions["items"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|row| row.as_array()?.first()?.as_str().map(|v| v.to_string()))
-            .collect::<HashSet<_>>();
-
-        let listed_by_code = masters["items"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|row| {
-                let arr = row.as_array()?;
-                Some((
-                    arr.first()?.as_str()?.to_string(),
-                    Self::optional_date(arr.get(1))?,
-                ))
-            })
-            .collect::<HashMap<_, _>>();
-
-        let mut st_codes = HashSet::new();
-        for row in namechanges["items"].as_array().cloned().unwrap_or_default() {
-            let Some(arr) = row.as_array() else { continue };
-            let Some(code) = arr.first().and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let name = arr.get(1).and_then(|v| v.as_str()).unwrap_or("");
-            let start = Self::optional_date(arr.get(2)).unwrap_or(NaiveDate::MIN);
-            let end = Self::optional_date(arr.get(3)).unwrap_or(NaiveDate::MAX);
-            let reason = arr.get(4).and_then(|v| v.as_str()).unwrap_or("");
-            if start <= trade_date
-                && trade_date <= end
-                && (name.to_ascii_uppercase().contains("ST")
-                    || reason.to_ascii_uppercase().contains("ST"))
-            {
-                st_codes.insert(code.to_string());
-            }
-        }
-
-        let mut rows = Vec::new();
-        for (code, close) in close_by_code {
-            let price_limit_pct = limit_by_code.get(&code).and_then(|(up, _down)| {
-                let up = (*up)?;
-                if close == 0.0 {
-                    None
-                } else {
-                    Some(((up / close - 1.0) * 100.0 * 100.0).round() / 100.0)
-                }
-            });
-            let listed_days = listed_by_code.get(&code).map(|list_date| {
-                trade_date
-                    .signed_duration_since(*list_date)
-                    .num_days()
-                    .saturating_add(1) as i32
-            });
-            rows.push(SecurityDailyStatus {
-                code: code.clone(),
-                trade_date,
-                listed_days,
-                is_st: st_codes.contains(&code),
-                is_suspended: suspended.contains(&code),
-                price_limit_pct,
-                available_at: fetched_at,
-                ingested_at: fetched_at,
-                availability_quality: AvailabilityQuality::Observed,
-                source: Self::source(),
-            });
-        }
-
-        Ok(rows)
+        Ok(Self::assemble_security_statuses(
+            trade_date,
+            fetched_at,
+            &daily,
+            &limits,
+            &suspensions,
+            &masters,
+            &namechanges,
+        ))
     }
 
     async fn get_index_daily_range(
@@ -1513,6 +1570,64 @@ mod tests {
         assert_eq!(rows[0].price_limit_pct, Some(10.0));
         assert_eq!(rows[0].available_at, fetched_at);
         assert_eq!(rows[0].availability_quality, AvailabilityQuality::Observed);
+    }
+
+    #[test]
+    fn security_statuses_include_suspensions_absent_from_daily() {
+        let trade_date = NaiveDate::from_ymd_opt(2026, 7, 10).unwrap();
+        let fetched_at = Utc.with_ymd_and_hms(2026, 7, 10, 9, 30, 0).unwrap();
+        let daily = serde_json::json!({
+            "fields": ["ts_code", "trade_date", "close"],
+            "items": [["600000.SH", "20260710", 10.0]]
+        });
+        let limits = serde_json::json!({
+            "fields": ["ts_code", "trade_date", "up_limit", "down_limit"],
+            "items": [["600000.SH", "20260710", 11.0, 9.0]]
+        });
+        let suspensions = serde_json::json!({
+            "fields": ["ts_code", "suspend_date", "suspend_type"],
+            "items": [["000001.SZ", "20260710", "P"]]
+        });
+        let masters = serde_json::json!({
+            "fields": ["ts_code", "list_date"],
+            "items": [
+                ["600000.SH", "19991110"],
+                ["000001.SZ", "19910403"]
+            ]
+        });
+        let namechanges = serde_json::json!({
+            "fields": ["ts_code", "name", "start_date", "end_date", "change_reason"],
+            "items": []
+        });
+
+        let rows = TushareClient::assemble_security_statuses(
+            trade_date,
+            fetched_at,
+            &daily,
+            &limits,
+            &suspensions,
+            &masters,
+            &namechanges,
+        );
+
+        let suspended_only = rows
+            .iter()
+            .find(|row| row.code == "000001.SZ")
+            .expect("suspended-only security should be emitted");
+        assert!(suspended_only.is_suspended);
+        assert!(!suspended_only.is_st);
+        assert_eq!(suspended_only.price_limit_pct, None);
+        assert_eq!(
+            suspended_only.availability_quality,
+            AvailabilityQuality::Observed
+        );
+
+        let daily_row = rows
+            .iter()
+            .find(|row| row.code == "600000.SH")
+            .expect("daily security should still be emitted");
+        assert!(!daily_row.is_suspended);
+        assert_eq!(daily_row.price_limit_pct, Some(10.0));
     }
 
     #[test]

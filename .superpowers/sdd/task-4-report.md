@@ -143,3 +143,27 @@ I fixed the parser to normalize summed stock ratios instead of weakening the fix
 
 - The required test commands still emit existing dead-code warnings from the binary test build.
 - `analysis_data_runs.status` is limited to 20 characters, so missing point-in-time prerequisites are persisted as status `missing`; exact missing capabilities remain in `details.missing_capabilities`.
+
+## Task 4 Re-review Fix: Suspended-only statuses
+
+### What changed
+
+- Updated Tushare security status assembly so `suspend_d` codes are emitted even when absent from `daily`.
+- Kept suspended-only rows sourced from explicit suspension data; they do not receive fabricated close values or price-derived `price_limit_pct`.
+- Preserved the existing verified source handling for ST status and did not add fallback or current-name inference.
+- Added a fixture-based regression test covering a `suspend_d`-only code.
+
+### Test results
+
+- `cargo test data::tushare -- --nocapture` - PASS, 10 passed.
+- `cargo fmt --all -- --check` - PASS.
+- `git diff --check` - PASS.
+
+### Files changed
+
+- `src/data/tushare.rs`
+- `.superpowers/sdd/task-4-report.md`
+
+### Concerns
+
+- The required Rust test command still emits existing dead-code warnings from the binary test build.
