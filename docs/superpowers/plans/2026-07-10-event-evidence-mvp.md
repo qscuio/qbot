@@ -369,7 +369,7 @@ git commit -m "feat: ingest manual market-event evidence"
 - Produces `DuplicateDecision`.
 - Does not implement EventCluster.
 
-- [ ] **Step 1: Define decisions**
+- [x] **Step 1: Define decisions**
 
 ```rust
 pub enum DuplicateDecision {
@@ -380,7 +380,7 @@ pub enum DuplicateDecision {
 }
 ```
 
-- [ ] **Step 2: Test exact duplicate rules**
+- [x] **Step 2: Test exact duplicate rules**
 
 Exact when:
 
@@ -388,17 +388,17 @@ Exact when:
 - canonical URL match.
 - content hash match.
 
-- [ ] **Step 3: Implement conservative near duplicate**
+- [x] **Step 3: Implement conservative near duplicate**
 
 Use title token Jaccard plus normalized content prefix similarity. Automatic near-duplicate requires a configured threshold at least `0.92`; otherwise return `ReviewRequired`.
 
 Do not use an LLM for duplicate decisions in Phase 2.
 
-- [ ] **Step 4: Test locked relations**
+- [x] **Step 4: Test locked relations**
 
 A user-locked `Independent` or duplicate relation cannot be overwritten by reprocessing.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 cargo test analysis::events::dedup
@@ -782,7 +782,7 @@ git commit -m "feat: publish daily evidence-backed market facts"
 - [ ] One official source works through an adapter.
 - [ ] Retention policy is enforced.
 - [ ] Evidence versions are immutable.
-- [ ] Exact and near duplicates are conservative and auditable.
+- [x] Exact and near duplicates are conservative and auditable.
 - [ ] Every published fact has evidence.
 - [ ] Direct entity mapping does not guess ambiguous stocks.
 - [ ] ClaimGraph contains facts only.
