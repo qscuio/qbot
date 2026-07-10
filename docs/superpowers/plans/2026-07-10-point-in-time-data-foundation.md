@@ -909,7 +909,7 @@ git commit -m "feat: probe point-in-time data capabilities"
 - New live observations use observed timestamps.
 - Historical backfills append estimated observations without overwriting them later.
 
-- [ ] **Step 1: Write failing current-view and version-history tests**
+- [x] **Step 1: Write failing current-view and version-history tests**
 
 Add SQLx tests proving that:
 
@@ -917,7 +917,7 @@ Add SQLx tests proving that:
 - two observations for the same `(code, trade_date)` with different `available_at` values both remain in `stock_daily_bar_versions`;
 - a repeated observation with the same `(code, trade_date, available_at)` is idempotent.
 
-- [ ] **Step 2: Verify failure**
+- [x] **Step 2: Verify failure**
 
 Run:
 
@@ -927,7 +927,7 @@ cargo test daily_bar_upsert_updates_fundamentals append_daily_bar_versions_is_po
 
 Expected: FAIL because the current legacy `ON CONFLICT` clause omits fundamental fields and the append-only version function does not exist.
 
-- [ ] **Step 3: Extend the upsert signature**
+- [x] **Step 3: Extend the upsert signature**
 
 Keep the existing legacy signature and current-state table behavior:
 
@@ -952,7 +952,7 @@ pub async fn append_daily_bar_versions(
 
 The legacy table remains the current operational view. Research and replay read only `stock_daily_bar_versions`.
 
-- [ ] **Step 4: Update call sites**
+- [x] **Step 4: Update call sites**
 
 Daily live ingestion:
 
@@ -984,7 +984,7 @@ MarketRepository::new(self.state.db.clone())
 
 Add `MarketRepository::append_sector_versions` and `MarketRepository::append_limit_up_versions` with the same append-only rule. Existing sector and limit-up tables remain current operational views.
 
-- [ ] **Step 5: Run tests**
+- [x] **Step 5: Run tests**
 
 Run:
 
@@ -995,7 +995,7 @@ cargo test --all --locked
 
 Expected: all non-environment-dependent tests PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/storage/postgres.rs src/storage/market_repository.rs src/services/stock_history.rs src/services/sector.rs src/services/limit_up.rs
