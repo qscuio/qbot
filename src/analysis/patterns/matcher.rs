@@ -13,9 +13,13 @@ use super::model::{
     mahalanobis_distance_squared, CandidateStatus, DistanceMetric, PatternModelPayload,
     ValidationPayload,
 };
-use super::ranking::{final_score, rank_candidate, ShadowTier};
+use super::ranking::{final_score, rank_candidate, ScoreComponents, ShadowTier};
 use crate::analysis::market_snapshot::adjustment::adjust_candles;
-use crate::analysis::market_snapshot::{AdjustmentFactor, SecurityDailyStatus};
+use crate::analysis::market_snapshot::MARKET_SNAPSHOT_VERSION;
+use crate::analysis::market_snapshot::{
+    AdjustmentFactor, AvailabilityQuality, DailyBasicSnapshot, MarketSnapshot, SectorMembership,
+    SecurityDailyStatus, SecurityMasterVersion,
+};
 use crate::data::types::Candle;
 use crate::error::{AppError, Result};
 use crate::storage::market_repository::{MarketRepository, PointInTimeDailyBarVersion};
@@ -70,6 +74,32 @@ pub(crate) trait MarketSource: Send + Sync {
         end: NaiveDate,
         as_of: DateTime<Utc>,
     ) -> Result<Vec<AdjustmentFactor>>;
+
+    async fn security_master(
+        &self,
+        code: &str,
+        as_of: DateTime<Utc>,
+    ) -> Result<Option<SecurityMasterVersion>>;
+
+    async fn active_sector_memberships(
+        &self,
+        code: &str,
+        trade_date: NaiveDate,
+        as_of: DateTime<Utc>,
+    ) -> Result<Vec<SectorMembership>>;
+
+    async fn market_snapshot(
+        &self,
+        trade_date: NaiveDate,
+        version: &str,
+    ) -> Result<Option<MarketSnapshot>>;
+
+    async fn daily_basic(
+        &self,
+        code: &str,
+        trade_date: NaiveDate,
+        as_of: DateTime<Utc>,
+    ) -> Result<Option<DailyBasicSnapshot>>;
 }
 
 #[async_trait]
@@ -99,6 +129,40 @@ impl MarketSource for MarketRepository {
         as_of: DateTime<Utc>,
     ) -> Result<Vec<AdjustmentFactor>> {
         MarketRepository::adjustment_factors_as_of(self, codes, start, end, as_of).await
+    }
+
+    async fn security_master(
+        &self,
+        code: &str,
+        as_of: DateTime<Utc>,
+    ) -> Result<Option<SecurityMasterVersion>> {
+        MarketRepository::security_master(self, code, as_of).await
+    }
+
+    async fn active_sector_memberships(
+        &self,
+        code: &str,
+        trade_date: NaiveDate,
+        as_of: DateTime<Utc>,
+    ) -> Result<Vec<SectorMembership>> {
+        MarketRepository::active_sector_memberships(self, code, trade_date, as_of).await
+    }
+
+    async fn market_snapshot(
+        &self,
+        trade_date: NaiveDate,
+        version: &str,
+    ) -> Result<Option<MarketSnapshot>> {
+        MarketRepository::market_snapshot(self, trade_date, version).await
+    }
+
+    async fn daily_basic(
+        &self,
+        code: &str,
+        trade_date: NaiveDate,
+        as_of: DateTime<Utc>,
+    ) -> Result<Option<DailyBasicSnapshot>> {
+        MarketRepository::daily_basic(self, code, trade_date, as_of).await
     }
 }
 
@@ -131,10 +195,20 @@ pub struct PatternEvaluation {
     pub invalidations: Vec<Invalidation>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ScoreContext {
+    pub sector_memberships: Vec<SectorMembership>,
+    pub market_snapshot: Option<MarketSnapshot>,
+    pub daily_basic: Option<DailyBasicSnapshot>,
+    pub current_bar: Option<Candle>,
+    pub data_quality_flags: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PatternCandidate {
     pub trade_date: NaiveDate,
     pub code: String,
+    pub name: Option<String>,
     pub horizon: String,
     pub pattern_version_id: Uuid,
     pub pattern_set_id: Uuid,
@@ -155,6 +229,7 @@ impl PatternCandidate {
         ShadowCandidateRow {
             trade_date: self.trade_date,
             code: self.code.clone(),
+            name: self.name.clone(),
             horizon: self.horizon.clone(),
             pattern_version_id: self.pattern_version_id,
             pattern_set_id: self.pattern_set_id,
@@ -224,6 +299,10 @@ where
             .market_repo
             .security_status_universe_as_of(trade_date, as_of)
             .await?;
+        let market_snapshot = self
+            .market_repo
+            .market_snapshot(trade_date, MARKET_SNAPSHOT_VERSION)
+            .await?;
 
         let histories = histories_by_code(history_rows);
         let adjustment_rows = if histories.is_empty() {
@@ -263,6 +342,34 @@ where
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
             let status = status_by_code.get(&code);
+            let security_master = self.market_repo.security_master(&code, as_of).await?;
+            let candidate_name = security_master.as_ref().and_then(|security| {
+                let trimmed = security.name.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_string())
+            });
+            let sector_memberships = self
+                .market_repo
+                .active_sector_memberships(&code, trade_date, as_of)
+                .await?;
+            let daily_basic = self
+                .market_repo
+                .daily_basic(&code, trade_date, as_of)
+                .await?;
+            let data_quality_flags = data_quality_flags(
+                history,
+                status,
+                &adjustments.get(&code).cloned().unwrap_or_default(),
+                security_master.as_ref(),
+                &sector_memberships,
+                daily_basic.as_ref(),
+            );
+            let score_context = ScoreContext {
+                sector_memberships,
+                market_snapshot: market_snapshot.clone(),
+                daily_basic,
+                current_bar: history.last().and_then(|row| row.bar.clone()),
+                data_quality_flags,
+            };
             for pattern in &patterns {
                 let (features, mut derivation_invalidations) = derive_feature_vector(
                     &pattern.model.required_features,
@@ -273,8 +380,21 @@ where
                     derivation_invalidations.push(adjustment_invalidation.clone());
                 }
                 derivation_invalidations.extend(status_invalidations(status));
-                let mut evaluation =
-                    evaluate_pattern(&pattern.model, &pattern.validation, &features);
+                if candidate_name.is_none() {
+                    derivation_invalidations.push(Invalidation {
+                        reason: "missing_security_master_name".to_string(),
+                        feature: None,
+                        detail:
+                            "security master name was not available as of the trade date cutoff"
+                                .to_string(),
+                    });
+                }
+                let mut evaluation = evaluate_pattern(
+                    &pattern.model,
+                    &pattern.validation,
+                    &features,
+                    &score_context,
+                );
                 evaluation.invalidations.extend(derivation_invalidations);
                 if !evaluation.invalidations.is_empty() {
                     evaluation.shadow_tier = ShadowTier::Reject;
@@ -298,6 +418,7 @@ where
                 candidates.push(PatternCandidate {
                     trade_date,
                     code: code.clone(),
+                    name: candidate_name.clone(),
                     horizon: pattern.horizon.clone(),
                     pattern_version_id: pattern.pattern_version_id,
                     pattern_set_id,
@@ -333,6 +454,7 @@ where
     }
 }
 
+#[derive(Debug)]
 struct PublishedPattern {
     pattern_version_id: Uuid,
     horizon: String,
@@ -350,15 +472,48 @@ fn load_published_patterns(rows: Vec<PatternVersionRow>) -> Result<Vec<Published
                     row.schema_version, row.pattern_version_id, SUPPORTED_PATTERN_SCHEMA_VERSION
                 )));
             }
+            let model = PatternModelPayload::from_value(row.model_payload)?;
+            let validation = ValidationPayload::from_value(row.validation_payload)?;
+            validate_model_validation_consistency(&model, &validation, row.pattern_version_id)?;
             Ok(PublishedPattern {
                 pattern_version_id: row.pattern_version_id,
                 horizon: row.horizon,
                 pattern_type: row.pattern_type,
-                model: PatternModelPayload::from_value(row.model_payload)?,
-                validation: ValidationPayload::from_value(row.validation_payload)?,
+                model,
+                validation,
             })
         })
         .collect()
+}
+
+fn validate_model_validation_consistency(
+    model: &PatternModelPayload,
+    validation: &ValidationPayload,
+    pattern_version_id: Uuid,
+) -> Result<()> {
+    if !same_f64(model.validation_lift, validation.lift) {
+        return Err(AppError::Internal(format!(
+            "model_payload.validation_lift must match validation_payload.lift for pattern_version_id {}",
+            pattern_version_id
+        )));
+    }
+    if !same_f64(model.validation_coverage, validation.coverage) {
+        return Err(AppError::Internal(format!(
+            "model_payload.validation_coverage must match validation_payload.coverage for pattern_version_id {}",
+            pattern_version_id
+        )));
+    }
+    if model.baseline_comparison != validation.baseline_comparison {
+        return Err(AppError::Internal(format!(
+            "model_payload.baseline_comparison must match validation_payload.baseline_comparison for pattern_version_id {}",
+            pattern_version_id
+        )));
+    }
+    Ok(())
+}
+
+fn same_f64(left: f64, right: f64) -> bool {
+    (left - right).abs() <= 1e-12
 }
 
 pub fn similarity(
@@ -466,6 +621,7 @@ pub fn evaluate_pattern(
     model: &PatternModelPayload,
     validation: &ValidationPayload,
     features: &FeatureVector,
+    score_context: &ScoreContext,
 ) -> PatternEvaluation {
     let mut invalidations = Vec::new();
     for feature in &model.required_features {
@@ -519,11 +675,19 @@ pub fn evaluate_pattern(
         .as_ref()
         .map(|score| score.similarity)
         .unwrap_or(0.0);
-    let final_score = if invalidations.is_empty() {
-        final_score(similarity_score, validation.lift) * risk_multiplier
-    } else {
-        0.0
-    };
+    let score_evaluation = evaluate_score_components(
+        model,
+        features,
+        score_context,
+        similarity_score,
+        risk_multiplier,
+    );
+    let final_score = score_evaluation
+        .components
+        .as_ref()
+        .filter(|_| invalidations.is_empty())
+        .map(final_score)
+        .unwrap_or(0.0);
     let base_shadow_tier = match (
         model.similarity_thresholds.get("shadow_a").copied(),
         model.similarity_thresholds.get("shadow_b").copied(),
@@ -534,6 +698,8 @@ pub fn evaluate_pattern(
             shadow_a_threshold,
             shadow_b_threshold,
             !invalidations.is_empty(),
+            score_evaluation.context_complete,
+            score_evaluation.market_state_satisfied,
         ),
         _ => ShadowTier::Reject,
     };
@@ -551,11 +717,180 @@ pub fn evaluate_pattern(
             &necessary_conditions,
             &risk_conditions,
             similarity_result.as_ref(),
-            risk_multiplier,
+            &score_evaluation,
             shadow_tier,
         ),
         invalidations,
     }
+}
+
+struct ScoreComponentEvaluation {
+    components: Option<ScoreComponents>,
+    payload: Value,
+    context_complete: bool,
+    market_state_satisfied: bool,
+}
+
+fn evaluate_score_components(
+    model: &PatternModelPayload,
+    features: &FeatureVector,
+    context: &ScoreContext,
+    similarity_score: f64,
+    risk_multiplier: f64,
+) -> ScoreComponentEvaluation {
+    let mut missing_components = Vec::new();
+    let relative_strength = relative_strength_component(model, features).or_else(|| {
+        missing_components.push("relative_strength");
+        None
+    });
+    let sector_confirmation = (!context.sector_memberships.is_empty()).then_some(1.0);
+    if sector_confirmation.is_none() {
+        missing_components.push("sector_confirmation");
+    }
+    let market_regime = market_regime_component(context.market_snapshot.as_ref()).or_else(|| {
+        missing_components.push("market_regime");
+        None
+    });
+    let extension_penalty = extension_penalty_component(model, features).or_else(|| {
+        missing_components.push("extension_penalty");
+        None
+    });
+    let liquidity_penalty = liquidity_penalty_component(context).or_else(|| {
+        missing_components.push("liquidity_penalty");
+        None
+    });
+    let data_quality_penalty = data_quality_penalty_component(context).or_else(|| {
+        missing_components.push("data_quality_penalty");
+        None
+    });
+    let context_complete = missing_components.is_empty() && context.data_quality_flags.is_empty();
+    let market_state_satisfied = market_regime.is_some_and(|value| value >= 0.5);
+
+    let components = match (
+        relative_strength,
+        sector_confirmation,
+        market_regime,
+        extension_penalty,
+        liquidity_penalty,
+        data_quality_penalty,
+    ) {
+        (
+            Some(relative_strength),
+            Some(sector_confirmation),
+            Some(market_regime),
+            Some(extension_penalty),
+            Some(liquidity_penalty),
+            Some(data_quality_penalty),
+        ) => Some(ScoreComponents {
+            validated_pattern_strength: model.validation_lift,
+            current_similarity: similarity_score,
+            relative_strength,
+            sector_confirmation,
+            market_regime,
+            extension_penalty,
+            liquidity_penalty,
+            data_quality_penalty,
+            risk_adjustment: risk_multiplier,
+        }),
+        _ => None,
+    };
+
+    ScoreComponentEvaluation {
+        payload: json!({
+            "validated_pattern_strength": model.validation_lift,
+            "current_similarity": similarity_score,
+            "relative_strength": relative_strength,
+            "sector_confirmation": sector_confirmation,
+            "market_regime": market_regime,
+            "extension_penalty": extension_penalty,
+            "liquidity_penalty": liquidity_penalty,
+            "data_quality_penalty": data_quality_penalty,
+            "risk_adjustment": risk_multiplier,
+            "context_complete": context_complete,
+            "market_state_satisfied": market_state_satisfied,
+            "missing_components": missing_components,
+            "data_quality_flags": context.data_quality_flags,
+        }),
+        components,
+        context_complete,
+        market_state_satisfied,
+    }
+}
+
+fn relative_strength_component(
+    model: &PatternModelPayload,
+    features: &FeatureVector,
+) -> Option<f64> {
+    model
+        .required_features
+        .iter()
+        .find(|feature| feature.starts_with("relative_strength_"))
+        .and_then(|feature| features.get(feature))
+        .copied()
+        .filter(|value| value.is_finite() && *value > 0.0)
+}
+
+fn market_regime_component(snapshot: Option<&MarketSnapshot>) -> Option<f64> {
+    let snapshot = snapshot?;
+    if !snapshot.data_complete || !snapshot.missing_inputs.is_empty() {
+        return None;
+    }
+    let breadth = snapshot.metrics.get("breadth")?;
+    let up_count = breadth.get("up_count")?.as_f64()?;
+    let down_count = breadth.get("down_count")?.as_f64()?;
+    let flat_count = breadth.get("flat_count")?.as_f64()?;
+    let above_ma20_count = breadth.get("above_ma20_count")?.as_f64()?;
+    let total = up_count + down_count + flat_count;
+    if total > 0.0 && above_ma20_count.is_finite() && above_ma20_count <= total {
+        Some(above_ma20_count / total)
+    } else {
+        None
+    }
+}
+
+fn extension_penalty_component(
+    model: &PatternModelPayload,
+    features: &FeatureVector,
+) -> Option<f64> {
+    let value = model
+        .required_features
+        .iter()
+        .find(|feature| feature.starts_with("distance_from_") && feature.ends_with("d_low"))
+        .and_then(|feature| features.get(feature))
+        .copied()
+        .filter(|value| value.is_finite() && *value >= 0.0)?;
+    Some(((value - 0.25) / 0.75).clamp(0.0, 1.0))
+}
+
+fn liquidity_penalty_component(context: &ScoreContext) -> Option<f64> {
+    if let Some(turnover_rate) = context
+        .daily_basic
+        .as_ref()
+        .and_then(|basic| basic.turnover_rate)
+        .filter(|value| value.is_finite() && *value >= 0.0)
+    {
+        return Some((0.5 - turnover_rate).clamp(0.0, 1.0));
+    }
+    if let Some(volume_ratio) = context
+        .daily_basic
+        .as_ref()
+        .and_then(|basic| basic.volume_ratio)
+        .filter(|value| value.is_finite() && *value >= 0.0)
+    {
+        return Some((1.0 - volume_ratio).clamp(0.0, 1.0));
+    }
+    context
+        .current_bar
+        .as_ref()
+        .and_then(|bar| (bar.amount.is_finite() && bar.amount > 0.0).then_some(0.0))
+}
+
+fn data_quality_penalty_component(context: &ScoreContext) -> Option<f64> {
+    let snapshot = context.market_snapshot.as_ref()?;
+    if !snapshot.data_complete || !snapshot.missing_inputs.is_empty() {
+        return None;
+    }
+    Some((context.data_quality_flags.len() as f64 * 0.25).clamp(0.0, 1.0))
 }
 
 fn evaluate_conditions(
@@ -610,23 +945,33 @@ fn supporting_signals_payload(
     necessary_conditions: &[ConditionEvaluation],
     risk_conditions: &[ConditionEvaluation],
     score: Option<&SimilarityScore>,
-    risk_multiplier: f64,
+    score_evaluation: &ScoreComponentEvaluation,
     shadow_tier: ShadowTier,
 ) -> Value {
+    let mut score_components = score_evaluation.payload.clone();
+    if let Some(score_components) = score_components.as_object_mut() {
+        score_components.insert(
+            "similarity".to_string(),
+            json!(score.map(|score| score.similarity)),
+        );
+        score_components.insert("validated_lift".to_string(), json!(validation.lift));
+        score_components.insert(
+            "release_gate_passed".to_string(),
+            json!(validation.release_gate_passed),
+        );
+        score_components.insert(
+            "candidate_status".to_string(),
+            json!(match validation.candidate_status {
+                CandidateStatus::Draft => "draft",
+                CandidateStatus::Validated => "validated",
+            }),
+        );
+        score_components.insert("shadow_tier".to_string(), json!(shadow_tier.as_str()));
+    }
     json!({
         "necessary_conditions": necessary_conditions,
         "risk_conditions": risk_conditions,
-        "score_components": {
-            "similarity": score.map(|score| score.similarity),
-            "validated_lift": validation.lift,
-            "risk_adjustment": risk_multiplier,
-            "release_gate_passed": validation.release_gate_passed,
-            "candidate_status": match validation.candidate_status {
-                CandidateStatus::Draft => "draft",
-                CandidateStatus::Validated => "validated",
-            },
-            "shadow_tier": shadow_tier.as_str(),
-        }
+        "score_components": score_components,
     })
 }
 
@@ -1281,6 +1626,49 @@ fn status_invalidations(status: Option<&SecurityDailyStatus>) -> Vec<Invalidatio
     invalidations
 }
 
+fn data_quality_flags(
+    history: &[PointInTimeDailyBarVersion],
+    status: Option<&SecurityDailyStatus>,
+    adjustments: &[AdjustmentFactor],
+    security_master: Option<&SecurityMasterVersion>,
+    sector_memberships: &[SectorMembership],
+    daily_basic: Option<&DailyBasicSnapshot>,
+) -> Vec<String> {
+    let mut flags = Vec::new();
+    for row in history {
+        if !row.missing_critical_fields.is_empty() {
+            flags.push(format!(
+                "daily_bar_missing_critical_fields:{}:{}",
+                row.trade_date,
+                row.missing_critical_fields.join(",")
+            ));
+        }
+    }
+    if status.is_some_and(|row| row.availability_quality == AvailabilityQuality::Estimated) {
+        flags.push("security_status_estimated".to_string());
+    }
+    if security_master.is_some_and(|row| row.availability_quality == AvailabilityQuality::Estimated)
+    {
+        flags.push("security_master_estimated".to_string());
+    }
+    if daily_basic.is_some_and(|row| row.availability_quality == AvailabilityQuality::Estimated) {
+        flags.push("daily_basic_estimated".to_string());
+    }
+    if adjustments
+        .iter()
+        .any(|row| row.availability_quality == AvailabilityQuality::Estimated)
+    {
+        flags.push("adjustment_factor_estimated".to_string());
+    }
+    if sector_memberships
+        .iter()
+        .any(|row| row.availability_quality == AvailabilityQuality::Estimated)
+    {
+        flags.push("sector_membership_estimated".to_string());
+    }
+    flags
+}
+
 fn input_fingerprint(
     trade_date: NaiveDate,
     code: &str,
@@ -1322,11 +1710,12 @@ mod tests {
     use super::super::model::{PatternModelPayload, ValidationPayload};
     use super::{
         derive_feature_vector, evaluate_pattern, load_published_patterns, similarity,
-        MarketFeatureContext, MarketSource, PatternEngine, PatternStore, SimilarityScore,
-        SupportedFeature,
+        MarketFeatureContext, MarketSource, PatternEngine, PatternStore, ScoreContext,
+        SimilarityScore, SupportedFeature,
     };
     use crate::analysis::market_snapshot::{
-        AdjustmentFactor, AvailabilityQuality, SecurityDailyStatus,
+        AdjustmentFactor, AvailabilityQuality, DailyBasicSnapshot, MarketSnapshot,
+        SectorMembership, SecurityDailyStatus, SecurityMasterVersion,
     };
     use crate::analysis::patterns::ranking::ShadowTier;
     use crate::data::types::Candle;
@@ -1417,6 +1806,95 @@ mod tests {
         }
     }
 
+    fn security_master(code: &str, name: &str, day: u32) -> SecurityMasterVersion {
+        let timestamp = date(day).and_hms_opt(16, 0, 0).unwrap().and_utc();
+        SecurityMasterVersion {
+            code: code.to_string(),
+            name: name.to_string(),
+            market: Some("A".to_string()),
+            exchange: Some("SH".to_string()),
+            list_status: "L".to_string(),
+            list_date: Some(date(1)),
+            delist_date: None,
+            available_at: timestamp,
+            ingested_at: timestamp,
+            availability_quality: AvailabilityQuality::Observed,
+            source: "test".to_string(),
+        }
+    }
+
+    fn sector_membership(code: &str, day: u32) -> SectorMembership {
+        let timestamp = date(day).and_hms_opt(16, 0, 0).unwrap().and_utc();
+        SectorMembership {
+            code: code.to_string(),
+            sector_code: "801010".to_string(),
+            sector_name: "Energy".to_string(),
+            sector_type: "sw_l1".to_string(),
+            valid_from: date(1),
+            valid_to: None,
+            available_at: timestamp,
+            ingested_at: timestamp,
+            availability_quality: AvailabilityQuality::Observed,
+            source: "test".to_string(),
+        }
+    }
+
+    fn daily_basic(code: &str, day: u32) -> DailyBasicSnapshot {
+        let timestamp = date(day).and_hms_opt(16, 0, 0).unwrap().and_utc();
+        DailyBasicSnapshot {
+            code: code.to_string(),
+            trade_date: date(day),
+            turnover_rate: Some(2.0),
+            volume_ratio: Some(1.2),
+            pe: Some(10.0),
+            pb: Some(1.5),
+            ps: Some(2.0),
+            total_share: Some(1_000_000.0),
+            float_share: Some(800_000.0),
+            total_mv: Some(10_000_000.0),
+            circ_mv: Some(8_000_000.0),
+            available_at: timestamp,
+            ingested_at: timestamp,
+            availability_quality: AvailabilityQuality::Observed,
+            source: "test".to_string(),
+        }
+    }
+
+    fn market_snapshot(day: u32) -> MarketSnapshot {
+        let timestamp = date(day).and_hms_opt(16, 0, 0).unwrap().and_utc();
+        MarketSnapshot {
+            trade_date: date(day),
+            snapshot_version: "market-v1".to_string(),
+            available_at: timestamp,
+            data_complete: true,
+            metrics: json!({
+                "breadth": {
+                    "up_count": 6,
+                    "down_count": 2,
+                    "flat_count": 2,
+                    "above_ma20_count": 7,
+                    "new_high_20_count": 1,
+                    "new_low_20_count": 0,
+                    "limit_up_count": 0,
+                    "limit_down_count": 0,
+                    "total_amount": 100000000.0
+                }
+            }),
+            missing_inputs: Vec::new(),
+            input_fingerprint: "market-fp".to_string(),
+        }
+    }
+
+    fn complete_score_context(code: &str, day: u32) -> ScoreContext {
+        ScoreContext {
+            sector_memberships: vec![sector_membership(code, day)],
+            market_snapshot: Some(market_snapshot(day)),
+            daily_basic: Some(daily_basic(code, day)),
+            current_bar: daily_row_for_code(code, day, 100.0, 101.0, 99.0, 100.0, 10_000).bar,
+            data_quality_flags: Vec::new(),
+        }
+    }
+
     fn active_status(code: &str, day: u32) -> SecurityDailyStatus {
         let timestamp = date(day).and_hms_opt(16, 0, 0).unwrap().and_utc();
         SecurityDailyStatus {
@@ -1461,6 +1939,10 @@ mod tests {
         history: Vec<PointInTimeDailyBarVersion>,
         statuses: Vec<SecurityDailyStatus>,
         adjustments: Vec<AdjustmentFactor>,
+        security_master: BTreeMap<String, SecurityMasterVersion>,
+        sector_memberships: BTreeMap<String, Vec<SectorMembership>>,
+        market_snapshot: Option<MarketSnapshot>,
+        daily_basics: BTreeMap<String, DailyBasicSnapshot>,
     }
 
     #[async_trait]
@@ -1490,6 +1972,44 @@ mod tests {
             _as_of: chrono::DateTime<Utc>,
         ) -> Result<Vec<AdjustmentFactor>> {
             Ok(self.adjustments.clone())
+        }
+
+        async fn security_master(
+            &self,
+            code: &str,
+            _as_of: chrono::DateTime<Utc>,
+        ) -> Result<Option<SecurityMasterVersion>> {
+            Ok(self.security_master.get(code).cloned())
+        }
+
+        async fn active_sector_memberships(
+            &self,
+            code: &str,
+            _trade_date: NaiveDate,
+            _as_of: chrono::DateTime<Utc>,
+        ) -> Result<Vec<SectorMembership>> {
+            Ok(self
+                .sector_memberships
+                .get(code)
+                .cloned()
+                .unwrap_or_default())
+        }
+
+        async fn market_snapshot(
+            &self,
+            _trade_date: NaiveDate,
+            _version: &str,
+        ) -> Result<Option<MarketSnapshot>> {
+            Ok(self.market_snapshot.clone())
+        }
+
+        async fn daily_basic(
+            &self,
+            code: &str,
+            _trade_date: NaiveDate,
+            _as_of: chrono::DateTime<Utc>,
+        ) -> Result<Option<DailyBasicSnapshot>> {
+            Ok(self.daily_basics.get(code).cloned())
         }
     }
 
@@ -1600,6 +2120,12 @@ mod tests {
             vec!["return_20d", "relative_strength_20d"]
         );
         assert_eq!(model.distance_metric.as_str(), "euclidean");
+        assert_close(model.validation_lift, 2.0);
+        assert_close(model.validation_coverage, 0.27);
+        assert_eq!(
+            model.baseline_comparison["cost_adjusted_return_delta"],
+            0.022
+        );
     }
 
     #[test]
@@ -1636,6 +2162,26 @@ mod tests {
     }
 
     #[test]
+    fn model_payload_requires_validation_summary_fields() {
+        let mut payload = fixture_payload();
+        payload.as_object_mut().unwrap().remove("validation_lift");
+
+        let error = PatternModelPayload::from_value(payload).unwrap_err();
+
+        assert!(error.to_string().contains("validation_lift"));
+    }
+
+    #[test]
+    fn model_payload_baseline_comparison_values_must_be_finite() {
+        let mut payload = fixture_payload();
+        payload["baseline_comparison"]["cost_adjusted_return_delta"] = json!(f64::INFINITY);
+
+        let error = PatternModelPayload::from_value(payload).unwrap_err();
+
+        assert!(error.to_string().contains("baseline_comparison"));
+    }
+
+    #[test]
     fn fixed_feature_vector_produces_fixed_similarity() {
         let model = PatternModelPayload::from_value(fixture_payload()).unwrap();
         let features = BTreeMap::from([
@@ -1657,7 +2203,12 @@ mod tests {
         ]);
         let validation = validation_payload(false, 2.0);
 
-        let candidate = evaluate_pattern(&model, &validation, &features);
+        let candidate = evaluate_pattern(
+            &model,
+            &validation,
+            &features,
+            &complete_score_context("600000.SH", 21),
+        );
 
         assert_ne!(candidate.shadow_tier, ShadowTier::ShadowA);
         assert_eq!(candidate.shadow_tier, ShadowTier::ShadowB);
@@ -1672,7 +2223,12 @@ mod tests {
         ]);
         let validation = validation_payload(true, 1.0);
 
-        let candidate = evaluate_pattern(&model, &validation, &features);
+        let candidate = evaluate_pattern(
+            &model,
+            &validation,
+            &features,
+            &complete_score_context("600000.SH", 21),
+        );
 
         assert_ne!(candidate.shadow_tier, ShadowTier::ShadowA);
         assert_eq!(candidate.shadow_tier, ShadowTier::ShadowB);
@@ -1684,7 +2240,12 @@ mod tests {
         let features = BTreeMap::from([("return_20d".to_string(), 0.20)]);
         let validation = validation_payload(true, 2.0);
 
-        let candidate = evaluate_pattern(&model, &validation, &features);
+        let candidate = evaluate_pattern(
+            &model,
+            &validation,
+            &features,
+            &complete_score_context("600000.SH", 21),
+        );
 
         assert_eq!(candidate.shadow_tier, ShadowTier::Reject);
         assert!(candidate
@@ -1833,6 +2394,169 @@ mod tests {
         assert!(error.to_string().contains("2"));
     }
 
+    #[test]
+    fn published_pattern_loading_rejects_model_validation_summary_mismatch() {
+        let mut row = pattern_row("1");
+        row.model_payload["validation_lift"] = json!(1.99);
+
+        let error = load_published_patterns(vec![row]).unwrap_err();
+
+        assert!(error.to_string().contains("validation_lift"));
+        assert!(error.to_string().contains("validation_payload.lift"));
+    }
+
+    #[test]
+    fn final_score_uses_all_required_score_components() {
+        let mut payload = fixture_payload();
+        payload["required_features"] = json!([
+            "return_20d",
+            "relative_strength_20d",
+            "distance_from_20d_low"
+        ]);
+        payload["scaler_mean"]["distance_from_20d_low"] = json!(0.0);
+        payload["scaler_scale"]["distance_from_20d_low"] = json!(1.0);
+        payload["centroid"]["distance_from_20d_low"] = json!(0.10);
+        let model = PatternModelPayload::from_value(payload).unwrap();
+        let features = BTreeMap::from([
+            ("return_20d".to_string(), 0.20),
+            ("relative_strength_20d".to_string(), 1.30),
+            ("distance_from_20d_low".to_string(), 0.15),
+        ]);
+        let validation = validation_payload(true, 2.0);
+        let context = complete_score_context("600000.SH", 21);
+
+        let candidate = evaluate_pattern(&model, &validation, &features, &context);
+
+        assert_eq!(candidate.shadow_tier, ShadowTier::ShadowA);
+        let components = &candidate.supporting_signals["score_components"];
+        for key in [
+            "validated_pattern_strength",
+            "current_similarity",
+            "relative_strength",
+            "sector_confirmation",
+            "market_regime",
+            "extension_penalty",
+            "liquidity_penalty",
+            "data_quality_penalty",
+        ] {
+            assert!(
+                components.get(key).is_some(),
+                "missing score component {key}: {components}"
+            );
+        }
+        assert_eq!(components["context_complete"], json!(true));
+        assert_eq!(components["market_state_satisfied"], json!(true));
+        let expected = components["validated_pattern_strength"].as_f64().unwrap()
+            * components["current_similarity"].as_f64().unwrap()
+            * components["relative_strength"].as_f64().unwrap()
+            * components["sector_confirmation"].as_f64().unwrap()
+            * components["market_regime"].as_f64().unwrap()
+            * (1.0 - components["extension_penalty"].as_f64().unwrap())
+            * (1.0 - components["liquidity_penalty"].as_f64().unwrap())
+            * (1.0 - components["data_quality_penalty"].as_f64().unwrap())
+            * components["risk_adjustment"].as_f64().unwrap();
+        assert_close(candidate.final_score, expected);
+    }
+
+    #[test]
+    fn missing_score_context_demotes_shadow_a_without_zero_substitution() {
+        let model = PatternModelPayload::from_value(fixture_payload()).unwrap();
+        let features = BTreeMap::from([
+            ("return_20d".to_string(), 0.20),
+            ("relative_strength_20d".to_string(), 1.30),
+        ]);
+        let validation = validation_payload(true, 2.0);
+        let context = ScoreContext {
+            sector_memberships: Vec::new(),
+            market_snapshot: None,
+            daily_basic: None,
+            current_bar: None,
+            data_quality_flags: vec!["missing_daily_basic".to_string()],
+        };
+
+        let candidate = evaluate_pattern(&model, &validation, &features, &context);
+
+        assert_ne!(candidate.shadow_tier, ShadowTier::ShadowA);
+        assert_eq!(
+            candidate.supporting_signals["score_components"]["context_complete"],
+            json!(false)
+        );
+        assert_eq!(
+            candidate.supporting_signals["score_components"]["missing_components"],
+            json!([
+                "sector_confirmation",
+                "market_regime",
+                "extension_penalty",
+                "liquidity_penalty",
+                "data_quality_penalty"
+            ])
+        );
+        assert!(
+            candidate.supporting_signals["score_components"]["relative_strength"]
+                .as_f64()
+                .unwrap()
+                > 0.0
+        );
+    }
+
+    #[test]
+    fn shadow_a_requires_each_market_context_component() {
+        let mut payload = fixture_payload();
+        payload["required_features"] = json!([
+            "return_20d",
+            "relative_strength_20d",
+            "distance_from_20d_low"
+        ]);
+        payload["scaler_mean"]["distance_from_20d_low"] = json!(0.0);
+        payload["scaler_scale"]["distance_from_20d_low"] = json!(1.0);
+        payload["centroid"]["distance_from_20d_low"] = json!(0.10);
+        let model = PatternModelPayload::from_value(payload).unwrap();
+        let features = BTreeMap::from([
+            ("return_20d".to_string(), 0.20),
+            ("relative_strength_20d".to_string(), 1.30),
+            ("distance_from_20d_low".to_string(), 0.15),
+        ]);
+        let validation = validation_payload(true, 2.0);
+        let complete = complete_score_context("600000.SH", 21);
+        assert_eq!(
+            evaluate_pattern(&model, &validation, &features, &complete).shadow_tier,
+            ShadowTier::ShadowA
+        );
+
+        let mut missing_sector = complete.clone();
+        missing_sector.sector_memberships.clear();
+        let mut missing_snapshot = complete.clone();
+        missing_snapshot.market_snapshot = None;
+        let mut incomplete_snapshot = complete.clone();
+        incomplete_snapshot
+            .market_snapshot
+            .as_mut()
+            .unwrap()
+            .data_complete = false;
+        let mut missing_liquidity = complete.clone();
+        missing_liquidity.daily_basic = None;
+        missing_liquidity.current_bar = None;
+        let mut estimated_quality = complete.clone();
+        estimated_quality
+            .data_quality_flags
+            .push("daily_basic_estimated".to_string());
+
+        for context in [
+            missing_sector,
+            missing_snapshot,
+            incomplete_snapshot,
+            missing_liquidity,
+            estimated_quality,
+        ] {
+            let candidate = evaluate_pattern(&model, &validation, &features, &context);
+            assert_ne!(candidate.shadow_tier, ShadowTier::ShadowA);
+            assert_eq!(
+                candidate.supporting_signals["score_components"]["context_complete"],
+                json!(false)
+            );
+        }
+    }
+
     #[tokio::test]
     async fn match_market_loads_patterns_derives_features_and_persists_shadow_candidates() {
         let trade_date = date(21);
@@ -1867,6 +2591,16 @@ mod tests {
             history,
             statuses: vec![active_status(code, 21)],
             adjustments: (1..=21).map(|day| adjustment_factor(code, day)).collect(),
+            security_master: BTreeMap::from([(
+                code.to_string(),
+                security_master(code, "Pudong Bank", 21),
+            )]),
+            sector_memberships: BTreeMap::from([(
+                code.to_string(),
+                vec![sector_membership(code, 21)],
+            )]),
+            market_snapshot: Some(market_snapshot(21)),
+            daily_basics: BTreeMap::from([(code.to_string(), daily_basic(code, 21))]),
         };
         let pattern_store = FakePatternStore {
             rows: vec![row],
@@ -1885,6 +2619,7 @@ mod tests {
         assert_eq!(candidate.pattern_version_id, pattern_version_id);
         assert_eq!(candidate.pattern_set_id, pattern_set_id);
         assert_eq!(candidate.code, code);
+        assert_eq!(candidate.name.as_deref(), Some("Pudong Bank"));
         assert!(matches!(
             candidate.shadow_tier,
             ShadowTier::ShadowA | ShadowTier::ShadowB | ShadowTier::Watch | ShadowTier::Reject
@@ -1904,11 +2639,65 @@ mod tests {
         let saved = engine.pattern_repo.saved.lock().unwrap();
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].code, candidate.code);
+        assert_eq!(saved[0].name, candidate.name);
         assert_eq!(saved[0].shadow_tier, candidate.shadow_tier.as_str());
         assert_eq!(
             engine.pattern_repo.listed_sets.lock().unwrap().as_slice(),
             &[pattern_set_id]
         );
+    }
+
+    #[tokio::test]
+    async fn match_market_rejects_missing_security_master_name() {
+        let trade_date = date(21);
+        let pattern_set_id = Uuid::new_v4();
+        let mut row = pattern_row("1");
+        row.model_payload["necessary_conditions"] = json!([]);
+        row.model_payload["risk_conditions"] = json!([]);
+
+        let code = "600000.SH";
+        let mut history = Vec::new();
+        for day in 1..=21 {
+            history.push(daily_row_for_code(
+                code,
+                day,
+                100.0,
+                101.0,
+                99.0,
+                100.0 + f64::from(day),
+                10_000,
+            ));
+        }
+        let market = FakeMarketSource {
+            history,
+            statuses: vec![active_status(code, 21)],
+            adjustments: (1..=21).map(|day| adjustment_factor(code, day)).collect(),
+            security_master: BTreeMap::new(),
+            sector_memberships: BTreeMap::from([(
+                code.to_string(),
+                vec![sector_membership(code, 21)],
+            )]),
+            market_snapshot: Some(market_snapshot(21)),
+            daily_basics: BTreeMap::from([(code.to_string(), daily_basic(code, 21))]),
+        };
+        let pattern_store = FakePatternStore {
+            rows: vec![row],
+            saved: Mutex::new(Vec::new()),
+            listed_sets: Mutex::new(Vec::new()),
+        };
+        let engine = PatternEngine::with_sources(pattern_store, market);
+
+        let candidates = engine
+            .match_market(trade_date, pattern_set_id)
+            .await
+            .unwrap();
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].shadow_tier, ShadowTier::Reject);
+        assert!(candidates[0]
+            .invalidations
+            .to_string()
+            .contains("missing_security_master_name"));
     }
 
     #[test]
@@ -2064,7 +2853,12 @@ mod tests {
         ]);
         let validation = validation_payload(true, 2.0);
 
-        let candidate = evaluate_pattern(&model, &validation, &features);
+        let candidate = evaluate_pattern(
+            &model,
+            &validation,
+            &features,
+            &complete_score_context("600000.SH", 21),
+        );
 
         assert_eq!(candidate.shadow_tier, ShadowTier::Watch);
         assert!(candidate.final_score < 2.0);
@@ -2094,7 +2888,12 @@ mod tests {
         ]);
         let validation = validation_payload(true, 2.0);
 
-        let candidate = evaluate_pattern(&model, &validation, &features);
+        let candidate = evaluate_pattern(
+            &model,
+            &validation,
+            &features,
+            &complete_score_context("600000.SH", 21),
+        );
 
         assert_ne!(candidate.shadow_tier, ShadowTier::ShadowA);
         assert_eq!(candidate.shadow_tier, ShadowTier::Watch);

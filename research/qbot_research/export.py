@@ -179,8 +179,12 @@ def export_pattern_version(
     if not failed_examples:
         raise ValueError("at least one failed example is required")
 
-    model_payload = PatternModelPayload.model_validate(candidate_payload)
     validated_payload = ValidationPayload.model_validate(validation_payload)
+    model_payload_input = dict(candidate_payload)
+    model_payload_input["validation_lift"] = validated_payload.lift
+    model_payload_input["validation_coverage"] = validated_payload.coverage
+    model_payload_input["baseline_comparison"] = dict(validated_payload.baseline_comparison)
+    model_payload = PatternModelPayload.model_validate(model_payload_input)
     row = PatternVersionRow(
         pattern_version_id=metadata.pattern_version_id,
         pattern_id=metadata.pattern_id,

@@ -39,6 +39,7 @@ pub struct PatternSetRow {
 pub struct ShadowCandidateRow {
     pub trade_date: NaiveDate,
     pub code: String,
+    pub name: Option<String>,
     pub horizon: String,
     pub pattern_version_id: Uuid,
     pub pattern_set_id: Uuid,
@@ -142,23 +143,23 @@ impl PatternRepository {
         for row in rows {
             let rows_affected = sqlx::query(
                 r#"INSERT INTO analysis_shadow_candidates
-                   (trade_date, code, horizon, pattern_version_id, pattern_set_id,
+                   (trade_date, code, name, horizon, pattern_version_id, pattern_set_id,
                     pattern_type, similarity_score, validated_lift, final_score,
                     shadow_tier, matched_features, risk_flags, supporting_signals,
                     invalidations, input_fingerprint, created_at)
-                   SELECT $1, $2, $3, $4, $5,
-                          $6, $7, $8, $9,
-                          $10, $11, $12, $13,
-                          $14, $15, $16
+                   SELECT $1, $2, $3, $4, $5, $6,
+                          $7, $8, $9, $10,
+                          $11, $12, $13, $14,
+                          $15, $16, $17
                    FROM analysis_pattern_set_members psm
                    INNER JOIN analysis_pattern_sets ps
                        ON ps.pattern_set_id = psm.pattern_set_id
                    INNER JOIN analysis_pattern_versions pv
                        ON pv.pattern_version_id = psm.pattern_version_id
-                   WHERE psm.pattern_set_id = $5
-                     AND psm.pattern_version_id = $4
-                     AND pv.horizon = $3
-                     AND pv.pattern_type = $6
+                   WHERE psm.pattern_set_id = $6
+                     AND psm.pattern_version_id = $5
+                     AND pv.horizon = $4
+                     AND pv.pattern_type = $7
                      AND pv.status = 'published'
                      AND pv.horizon IN ('week', 'month')
                      AND pv.approved_by IS NOT NULL
@@ -167,6 +168,7 @@ impl PatternRepository {
                      AND ps.published_at IS NOT NULL
                    ON CONFLICT (trade_date, code, horizon, pattern_version_id) DO UPDATE SET
                        pattern_set_id = EXCLUDED.pattern_set_id,
+                       name = EXCLUDED.name,
                        pattern_type = EXCLUDED.pattern_type,
                        similarity_score = EXCLUDED.similarity_score,
                        validated_lift = EXCLUDED.validated_lift,
@@ -181,6 +183,7 @@ impl PatternRepository {
             )
             .bind(row.trade_date)
             .bind(&row.code)
+            .bind(&row.name)
             .bind(&row.horizon)
             .bind(row.pattern_version_id)
             .bind(row.pattern_set_id)
@@ -240,33 +243,17 @@ impl PatternRepository {
         &self,
         trade_date: NaiveDate,
     ) -> Result<Vec<ShadowCandidateRow>> {
-        let rows: Vec<(
-            NaiveDate,
-            String,
-            String,
-            Uuid,
-            Uuid,
-            String,
-            f64,
-            f64,
-            f64,
-            String,
-            Value,
-            Value,
-            Value,
-            Value,
-            String,
-            DateTime<Utc>,
-        )> = sqlx::query_as(
+        let rows = sqlx::query(
             r#"SELECT trade_date,
                       code,
+                      name,
                       horizon,
                       pattern_version_id,
                       pattern_set_id,
                       pattern_type,
-                      similarity_score::float8,
-                      validated_lift::float8,
-                      final_score::float8,
+                      similarity_score::float8 AS similarity_score,
+                      validated_lift::float8 AS validated_lift,
+                      final_score::float8 AS final_score,
                       shadow_tier,
                       matched_features,
                       risk_flags,
@@ -284,43 +271,25 @@ impl PatternRepository {
 
         Ok(rows
             .into_iter()
-            .map(
-                |(
-                    trade_date,
-                    code,
-                    horizon,
-                    pattern_version_id,
-                    pattern_set_id,
-                    pattern_type,
-                    similarity_score,
-                    validated_lift,
-                    final_score,
-                    shadow_tier,
-                    matched_features,
-                    risk_flags,
-                    supporting_signals,
-                    invalidations,
-                    input_fingerprint,
-                    created_at,
-                )| ShadowCandidateRow {
-                    trade_date,
-                    code,
-                    horizon,
-                    pattern_version_id,
-                    pattern_set_id,
-                    pattern_type,
-                    similarity_score,
-                    validated_lift,
-                    final_score,
-                    shadow_tier,
-                    matched_features,
-                    risk_flags,
-                    supporting_signals,
-                    invalidations,
-                    input_fingerprint,
-                    created_at,
-                },
-            )
+            .map(|row| ShadowCandidateRow {
+                trade_date: row.get("trade_date"),
+                code: row.get("code"),
+                name: row.get("name"),
+                horizon: row.get("horizon"),
+                pattern_version_id: row.get("pattern_version_id"),
+                pattern_set_id: row.get("pattern_set_id"),
+                pattern_type: row.get("pattern_type"),
+                similarity_score: row.get("similarity_score"),
+                validated_lift: row.get("validated_lift"),
+                final_score: row.get("final_score"),
+                shadow_tier: row.get("shadow_tier"),
+                matched_features: row.get("matched_features"),
+                risk_flags: row.get("risk_flags"),
+                supporting_signals: row.get("supporting_signals"),
+                invalidations: row.get("invalidations"),
+                input_fingerprint: row.get("input_fingerprint"),
+                created_at: row.get("created_at"),
+            })
             .collect())
     }
 }
@@ -798,6 +767,7 @@ mod tests {
         let mismatched_metadata = ShadowCandidateRow {
             trade_date,
             code: "600001.SH".to_string(),
+            name: Some("Alpha Bank".to_string()),
             horizon: "month".to_string(),
             pattern_version_id,
             pattern_set_id: member_set_id,
@@ -817,6 +787,7 @@ mod tests {
         let missing_membership = ShadowCandidateRow {
             trade_date,
             code: "600002.SH".to_string(),
+            name: Some("Beta Steel".to_string()),
             horizon: "week".to_string(),
             pattern_version_id,
             pattern_set_id: non_member_set_id,
@@ -855,6 +826,7 @@ mod tests {
         let row = ShadowCandidateRow {
             trade_date: date(2026, 7, 10),
             code: "600001.SH".to_string(),
+            name: Some("Alpha Bank".to_string()),
             horizon: "week".to_string(),
             pattern_version_id: Uuid::new_v4(),
             pattern_set_id: Uuid::new_v4(),
@@ -914,6 +886,7 @@ mod tests {
         let first = ShadowCandidateRow {
             trade_date,
             code: "600000.SH".to_string(),
+            name: Some("Pudong Bank".to_string()),
             horizon: "week".to_string(),
             pattern_version_id,
             pattern_set_id,
@@ -931,6 +904,7 @@ mod tests {
         };
         let mut second = first.clone();
         second.similarity_score = 0.92;
+        second.name = Some("Pudong Bank Updated".to_string());
         second.validated_lift = 0.22;
         second.final_score = 2.3456;
         second.shadow_tier = "shadow_b".to_string();
@@ -952,6 +926,7 @@ mod tests {
         let rows = repo.list_shadow_candidates(trade_date).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0], second);
+        assert_eq!(rows[0].name.as_deref(), Some("Pudong Bank Updated"));
         Ok(())
     }
 
@@ -990,6 +965,7 @@ mod tests {
         let first = ShadowCandidateRow {
             trade_date,
             code: "600003.SH".to_string(),
+            name: Some("Gamma Energy".to_string()),
             horizon: "week".to_string(),
             pattern_version_id,
             pattern_set_id,
@@ -1007,6 +983,7 @@ mod tests {
         };
         let mut second = first.clone();
         second.similarity_score = 0.83;
+        second.name = Some("Gamma Energy Updated".to_string());
         second.validated_lift = 0.19;
         second.final_score = 1.8765;
         second.shadow_tier = "shadow_b".to_string();

@@ -59,6 +59,9 @@ class PatternModelPayload(ContractModel):
     centroid: dict[str, float]
     distance_metric: DistanceMetric
     cluster_parameters: ClusterParameters
+    validation_lift: float
+    validation_coverage: float
+    baseline_comparison: dict[str, float]
     similarity_thresholds: dict[str, float]
     necessary_conditions: list[ConditionPayload]
     risk_conditions: list[ConditionPayload]
@@ -86,6 +89,21 @@ class PatternModelPayload(ContractModel):
             raise ValueError(
                 f"{info.field_name} must include values for required_features: {missing_csv}"
             )
+        return value
+
+    @field_validator("validation_lift", "validation_coverage")
+    @classmethod
+    def validate_finite_summary_field(cls, value: float, info: ValidationInfo) -> float:
+        if not isfinite(value):
+            raise ValueError(f"{info.field_name} must be finite")
+        return value
+
+    @field_validator("baseline_comparison")
+    @classmethod
+    def validate_baseline_comparison(cls, value: dict[str, float]) -> dict[str, float]:
+        for key, metric in value.items():
+            if not isfinite(metric):
+                raise ValueError(f"baseline_comparison.{key} must be finite")
         return value
 
     @model_validator(mode="after")
@@ -189,6 +207,14 @@ class ValidationPayload(ContractModel):
     baseline_comparison: dict[str, float]
     release_gate_passed: bool
     candidate_status: PatternVersionStatus
+
+    @field_validator("baseline_comparison")
+    @classmethod
+    def validate_validation_baseline_comparison(cls, value: dict[str, float]) -> dict[str, float]:
+        for key, metric in value.items():
+            if not isfinite(metric):
+                raise ValueError(f"baseline_comparison.{key} must be finite")
+        return value
 
 
 class AnalysisPatternVersionPayload(ContractModel):

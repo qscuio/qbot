@@ -87,6 +87,7 @@ CREATE TABLE analysis_pattern_examples (
 CREATE TABLE analysis_shadow_candidates (
     trade_date           DATE NOT NULL,
     code                 VARCHAR(12) NOT NULL,
+    name                 VARCHAR(120),
     horizon              VARCHAR(20) NOT NULL,
     pattern_version_id   UUID NOT NULL REFERENCES analysis_pattern_versions(pattern_version_id),
     pattern_set_id       UUID NOT NULL REFERENCES analysis_pattern_sets(pattern_set_id),

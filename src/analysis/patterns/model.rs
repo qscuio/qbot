@@ -45,6 +45,9 @@ pub struct PatternModelPayload {
     pub centroid: FeatureVector,
     pub distance_metric: DistanceMetric,
     pub cluster_parameters: ClusterParameters,
+    pub validation_lift: f64,
+    pub validation_coverage: f64,
+    pub baseline_comparison: BTreeMap<String, f64>,
     pub similarity_thresholds: FeatureVector,
     pub necessary_conditions: Vec<ConditionPayload>,
     pub risk_conditions: Vec<ConditionPayload>,
@@ -52,6 +55,7 @@ pub struct PatternModelPayload {
 
 impl PatternModelPayload {
     pub fn from_value(value: Value) -> Result<Self> {
+        validate_raw_model_payload(&value)?;
         let model: Self = serde_json::from_value(value)?;
         model.validate()?;
         Ok(model)
@@ -77,6 +81,9 @@ impl PatternModelPayload {
         )?;
         validate_feature_payload("centroid", &self.required_features, &self.centroid, false)?;
         self.validate_cluster_parameters()?;
+        validate_finite_field("validation_lift", self.validation_lift)?;
+        validate_finite_field("validation_coverage", self.validation_coverage)?;
+        validate_finite_map("baseline_comparison", &self.baseline_comparison)?;
         Ok(())
     }
 
@@ -153,6 +160,51 @@ impl PatternModelPayload {
             }
         }
     }
+}
+
+fn validate_raw_model_payload(value: &Value) -> Result<()> {
+    for field_name in ["validation_lift", "validation_coverage"] {
+        if let Some(value) = value.get(field_name) {
+            match value.as_f64() {
+                Some(number) if number.is_finite() => {}
+                _ => {
+                    return Err(AppError::Internal(format!("{field_name} must be finite")));
+                }
+            }
+        }
+    }
+    if let Some(Value::Object(baseline_comparison)) = value.get("baseline_comparison") {
+        for (key, value) in baseline_comparison {
+            match value.as_f64() {
+                Some(number) if number.is_finite() => {}
+                _ => {
+                    return Err(AppError::Internal(format!(
+                        "baseline_comparison.{key} must be finite"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_finite_field(field_name: &str, value: f64) -> Result<()> {
+    if value.is_finite() {
+        Ok(())
+    } else {
+        Err(AppError::Internal(format!("{field_name} must be finite")))
+    }
+}
+
+fn validate_finite_map(field_name: &str, payload: &BTreeMap<String, f64>) -> Result<()> {
+    for (key, value) in payload {
+        if !value.is_finite() {
+            return Err(AppError::Internal(format!(
+                "{field_name}.{key} must be finite"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_feature_payload(
@@ -401,6 +453,7 @@ impl ValidationPayload {
         }
         validate_nested_numeric("yearly_results", &self.yearly_results)?;
         validate_nested_numeric("regime_results", &self.regime_results)?;
+        validate_finite_map("baseline_comparison", &self.baseline_comparison)?;
         Ok(())
     }
 }

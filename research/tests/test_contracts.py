@@ -109,6 +109,12 @@ def _pattern_model_payload(**overrides: object) -> dict[str, object]:
         "centroid": {"close_strength": 1.1, "volume_ratio": 3.1},
         "distance_metric": "euclidean",
         "cluster_parameters": {},
+        "validation_lift": 1.875,
+        "validation_coverage": 0.27,
+        "baseline_comparison": {
+            "best_required_baseline_return": 0.01,
+            "cost_adjusted_return_delta": 0.022,
+        },
         "similarity_thresholds": {"shadow_a": 0.9},
         "necessary_conditions": [{"field": "trend", "operator": "gte", "value": 1.0}],
         "risk_conditions": [{"field": "drawdown", "operator": "lte", "value": 0.1}],
@@ -121,6 +127,38 @@ def test_pattern_model_payload_accepts_empty_euclidean_cluster_parameters() -> N
     model = PatternModelPayload.model_validate(_pattern_model_payload())
 
     assert model.cluster_parameters.model_dump(exclude_none=True) == {}
+    assert model.validation_lift == 1.875
+    assert model.validation_coverage == 0.27
+    assert model.baseline_comparison["cost_adjusted_return_delta"] == 0.022
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    ["validation_lift", "validation_coverage", "baseline_comparison"],
+)
+def test_pattern_model_payload_requires_validation_summary_fields(missing_field: str) -> None:
+    payload = _pattern_model_payload()
+    del payload[missing_field]
+
+    with pytest.raises(ValidationError, match=missing_field):
+        PatternModelPayload.model_validate(payload)
+
+
+def test_pattern_model_payload_rejects_non_finite_validation_summary_fields() -> None:
+    with pytest.raises(ValidationError, match="validation_lift"):
+        PatternModelPayload.model_validate(_pattern_model_payload(validation_lift=float("nan")))
+
+    with pytest.raises(ValidationError, match="validation_coverage"):
+        PatternModelPayload.model_validate(
+            _pattern_model_payload(validation_coverage=float("inf"))
+        )
+
+    with pytest.raises(ValidationError, match="baseline_comparison"):
+        PatternModelPayload.model_validate(
+            _pattern_model_payload(
+                baseline_comparison={"cost_adjusted_return_delta": float("nan")}
+            )
+        )
 
 
 def test_pattern_model_payload_rejects_missing_mahalanobis_covariance() -> None:
@@ -251,6 +289,12 @@ def _analysis_pattern_version_payload(pattern_version_id: object) -> dict[str, o
             "centroid": {"return_20d": 0.18},
             "distance_metric": "euclidean",
             "cluster_parameters": {},
+            "validation_lift": 1.875,
+            "validation_coverage": 0.27,
+            "baseline_comparison": {
+                "best_required_baseline_return": 0.01,
+                "cost_adjusted_return_delta": 0.022,
+            },
             "similarity_thresholds": {"shadow_a": 0.88},
             "necessary_conditions": [
                 {"column": "return_20d", "operator": ">=", "value": 0.10},

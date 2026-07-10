@@ -179,6 +179,12 @@ def test_export_pattern_version_builds_validated_immutable_rows_and_examples() -
     assert payload.status == "validated"
     assert payload.model_payload.required_features == ["return_20d", "relative_strength_20d"]
     assert payload.model_payload.cluster_parameters.model_dump(exclude_none=True) == {}
+    assert payload.model_payload.validation_lift == payload.validation_payload.lift
+    assert payload.model_payload.validation_coverage == payload.validation_payload.coverage
+    assert (
+        payload.model_payload.baseline_comparison
+        == payload.validation_payload.baseline_comparison
+    )
     assert payload.validation_payload.candidate_status == "validated"
 
     with pytest.raises(AttributeError):
@@ -229,6 +235,18 @@ def test_export_pattern_version_rejects_non_model_export_horizons() -> None:
             typical_positive_examples=_positive_examples(),
             failed_examples=_failed_examples(),
         )
+
+
+def test_export_pattern_version_populates_model_validation_summary_from_validation_payload() -> None:
+    exported = _export()
+
+    model_payload = exported.version_row_payload()["model_payload"]
+    validation_payload = exported.version_row_payload()["validation_payload"]
+
+    assert "validation_lift" not in _candidate_payload()
+    assert model_payload["validation_lift"] == validation_payload["lift"]
+    assert model_payload["validation_coverage"] == validation_payload["coverage"]
+    assert model_payload["baseline_comparison"] == validation_payload["baseline_comparison"]
 
 
 def test_export_pattern_version_requires_positive_and_failed_examples() -> None:
