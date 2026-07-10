@@ -1252,7 +1252,7 @@ git commit -m "feat: add adjusted-price calculation"
 - Persists one versioned snapshot per trade date.
 - Does not alter existing market report output yet.
 
-- [ ] **Step 1: Write a failing pure metrics test**
+- [x] **Step 1: Write a failing pure metrics test**
 
 Create a fixture with four securities and assert:
 
@@ -1265,7 +1265,7 @@ assert_eq!(metrics.new_high_20_count, 1);
 assert_eq!(metrics.new_low_20_count, 1);
 ```
 
-- [ ] **Step 2: Implement pure calculation types**
+- [x] **Step 2: Implement pure calculation types**
 
 ```rust
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1284,7 +1284,7 @@ pub struct MarketBreadthMetrics {
 
 Implement `calculate_market_breadth`.
 
-- [ ] **Step 3: Implement the deep module**
+- [x] **Step 3: Implement the deep module**
 
 ```rust
 #[derive(Clone)]
@@ -1318,7 +1318,7 @@ The builder must:
 7. Calculate `input_fingerprint` from sorted source IDs and timestamps.
 8. Persist `snapshot_version = "market-v1"`.
 
-- [ ] **Step 4: Add a scheduler job function without enabling a new cron yet**
+- [x] **Step 4: Add a scheduler job function without enabling a new cron yet**
 
 ```rust
 pub async fn run_market_snapshot_job(state: Arc<AppState>) {
@@ -1335,7 +1335,7 @@ pub async fn run_market_snapshot_job(state: Arc<AppState>) {
 
 Call it from `--run-now` after `run_fetch_job` and before `run_scan_job`. Do not add the production cron until Task 9 adds completeness behavior.
 
-- [ ] **Step 5: Run tests**
+- [x] **Step 5: Run tests**
 
 Run:
 
@@ -1346,7 +1346,7 @@ cargo test scheduler::tests -- --nocapture
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/analysis/market_snapshot src/scheduler/mod.rs src/main.rs
