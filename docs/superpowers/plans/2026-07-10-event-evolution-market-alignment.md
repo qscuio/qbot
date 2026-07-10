@@ -30,7 +30,7 @@
 **Interfaces:**
 - Produces mentions, clusters, deltas, hypotheses, observations, and type-statistics tables.
 
-- [ ] **Step 1: Create the migration**
+- [x] **Step 1: Create the migration**
 
 ```sql
 CREATE TABLE market_event_mentions (
@@ -143,7 +143,7 @@ CREATE TABLE market_event_type_statistics (
 );
 ```
 
-- [ ] **Step 2: Add repository tests**
+- [x] **Step 2: Add repository tests**
 
 Verify:
 
@@ -153,7 +153,7 @@ Verify:
 - market observations cannot exist without a hypothesis.
 - observation status accepts only configured values at the application layer.
 
-- [ ] **Step 3: Implement repository methods**
+- [x] **Step 3: Implement repository methods**
 
 ```rust
 pub async fn save_event_cluster_version(&self, row: &EventClusterRow) -> Result<()>;
@@ -163,7 +163,7 @@ pub async fn save_market_observation(&self, row: &MarketObservationRow) -> Resul
 pub async fn latest_cluster_version(&self, id: Uuid) -> Result<Option<EventClusterRow>>;
 ```
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ```bash
 cargo test storage::event_repository -- --nocapture
