@@ -3,7 +3,7 @@ use serde_json::Value;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
-use crate::error::Result;
+use crate::error::{AppError, Result};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PatternVersionRow {
@@ -94,7 +94,11 @@ impl PatternRepository {
                    ON pv.pattern_version_id = psm.pattern_version_id
                WHERE psm.pattern_set_id = $1
                  AND ps.status = 'published'
+                 AND ps.published_at IS NOT NULL
                  AND pv.status = 'published'
+                 AND pv.horizon IN ('week', 'month')
+                 AND pv.approved_by IS NOT NULL
+                 AND pv.published_at IS NOT NULL
                ORDER BY psm.member_order ASC"#,
         )
         .bind(pattern_set_id)
@@ -133,16 +137,31 @@ impl PatternRepository {
         let mut tx = self.pool.begin().await?;
         let mut count = 0usize;
         for row in rows {
-            count += sqlx::query(
+            let rows_affected = sqlx::query(
                 r#"INSERT INTO analysis_shadow_candidates
                    (trade_date, code, horizon, pattern_version_id, pattern_set_id,
                     pattern_type, similarity_score, validated_lift, final_score,
                     shadow_tier, matched_features, risk_flags, supporting_signals,
                     invalidations, input_fingerprint, created_at)
-                   VALUES ($1, $2, $3, $4, $5,
-                           $6, $7, $8, $9,
-                           $10, $11, $12, $13,
-                           $14, $15, $16)
+                   SELECT $1, $2, $3, $4, $5,
+                          $6, $7, $8, $9,
+                          $10, $11, $12, $13,
+                          $14, $15, $16
+                   FROM analysis_pattern_set_members psm
+                   INNER JOIN analysis_pattern_sets ps
+                       ON ps.pattern_set_id = psm.pattern_set_id
+                   INNER JOIN analysis_pattern_versions pv
+                       ON pv.pattern_version_id = psm.pattern_version_id
+                   WHERE psm.pattern_set_id = $5
+                     AND psm.pattern_version_id = $4
+                     AND pv.horizon = $3
+                     AND pv.pattern_type = $6
+                     AND pv.status = 'published'
+                     AND pv.horizon IN ('week', 'month')
+                     AND pv.approved_by IS NOT NULL
+                     AND pv.published_at IS NOT NULL
+                     AND ps.status = 'published'
+                     AND ps.published_at IS NOT NULL
                    ON CONFLICT (trade_date, code, horizon, pattern_version_id) DO UPDATE SET
                        pattern_set_id = EXCLUDED.pattern_set_id,
                        pattern_type = EXCLUDED.pattern_type,
@@ -176,6 +195,15 @@ impl PatternRepository {
             .execute(&mut *tx)
             .await?
             .rows_affected() as usize;
+
+            if rows_affected != 1 {
+                return Err(AppError::Internal(format!(
+                    "shadow candidate does not match a published week/month pattern in a published set: code={}, trade_date={}, horizon={}, pattern_version_id={}, pattern_set_id={}",
+                    row.code, row.trade_date, row.horizon, row.pattern_version_id, row.pattern_set_id
+                )));
+            }
+
+            count += rows_affected;
         }
         tx.commit().await?;
         Ok(count)
@@ -187,6 +215,7 @@ impl PatternRepository {
                 r#"SELECT pattern_set_id, name, status, created_at, published_at
                    FROM analysis_pattern_sets
                    WHERE status = 'published'
+                     AND published_at IS NOT NULL
                    ORDER BY published_at DESC NULLS LAST, created_at DESC
                    LIMIT 1"#,
             )
@@ -296,6 +325,7 @@ impl PatternRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::AppError;
     use chrono::TimeZone;
     use serde_json::json;
     use sqlx::PgPool;
@@ -331,6 +361,7 @@ mod tests {
         status: &str,
         horizon: &str,
         pattern_type: &str,
+        approved_by: Option<&str>,
         published_at: Option<DateTime<Utc>>,
     ) -> sqlx::Result<()> {
         sqlx::query(
@@ -344,7 +375,7 @@ mod tests {
                        '{"centroid":{"close_strength":1.1}}',
                        '{"lift":0.42}',
                        '2026-01-01', '2026-06-30', '2026-07-01T00:00:00Z',
-                       'reviewer', $7)"#,
+                       $7, $8)"#,
         )
         .bind(pattern_version_id)
         .bind(pattern_id)
@@ -352,6 +383,7 @@ mod tests {
         .bind(pattern_type)
         .bind(status)
         .bind(dataset_version)
+        .bind(approved_by)
         .bind(published_at)
         .execute(pool)
         .await?;
@@ -411,6 +443,7 @@ mod tests {
             "week",
             "trend",
             None,
+            None,
         )
         .await?;
 
@@ -448,6 +481,7 @@ mod tests {
             "published",
             "week",
             "trend",
+            Some("reviewer"),
             Some(dt(2026, 7, 10, 8)),
         )
         .await?;
@@ -460,6 +494,7 @@ mod tests {
             "week",
             "trend",
             None,
+            None,
         )
         .await?;
         insert_pattern_version(
@@ -470,6 +505,7 @@ mod tests {
             "published",
             "month",
             "vcp_breakout",
+            Some("reviewer"),
             Some(dt(2026, 7, 10, 9)),
         )
         .await?;
@@ -518,6 +554,7 @@ mod tests {
             "published",
             "week",
             "trend",
+            Some("reviewer"),
             Some(dt(2026, 7, 10, 8)),
         )
         .await?;
@@ -529,6 +566,7 @@ mod tests {
             "published",
             "week",
             "trend",
+            Some("reviewer"),
             Some(dt(2026, 7, 10, 9)),
         )
         .await?;
@@ -552,6 +590,251 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn published_pattern_versions_reject_forbidden_horizons_and_manual_metadata(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        insert_dataset_manifest(&pool, "dataset-invalid-published").await?;
+
+        let forbidden_quarter = insert_pattern_version(
+            &pool,
+            Uuid::new_v4(),
+            "quarter-pattern",
+            "dataset-invalid-published",
+            "published",
+            "quarter",
+            "trend",
+            Some("reviewer"),
+            Some(dt(2026, 7, 10, 8)),
+        )
+        .await;
+        assert!(forbidden_quarter.is_err());
+
+        let forbidden_year = insert_pattern_version(
+            &pool,
+            Uuid::new_v4(),
+            "year-pattern",
+            "dataset-invalid-published",
+            "published",
+            "year",
+            "trend",
+            Some("reviewer"),
+            Some(dt(2026, 7, 10, 8)),
+        )
+        .await;
+        assert!(forbidden_year.is_err());
+
+        let missing_approval = insert_pattern_version(
+            &pool,
+            Uuid::new_v4(),
+            "missing-approval",
+            "dataset-invalid-published",
+            "published",
+            "week",
+            "trend",
+            None,
+            Some(dt(2026, 7, 10, 8)),
+        )
+        .await;
+        assert!(missing_approval.is_err());
+
+        let missing_published_at = insert_pattern_version(
+            &pool,
+            Uuid::new_v4(),
+            "missing-published-at",
+            "dataset-invalid-published",
+            "published",
+            "month",
+            "trend",
+            Some("reviewer"),
+            None,
+        )
+        .await;
+        assert!(missing_published_at.is_err());
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn published_pattern_sets_require_published_at(pool: PgPool) -> sqlx::Result<()> {
+        let result = insert_pattern_set(
+            &pool,
+            Uuid::new_v4(),
+            "invalid-published-set",
+            "published",
+            None,
+        )
+        .await;
+
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn published_readers_ignore_rows_that_break_manual_publish_invariants(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        insert_dataset_manifest(&pool, "dataset-reader-filter").await?;
+
+        sqlx::query(
+            r#"ALTER TABLE analysis_pattern_versions
+               DROP CONSTRAINT IF EXISTS analysis_pattern_versions_published_contract_check"#,
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            r#"ALTER TABLE analysis_pattern_sets
+               DROP CONSTRAINT IF EXISTS analysis_pattern_sets_published_contract_check"#,
+        )
+        .execute(&pool)
+        .await?;
+
+        let valid_pattern_id = Uuid::new_v4();
+        let invalid_pattern_id = Uuid::new_v4();
+        let valid_set_id = Uuid::new_v4();
+        let invalid_set_id = Uuid::new_v4();
+
+        insert_pattern_version(
+            &pool,
+            valid_pattern_id,
+            "valid-pattern",
+            "dataset-reader-filter",
+            "published",
+            "week",
+            "trend",
+            Some("reviewer"),
+            Some(dt(2026, 7, 10, 8)),
+        )
+        .await?;
+        insert_pattern_version(
+            &pool,
+            invalid_pattern_id,
+            "invalid-pattern",
+            "dataset-reader-filter",
+            "published",
+            "quarter",
+            "trend",
+            None,
+            None,
+        )
+        .await?;
+
+        insert_pattern_set(
+            &pool,
+            valid_set_id,
+            "valid-set",
+            "published",
+            Some(dt(2026, 7, 10, 9)),
+        )
+        .await?;
+        insert_pattern_set(&pool, invalid_set_id, "invalid-set", "published", None).await?;
+
+        insert_pattern_set_member(&pool, valid_set_id, valid_pattern_id, 1).await?;
+        insert_pattern_set_member(&pool, valid_set_id, invalid_pattern_id, 2).await?;
+
+        let repo = PatternRepository::new(pool);
+        let patterns = repo.list_published_patterns(valid_set_id).await.unwrap();
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].pattern_version_id, valid_pattern_id);
+
+        let latest_set = repo.latest_published_set().await.unwrap().unwrap();
+        assert_eq!(latest_set.pattern_set_id, valid_set_id);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn upsert_shadow_candidates_rejects_inconsistent_metadata_and_set_membership(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        insert_dataset_manifest(&pool, "dataset-shadow-invalid").await?;
+        let pattern_version_id = Uuid::new_v4();
+        let member_set_id = Uuid::new_v4();
+        let non_member_set_id = Uuid::new_v4();
+
+        insert_pattern_version(
+            &pool,
+            pattern_version_id,
+            "pattern-shadow-invalid",
+            "dataset-shadow-invalid",
+            "published",
+            "week",
+            "trend",
+            Some("reviewer"),
+            Some(dt(2026, 7, 10, 8)),
+        )
+        .await?;
+        insert_pattern_set(
+            &pool,
+            member_set_id,
+            "member-set",
+            "published",
+            Some(dt(2026, 7, 10, 9)),
+        )
+        .await?;
+        insert_pattern_set(
+            &pool,
+            non_member_set_id,
+            "non-member-set",
+            "published",
+            Some(dt(2026, 7, 10, 10)),
+        )
+        .await?;
+        insert_pattern_set_member(&pool, member_set_id, pattern_version_id, 1).await?;
+
+        let repo = PatternRepository::new(pool);
+        let trade_date = date(2026, 7, 10);
+
+        let mismatched_metadata = ShadowCandidateRow {
+            trade_date,
+            code: "600001.SH".to_string(),
+            horizon: "month".to_string(),
+            pattern_version_id,
+            pattern_set_id: member_set_id,
+            pattern_type: "vcp_breakout".to_string(),
+            similarity_score: 0.71,
+            validated_lift: 0.12,
+            final_score: 1.2345,
+            shadow_tier: "tier1".to_string(),
+            matched_features: json!({"close_strength": 1.1}),
+            risk_flags: json!(["extended"]),
+            supporting_signals: json!(["scan_ranker"]),
+            invalidations: json!([]),
+            input_fingerprint: "shadow-fp-invalid-meta".to_string(),
+            created_at: dt(2026, 7, 10, 10),
+        };
+
+        let missing_membership = ShadowCandidateRow {
+            trade_date,
+            code: "600002.SH".to_string(),
+            horizon: "week".to_string(),
+            pattern_version_id,
+            pattern_set_id: non_member_set_id,
+            pattern_type: "trend".to_string(),
+            similarity_score: 0.72,
+            validated_lift: 0.13,
+            final_score: 1.3456,
+            shadow_tier: "tier1".to_string(),
+            matched_features: json!({"close_strength": 1.2}),
+            risk_flags: json!(["extended"]),
+            supporting_signals: json!(["scan_ranker"]),
+            invalidations: json!([]),
+            input_fingerprint: "shadow-fp-missing-member".to_string(),
+            created_at: dt(2026, 7, 10, 11),
+        };
+
+        let mismatched_error = repo
+            .upsert_shadow_candidates(&[mismatched_metadata])
+            .await
+            .unwrap_err();
+        assert!(matches!(mismatched_error, AppError::Internal(_)));
+
+        let membership_error = repo
+            .upsert_shadow_candidates(&[missing_membership])
+            .await
+            .unwrap_err();
+        assert!(matches!(membership_error, AppError::Internal(_)));
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn duplicate_shadow_candidate_upserts_are_deterministic(
         pool: PgPool,
     ) -> sqlx::Result<()> {
@@ -567,6 +850,7 @@ mod tests {
             "published",
             "week",
             "trend",
+            Some("reviewer"),
             Some(dt(2026, 7, 10, 8)),
         )
         .await?;

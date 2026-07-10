@@ -43,7 +43,17 @@ CREATE TABLE analysis_pattern_versions (
     approved_by          VARCHAR(100),
     published_at         TIMESTAMPTZ,
     created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (pattern_id, pattern_version_id)
+    UNIQUE (pattern_id, pattern_version_id),
+    UNIQUE (pattern_version_id, horizon, pattern_type),
+    CONSTRAINT analysis_pattern_versions_published_contract_check
+        CHECK (
+            status <> 'published'
+            OR (
+                horizon IN ('week', 'month')
+                AND approved_by IS NOT NULL
+                AND published_at IS NOT NULL
+            )
+        )
 );
 
 CREATE TABLE analysis_pattern_sets (
@@ -51,7 +61,9 @@ CREATE TABLE analysis_pattern_sets (
     name                 VARCHAR(100) NOT NULL,
     status               VARCHAR(20) NOT NULL,
     created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    published_at         TIMESTAMPTZ
+    published_at         TIMESTAMPTZ,
+    CONSTRAINT analysis_pattern_sets_published_contract_check
+        CHECK (status <> 'published' OR published_at IS NOT NULL)
 );
 
 CREATE TABLE analysis_pattern_set_members (
@@ -89,7 +101,13 @@ CREATE TABLE analysis_shadow_candidates (
     invalidations        JSONB NOT NULL,
     input_fingerprint    VARCHAR(64) NOT NULL,
     created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (trade_date, code, horizon, pattern_version_id)
+    PRIMARY KEY (trade_date, code, horizon, pattern_version_id),
+    CONSTRAINT analysis_shadow_candidates_pattern_version_fk
+        FOREIGN KEY (pattern_version_id, horizon, pattern_type)
+        REFERENCES analysis_pattern_versions(pattern_version_id, horizon, pattern_type),
+    CONSTRAINT analysis_shadow_candidates_pattern_set_member_fk
+        FOREIGN KEY (pattern_set_id, pattern_version_id)
+        REFERENCES analysis_pattern_set_members(pattern_set_id, pattern_version_id)
 );
 
 CREATE INDEX idx_pattern_versions_status

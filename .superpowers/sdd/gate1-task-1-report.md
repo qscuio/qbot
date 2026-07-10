@@ -171,3 +171,73 @@ Outcome: succeeded, `1 passed; 0 failed`.
 No task-specific concerns.
 
 The broader test runs emitted pre-existing compiler warnings in unrelated modules, but they did not block this task and no new warnings specific to this change remained after implementation.
+
+## Review fix
+
+### What changed
+
+- Added database publication-contract checks in `014`:
+  - published pattern versions now require `horizon IN ('week', 'month')`
+  - published pattern versions now require non-null `approved_by`
+  - published pattern versions now require non-null `published_at`
+  - published pattern sets now require non-null `published_at`
+- Added relational enforcement for shadow candidates:
+  - `(pattern_version_id, horizon, pattern_type)` must match a real pattern version
+  - `(pattern_set_id, pattern_version_id)` must match real set membership
+- Tightened repository reads:
+  - `list_published_patterns` only returns published week/month pattern versions with approval metadata from a published set with `published_at`
+  - `latest_published_set` ignores published-set rows missing `published_at`
+- Tightened repository writes:
+  - `upsert_shadow_candidates` now inserts through published set membership joins and returns `AppError::Internal` when a row does not match a published week/month pattern in a published set
+- Added negative SQLx tests for forbidden publication states, missing approval metadata, reader filtering, and inconsistent shadow candidate metadata/set membership.
+
+### RED evidence for the new tests
+
+Command run before the fix:
+
+```bash
+DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test --locked storage::pattern_repository -- --nocapture
+```
+
+Observed failures before implementation:
+
+- `published_pattern_versions_reject_forbidden_horizons_and_manual_metadata`
+  - failed at `assert!(forbidden_quarter.is_err())`
+- `published_pattern_sets_require_published_at`
+  - failed at `assert!(result.is_err())`
+- `published_readers_ignore_rows_that_break_manual_publish_invariants`
+  - failed with `left: 2 right: 1`, showing invalid published rows were surfaced
+- `upsert_shadow_candidates_rejects_inconsistent_metadata_and_set_membership`
+  - failed because `upsert_shadow_candidates` returned `Ok(1)` for invalid input instead of an error
+
+### GREEN evidence with commands/results
+
+1. Focused repository tests after the fix:
+
+```bash
+DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test --locked storage::pattern_repository -- --nocapture
+```
+
+Result: `9 passed; 0 failed`
+
+2. Required formatting check:
+
+```bash
+cargo fmt --all -- --check
+```
+
+Result: passed
+
+3. Required diff hygiene check:
+
+```bash
+git diff --check
+```
+
+Result: passed
+
+### Files changed
+
+- `migrations/014_pattern_research_and_shadow.sql`
+- `src/storage/pattern_repository.rs`
+- `.superpowers/sdd/gate1-task-1-report.md`
