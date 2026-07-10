@@ -493,14 +493,14 @@ git commit -m "feat: discover interpretable strong-stock archetypes"
 - Produces `validate_archetype`.
 - Produces baseline metrics with the same result schema.
 
-- [ ] **Step 1: Test purge and embargo**
+- [x] **Step 1: Test purge and embargo**
 
 For a 20-day horizon, assert:
 
 - no train label window overlaps validation start.
 - embargo contains at least 20 trading days after validation.
 
-- [ ] **Step 2: Implement split generator**
+- [x] **Step 2: Implement split generator**
 
 ```python
 def purged_walk_forward_splits(
@@ -513,7 +513,7 @@ def purged_walk_forward_splits(
     ...
 ```
 
-- [ ] **Step 3: Implement baselines**
+- [x] **Step 3: Implement baselines**
 
 Required:
 
@@ -524,7 +524,7 @@ volatility_contraction_breakout
 scan_ranker_a
 ```
 
-- [ ] **Step 4: Implement validation metrics**
+- [x] **Step 4: Implement validation metrics**
 
 Calculate:
 
@@ -545,7 +545,7 @@ top_stock_contribution
 top_period_contribution
 ```
 
-- [ ] **Step 5: Enforce release gate**
+- [x] **Step 5: Enforce release gate**
 
 A candidate can become `validated` only if:
 
@@ -556,7 +556,7 @@ and top_stock_contribution <= config.max_single_stock_contribution
 and top_period_contribution <= config.max_single_period_contribution
 ```
 
-- [ ] **Step 6: Verify and commit**
+- [x] **Step 6: Verify and commit**
 
 ```bash
 cd research
