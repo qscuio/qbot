@@ -1374,7 +1374,7 @@ git commit -m "feat: build daily market snapshots"
 - Adds explicit refresh and snapshot job endpoints.
 - Schedules point-in-time refresh before the market snapshot.
 
-- [ ] **Step 1: Add router tests**
+- [x] **Step 1: Add router tests**
 
 Test that `analysis_router` contains:
 
@@ -1387,7 +1387,7 @@ POST /api/jobs/analysis/snapshot
 
 Use an Axum `Router` smoke test or a direct handler unit test with a SQLx database.
 
-- [ ] **Step 2: Implement handlers**
+- [x] **Step 2: Implement handlers**
 
 Response:
 
@@ -1404,7 +1404,7 @@ Response:
 
 The handlers call `run_point_in_time_trade_date_refresh_job`, `run_point_in_time_reference_refresh_job`, and `run_market_snapshot_job` respectively.
 
-- [ ] **Step 3: Mount the sub-router**
+- [x] **Step 3: Mount the sub-router**
 
 ```rust
 // src/api/mod.rs
@@ -1420,7 +1420,7 @@ In `build_router`:
 .merge(crate::api::analysis_routes::analysis_router(state.clone()))
 ```
 
-- [ ] **Step 4: Add the production cron**
+- [x] **Step 4: Add the production cron**
 
 Add:
 
@@ -1440,7 +1440,7 @@ Initialize it in `main.rs`. Register daily trade-date refresh after the legacy f
 
 Update scheduler tests to assert the exact schedules and order.
 
-- [ ] **Step 5: Document environment and endpoints**
+- [x] **Step 5: Document environment and endpoints**
 
 README must state:
 
@@ -1448,7 +1448,7 @@ README must state:
 - Pattern research is blocked until security master, daily basics, corporate actions, adjustment factors, status, indices, and sector membership are complete.
 - The new endpoint reports capability failures, completeness, and estimated-row counts without guessing missing inputs.
 
-- [ ] **Step 6: Verify**
+- [x] **Step 6: Verify**
 
 Run:
 
@@ -1460,7 +1460,7 @@ git diff --check
 
 Expected: formatting and non-environment-dependent tests PASS; SQLx failures must be reported if `DATABASE_URL` is unavailable.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/api src/scheduler/mod.rs src/state.rs src/main.rs README.md
