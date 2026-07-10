@@ -213,7 +213,10 @@ def _float_value(row: dict[str, Any], column: str) -> float:
 def _market_daily_return(row: dict[str, Any], market_columns: list[str]) -> float:
     values = [float(row[column]) / 100.0 for column in market_columns if row[column] is not None]
     if not values:
-        return 0.0
+        raise ValueError(
+            "label_samples requires a market benchmark return for future row "
+            f"trade_date={row['trade_date']} code={row['code']}"
+        )
     return sum(values) / len(values)
 
 

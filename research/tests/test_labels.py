@@ -133,6 +133,29 @@ def _make_linear_frame(length: int) -> pl.DataFrame:
     return pl.DataFrame(rows)
 
 
+def _make_missing_market_benchmark_frame() -> pl.DataFrame:
+    return _make_linear_frame(6).with_columns(
+        [
+            pl.when(pl.col("trade_date") == date(2026, 1, 2))
+            .then(pl.lit(None, dtype=pl.Float64))
+            .otherwise(pl.col("sse_change_pct"))
+            .alias("sse_change_pct"),
+            pl.when(pl.col("trade_date") == date(2026, 1, 2))
+            .then(pl.lit(None, dtype=pl.Float64))
+            .otherwise(pl.col("szse_change_pct"))
+            .alias("szse_change_pct"),
+            pl.when(pl.col("trade_date") == date(2026, 1, 2))
+            .then(pl.lit(None, dtype=pl.Float64))
+            .otherwise(pl.col("chinext_change_pct"))
+            .alias("chinext_change_pct"),
+            pl.when(pl.col("trade_date") == date(2026, 1, 2))
+            .then(pl.lit(None, dtype=pl.Float64))
+            .otherwise(pl.col("star50_change_pct"))
+            .alias("star50_change_pct"),
+        ]
+    )
+
+
 def test_label_samples_keeps_feature_date_fields_and_adds_expected_label_columns() -> None:
     labeled = label_samples(_make_week_label_frame(), "week")
 
@@ -192,6 +215,11 @@ def test_label_samples_supports_month_publishable_horizon() -> None:
     assert first_row["future_industry_excess"] == pytest.approx(0.0)
     assert first_row["tradable_sample"] is True
     assert first_row["is_positive"] is False
+
+
+def test_label_samples_rejects_future_rows_with_no_market_benchmark_return() -> None:
+    with pytest.raises(ValueError, match="market benchmark return"):
+        label_samples(_make_missing_market_benchmark_frame(), "week")
 
 
 @pytest.mark.parametrize(

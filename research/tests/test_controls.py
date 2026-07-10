@@ -162,6 +162,19 @@ def _make_bucket_filter_candidate_frame() -> pl.DataFrame:
                 volatility_20d_bucket=1,
             ),
             row(
+                code="NONTRADABLE_DECOY",
+                control_type="ordinary",
+                market_cap=100.5,
+                adjusted_close=20.1,
+                amount_20d_avg=1_000.1,
+                volatility_20d=0.0501,
+                market_cap_bucket=2,
+                price_bucket=3,
+                amount_20d_bucket=4,
+                volatility_20d_bucket=1,
+            )
+            | {"tradable_sample": False},
+            row(
                 code="FAIL",
                 control_type="failed_breakout",
                 market_cap=142.0,
@@ -289,6 +302,17 @@ def test_match_controls_excludes_decoys_that_miss_any_required_bucket() -> None:
         "AMOUNT_DECOY",
         "VOL_DECOY",
     }.isdisjoint(set(matches.select("control_code").to_series().to_list()))
+
+
+def test_match_controls_excludes_same_bucket_non_tradable_decoy() -> None:
+    candidates = _make_bucket_filter_candidate_frame()
+    samples = candidates.filter(pl.col("code") == "POS")
+
+    matches = match_controls(samples, candidates, ControlMatchConfig(bucket_count=5))
+
+    assert matches.select("control_code").to_series().to_list() == ["ORD", "FAIL", "NEG"]
+    assert "NONTRADABLE_DECOY" not in matches.select("control_code").to_series().to_list()
+    assert matches.select("tradable_sample").to_series().to_list() == [True, True, True]
 
 
 def test_match_controls_accepts_precomputed_market_cap_bucket_without_market_cap_metric() -> None:
