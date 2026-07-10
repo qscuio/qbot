@@ -255,3 +255,44 @@ Observed warning noise during test runs:
 ### Concerns
 
 - Required verification passed, but the targeted cargo test commands remain warning-noisy because of existing crate-wide unused/dead-code warnings plus Cargo future-incompatibility notices for `redis v0.25.4` and `sqlx-postgres v0.7.4`.
+
+## Fix subagent follow-up 4
+
+### Summary
+
+- Added a shared test-only `ScopedEnvGuard` in `src/config.rs` backed by a static `Mutex`, so env-mutating tests take one process-wide lock before reading or mutating configuration env vars.
+- Updated the env-mutating tests in `src/config.rs` and `src/analysis/adapters/official_event_source.rs` to use the guard instead of open-coded `std::env::set_var` / `remove_var` sequences.
+- Guard teardown restores each tracked variable to its pre-test value, so the new tests do not leave `TUSHARE_TOKEN`, `TELEGRAM_BOT_TOKEN`, `DATABASE_URL`, `REDIS_URL`, `DATA_PROXY`, or the official-event env vars behind after completion.
+- Left the config and adapter implementation behavior unchanged; this is test isolation only.
+
+### RED
+
+- A deterministic RED for this review issue is not practical without manufacturing a scheduler-dependent race. The failure mode is parallel-test interference on process-global environment state, so a forced RED would be flaky by design and would not satisfy the no-fake-RED requirement.
+- Applied the isolation helper first as a test-infrastructure fix that is reviewable in code: one shared mutex, explicit env snapshotting, and drop-based restoration.
+
+### GREEN
+
+- Reran the targeted test commands with Cargo's default parallel scheduling after the guard was in place.
+- Result:
+  - `cargo test analysis::adapters::official_event_source -- --nocapture` -> `10 passed; 0 failed`
+  - `cargo test --all --locked config::tests::test_config_defaults -- --nocapture` -> `1 passed; 0 failed`
+
+### Final verification
+
+- `cargo fmt --all -- --check` -> pass
+- `cargo test analysis::adapters::official_event_source -- --nocapture` -> warning-noisy pass (`10 passed; 0 failed`; default parallel test execution, existing crate warnings and Cargo future-incompatibility notices still present)
+- `cargo test --all --locked config::tests::test_config_defaults -- --nocapture` -> warning-noisy pass (`1 passed; 0 failed`; same existing warnings and future-incompatibility notices)
+- `git diff --check` -> pass
+
+### Files changed
+
+- `src/config.rs`
+- `src/analysis/adapters/official_event_source.rs`
+
+### Commit hash
+
+- Fix commit: `cd2acac` (`test: serialize env-mutating config tests`)
+
+### Concerns
+
+- The required targeted tests now serialize the env-mutating cases touched by this task, but the cargo runs remain warning-noisy because of existing crate-wide unused/dead-code warnings plus Cargo future-incompatibility notices for `redis v0.25.4` and `sqlx-postgres v0.7.4`.
