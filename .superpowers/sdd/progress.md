@@ -40,3 +40,7 @@ Final branch review: complete (commits 811e16c..f090cad, final review clean afte
 - `src/analysis/market_snapshot/ingestion.rs`
 - `src/scheduler/mod.rs`
 - `src/api/analysis_routes.rs`
+
+## Gate 1: Strong-Stock Pattern Shadow Engine
+
+Gate 1 Task 1: complete (commits 34dd225..2f55ba1, review clean after publication-contract and duplicate-batch coverage fixes; verification: storage::pattern_repository 10/10 passed, fmt check passed, diff check passed)

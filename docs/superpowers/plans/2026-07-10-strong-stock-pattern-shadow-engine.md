@@ -34,7 +34,7 @@
 - Produces training-run, dataset, model-version, model-set, and shadow-candidate tables.
 - Later Python and Rust tasks use these tables as the contract.
 
-- [ ] **Step 1: Create the migration**
+- [x] **Step 1: Create the migration**
 
 ```sql
 CREATE TABLE analysis_dataset_manifests (
@@ -138,7 +138,7 @@ CREATE INDEX idx_shadow_candidates_date
     ON analysis_shadow_candidates(trade_date DESC, horizon, shadow_tier, final_score DESC);
 ```
 
-- [ ] **Step 2: Add SQLx tests**
+- [x] **Step 2: Add SQLx tests**
 
 Test:
 
@@ -147,7 +147,7 @@ Test:
 - a pattern set cannot contain duplicate members or duplicate member order.
 - duplicate shadow candidate upserts deterministically.
 
-- [ ] **Step 3: Implement `PatternRepository`**
+- [x] **Step 3: Implement `PatternRepository`**
 
 Public methods:
 
@@ -158,7 +158,7 @@ pub async fn latest_published_set(&self) -> Result<Option<PatternSetRow>>;
 pub async fn list_shadow_candidates(&self, trade_date: NaiveDate) -> Result<Vec<ShadowCandidateRow>>;
 ```
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ```bash
 cargo test storage::pattern_repository -- --nocapture
