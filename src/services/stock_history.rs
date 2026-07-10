@@ -6,6 +6,7 @@ use crate::data::provider::DataProvider;
 use crate::error::Result;
 use crate::market_time::beijing_today;
 use crate::state::AppState;
+use crate::storage::market_repository::MarketRepository;
 use crate::storage::{postgres, upsert_stock_info};
 
 pub struct StockHistoryService {
@@ -51,6 +52,14 @@ impl StockHistoryService {
                 Ok(bars) => {
                     let count = bars.len();
                     postgres::upsert_daily_bars(&self.state.db, &bars).await?;
+                    MarketRepository::new(self.state.db.clone())
+                        .append_daily_bar_versions(
+                            &bars,
+                            chrono::Utc::now(),
+                            "estimated",
+                            self.provider.name(),
+                        )
+                        .await?;
                     if i % 50 == 0 {
                         info!(
                             "Backfill progress: {}/{} ({}, {} bars)",
@@ -81,6 +90,9 @@ impl StockHistoryService {
         let bars = self.provider.get_daily_bars_by_date(today).await?;
         let count = bars.len();
         postgres::upsert_daily_bars(&self.state.db, &bars).await?;
+        MarketRepository::new(self.state.db.clone())
+            .append_daily_bar_versions(&bars, chrono::Utc::now(), "observed", self.provider.name())
+            .await?;
         info!("Daily update: {} bars saved for {}", count, today);
 
         // Also refresh stock info

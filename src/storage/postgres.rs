@@ -68,7 +68,8 @@ pub async fn upsert_daily_bars(pool: &PgPool, bars: &[(String, Candle)]) -> Resu
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
                ON CONFLICT (code, trade_date) DO UPDATE SET
                open=EXCLUDED.open, high=EXCLUDED.high, low=EXCLUDED.low,
-               close=EXCLUDED.close, volume=EXCLUDED.volume, amount=EXCLUDED.amount"#,
+               close=EXCLUDED.close, volume=EXCLUDED.volume, amount=EXCLUDED.amount,
+               turnover=EXCLUDED.turnover, pe=EXCLUDED.pe, pb=EXCLUDED.pb"#,
         )
         .bind(code)
         .bind(bar.trade_date)
@@ -844,6 +845,52 @@ mod tests {
 
     fn d(value: &str) -> NaiveDate {
         NaiveDate::parse_from_str(value, "%Y-%m-%d").unwrap()
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn daily_bar_upsert_updates_fundamentals(pool: PgPool) -> sqlx::Result<()> {
+        let initial = Candle {
+            trade_date: d("2026-07-10"),
+            open: 10.0,
+            high: 11.0,
+            low: 9.5,
+            close: 10.5,
+            volume: 1_000,
+            amount: 10_500.0,
+            turnover: Some(1.1),
+            pe: Some(12.2),
+            pb: Some(1.3),
+        };
+        let revised = Candle {
+            open: 10.2,
+            high: 11.2,
+            low: 9.7,
+            close: 10.8,
+            volume: 1_100,
+            amount: 11_880.0,
+            turnover: Some(2.2),
+            pe: Some(13.3),
+            pb: Some(1.4),
+            ..initial.clone()
+        };
+
+        upsert_daily_bars(&pool, &[("600000.SH".to_string(), initial)])
+            .await
+            .unwrap();
+        upsert_daily_bars(&pool, &[("600000.SH".to_string(), revised)])
+            .await
+            .unwrap();
+
+        let row: (f64, f64, f64, f64) = sqlx::query_as(
+            r#"SELECT close::float8, turnover::float8, pe::float8, pb::float8
+               FROM stock_daily_bars
+               WHERE code = '600000.SH' AND trade_date = '2026-07-10'"#,
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(row, (10.8, 2.2, 13.3, 1.4));
+        Ok(())
     }
 
     async fn seed_limit_up(

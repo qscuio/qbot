@@ -8,6 +8,7 @@ use crate::analysis::market_snapshot::{
     MarketSnapshot, SectorMembership, SecurityDailyStatus, SecurityMasterVersion,
 };
 use crate::data::point_in_time_provider::PointInTimeCapabilities;
+use crate::data::types::{Candle, LimitUpStock, SectorData};
 use crate::error::Result;
 
 pub const POINT_IN_TIME_CAPABILITY_PROBE_RUN_TYPE: &str = "point_in_time_capability_probe";
@@ -123,6 +124,110 @@ impl MarketRepository {
                 }
             },
         ))
+    }
+
+    pub async fn append_daily_bar_versions(
+        &self,
+        bars: &[(String, Candle)],
+        available_at: chrono::DateTime<chrono::Utc>,
+        availability_quality: &str,
+        source: &str,
+    ) -> Result<usize> {
+        let mut inserted = 0;
+        for (code, bar) in bars {
+            inserted += sqlx::query(
+                r#"INSERT INTO stock_daily_bar_versions
+                   (code, trade_date, open, high, low, close, volume, amount,
+                    turnover, pe, pb, available_at, availability_quality, source)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                   ON CONFLICT (code, trade_date, available_at) DO NOTHING"#,
+            )
+            .bind(code)
+            .bind(bar.trade_date)
+            .bind(bar.open)
+            .bind(bar.high)
+            .bind(bar.low)
+            .bind(bar.close)
+            .bind(bar.volume)
+            .bind(bar.amount)
+            .bind(bar.turnover)
+            .bind(bar.pe)
+            .bind(bar.pb)
+            .bind(available_at)
+            .bind(availability_quality)
+            .bind(source)
+            .execute(&self.pool)
+            .await?
+            .rows_affected() as usize;
+        }
+        Ok(inserted)
+    }
+
+    pub async fn append_sector_versions(
+        &self,
+        rows: &[SectorData],
+        available_at: DateTime<Utc>,
+        availability_quality: &str,
+        source: &str,
+    ) -> Result<usize> {
+        let mut inserted = 0;
+        for row in rows {
+            inserted += sqlx::query(
+                r#"INSERT INTO sector_daily_versions
+                   (code, name, sector_type, change_pct, amount, trade_date,
+                    available_at, availability_quality, source)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                   ON CONFLICT (code, trade_date, available_at) DO NOTHING"#,
+            )
+            .bind(&row.code)
+            .bind(&row.name)
+            .bind(&row.sector_type)
+            .bind(row.change_pct)
+            .bind(row.amount)
+            .bind(row.trade_date)
+            .bind(available_at)
+            .bind(availability_quality)
+            .bind(source)
+            .execute(&self.pool)
+            .await?
+            .rows_affected() as usize;
+        }
+        Ok(inserted)
+    }
+
+    pub async fn append_limit_up_versions(
+        &self,
+        rows: &[LimitUpStock],
+        available_at: DateTime<Utc>,
+        availability_quality: &str,
+        source: &str,
+    ) -> Result<usize> {
+        let mut inserted = 0;
+        for row in rows {
+            inserted += sqlx::query(
+                r#"INSERT INTO limit_up_stock_versions
+                   (code, trade_date, name, limit_time, seal_amount, burst_count,
+                    close, pct_chg, strth, available_at, availability_quality, source)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                   ON CONFLICT (code, trade_date, available_at) DO NOTHING"#,
+            )
+            .bind(&row.code)
+            .bind(row.trade_date)
+            .bind(&row.name)
+            .bind(&row.first_time)
+            .bind(row.fd_amount)
+            .bind(row.open_times)
+            .bind(row.close)
+            .bind(row.pct_chg)
+            .bind(row.strth)
+            .bind(available_at)
+            .bind(availability_quality)
+            .bind(source)
+            .execute(&self.pool)
+            .await?
+            .rows_affected() as usize;
+        }
+        Ok(inserted)
     }
 
     pub async fn append_daily_basics(&self, rows: &[DailyBasicSnapshot]) -> Result<usize> {
@@ -886,6 +991,7 @@ fn quality_to_str(value: AvailabilityQuality) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::types::Candle;
     use chrono::TimeZone;
     use serde_json::json;
     use sqlx::PgPool;
@@ -1097,6 +1203,96 @@ mod tests {
             .unwrap();
         assert_eq!(at_13.turnover_rate, Some(2.34));
         assert_eq!(at_13.availability_quality, AvailabilityQuality::Estimated);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn append_daily_bar_versions_is_point_in_time_safe(pool: PgPool) -> sqlx::Result<()> {
+        let repo = MarketRepository::new(pool.clone());
+        let early_available_at = dt(2026, 7, 10, 8);
+        let later_available_at = dt(2026, 7, 10, 12);
+        let early = Candle {
+            trade_date: date(2026, 7, 10),
+            open: 10.0,
+            high: 11.0,
+            low: 9.5,
+            close: 10.5,
+            volume: 1_000,
+            amount: 10_500.0,
+            turnover: Some(1.1),
+            pe: Some(12.2),
+            pb: Some(1.3),
+        };
+        let revised = Candle {
+            close: 10.8,
+            turnover: Some(2.2),
+            pe: Some(13.3),
+            pb: Some(1.4),
+            ..early.clone()
+        };
+
+        let first_inserted = repo
+            .append_daily_bar_versions(
+                &[("600000.SH".to_string(), early.clone())],
+                early_available_at,
+                "observed",
+                "test",
+            )
+            .await
+            .unwrap();
+        let duplicate_inserted = repo
+            .append_daily_bar_versions(
+                &[("600000.SH".to_string(), revised.clone())],
+                early_available_at,
+                "observed",
+                "test",
+            )
+            .await
+            .unwrap();
+        let later_inserted = repo
+            .append_daily_bar_versions(
+                &[("600000.SH".to_string(), revised)],
+                later_available_at,
+                "estimated",
+                "test",
+            )
+            .await
+            .unwrap();
+
+        let rows: Vec<(chrono::DateTime<Utc>, f64, f64, String, String)> = sqlx::query_as(
+            r#"SELECT available_at, close::float8, turnover::float8,
+                      availability_quality, source
+               FROM stock_daily_bar_versions
+               WHERE code = '600000.SH' AND trade_date = '2026-07-10'
+               ORDER BY available_at"#,
+        )
+        .fetch_all(&pool)
+        .await?;
+
+        assert_eq!(first_inserted, 1);
+        assert_eq!(duplicate_inserted, 0);
+        assert_eq!(later_inserted, 1);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0],
+            (
+                early_available_at,
+                10.5,
+                1.1,
+                "observed".to_string(),
+                "test".to_string()
+            )
+        );
+        assert_eq!(
+            rows[1],
+            (
+                later_available_at,
+                10.8,
+                2.2,
+                "estimated".to_string(),
+                "test".to_string()
+            )
+        );
         Ok(())
     }
 

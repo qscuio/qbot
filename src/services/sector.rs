@@ -5,6 +5,7 @@ use tracing::info;
 use crate::data::provider::DataProvider;
 use crate::error::Result;
 use crate::state::AppState;
+use crate::storage::market_repository::MarketRepository;
 use crate::storage::postgres;
 
 pub struct SectorService {
@@ -21,6 +22,14 @@ impl SectorService {
         let sectors = self.provider.get_sector_data(date).await?;
         info!("Sectors: {} records for {}", sectors.len(), date);
         postgres::save_sector_data(&self.state.db, &sectors).await?;
+        MarketRepository::new(self.state.db.clone())
+            .append_sector_versions(
+                &sectors,
+                chrono::Utc::now(),
+                "observed",
+                self.provider.name(),
+            )
+            .await?;
         Ok(())
     }
 

@@ -6,6 +6,7 @@ use crate::data::provider::DataProvider;
 use crate::data::types::LimitUpStock;
 use crate::error::Result;
 use crate::state::AppState;
+use crate::storage::market_repository::MarketRepository;
 use crate::storage::postgres::{self, StartupWatchStock, StrongLimitUpStock};
 
 pub struct LimitUpService {
@@ -22,6 +23,14 @@ impl LimitUpService {
         let stocks = self.provider.get_limit_up_stocks(date).await?;
         info!("涨停板: {} stocks on {}", stocks.len(), date);
         postgres::save_limit_up_stocks(&self.state.db, &stocks).await?;
+        MarketRepository::new(self.state.db.clone())
+            .append_limit_up_versions(
+                &stocks,
+                chrono::Utc::now(),
+                "observed",
+                self.provider.name(),
+            )
+            .await?;
         postgres::rebuild_startup_watchlist(&self.state.db, date).await?;
         Ok(stocks)
     }
