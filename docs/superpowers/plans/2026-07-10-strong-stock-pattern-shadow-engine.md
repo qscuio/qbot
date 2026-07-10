@@ -578,7 +578,7 @@ git commit -m "feat: validate patterns with purged walk-forward"
 - Produces immutable `analysis_pattern_versions` rows.
 - Never writes `published`.
 
-- [ ] **Step 1: Test export contract**
+- [x] **Step 1: Test export contract**
 
 Assert exported payload validates with Pydantic and status is only:
 
@@ -587,7 +587,7 @@ draft
 validated
 ```
 
-- [ ] **Step 2: Implement CLI commands**
+- [x] **Step 2: Implement CLI commands**
 
 ```text
 qbot-research build-dataset --horizon week --as-of YYYY-MM-DD
@@ -595,11 +595,11 @@ qbot-research train --horizon week --dataset-version ...
 qbot-research train-all --as-of YYYY-MM-DD
 ```
 
-- [ ] **Step 3: Save examples**
+- [x] **Step 3: Save examples**
 
 Write typical positive and failed examples to `analysis_pattern_examples`.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ```bash
 cd research
