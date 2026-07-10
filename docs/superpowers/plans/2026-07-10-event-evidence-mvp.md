@@ -586,7 +586,7 @@ git commit -m "feat: extract evidence-backed market-event claims"
 - Produces ClaimGraph with evidence-backed nodes and edges.
 - No industry-chain beneficiary expansion.
 
-- [ ] **Step 1: Test direct entity linking**
+- [x] **Step 1: Test direct entity linking**
 
 Fixture cases:
 
@@ -596,7 +596,7 @@ Fixture cases:
 - ambiguous short name returns review required.
 - unknown organization remains unmapped.
 
-- [ ] **Step 2: Implement link priority**
+- [x] **Step 2: Implement link priority**
 
 ```text
 explicit security code
@@ -606,7 +606,7 @@ exact official industry name
 otherwise unresolved
 ```
 
-- [ ] **Step 3: Define ClaimGraph payload**
+- [x] **Step 3: Define ClaimGraph payload**
 
 ```rust
 pub struct ClaimGraph {
@@ -632,11 +632,11 @@ pub struct ClaimEdge {
 }
 ```
 
-- [ ] **Step 4: Enforce evidence**
+- [x] **Step 4: Enforce evidence**
 
 Graph construction returns an error if any node or edge has no evidence IDs.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 cargo test analysis::events::entity_linking analysis::events::claims
@@ -784,7 +784,7 @@ git commit -m "feat: publish daily evidence-backed market facts"
 - [ ] Evidence versions are immutable.
 - [x] Exact and near duplicates are conservative and auditable.
 - [ ] Every published fact has evidence.
-- [ ] Direct entity mapping does not guess ambiguous stocks.
+- [x] Direct entity mapping does not guess ambiguous stocks.
 - [ ] ClaimGraph contains facts only.
 - [ ] No GDELT or complex clustering exists yet.
 - [ ] No event score reaches candidate ranking.
