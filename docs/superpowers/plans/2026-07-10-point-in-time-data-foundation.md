@@ -1017,7 +1017,7 @@ git commit -m "feat: persist market data availability metadata"
 - Consumes the capability-checked provider and append-only repository methods.
 - Records partial and failed runs in `analysis_data_runs`.
 
-- [ ] **Step 1: Write fake-provider tests**
+- [x] **Step 1: Write fake-provider tests**
 
 Create a fake `PointInTimeDataProvider` and assert:
 
@@ -1027,7 +1027,7 @@ Create a fake `PointInTimeDataProvider` and assert:
 - a failure in corporate actions does not erase successfully fetched daily basics;
 - the run status becomes `partial` when a non-critical category fails.
 
-- [ ] **Step 2: Define the ingestion interface**
+- [x] **Step 2: Define the ingestion interface**
 
 ```rust
 #[derive(Clone)]
@@ -1062,7 +1062,7 @@ impl PointInTimeIngestion {
 }
 ```
 
-- [ ] **Step 3: Implement reference-data refresh**
+- [x] **Step 3: Implement reference-data refresh**
 
 `refresh_reference_data` fetches and appends:
 
@@ -1074,7 +1074,7 @@ stock_sector_membership
 
 It must compare source records and avoid appending a new version when the normalized payload is unchanged.
 
-- [ ] **Step 4: Implement trade-date refresh**
+- [x] **Step 4: Implement trade-date refresh**
 
 `refresh_trade_date` fetches and appends:
 
@@ -1087,7 +1087,7 @@ stock_adjustment_factors
 
 It also verifies that daily bar, sector, and limit-up version writes from Task 5 exist for the date.
 
-- [ ] **Step 5: Implement historical backfill semantics**
+- [x] **Step 5: Implement historical backfill semantics**
 
 Historical backfill records:
 
@@ -1108,7 +1108,7 @@ Conservative estimation rules:
 
 Dataset construction may include estimated records but must report estimated-row counts and support a sensitivity run that excludes them. It must never use `ingested_at` as the historical decision cutoff.
 
-- [ ] **Step 6: Add scheduler job functions without enabling a new cron**
+- [x] **Step 6: Add scheduler job functions without enabling a new cron**
 
 ```rust
 pub async fn run_point_in_time_reference_refresh_job(state: Arc<AppState>);
@@ -1117,7 +1117,7 @@ pub async fn run_point_in_time_trade_date_refresh_job(state: Arc<AppState>);
 
 Call both from `--run-now` after the legacy fetch job. Production schedules are added in Task 9 after completeness reporting exists.
 
-- [ ] **Step 7: Run tests and commit**
+- [x] **Step 7: Run tests and commit**
 
 ```bash
 cargo test analysis::market_snapshot::ingestion -- --nocapture
