@@ -39,6 +39,7 @@ const DAILY_SIGNAL_ARCHIVE_JOB_CRON: &str = "0 5 20 * * Mon,Tue,Wed,Thu,Fri";
 const DAILY_REPORT_JOB_CRON: &str = "0 0 18 * * Mon,Tue,Wed,Thu,Fri";
 const WEEKLY_REPORT_JOB_CRON: &str = "0 0 20 * * Fri";
 const POINT_IN_TIME_REFERENCE_JOB_CRON: &str = "0 15 17 * * Fri";
+static EVENT_FACT_BRIEF_JOB_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Fetch today's OHLCV, limit-up stocks, and sector data (17:00 job).
 pub async fn run_fetch_job(state: Arc<AppState>, provider: Arc<dyn DataProvider>) {
@@ -294,8 +295,10 @@ pub async fn run_event_ingestion_job(state: Arc<AppState>) {
     };
 
     let repo = EventRepository::new(state.db.clone());
+    let mut ingest_failed = false;
     for item in &batch.items {
         if let Err(error) = ingest_fetched_event(&repo, &source, item, now).await {
+            ingest_failed = true;
             warn!(
                 "Event ingestion upsert failed for source={} item={}: {}",
                 source.source_id(),
@@ -305,11 +308,20 @@ pub async fn run_event_ingestion_job(state: Arc<AppState>) {
         }
     }
 
-    if let Some(next_cursor) = batch.next_cursor.as_deref() {
-        if let Err(error) = event_cursor_set(state.redis.clone(), &cursor_key, next_cursor).await {
-            warn!("Event ingestion cursor write failed: {}", error);
-            return;
+    if !ingest_failed {
+        if let Some(next_cursor) = batch.next_cursor.as_deref() {
+            if let Err(error) =
+                event_cursor_set(state.redis.clone(), &cursor_key, next_cursor).await
+            {
+                warn!("Event ingestion cursor write failed: {}", error);
+                return;
+            }
         }
+    } else {
+        warn!(
+            "Event ingestion cursor preserved for source={} because at least one item failed",
+            source.source_id()
+        );
     }
 
     let stock_list = match state.provider.get_stock_list().await {
@@ -349,7 +361,7 @@ pub async fn run_event_ingestion_job(state: Arc<AppState>) {
 }
 
 pub async fn run_event_fact_brief_job(state: Arc<AppState>) {
-    let _guard = state.daily_report_job_lock.lock().await;
+    let _guard = EVENT_FACT_BRIEF_JOB_LOCK.lock().await;
     let trade_date = beijing_today();
     let intelligence = EventIntelligence::new(state.db.clone());
     let brief = match intelligence.build_daily_brief(trade_date).await {
@@ -376,7 +388,7 @@ pub async fn run_event_fact_brief_job(state: Arc<AppState>) {
     let row = DailyEventBriefRow {
         trade_date,
         brief_version: "daily_event_brief_v1".to_string(),
-        content,
+        content: content.clone(),
         structured_payload: match serde_json::to_value(&brief) {
             Ok(payload) => payload,
             Err(error) => {
@@ -398,6 +410,13 @@ pub async fn run_event_fact_brief_job(state: Arc<AppState>) {
             "Event fact brief persistence failed for {}: {}",
             trade_date, error
         );
+        return;
+    }
+
+    if let Some(channel) = &state.config.report_channel {
+        if let Err(error) = state.pusher.push(channel, &content).await {
+            warn!("Event fact brief push failed for {}: {}", trade_date, error);
+        }
     }
 }
 
@@ -860,11 +879,16 @@ fn event_content_hash(title: &str, content: Option<&str>) -> String {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use axum::{http::header, routing::get, Router};
     use chrono::{DateTime, Duration, NaiveDate, TimeZone};
     use serde_json::{json, Value};
     use sqlx::PgPool;
     use std::collections::BTreeMap;
+    use std::sync::Arc as StdArc;
+    use tokio::net::TcpListener;
     use tokio::sync::Mutex;
+    use tokio::task::JoinHandle;
+    use tokio::time::{timeout, Duration as TokioDuration};
     use uuid::Uuid;
 
     use crate::analysis::market_snapshot::{
@@ -1078,6 +1102,68 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn event_ingestion_job_does_not_advance_cursor_when_any_item_ingest_fails(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let state = test_state(pool.clone()).await;
+        let (feed_url, server) = spawn_event_feed_server(
+            r#"{
+              "next_cursor": "cursor-2",
+              "items": [
+                {
+                  "source_item_id": "notice-001",
+                  "published_at": "2026-07-10T08:15:00Z",
+                  "title": "Exchange trading status update",
+                  "content": "Full bulletin body.",
+                  "summary": "Exchange confirms normal trading conditions.",
+                  "source_url": "https://example.test/notices/notice-001",
+                  "category": "market-status"
+                },
+                {
+                  "source_item_id": "notice-002",
+                  "published_at": "2026-07-10T08:30:00Z",
+                  "title": "Broken notice payload",
+                  "content": "Bad source URL should fail ingestion.",
+                  "summary": "Broken source URL should fail ingestion.",
+                  "source_url": "not-a-url",
+                  "category": "market-status"
+                }
+              ]
+            }"#,
+        )
+        .await;
+        let mut config = (*state.config).clone();
+        config.official_event_feed_url = Some(feed_url);
+        config.official_event_store_full_content = true;
+        let state = Arc::new(AppState {
+            config: Arc::new(config),
+            ..(*state).clone()
+        });
+        let cursor_key = event_cursor_key("official:market_event");
+        event_cursor_set(state.redis.clone(), &cursor_key, "cursor-1")
+            .await
+            .unwrap();
+
+        run_event_ingestion_job(state.clone()).await;
+
+        assert_eq!(
+            event_cursor_get(state.redis.clone(), &cursor_key)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("cursor-1")
+        );
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM market_event_evidence")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(count, 1);
+
+        server.abort();
+        let _ = server.await;
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn event_fact_brief_job_keeps_failures_isolated_and_does_not_persist_bad_briefs(
         pool: PgPool,
     ) -> sqlx::Result<()> {
@@ -1143,6 +1229,46 @@ mod tests {
             .unwrap()
             .is_none());
         Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn event_fact_brief_job_does_not_wait_on_daily_report_lock(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let state = test_state(pool.clone()).await;
+        let _daily_report_guard = state.daily_report_job_lock.lock().await;
+
+        let run = timeout(
+            TokioDuration::from_secs(1),
+            run_event_fact_brief_job(state.clone()),
+        )
+        .await;
+
+        assert!(
+            run.is_ok(),
+            "fact brief job should not block on daily report lock"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn event_fact_brief_job_pushes_rendered_content_after_persistence() {
+        let source = include_str!("mod.rs");
+        let implementation_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("scheduler source includes implementation before tests");
+        let fact_job_source = implementation_source
+            .split("pub async fn run_event_fact_brief_job")
+            .nth(1)
+            .and_then(|section| section.split("/// Generate daily market report").next())
+            .expect("fact brief job implementation present");
+
+        assert!(
+            fact_job_source.contains(".save_daily_brief(&row)")
+                && fact_job_source.contains("state.pusher.push(channel, &content).await"),
+            "fact brief job must persist the brief and then push the rendered content without wrapper text"
+        );
     }
 
     #[test]
@@ -1422,6 +1548,29 @@ mod tests {
         };
         let (count,): (i64,) = sqlx::query_as(query).fetch_one(pool).await?;
         Ok(count)
+    }
+
+    async fn spawn_event_feed_server(body: &'static str) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = StdArc::new(body);
+        let app = Router::new().route(
+            "/feed",
+            get(move || {
+                let body = body.clone();
+                async move {
+                    (
+                        [(header::CONTENT_TYPE, "application/json")],
+                        body.as_ref().to_string(),
+                    )
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        (format!("http://{addr}/feed"), server)
     }
 
     async fn test_state(pool: PgPool) -> Arc<AppState> {

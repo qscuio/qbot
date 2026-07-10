@@ -53,10 +53,15 @@ pub(crate) fn build_daily_event_brief(
     let mut unconfirmed = Vec::new();
 
     for claim in claims {
-        let mapped_evidence_ids = map_claim_evidence_ids(&claim, &evidence_by_id)?;
+        let published_fact = claim.review_status == "published" && claim.claim_type == "fact";
+        let mapped_evidence_ids = if published_fact {
+            map_claim_evidence_ids(&claim, &evidence_by_id)?
+        } else {
+            map_optional_claim_evidence_ids(&claim, &evidence_by_id)?
+        };
         referenced_evidence_ids.extend(mapped_evidence_ids.iter().copied());
 
-        if claim.review_status == "published" && claim.claim_type == "fact" {
+        if published_fact {
             if let Some(previous_fact_id) = claim.previous_fact_id {
                 revisions.push(BriefRevision {
                     revision_id: claim.claim_id,
@@ -71,7 +76,7 @@ pub(crate) fn build_daily_event_brief(
                     evidence_ids: mapped_evidence_ids,
                 });
             }
-        } else {
+        } else if !mapped_evidence_ids.is_empty() {
             unconfirmed.push(BriefUnconfirmed {
                 item_id: claim.claim_id,
                 summary: claim.claim_text,
@@ -197,6 +202,17 @@ pub(crate) fn daily_event_brief_input_fingerprint(brief: &DailyEventBrief) -> Re
     fingerprint_json(brief)
 }
 
+fn map_optional_claim_evidence_ids(
+    claim: &BriefClaimRecord,
+    evidence_by_id: &std::collections::BTreeMap<Uuid, BriefEvidenceRecord>,
+) -> Result<Vec<Uuid>> {
+    if claim.evidence_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    map_evidence_ids(claim, evidence_by_id)
+}
+
 fn map_claim_evidence_ids(
     claim: &BriefClaimRecord,
     evidence_by_id: &std::collections::BTreeMap<Uuid, BriefEvidenceRecord>,
@@ -207,6 +223,13 @@ fn map_claim_evidence_ids(
         ));
     }
 
+    map_evidence_ids(claim, evidence_by_id)
+}
+
+fn map_evidence_ids(
+    claim: &BriefClaimRecord,
+    evidence_by_id: &std::collections::BTreeMap<Uuid, BriefEvidenceRecord>,
+) -> Result<Vec<Uuid>> {
     claim.evidence_ids
         .iter()
         .map(|evidence_id| {
@@ -427,6 +450,48 @@ mod tests {
                 .contains("published fact must reference at least one source evidence"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn source_less_unconfirmed_non_fact_claim_does_not_abort_brief_rendering() {
+        let evidence_id = Uuid::from_u128(41);
+        let brief = build_daily_event_brief(
+            date(2026, 7, 10),
+            vec![BriefEvidenceRecord {
+                evidence_id,
+                source_id: "official:market_event".to_string(),
+                source_item_id: "notice-041".to_string(),
+                published_at: Some(dt(2026, 7, 10, 10, 0, 0)),
+                available_at: dt(2026, 7, 10, 10, 0, 0),
+                title: "交易所公告".to_string(),
+                supersedes_evidence_id: None,
+            }],
+            vec![
+                BriefClaimRecord {
+                    claim_id: Uuid::from_u128(42),
+                    claim_type: "fact".to_string(),
+                    claim_text: "公司披露正式事项。".to_string(),
+                    review_status: "published".to_string(),
+                    evidence_ids: vec![evidence_id],
+                    previous_fact_id: None,
+                },
+                BriefClaimRecord {
+                    claim_id: Uuid::from_u128(43),
+                    claim_type: "rumor".to_string(),
+                    claim_text: "市场传闻称仍在磋商。".to_string(),
+                    review_status: "draft".to_string(),
+                    evidence_ids: Vec::new(),
+                    previous_fact_id: None,
+                },
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+
+        let rendered = render_daily_event_brief(&brief).unwrap();
+
+        assert!(rendered.contains("公司披露正式事项。"));
+        assert!(!rendered.contains("市场传闻称仍在磋商。"));
     }
 
     #[test]
