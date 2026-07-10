@@ -375,11 +375,11 @@ git commit -m "feat: export point-in-time research datasets"
 - Produces `label_samples(frame, horizon)`.
 - Produces `match_controls(samples, candidates, config)`.
 
-- [ ] **Step 1: Test label timing**
+- [x] **Step 1: Test label timing**
 
 Assert feature date `t` never reads a future value except the label columns.
 
-- [ ] **Step 2: Implement labels**
+- [x] **Step 2: Implement labels**
 
 Output:
 
@@ -394,7 +394,7 @@ strength_score
 is_positive
 ```
 
-- [ ] **Step 3: Test matched controls**
+- [x] **Step 3: Test matched controls**
 
 Given a positive sample, select controls using:
 
@@ -410,7 +410,7 @@ tradable state
 
 Assert the positive sample cannot match itself.
 
-- [ ] **Step 4: Add failure-control types**
+- [x] **Step 4: Add failure-control types**
 
 Label controls as:
 
@@ -420,7 +420,7 @@ failed_breakout
 negative_excess
 ```
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 cd research
