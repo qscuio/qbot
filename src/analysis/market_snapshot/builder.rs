@@ -70,10 +70,7 @@ impl MarketSnapshotModule {
         }
         let current_bar_codes: BTreeSet<String> = bars_by_code
             .iter()
-            .filter(|(_, rows)| {
-                rows.last()
-                    .is_some_and(|row| row.bar.trade_date == trade_date)
-            })
+            .filter(|(_, rows)| rows.last().is_some_and(|row| row.trade_date == trade_date))
             .map(|(code, _)| code.clone())
             .collect();
 
@@ -96,7 +93,7 @@ impl MarketSnapshotModule {
         let codes: Vec<String> = bars_by_code.keys().cloned().collect();
         let history_start = bars_by_code
             .values()
-            .filter_map(|rows| rows.first().map(|row| row.bar.trade_date))
+            .filter_map(|rows| rows.first().map(|row| row.trade_date))
             .min()
             .unwrap_or(trade_date);
 
@@ -156,11 +153,17 @@ impl MarketSnapshotModule {
                 fingerprint_inputs.insert(fingerprint_component(
                     "stock_daily_bar_versions",
                     &row.code,
-                    row.bar.trade_date,
+                    row.trade_date,
                     &row.source,
                     row.available_at,
                     row.ingested_at,
                 ));
+                for field in &row.missing_critical_fields {
+                    missing_inputs.insert(format!(
+                        "stock_daily_bar_versions:{}:{}:{}",
+                        row.code, row.trade_date, field
+                    ));
+                }
             }
 
             if let Some(factors) = adjustments_by_code.get(code) {
@@ -189,11 +192,11 @@ impl MarketSnapshotModule {
             let factor_map = adjustments_by_code.get(code);
             let mut missing_adjustment = false;
             for row in rows {
-                let Some(factor) = factor_map.and_then(|entries| entries.get(&row.bar.trade_date))
+                let Some(factor) = factor_map.and_then(|entries| entries.get(&row.trade_date))
                 else {
                     missing_inputs.insert(format!(
                         "stock_adjustment_factors:{code}:{}",
-                        row.bar.trade_date
+                        row.trade_date
                     ));
                     missing_adjustment = true;
                     continue;
@@ -204,7 +207,13 @@ impl MarketSnapshotModule {
             let Some(status) = status else {
                 continue;
             };
+            let has_incomplete_bars = rows
+                .iter()
+                .any(|row| !row.missing_critical_fields.is_empty());
             if missing_adjustment {
+                continue;
+            }
+            if has_incomplete_bars {
                 continue;
             }
 
@@ -224,7 +233,14 @@ impl MarketSnapshotModule {
                 ));
             }
 
-            let raw_bars: Vec<Candle> = rows.iter().map(|row| row.bar.clone()).collect();
+            let raw_bars: Vec<Candle> = rows
+                .iter()
+                .map(|row| {
+                    row.bar
+                        .clone()
+                        .expect("complete daily bar rows expose candle")
+                })
+                .collect();
             let adjusted_bars = adjust_candles(&raw_bars, &factors)?;
 
             breadth_inputs.push(SecurityBreadthInput {
@@ -744,6 +760,62 @@ mod tests {
         assert!(snapshot
             .missing_inputs
             .contains(&"stock_daily_bar_versions:600041.SH:2026-07-20".to_string()));
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn build_trade_date_marks_null_critical_bar_field_incomplete_and_excludes_breadth(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        seed_security_history(&pool, "600045.SH", 1..=19, true).await?;
+        sqlx::query(
+            r#"INSERT INTO stock_daily_bar_versions
+               (code, trade_date, open, high, low, close, volume, amount, turnover, pe, pb,
+                available_at, availability_quality, source, ingested_at)
+               VALUES ($1, $2, 29.8, 30.4, 29.4, NULL, 1000, 1000.0,
+                       NULL, NULL, NULL, $3, 'observed', 'bars', $4)"#,
+        )
+        .bind("600045.SH")
+        .bind(date(20))
+        .bind(dt(20, 17, 0))
+        .bind(dt(20, 17, 5))
+        .execute(&pool)
+        .await?;
+        seed_adjustment_factor_version(
+            &pool,
+            "600045.SH",
+            20,
+            1.0,
+            dt(20, 17, 10),
+            dt(20, 17, 15),
+            "adjustments",
+        )
+        .await?;
+        seed_status(&pool, "600045.SH", dt(20, 17, 20), dt(20, 17, 25)).await?;
+        seed_all_indices(&pool).await?;
+
+        let snapshot = MarketSnapshotModule::new(pool.clone())
+            .build_trade_date(date(20), dt(20, 19, 0))
+            .await
+            .unwrap()
+            .snapshot;
+
+        assert!(!snapshot.data_complete);
+        assert!(snapshot
+            .missing_inputs
+            .contains(&"stock_daily_bar_versions:600045.SH:2026-07-20:close".to_string()));
+        assert_eq!(snapshot.metrics["breadth"]["up_count"], json!(0));
+        assert_eq!(snapshot.metrics["breadth"]["down_count"], json!(0));
+        assert_eq!(snapshot.metrics["breadth"]["flat_count"], json!(0));
+        assert_eq!(snapshot.metrics["breadth"]["total_amount"], json!(0.0));
+
+        let saved = MarketRepository::new(pool)
+            .market_snapshot(date(20), MARKET_SNAPSHOT_VERSION)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!saved.data_complete);
+        assert_eq!(saved.metrics["breadth"]["down_count"], json!(0));
         Ok(())
     }
 

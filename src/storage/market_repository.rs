@@ -34,7 +34,9 @@ pub struct MarketRepository {
 #[derive(Debug, Clone)]
 pub struct PointInTimeDailyBarVersion {
     pub code: String,
-    pub bar: Candle,
+    pub trade_date: NaiveDate,
+    pub bar: Option<Candle>,
+    pub missing_critical_fields: Vec<&'static str>,
     pub available_at: DateTime<Utc>,
     pub ingested_at: DateTime<Utc>,
     pub source: String,
@@ -1121,23 +1123,35 @@ impl MarketRepository {
                     available_at,
                     ingested_at,
                     source,
-                )| PointInTimeDailyBarVersion {
-                    code,
-                    bar: Candle {
+                )| {
+                    let missing_critical_fields =
+                        daily_bar_missing_critical_fields(open, high, low, close, volume, amount);
+                    let bar = if missing_critical_fields.is_empty() {
+                        Some(Candle {
+                            trade_date,
+                            open: open.expect("checked daily bar open is present"),
+                            high: high.expect("checked daily bar high is present"),
+                            low: low.expect("checked daily bar low is present"),
+                            close: close.expect("checked daily bar close is present"),
+                            volume: volume.expect("checked daily bar volume is present"),
+                            amount: amount.expect("checked daily bar amount is present"),
+                            turnover,
+                            pe,
+                            pb,
+                        })
+                    } else {
+                        None
+                    };
+
+                    PointInTimeDailyBarVersion {
+                        code,
                         trade_date,
-                        open: open.unwrap_or(0.0),
-                        high: high.unwrap_or(0.0),
-                        low: low.unwrap_or(0.0),
-                        close: close.unwrap_or(0.0),
-                        volume: volume.unwrap_or(0),
-                        amount: amount.unwrap_or(0.0),
-                        turnover,
-                        pe,
-                        pb,
-                    },
-                    available_at,
-                    ingested_at,
-                    source,
+                        bar,
+                        missing_critical_fields,
+                        available_at,
+                        ingested_at,
+                        source,
+                    }
                 },
             )
             .collect())
@@ -1844,6 +1858,27 @@ fn parse_quality(value: &str) -> AvailabilityQuality {
     }
 }
 
+fn daily_bar_missing_critical_fields(
+    open: Option<f64>,
+    high: Option<f64>,
+    low: Option<f64>,
+    close: Option<f64>,
+    volume: Option<i64>,
+    amount: Option<f64>,
+) -> Vec<&'static str> {
+    [
+        ("open", open.is_none()),
+        ("high", high.is_none()),
+        ("low", low.is_none()),
+        ("close", close.is_none()),
+        ("volume", volume.is_none()),
+        ("amount", amount.is_none()),
+    ]
+    .into_iter()
+    .filter_map(|(field, missing)| missing.then_some(field))
+    .collect()
+}
+
 fn quality_to_str(value: AvailabilityQuality) -> &'static str {
     match value {
         AvailabilityQuality::Observed => "observed",
@@ -2432,6 +2467,44 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(at_13.is_suspended);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn security_statuses_as_of_breaks_equal_available_at_ties_deterministically(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        sqlx::query("ALTER TABLE security_daily_status DROP CONSTRAINT security_daily_status_pkey")
+            .execute(&pool)
+            .await?;
+        sqlx::query(
+            r#"INSERT INTO security_daily_status
+               (code, trade_date, listed_days, is_st, is_suspended, price_limit_pct,
+                available_at, availability_quality, source, ingested_at)
+               VALUES
+               ('600100.SH', '2026-07-10', 100, FALSE, FALSE, 3.0,
+                '2026-07-10T08:00:00Z', 'observed', 'z-status', '2026-07-10T09:00:00Z'),
+               ('600100.SH', '2026-07-10', 100, FALSE, FALSE, 5.0,
+                '2026-07-10T08:00:00Z', 'observed', 'z-status', '2026-07-10T10:00:00Z'),
+               ('600100.SH', '2026-07-10', 100, FALSE, FALSE, 10.0,
+                '2026-07-10T08:00:00Z', 'observed', 'a-status', '2026-07-10T10:00:00Z')"#,
+        )
+        .execute(&pool)
+        .await?;
+
+        let rows = MarketRepository::new(pool)
+            .security_statuses_as_of(
+                &["600100.SH".to_string()],
+                date(2026, 7, 10),
+                dt(2026, 7, 10, 12),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source, "a-status");
+        assert_eq!(rows[0].ingested_at, dt(2026, 7, 10, 10));
+        assert_eq!(rows[0].price_limit_pct, Some(10.0));
         Ok(())
     }
 

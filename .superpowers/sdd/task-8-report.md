@@ -18,8 +18,11 @@
   - `MarketSnapshotModule::build_trade_date` now always builds from the requested `(trade_date, as_of)` and returns that freshly built snapshot instead of returning an already persisted `market-v1` row first.
   - `save_market_snapshot` now upserts the single `(trade_date, snapshot_version)` row so a rebuilt `market-v1` snapshot replaces stale metrics, completeness, missing-inputs, and fingerprint fields.
   - Snapshot fingerprints now include loaded bar, adjustment, status, and index provenance even for securities later excluded from breadth because a critical input is missing.
+  - `daily_bar_history_as_of` now treats `open`, `high`, `low`, `close`, `amount`, and `volume` as critical daily bar fields. It no longer fabricates zero-valued candles for NULL critical fields; incomplete rows retain loaded provenance and field-level missing metadata.
+  - `MarketSnapshotModule::build_trade_date` now records `stock_daily_bar_versions:<code>:<trade_date>:<field>` for NULL critical daily bar fields and excludes securities with incomplete bar history from breadth so snapshots persist with `data_complete = false`.
   - Trade-date status rows now act as the known-universe signal for current-day bar completeness. A code with a trade-date status row but no current trade-date bar available as-of records `stock_daily_bar_versions:<code>:<trade_date>` without guessing securities that have neither bars nor status.
   - Point-in-time repository helpers now break equal-`available_at` ties deterministically with `ingested_at DESC, source ASC` in the Task 8 window queries for daily bars, adjustment factors, security statuses, status universe, and index bars.
+  - Added direct `security_statuses_as_of` test coverage for equal-`available_at` tie selection.
 - Added `run_market_snapshot_job` in [`src/scheduler/mod.rs`](/home/ubuntu/work/qbot/.worktrees/point-in-time-data-foundation/src/scheduler/mod.rs).
 - Inserted market snapshot execution into `--run-now` in [`src/main.rs`](/home/ubuntu/work/qbot/.worktrees/point-in-time-data-foundation/src/main.rs) after the point-in-time refreshes and before the scan.
 - Added `sha2` in [`Cargo.toml`](/home/ubuntu/work/qbot/.worktrees/point-in-time-data-foundation/Cargo.toml) and updated [`Cargo.lock`](/home/ubuntu/work/qbot/.worktrees/point-in-time-data-foundation/Cargo.lock) for deterministic `input_fingerprint` hashing.
@@ -41,6 +44,8 @@
       - Failed as expected because the original persisted snapshot was kept instead of upserting the rebuilt row.
     - `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test build_trade_date_uses_deterministic_equal_available_at_versions -- --nocapture`
       - Failed as expected before the SQL tie-breaker fix because the snapshot selected the wrong equal-`available_at` status version and produced `limit_up_count = 1` instead of the expected `0`.
+    - `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test analysis::market_snapshot::builder::tests::build_trade_date_marks_null_critical_bar_field_incomplete_and_excludes_breadth -- --nocapture`
+      - Failed as expected because `snapshot.data_complete` stayed true when a current daily bar had `close = NULL`, demonstrating the old NULL-to-zero conversion path.
 - Green:
   - Implemented `MarketBreadthMetrics` and `calculate_market_breadth`.
   - Implemented `MarketSnapshotModule::build_trade_date` and repository helpers.
@@ -51,11 +56,15 @@
     - fingerprint completeness for excluded securities
     - trade-date status universe missing-current-bar completeness
     - equal-`available_at` duplicate candidates selecting the later `ingested_at` and source-ascending point-in-time winners, with deterministic snapshot metrics and fingerprint
+    - NULL critical daily bar fields producing field-level `missing_inputs`, incomplete snapshots, and no fabricated breadth contribution
+  - Added direct repository coverage for `security_statuses_as_of` equal-`available_at` ties choosing the later `ingested_at`, then source-ascending row.
 
 ## Verification results
 
 - `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test analysis::market_snapshot -- --nocapture`
-  - PASS: 23 passed, 0 failed
+  - PASS: 24 passed, 0 failed
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test storage::market_repository::tests::security_statuses_as_of_breaks_equal_available_at_ties_deterministically -- --nocapture`
+  - PASS: 1 passed, 0 failed
 - `cargo test scheduler::tests -- --nocapture`
   - PASS: 2 passed, 0 failed
 - `cargo fmt --all -- --check`
