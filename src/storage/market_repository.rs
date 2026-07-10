@@ -778,7 +778,17 @@ fn quality_to_str(value: AvailabilityQuality) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+    use serde_json::json;
     use sqlx::PgPool;
+
+    fn date(year: i32, month: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(year, month, day).unwrap()
+    }
+
+    fn dt(year: i32, month: u32, day: u32, hour: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(year, month, day, hour, 0, 0).unwrap()
+    }
 
     #[sqlx::test(migrations = "./migrations")]
     async fn point_in_time_tables_exist(pool: PgPool) -> sqlx::Result<()> {
@@ -835,6 +845,452 @@ mod tests {
             .unwrap();
 
         assert_eq!(value.unwrap().trade_date.to_string(), "2026-07-09");
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn adjustment_factor_append_is_idempotent_and_reads_latest_as_of(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = MarketRepository::new(pool);
+        let early = AdjustmentFactor {
+            code: "600000.SH".to_string(),
+            trade_date: date(2026, 7, 10),
+            adj_factor: 1.10,
+            available_at: dt(2026, 7, 10, 8),
+            ingested_at: dt(2026, 7, 10, 8),
+            availability_quality: AvailabilityQuality::Observed,
+            source: "test".to_string(),
+        };
+        let later = AdjustmentFactor {
+            adj_factor: 1.20,
+            available_at: dt(2026, 7, 10, 12),
+            ingested_at: dt(2026, 7, 10, 12),
+            availability_quality: AvailabilityQuality::Estimated,
+            ..early.clone()
+        };
+
+        let inserted = repo
+            .append_adjustment_factors(&[early.clone(), early.clone(), later.clone()])
+            .await
+            .unwrap();
+
+        assert_eq!(inserted, 2);
+        let at_09 = repo
+            .latest_adjustment_factor("600000.SH", date(2026, 7, 10), dt(2026, 7, 10, 9))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(at_09.adj_factor, 1.10);
+
+        let at_13 = repo
+            .latest_adjustment_factor("600000.SH", date(2026, 7, 10), dt(2026, 7, 10, 13))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(at_13.adj_factor, 1.20);
+        assert_eq!(at_13.availability_quality, AvailabilityQuality::Estimated);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn daily_basic_append_is_idempotent_and_reads_latest_as_of(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = MarketRepository::new(pool);
+        let early = DailyBasicSnapshot {
+            code: "600000.SH".to_string(),
+            trade_date: date(2026, 7, 10),
+            turnover_rate: Some(1.23),
+            volume_ratio: Some(0.98),
+            pe: Some(11.1),
+            pb: Some(1.2),
+            ps: Some(3.4),
+            total_share: Some(1000.0),
+            float_share: Some(800.0),
+            total_mv: Some(12000.0),
+            circ_mv: Some(9600.0),
+            available_at: dt(2026, 7, 10, 8),
+            ingested_at: dt(2026, 7, 10, 8),
+            availability_quality: AvailabilityQuality::Observed,
+            source: "test".to_string(),
+        };
+        let later = DailyBasicSnapshot {
+            turnover_rate: Some(2.34),
+            available_at: dt(2026, 7, 10, 12),
+            ingested_at: dt(2026, 7, 10, 12),
+            availability_quality: AvailabilityQuality::Estimated,
+            ..early.clone()
+        };
+
+        let inserted = repo
+            .append_daily_basics(&[early.clone(), early.clone(), later.clone()])
+            .await
+            .unwrap();
+
+        assert_eq!(inserted, 2);
+        assert!(repo
+            .daily_basic("600000.SH", date(2026, 7, 10), dt(2026, 7, 10, 7))
+            .await
+            .unwrap()
+            .is_none());
+
+        let at_09 = repo
+            .daily_basic("600000.SH", date(2026, 7, 10), dt(2026, 7, 10, 9))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(at_09.turnover_rate, Some(1.23));
+        assert_eq!(at_09.availability_quality, AvailabilityQuality::Observed);
+
+        let at_13 = repo
+            .daily_basic("600000.SH", date(2026, 7, 10), dt(2026, 7, 10, 13))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(at_13.turnover_rate, Some(2.34));
+        assert_eq!(at_13.availability_quality, AvailabilityQuality::Estimated);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn security_master_append_is_idempotent_and_reads_latest_as_of(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = MarketRepository::new(pool);
+        let listed = SecurityMasterVersion {
+            code: "600000.SH".to_string(),
+            name: "Old Name".to_string(),
+            market: Some("A".to_string()),
+            exchange: Some("SSE".to_string()),
+            list_status: "L".to_string(),
+            list_date: Some(date(1999, 11, 10)),
+            delist_date: None,
+            available_at: dt(2026, 7, 10, 8),
+            ingested_at: dt(2026, 7, 10, 8),
+            availability_quality: AvailabilityQuality::Observed,
+            source: "test".to_string(),
+        };
+        let renamed = SecurityMasterVersion {
+            name: "New Name".to_string(),
+            available_at: dt(2026, 7, 10, 12),
+            ingested_at: dt(2026, 7, 10, 12),
+            ..listed.clone()
+        };
+
+        let inserted = repo
+            .append_security_master_versions(&[listed.clone(), listed.clone(), renamed.clone()])
+            .await
+            .unwrap();
+
+        assert_eq!(inserted, 2);
+        assert!(repo
+            .security_master("600000.SH", dt(2026, 7, 10, 7))
+            .await
+            .unwrap()
+            .is_none());
+
+        let at_09 = repo
+            .security_master("600000.SH", dt(2026, 7, 10, 9))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(at_09.name, "Old Name");
+
+        let at_13 = repo
+            .security_master("600000.SH", dt(2026, 7, 10, 13))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(at_13.name, "New Name");
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn corporate_actions_append_is_idempotent_and_reads_latest_as_of(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = MarketRepository::new(pool);
+        let early = CorporateAction {
+            source: "test".to_string(),
+            action_key: "600000.SH-div-2026".to_string(),
+            code: "600000.SH".to_string(),
+            action_type: "cash_dividend".to_string(),
+            announcement_date: Some(date(2026, 7, 1)),
+            record_date: Some(date(2026, 7, 9)),
+            ex_date: Some(date(2026, 7, 10)),
+            pay_date: Some(date(2026, 7, 20)),
+            cash_dividend: Some(0.10),
+            stock_ratio: None,
+            rights_ratio: None,
+            rights_price: None,
+            available_at: dt(2026, 7, 10, 8),
+            ingested_at: dt(2026, 7, 10, 8),
+            availability_quality: AvailabilityQuality::Observed,
+        };
+        let revised = CorporateAction {
+            cash_dividend: Some(0.20),
+            available_at: dt(2026, 7, 10, 12),
+            ingested_at: dt(2026, 7, 10, 12),
+            availability_quality: AvailabilityQuality::Estimated,
+            ..early.clone()
+        };
+        let future_ex_date = CorporateAction {
+            action_key: "600000.SH-div-2026-later".to_string(),
+            ex_date: Some(date(2026, 7, 11)),
+            available_at: dt(2026, 7, 10, 8),
+            ingested_at: dt(2026, 7, 10, 8),
+            ..early.clone()
+        };
+
+        let inserted = repo
+            .append_corporate_actions(&[
+                early.clone(),
+                early.clone(),
+                revised.clone(),
+                future_ex_date.clone(),
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(inserted, 3);
+
+        let at_09 = repo
+            .corporate_actions("600000.SH", date(2026, 7, 10), dt(2026, 7, 10, 9))
+            .await
+            .unwrap();
+        assert_eq!(at_09.len(), 1);
+        assert_eq!(at_09[0].cash_dividend, Some(0.10));
+        assert_eq!(at_09[0].availability_quality, AvailabilityQuality::Observed);
+
+        let at_13 = repo
+            .corporate_actions("600000.SH", date(2026, 7, 10), dt(2026, 7, 10, 13))
+            .await
+            .unwrap();
+        assert_eq!(at_13.len(), 1);
+        assert_eq!(at_13[0].cash_dividend, Some(0.20));
+        assert_eq!(
+            at_13[0].availability_quality,
+            AvailabilityQuality::Estimated
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn security_status_append_is_idempotent_and_reads_latest_as_of(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = MarketRepository::new(pool);
+        let normal = SecurityDailyStatus {
+            code: "600000.SH".to_string(),
+            trade_date: date(2026, 7, 10),
+            listed_days: Some(100),
+            is_st: false,
+            is_suspended: false,
+            price_limit_pct: Some(10.0),
+            available_at: dt(2026, 7, 10, 8),
+            ingested_at: dt(2026, 7, 10, 8),
+            availability_quality: AvailabilityQuality::Observed,
+            source: "test".to_string(),
+        };
+        let suspended = SecurityDailyStatus {
+            is_suspended: true,
+            available_at: dt(2026, 7, 10, 12),
+            ingested_at: dt(2026, 7, 10, 12),
+            ..normal.clone()
+        };
+
+        let inserted = repo
+            .append_security_statuses(&[normal.clone(), normal.clone(), suspended.clone()])
+            .await
+            .unwrap();
+
+        assert_eq!(inserted, 2);
+        let at_09 = repo
+            .security_status("600000.SH", date(2026, 7, 10), dt(2026, 7, 10, 9))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!at_09.is_suspended);
+
+        let at_13 = repo
+            .security_status("600000.SH", date(2026, 7, 10), dt(2026, 7, 10, 13))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(at_13.is_suspended);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn index_history_append_is_idempotent_and_reads_latest_as_of(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = MarketRepository::new(pool);
+        let previous_day = IndexDailyBar {
+            code: "000001.SH".to_string(),
+            trade_date: date(2026, 7, 9),
+            close: 2990.0,
+            change_pct: Some(-0.1),
+            volume: Some(1_000),
+            amount: Some(10_000.0),
+            available_at: dt(2026, 7, 9, 18),
+            ingested_at: dt(2026, 7, 9, 18),
+            availability_quality: AvailabilityQuality::Observed,
+            source: "test".to_string(),
+        };
+        let early = IndexDailyBar {
+            trade_date: date(2026, 7, 10),
+            close: 3000.0,
+            available_at: dt(2026, 7, 10, 8),
+            ingested_at: dt(2026, 7, 10, 8),
+            ..previous_day.clone()
+        };
+        let revised = IndexDailyBar {
+            close: 3010.0,
+            available_at: dt(2026, 7, 10, 12),
+            ingested_at: dt(2026, 7, 10, 12),
+            availability_quality: AvailabilityQuality::Estimated,
+            ..early.clone()
+        };
+
+        let inserted = repo
+            .append_index_bars(&[
+                previous_day.clone(),
+                early.clone(),
+                early.clone(),
+                revised.clone(),
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(inserted, 3);
+
+        let at_09 = repo
+            .index_history("000001.SH", date(2026, 7, 10), dt(2026, 7, 10, 9), 2)
+            .await
+            .unwrap();
+        assert_eq!(at_09.len(), 2);
+        assert_eq!(at_09[0].trade_date, date(2026, 7, 10));
+        assert_eq!(at_09[0].close, 3000.0);
+        assert_eq!(at_09[1].trade_date, date(2026, 7, 9));
+
+        let at_13 = repo
+            .index_history("000001.SH", date(2026, 7, 10), dt(2026, 7, 10, 13), 1)
+            .await
+            .unwrap();
+        assert_eq!(at_13.len(), 1);
+        assert_eq!(at_13[0].close, 3010.0);
+        assert_eq!(
+            at_13[0].availability_quality,
+            AvailabilityQuality::Estimated
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn sector_membership_append_is_idempotent_and_reads_active_as_of(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = MarketRepository::new(pool);
+        let active_early = SectorMembership {
+            code: "600000.SH".to_string(),
+            sector_code: "BANK".to_string(),
+            sector_name: "Banking".to_string(),
+            sector_type: "industry".to_string(),
+            valid_from: date(2026, 7, 1),
+            valid_to: None,
+            available_at: dt(2026, 7, 10, 8),
+            ingested_at: dt(2026, 7, 10, 8),
+            availability_quality: AvailabilityQuality::Observed,
+            source: "test".to_string(),
+        };
+        let ended_later = SectorMembership {
+            valid_to: Some(date(2026, 7, 9)),
+            available_at: dt(2026, 7, 10, 12),
+            ingested_at: dt(2026, 7, 10, 12),
+            availability_quality: AvailabilityQuality::Estimated,
+            ..active_early.clone()
+        };
+        let active_theme = SectorMembership {
+            sector_code: "VALUE".to_string(),
+            sector_name: "Value".to_string(),
+            sector_type: "theme".to_string(),
+            valid_from: date(2026, 7, 5),
+            available_at: dt(2026, 7, 10, 8),
+            ingested_at: dt(2026, 7, 10, 8),
+            ..active_early.clone()
+        };
+
+        let inserted = repo
+            .append_sector_memberships(&[
+                active_early.clone(),
+                active_early.clone(),
+                ended_later.clone(),
+                active_theme.clone(),
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(inserted, 3);
+
+        let at_09 = repo
+            .active_sector_memberships("600000.SH", date(2026, 7, 10), dt(2026, 7, 10, 9))
+            .await
+            .unwrap();
+        assert_eq!(at_09.len(), 2);
+        assert_eq!(at_09[0].sector_code, "BANK");
+        assert_eq!(at_09[1].sector_code, "VALUE");
+
+        let at_13 = repo
+            .active_sector_memberships("600000.SH", date(2026, 7, 10), dt(2026, 7, 10, 13))
+            .await
+            .unwrap();
+        assert_eq!(at_13.len(), 1);
+        assert_eq!(at_13[0].sector_code, "VALUE");
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn market_snapshot_save_is_idempotent_and_reads_original_snapshot(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = MarketRepository::new(pool);
+        let snapshot = MarketSnapshot {
+            trade_date: date(2026, 7, 10),
+            snapshot_version: "gate0".to_string(),
+            available_at: dt(2026, 7, 10, 18),
+            data_complete: false,
+            metrics: json!({"advancers": 123, "decliners": 456}),
+            missing_inputs: vec!["index_history".to_string()],
+            input_fingerprint: "fingerprint-a".to_string(),
+        };
+        let conflicting = MarketSnapshot {
+            data_complete: true,
+            metrics: json!({"advancers": 999}),
+            missing_inputs: Vec::new(),
+            input_fingerprint: "fingerprint-b".to_string(),
+            ..snapshot.clone()
+        };
+
+        repo.save_market_snapshot(&snapshot).await.unwrap();
+        repo.save_market_snapshot(&conflicting).await.unwrap();
+
+        let saved = repo
+            .market_snapshot(date(2026, 7, 10), "gate0")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!saved.data_complete);
+        assert_eq!(saved.metrics, json!({"advancers": 123, "decliners": 456}));
+        assert_eq!(saved.missing_inputs, vec!["index_history".to_string()]);
+        assert_eq!(saved.input_fingerprint, "fingerprint-a");
+
+        assert!(repo
+            .market_snapshot(date(2026, 7, 10), "missing")
+            .await
+            .unwrap()
+            .is_none());
         Ok(())
     }
 }
