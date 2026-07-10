@@ -40,14 +40,14 @@ use crate::storage::redis_cache::RedisCache;
 
 type ApiResult = std::result::Result<Json<Value>, (StatusCode, Json<Value>)>;
 
-fn api_error(msg: &str) -> (StatusCode, Json<Value>) {
+pub(crate) fn api_error(msg: &str) -> (StatusCode, Json<Value>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({"error": msg})),
     )
 }
 
-fn check_auth(headers: &HeaderMap, api_key: Option<&str>) -> bool {
+pub(crate) fn check_auth(headers: &HeaderMap, api_key: Option<&str>) -> bool {
     match api_key {
         None => true,
         Some(key) => headers
@@ -348,7 +348,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/report/signal_auto", get(get_signal_auto_report))
         .route("/api/report/limitup", get(get_limitup_report))
         .route("/api/report/strong", get(get_strong_report))
-        .route("/api/analysis/data-status", get(get_analysis_data_status))
         .route("/api/signal-auto/accounts", get(get_signal_auto_accounts))
         .route("/api/market/overview", get(market_overview))
         .route("/api/chart/data/:code", get(chart_data))
@@ -383,7 +382,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/miniapp/chart",
             ServeDir::new("web/miniapp/chart").append_index_html_on_directories(true),
         )
-        .with_state(state)
+        .with_state(state.clone())
+        .merge(crate::api::analysis_routes::analysis_router(state.clone()))
 }
 
 fn parse_optional_date(
@@ -4084,51 +4084,6 @@ async fn list_signals() -> Json<Value> {
         .collect();
     let count = signals.len();
     Json(json!({"signals": signals, "count": count}))
-}
-
-async fn get_analysis_data_status(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> ApiResult {
-    if !check_auth(&headers, state.config.api_key.as_deref()) {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "unauthorized"})),
-        ));
-    }
-
-    let repo = crate::storage::market_repository::MarketRepository::new(state.db.clone());
-    let status = repo
-        .latest_point_in_time_data_status()
-        .await
-        .map_err(|e| api_error(&e.to_string()))?;
-
-    match status {
-        Some(status) => {
-            let missing_capabilities = status
-                .details
-                .get("missing_capabilities")
-                .cloned()
-                .unwrap_or_else(|| json!([]));
-            Ok(Json(json!({
-                "run_type": status.run_type,
-                "status": status.status,
-                "missing_capabilities": missing_capabilities,
-                "details": status.details,
-                "error_message": status.error_message,
-                "started_at": status.started_at,
-                "completed_at": status.completed_at,
-            })))
-        }
-        None => Ok(Json(json!({
-            "run_type": "point_in_time_capability_probe",
-            "status": "missing_probe",
-            "missing_capabilities": ["point_in_time_capability_probe"],
-            "details": {
-                "point_in_time_capability_probe": "missing: no point-in-time capability probe has been persisted"
-            }
-        }))),
-    }
 }
 
 async fn get_scan_latest(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult {

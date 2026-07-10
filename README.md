@@ -138,8 +138,12 @@ curl -X POST http://localhost:8080/api/jobs/scan           # run 24 signal detec
 curl -X POST http://localhost:8080/api/jobs/scan/archive   # archive daily signal snapshot
 curl -X POST http://localhost:8080/api/jobs/report/daily   # generate + push daily report
 curl -X POST http://localhost:8080/api/jobs/report/weekly  # generate + push weekly report
+curl -X POST http://localhost:8080/api/jobs/analysis/point-in-time/refresh           # refresh point-in-time trade-date inputs
+curl -X POST http://localhost:8080/api/jobs/analysis/point-in-time/reference-refresh # refresh point-in-time reference inputs
+curl -X POST http://localhost:8080/api/jobs/analysis/snapshot                        # build market snapshot
 
 # Read results
+curl http://localhost:8080/api/analysis/data-status
 curl http://localhost:8080/api/scan/latest
 curl http://localhost:8080/api/scan/prestart
 curl http://localhost:8080/api/scan/stats
@@ -148,6 +152,14 @@ curl http://localhost:8080/api/report/daily
 ```
 
 If `API_KEY` is set, add `-H "Authorization: Bearer <key>"` to protected endpoints.
+
+## Point-in-Time Analysis Data
+
+Existing current-state rows are not point-in-time history until they are copied through an explicit estimated backfill. Estimated rows are tracked separately so sensitivity work can exclude them.
+
+Pattern research is blocked until security master, daily basics, corporate actions, adjustment factors, status, indices, and sector membership are complete.
+
+`GET /api/analysis/data-status` reports capability failures, completeness, and estimated-row counts without guessing missing inputs. `missingInputs` comes from persisted market snapshots, not from API-side inference.
 
 ---
 
@@ -159,10 +171,13 @@ Jobs are scheduled with fixed `UTC+08:00` in code (`Job::new_async_tz`).
 | Time (Beijing) | Days | Job |
 |----------------|------|-----|
 | 17:00 | Mon–Fri | Fetch OHLCV, limit-up stocks, sector data |
+| 17:10 | Mon–Fri | Refresh point-in-time trade-date inputs |
+| 17:20 | Mon–Fri | Build point-in-time market snapshot |
 | 17:30 | Mon–Fri | Run full signal scan, cache to Redis |
 | 18:00 | Mon–Fri | Generate daily report, push to Telegram |
 | 20:00 | Friday | Generate weekly report, push to Telegram |
 | 20:05 | Mon–Fri | Run full signal scan and archive triggered hits to `daily_signal_scan_results` |
+| 20:30 | Friday | Refresh point-in-time reference inputs |
 
 Time basis:
 - Runtime date/time logic uses fixed `UTC+08:00` (`Asia/Shanghai` equivalent), not server local timezone.

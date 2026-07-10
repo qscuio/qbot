@@ -120,6 +120,7 @@ async fn main() -> Result<()> {
         point_in_time_provider,
         pusher: pusher.clone(),
         fetch_job_lock: Arc::new(Mutex::new(())),
+        analysis_job_lock: Arc::new(Mutex::new(())),
         scan_job_lock: Arc::new(Mutex::new(())),
         daily_report_job_lock: Arc::new(Mutex::new(())),
         weekly_report_job_lock: Arc::new(Mutex::new(())),

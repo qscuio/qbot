@@ -14,6 +14,7 @@ pub struct AppState {
     pub point_in_time_provider: Arc<dyn PointInTimeDataProvider>,
     pub pusher: Arc<TelegramPusher>,
     pub fetch_job_lock: Arc<Mutex<()>>,
+    pub analysis_job_lock: Arc<Mutex<()>>,
     pub scan_job_lock: Arc<Mutex<()>>,
     pub daily_report_job_lock: Arc<Mutex<()>>,
     pub weekly_report_job_lock: Arc<Mutex<()>>,

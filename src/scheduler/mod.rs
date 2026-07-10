@@ -16,10 +16,13 @@ use crate::storage::postgres;
 use crate::telegram::pusher::TelegramPusher;
 
 const FETCH_JOB_CRON: &str = "0 0 17 * * Mon,Tue,Wed,Thu,Fri";
+const POINT_IN_TIME_TRADE_DATE_JOB_CRON: &str = "0 10 17 * * Mon,Tue,Wed,Thu,Fri";
+const MARKET_SNAPSHOT_JOB_CRON: &str = "0 20 17 * * Mon,Tue,Wed,Thu,Fri";
 const SCAN_JOB_CRON: &str = "0 30 17 * * Mon,Tue,Wed,Thu,Fri";
 const DAILY_SIGNAL_ARCHIVE_JOB_CRON: &str = "0 5 20 * * Mon,Tue,Wed,Thu,Fri";
 const DAILY_REPORT_JOB_CRON: &str = "0 0 18 * * Mon,Tue,Wed,Thu,Fri";
 const WEEKLY_REPORT_JOB_CRON: &str = "0 0 20 * * Fri";
+const POINT_IN_TIME_REFERENCE_JOB_CRON: &str = "0 30 20 * * Fri";
 
 /// Fetch today's OHLCV, limit-up stocks, and sector data (17:00 job).
 pub async fn run_fetch_job(state: Arc<AppState>, provider: Arc<dyn DataProvider>) {
@@ -45,6 +48,7 @@ pub async fn run_fetch_job(state: Arc<AppState>, provider: Arc<dyn DataProvider>
 }
 
 pub async fn run_point_in_time_reference_refresh_job(state: Arc<AppState>) {
+    let _guard = state.analysis_job_lock.lock().await;
     let ingestion =
         PointInTimeIngestion::new(state.point_in_time_provider.clone(), state.db.clone());
     match ingestion.refresh_reference_data(Utc::now()).await {
@@ -60,6 +64,7 @@ pub async fn run_point_in_time_reference_refresh_job(state: Arc<AppState>) {
 }
 
 pub async fn run_point_in_time_trade_date_refresh_job(state: Arc<AppState>) {
+    let _guard = state.analysis_job_lock.lock().await;
     let trade_date = beijing_today();
     let ingestion =
         PointInTimeIngestion::new(state.point_in_time_provider.clone(), state.db.clone());
@@ -77,6 +82,7 @@ pub async fn run_point_in_time_trade_date_refresh_job(state: Arc<AppState>) {
 }
 
 pub async fn run_market_snapshot_job(state: Arc<AppState>) {
+    let _guard = state.analysis_job_lock.lock().await;
     let trade_date = match postgres::latest_stock_trade_date(&state.db).await {
         Ok(Some(value)) => value,
         Ok(None) => return,
@@ -298,6 +304,36 @@ pub async fn start_scheduler(
             .await?;
     }
 
+    // 17:10 weekdays
+    {
+        let s = state.clone();
+        sched
+            .add(Job::new_async_tz(
+                POINT_IN_TIME_TRADE_DATE_JOB_CRON,
+                beijing_tz(),
+                move |_, _| {
+                    let s = s.clone();
+                    Box::pin(async move { run_point_in_time_trade_date_refresh_job(s).await })
+                },
+            )?)
+            .await?;
+    }
+
+    // 17:20 weekdays
+    {
+        let s = state.clone();
+        sched
+            .add(Job::new_async_tz(
+                MARKET_SNAPSHOT_JOB_CRON,
+                beijing_tz(),
+                move |_, _| {
+                    let s = s.clone();
+                    Box::pin(async move { run_market_snapshot_job(s).await })
+                },
+            )?)
+            .await?;
+    }
+
     // 17:30 weekdays
     {
         let s = state.clone();
@@ -366,9 +402,37 @@ pub async fn start_scheduler(
             .await?;
     }
 
+    // 20:30 Friday
+    {
+        let s = state.clone();
+        sched
+            .add(Job::new_async_tz(
+                POINT_IN_TIME_REFERENCE_JOB_CRON,
+                beijing_tz(),
+                move |_, _| {
+                    let s = s.clone();
+                    Box::pin(async move { run_point_in_time_reference_refresh_job(s).await })
+                },
+            )?)
+            .await?;
+    }
+
     sched.start().await?;
-    info!("Scheduler started with 5 jobs");
+    info!("Scheduler started with 8 jobs");
     Ok(sched)
+}
+
+fn production_job_crons_in_registration_order() -> Vec<&'static str> {
+    vec![
+        FETCH_JOB_CRON,
+        POINT_IN_TIME_TRADE_DATE_JOB_CRON,
+        MARKET_SNAPSHOT_JOB_CRON,
+        SCAN_JOB_CRON,
+        DAILY_REPORT_JOB_CRON,
+        WEEKLY_REPORT_JOB_CRON,
+        DAILY_SIGNAL_ARCHIVE_JOB_CRON,
+        POINT_IN_TIME_REFERENCE_JOB_CRON,
+    ]
 }
 
 #[cfg(test)]
@@ -378,6 +442,11 @@ mod tests {
     #[test]
     fn weekday_pipeline_runs_after_tushare_eod_window() {
         assert_eq!(FETCH_JOB_CRON, "0 0 17 * * Mon,Tue,Wed,Thu,Fri");
+        assert_eq!(
+            POINT_IN_TIME_TRADE_DATE_JOB_CRON,
+            "0 10 17 * * Mon,Tue,Wed,Thu,Fri"
+        );
+        assert_eq!(MARKET_SNAPSHOT_JOB_CRON, "0 20 17 * * Mon,Tue,Wed,Thu,Fri");
         assert_eq!(SCAN_JOB_CRON, "0 30 17 * * Mon,Tue,Wed,Thu,Fri");
         assert_eq!(DAILY_REPORT_JOB_CRON, "0 0 18 * * Mon,Tue,Wed,Thu,Fri");
         assert_eq!(
@@ -389,5 +458,23 @@ mod tests {
     #[test]
     fn weekly_report_schedule_stays_on_friday_evening() {
         assert_eq!(WEEKLY_REPORT_JOB_CRON, "0 0 20 * * Fri");
+        assert_eq!(POINT_IN_TIME_REFERENCE_JOB_CRON, "0 30 20 * * Fri");
+    }
+
+    #[test]
+    fn analysis_jobs_are_registered_between_legacy_fetch_and_scan() {
+        assert_eq!(
+            production_job_crons_in_registration_order(),
+            vec![
+                "0 0 17 * * Mon,Tue,Wed,Thu,Fri",
+                "0 10 17 * * Mon,Tue,Wed,Thu,Fri",
+                "0 20 17 * * Mon,Tue,Wed,Thu,Fri",
+                "0 30 17 * * Mon,Tue,Wed,Thu,Fri",
+                "0 0 18 * * Mon,Tue,Wed,Thu,Fri",
+                "0 0 20 * * Fri",
+                "0 5 20 * * Mon,Tue,Wed,Thu,Fri",
+                "0 30 20 * * Fri",
+            ]
+        );
     }
 }

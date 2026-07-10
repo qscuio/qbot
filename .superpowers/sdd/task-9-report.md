@@ -1,0 +1,60 @@
+### Task 9 Report: Add data-completeness API and production schedule
+
+**Implementation summary**
+- Created `src/api/analysis_routes.rs` with `analysis_router`.
+- Moved `/api/analysis/data-status` out of the main routes file and mounted the analysis sub-router from `build_router`.
+- Added protected analysis endpoints:
+  - `GET /api/analysis/data-status`
+  - `POST /api/jobs/analysis/point-in-time/refresh`
+  - `POST /api/jobs/analysis/point-in-time/reference-refresh`
+  - `POST /api/jobs/analysis/snapshot`
+- The data-status response exposes camelCase snapshot fields: `tradeDate`, `snapshotVersion`, `dataComplete`, `missingInputs`, `availableAt`, and `inputFingerprint`.
+- The data-status response also reports `capabilityFailures`, `completeness`, `estimatedRowCounts`, `capabilityStatus`, and `latestRuns`.
+- Added `AppState.analysis_job_lock` and initialized it in `main.rs`.
+- Serialized scheduled and manual point-in-time refresh/snapshot work by locking inside:
+  - `run_point_in_time_trade_date_refresh_job`
+  - `run_point_in_time_reference_refresh_job`
+  - `run_market_snapshot_job`
+- Added production crons exactly as requested:
+  - `0 10 17 * * Mon,Tue,Wed,Thu,Fri`
+  - `0 20 17 * * Mon,Tue,Wed,Thu,Fri`
+  - `0 30 20 * * Fri`
+- Registered the daily point-in-time trade-date refresh after the legacy fetch, market snapshot after that refresh, and reference refresh on Friday evening.
+- Updated README with the point-in-time/current-state caveat, pattern-research blocking prerequisites, status endpoint behavior, manual endpoints, and schedule entries.
+
+**RED evidence**
+- Added `api::analysis_routes::tests`.
+- Initial focused run:
+  - Command: `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test --locked api::analysis_routes::tests -- --nocapture`
+  - Result: failed as expected with 404s for `/api/analysis/data-status`; tests expected 401/200 route behavior.
+
+**GREEN evidence**
+- Focused route tests:
+  - Command: `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test --locked api::analysis_routes::tests -- --nocapture`
+  - Result: PASS, 2 passed.
+- Focused scheduler tests:
+  - Command: `cargo test --locked scheduler::tests -- --nocapture`
+  - Result: PASS, 3 passed.
+
+**Verification results**
+- Command: `cargo fmt --all -- --check`
+  - Result: PASS.
+- Command: `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test --all --locked`
+  - Result: FAIL, 121 passed and 22 failed. The failing SQLx tests reported `DATABASE_URL must be set: EnvVar(NotPresent)`.
+- Additional command: `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test --all --locked -- --test-threads=1`
+  - Result: FAIL with the same 22 SQLx `DATABASE_URL must be set` failures.
+- Command: `git diff --check`
+  - Result: PASS.
+
+**Files changed**
+- `.superpowers/sdd/task-9-report.md`
+- `README.md`
+- `src/api/analysis_routes.rs`
+- `src/api/mod.rs`
+- `src/api/routes.rs`
+- `src/main.rs`
+- `src/scheduler/mod.rs`
+- `src/state.rs`
+
+**Concerns**
+- The exact full-test command fails because `config::tests::test_config_defaults` removes `DATABASE_URL` from the shared process environment, after which SQLx tests cannot create test databases. This was left unchanged because it is outside Task 9 scope. Focused Task 9 tests and formatting/diff verification pass.
