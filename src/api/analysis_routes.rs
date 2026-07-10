@@ -186,6 +186,7 @@ fn require_auth(
 fn analysis_run_summary_json(run: &AnalysisRunSummary) -> Value {
     json!({
         "runType": run.run_type,
+        "tradeDate": run.trade_date,
         "status": run.status,
         "details": run.details,
         "errorMessage": run.error_message,
@@ -389,6 +390,17 @@ mod tests {
         )
         .await
         .unwrap();
+        repo.record_analysis_data_run(
+            POINT_IN_TIME_REFERENCE_REFRESH_RUN_TYPE,
+            None,
+            "failed",
+            json!({
+                "missing_capabilities": ["historical_sector_membership"]
+            }),
+            Some("historical sector membership unavailable".to_string()),
+        )
+        .await
+        .unwrap();
 
         let mut router = analysis_router(state);
         let response = router
@@ -427,6 +439,8 @@ mod tests {
             payload["estimatedRowCounts"]["sensitivityExcludesEstimated"],
             true
         );
+        assert_eq!(payload["latestRuns"][0]["tradeDate"], "2026-07-10");
+        assert_eq!(payload["latestRuns"][1]["tradeDate"], Value::Null);
 
         Ok(())
     }

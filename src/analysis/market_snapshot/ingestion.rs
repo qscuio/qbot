@@ -181,42 +181,52 @@ impl PointInTimeIngestion {
                     &["security_master_history", "historical_sector_membership"],
                 )),
             );
-            return Ok(result);
         }
 
-        match self.provider.get_security_master_versions().await {
-            Ok(rows) => {
-                let mut normalized = Vec::new();
-                let mut skipped = 0;
-                for mut row in rows.iter().cloned() {
-                    row.ingested_at = as_of;
-                    row.availability_quality = AvailabilityQuality::Observed;
-                    if self
-                        .repo
-                        .latest_security_master_payload_unchanged(&row)
-                        .await?
-                    {
-                        skipped += 1;
-                    } else {
-                        normalized.push(row);
+        if capabilities.security_master_history {
+            match self.provider.get_security_master_versions().await {
+                Ok(rows) => {
+                    let mut normalized = Vec::new();
+                    let mut skipped = 0;
+                    for mut row in rows.iter().cloned() {
+                        row.ingested_at = as_of;
+                        row.availability_quality = AvailabilityQuality::Observed;
+                        if self
+                            .repo
+                            .latest_security_master_payload_unchanged(&row)
+                            .await?
+                        {
+                            skipped += 1;
+                        } else {
+                            normalized.push(row);
+                        }
                     }
+                    let inserted = self
+                        .repo
+                        .append_security_master_versions(&normalized)
+                        .await?;
+                    result.add_category(
+                        "security_master_versions",
+                        PointInTimeCategoryResult::ok(rows.len(), inserted, skipped),
+                    );
                 }
-                let inserted = self
-                    .repo
-                    .append_security_master_versions(&normalized)
-                    .await?;
-                result.add_category(
-                    "security_master_versions",
-                    PointInTimeCategoryResult::ok(rows.len(), inserted, skipped),
-                );
+                Err(error) => {
+                    result.mark_failed();
+                    result.add_category(
+                        "security_master_versions",
+                        PointInTimeCategoryResult::failed(error.to_string()),
+                    );
+                }
             }
-            Err(error) => {
-                result.mark_failed();
-                result.add_category(
-                    "security_master_versions",
-                    PointInTimeCategoryResult::failed(error.to_string()),
-                );
-            }
+        } else {
+            result.mark_failed();
+            result.add_category(
+                "security_master_versions",
+                PointInTimeCategoryResult::failed(missing_capabilities(
+                    &capabilities,
+                    &["security_master_history"],
+                )),
+            );
         }
 
         let as_of_date = as_of.date_naive();
@@ -269,36 +279,47 @@ impl PointInTimeIngestion {
             );
         }
 
-        match self.provider.get_sector_memberships(as_of_date).await {
-            Ok(rows) => {
-                let mut normalized = Vec::new();
-                let mut skipped = 0;
-                for mut row in rows.iter().cloned() {
-                    row.ingested_at = as_of;
-                    row.availability_quality = AvailabilityQuality::Observed;
-                    if self
-                        .repo
-                        .latest_sector_membership_payload_unchanged(&row)
-                        .await?
-                    {
-                        skipped += 1;
-                    } else {
-                        normalized.push(row);
+        if capabilities.historical_sector_membership {
+            match self.provider.get_sector_memberships(as_of_date).await {
+                Ok(rows) => {
+                    let mut normalized = Vec::new();
+                    let mut skipped = 0;
+                    for mut row in rows.iter().cloned() {
+                        row.ingested_at = as_of;
+                        row.availability_quality = AvailabilityQuality::Observed;
+                        if self
+                            .repo
+                            .latest_sector_membership_payload_unchanged(&row)
+                            .await?
+                        {
+                            skipped += 1;
+                        } else {
+                            normalized.push(row);
+                        }
                     }
+                    let inserted = self.repo.append_sector_memberships(&normalized).await?;
+                    result.add_category(
+                        "stock_sector_membership",
+                        PointInTimeCategoryResult::ok(rows.len(), inserted, skipped),
+                    );
                 }
-                let inserted = self.repo.append_sector_memberships(&normalized).await?;
-                result.add_category(
-                    "stock_sector_membership",
-                    PointInTimeCategoryResult::ok(rows.len(), inserted, skipped),
-                );
+                Err(error) => {
+                    result.mark_failed();
+                    result.add_category(
+                        "stock_sector_membership",
+                        PointInTimeCategoryResult::failed(error.to_string()),
+                    );
+                }
             }
-            Err(error) => {
-                result.mark_failed();
-                result.add_category(
-                    "stock_sector_membership",
-                    PointInTimeCategoryResult::failed(error.to_string()),
-                );
-            }
+        } else {
+            result.mark_failed();
+            result.add_category(
+                "stock_sector_membership",
+                PointInTimeCategoryResult::failed(missing_capabilities(
+                    &capabilities,
+                    &["historical_sector_membership"],
+                )),
+            );
         }
 
         Ok(result)
@@ -1335,6 +1356,40 @@ mod tests {
             "partial"
         );
         assert_eq!(table_count(&pool, "security_master_versions").await?, 1);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn unsupported_sector_membership_still_persists_supported_reference_data(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let provider = FakeProvider::new();
+        provider.update(|state| state.capabilities.historical_sector_membership = false);
+        let ingestion = PointInTimeIngestion::new(Arc::new(provider), pool.clone());
+
+        let result = ingestion
+            .refresh_reference_data(dt(2026, 7, 10, 18))
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, PointInTimeRefreshStatus::Failed);
+        assert_eq!(table_count(&pool, "security_master_versions").await?, 1);
+        assert_eq!(table_count(&pool, "corporate_action_versions").await?, 1);
+        assert_eq!(table_count(&pool, "stock_sector_membership").await?, 0);
+        assert!(result
+            .categories
+            .get("readiness")
+            .and_then(|category| category.error.as_deref())
+            .is_some_and(|error| error.contains("historical_sector_membership")));
+        assert!(result
+            .categories
+            .get("stock_sector_membership")
+            .and_then(|category| category.error.as_deref())
+            .is_some_and(|error| error.contains("historical_sector_membership")));
+        assert_eq!(
+            latest_run_status(&pool, "point_in_time_reference_refresh").await?,
+            "failed"
+        );
         Ok(())
     }
 

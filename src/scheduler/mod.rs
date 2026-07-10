@@ -22,7 +22,7 @@ const SCAN_JOB_CRON: &str = "0 30 17 * * Mon,Tue,Wed,Thu,Fri";
 const DAILY_SIGNAL_ARCHIVE_JOB_CRON: &str = "0 5 20 * * Mon,Tue,Wed,Thu,Fri";
 const DAILY_REPORT_JOB_CRON: &str = "0 0 18 * * Mon,Tue,Wed,Thu,Fri";
 const WEEKLY_REPORT_JOB_CRON: &str = "0 0 20 * * Fri";
-const POINT_IN_TIME_REFERENCE_JOB_CRON: &str = "0 30 20 * * Fri";
+const POINT_IN_TIME_REFERENCE_JOB_CRON: &str = "0 15 17 * * Fri";
 
 /// Fetch today's OHLCV, limit-up stocks, and sector data (17:00 job).
 pub async fn run_fetch_job(state: Arc<AppState>, provider: Arc<dyn DataProvider>) {
@@ -319,6 +319,21 @@ pub async fn start_scheduler(
             .await?;
     }
 
+    // 17:15 Friday
+    {
+        let s = state.clone();
+        sched
+            .add(Job::new_async_tz(
+                POINT_IN_TIME_REFERENCE_JOB_CRON,
+                beijing_tz(),
+                move |_, _| {
+                    let s = s.clone();
+                    Box::pin(async move { run_point_in_time_reference_refresh_job(s).await })
+                },
+            )?)
+            .await?;
+    }
+
     // 17:20 weekdays
     {
         let s = state.clone();
@@ -402,21 +417,6 @@ pub async fn start_scheduler(
             .await?;
     }
 
-    // 20:30 Friday
-    {
-        let s = state.clone();
-        sched
-            .add(Job::new_async_tz(
-                POINT_IN_TIME_REFERENCE_JOB_CRON,
-                beijing_tz(),
-                move |_, _| {
-                    let s = s.clone();
-                    Box::pin(async move { run_point_in_time_reference_refresh_job(s).await })
-                },
-            )?)
-            .await?;
-    }
-
     sched.start().await?;
     info!("Scheduler started with 8 jobs");
     Ok(sched)
@@ -426,12 +426,12 @@ fn production_job_crons_in_registration_order() -> Vec<&'static str> {
     vec![
         FETCH_JOB_CRON,
         POINT_IN_TIME_TRADE_DATE_JOB_CRON,
+        POINT_IN_TIME_REFERENCE_JOB_CRON,
         MARKET_SNAPSHOT_JOB_CRON,
         SCAN_JOB_CRON,
         DAILY_REPORT_JOB_CRON,
         WEEKLY_REPORT_JOB_CRON,
         DAILY_SIGNAL_ARCHIVE_JOB_CRON,
-        POINT_IN_TIME_REFERENCE_JOB_CRON,
     ]
 }
 
@@ -458,22 +458,22 @@ mod tests {
     #[test]
     fn weekly_report_schedule_stays_on_friday_evening() {
         assert_eq!(WEEKLY_REPORT_JOB_CRON, "0 0 20 * * Fri");
-        assert_eq!(POINT_IN_TIME_REFERENCE_JOB_CRON, "0 30 20 * * Fri");
+        assert_eq!(POINT_IN_TIME_REFERENCE_JOB_CRON, "0 15 17 * * Fri");
     }
 
     #[test]
-    fn analysis_jobs_are_registered_between_legacy_fetch_and_scan() {
+    fn analysis_jobs_register_reference_refresh_before_friday_snapshot() {
         assert_eq!(
             production_job_crons_in_registration_order(),
             vec![
                 "0 0 17 * * Mon,Tue,Wed,Thu,Fri",
                 "0 10 17 * * Mon,Tue,Wed,Thu,Fri",
+                "0 15 17 * * Fri",
                 "0 20 17 * * Mon,Tue,Wed,Thu,Fri",
                 "0 30 17 * * Mon,Tue,Wed,Thu,Fri",
                 "0 0 18 * * Mon,Tue,Wed,Thu,Fri",
                 "0 0 20 * * Fri",
                 "0 5 20 * * Mon,Tue,Wed,Thu,Fri",
-                "0 30 20 * * Fri",
             ]
         );
     }
