@@ -31,6 +31,15 @@ pub struct MarketRepository {
     pool: PgPool,
 }
 
+#[derive(Debug, Clone)]
+pub struct PointInTimeDailyBarVersion {
+    pub code: String,
+    pub bar: Candle,
+    pub available_at: DateTime<Utc>,
+    pub ingested_at: DateTime<Utc>,
+    pub source: String,
+}
+
 impl MarketRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -1038,6 +1047,102 @@ impl MarketRepository {
         ))
     }
 
+    pub async fn daily_bar_history_as_of(
+        &self,
+        end: NaiveDate,
+        as_of: DateTime<Utc>,
+        lookback: i64,
+    ) -> Result<Vec<PointInTimeDailyBarVersion>> {
+        let rows: Vec<(
+            String,
+            NaiveDate,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+            Option<i64>,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+            DateTime<Utc>,
+            DateTime<Utc>,
+            String,
+        )> = sqlx::query_as(
+            r#"WITH latest AS (
+                   SELECT code, trade_date, open, high, low, close, volume, amount,
+                          turnover, pe, pb, available_at, ingested_at, source,
+                          ROW_NUMBER() OVER (
+                              PARTITION BY code, trade_date
+                              ORDER BY available_at DESC
+                          ) AS version_rank
+                   FROM stock_daily_bar_versions
+                   WHERE trade_date <= $1
+                     AND available_at <= $2
+               ),
+               ranked AS (
+                   SELECT code, trade_date, open, high, low, close, volume, amount,
+                          turnover, pe, pb, available_at, ingested_at, source,
+                          ROW_NUMBER() OVER (
+                              PARTITION BY code
+                              ORDER BY trade_date DESC
+                          ) AS history_rank
+                   FROM latest
+                   WHERE version_rank = 1
+               )
+               SELECT code, trade_date, open::float8, high::float8, low::float8,
+                      close::float8, volume, amount::float8, turnover::float8,
+                      pe::float8, pb::float8, available_at, ingested_at, source
+               FROM ranked
+               WHERE history_rank <= $3
+               ORDER BY code, trade_date"#,
+        )
+        .bind(end)
+        .bind(as_of)
+        .bind(lookback)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    code,
+                    trade_date,
+                    open,
+                    high,
+                    low,
+                    close,
+                    volume,
+                    amount,
+                    turnover,
+                    pe,
+                    pb,
+                    available_at,
+                    ingested_at,
+                    source,
+                )| PointInTimeDailyBarVersion {
+                    code,
+                    bar: Candle {
+                        trade_date,
+                        open: open.unwrap_or(0.0),
+                        high: high.unwrap_or(0.0),
+                        low: low.unwrap_or(0.0),
+                        close: close.unwrap_or(0.0),
+                        volume: volume.unwrap_or(0),
+                        amount: amount.unwrap_or(0.0),
+                        turnover,
+                        pe,
+                        pb,
+                    },
+                    available_at,
+                    ingested_at,
+                    source,
+                },
+            )
+            .collect())
+    }
+
     pub async fn latest_adjustment_factor(
         &self,
         code: &str,
@@ -1081,6 +1186,68 @@ impl MarketRepository {
                 }
             },
         ))
+    }
+
+    pub async fn adjustment_factors_as_of(
+        &self,
+        codes: &[String],
+        start: NaiveDate,
+        end: NaiveDate,
+        as_of: DateTime<Utc>,
+    ) -> Result<Vec<AdjustmentFactor>> {
+        if codes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let rows: Vec<(
+            String,
+            NaiveDate,
+            f64,
+            DateTime<Utc>,
+            DateTime<Utc>,
+            String,
+            String,
+        )> = sqlx::query_as(
+            r#"SELECT code, trade_date, adj_factor::float8, available_at,
+                      ingested_at, availability_quality, source
+               FROM (
+                   SELECT code, trade_date, adj_factor, available_at, ingested_at,
+                          availability_quality, source,
+                          ROW_NUMBER() OVER (
+                              PARTITION BY code, trade_date
+                              ORDER BY available_at DESC
+                          ) AS version_rank
+                   FROM stock_adjustment_factors
+                   WHERE code = ANY($1)
+                     AND trade_date BETWEEN $2 AND $3
+                     AND available_at <= $4
+               ) latest
+               WHERE version_rank = 1
+               ORDER BY code, trade_date"#,
+        )
+        .bind(codes)
+        .bind(start)
+        .bind(end)
+        .bind(as_of)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(code, trade_date, adj_factor, available_at, ingested_at, quality, source)| {
+                    AdjustmentFactor {
+                        code,
+                        trade_date,
+                        adj_factor,
+                        available_at,
+                        ingested_at,
+                        availability_quality: parse_quality(&quality),
+                        source,
+                    }
+                },
+            )
+            .collect())
     }
 
     pub async fn corporate_actions(
@@ -1230,6 +1397,83 @@ impl MarketRepository {
         ))
     }
 
+    pub async fn security_statuses_as_of(
+        &self,
+        codes: &[String],
+        trade_date: NaiveDate,
+        as_of: DateTime<Utc>,
+    ) -> Result<Vec<SecurityDailyStatus>> {
+        if codes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let rows: Vec<(
+            String,
+            NaiveDate,
+            Option<i32>,
+            bool,
+            bool,
+            Option<f64>,
+            DateTime<Utc>,
+            DateTime<Utc>,
+            String,
+            String,
+        )> = sqlx::query_as(
+            r#"SELECT code, trade_date, listed_days, is_st, is_suspended,
+                      price_limit_pct::float8, available_at, ingested_at,
+                      availability_quality, source
+               FROM (
+                   SELECT code, trade_date, listed_days, is_st, is_suspended,
+                          price_limit_pct, available_at, ingested_at,
+                          availability_quality, source,
+                          ROW_NUMBER() OVER (
+                              PARTITION BY code, trade_date
+                              ORDER BY available_at DESC
+                          ) AS version_rank
+                   FROM security_daily_status
+                   WHERE code = ANY($1)
+                     AND trade_date = $2
+                     AND available_at <= $3
+               ) latest
+               WHERE version_rank = 1
+               ORDER BY code"#,
+        )
+        .bind(codes)
+        .bind(trade_date)
+        .bind(as_of)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    code,
+                    trade_date,
+                    listed_days,
+                    is_st,
+                    is_suspended,
+                    price_limit_pct,
+                    available_at,
+                    ingested_at,
+                    quality,
+                    source,
+                )| SecurityDailyStatus {
+                    code,
+                    trade_date,
+                    listed_days,
+                    is_st,
+                    is_suspended,
+                    price_limit_pct,
+                    available_at,
+                    ingested_at,
+                    availability_quality: parse_quality(&quality),
+                    source,
+                },
+            )
+            .collect())
+    }
+
     pub async fn active_sector_memberships(
         &self,
         code: &str,
@@ -1337,6 +1581,81 @@ impl MarketRepository {
         .bind(end)
         .bind(as_of)
         .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    code,
+                    trade_date,
+                    close,
+                    change_pct,
+                    volume,
+                    amount,
+                    available_at,
+                    ingested_at,
+                    quality,
+                    source,
+                )| IndexDailyBar {
+                    code,
+                    trade_date,
+                    close,
+                    change_pct,
+                    volume,
+                    amount,
+                    available_at,
+                    ingested_at,
+                    availability_quality: parse_quality(&quality),
+                    source,
+                },
+            )
+            .collect())
+    }
+
+    pub async fn index_bars_as_of(
+        &self,
+        codes: &[String],
+        trade_date: NaiveDate,
+        as_of: DateTime<Utc>,
+    ) -> Result<Vec<IndexDailyBar>> {
+        if codes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let rows: Vec<(
+            String,
+            NaiveDate,
+            f64,
+            Option<f64>,
+            Option<i64>,
+            Option<f64>,
+            DateTime<Utc>,
+            DateTime<Utc>,
+            String,
+            String,
+        )> = sqlx::query_as(
+            r#"SELECT code, trade_date, close::float8, change_pct::float8, volume,
+                      amount::float8, available_at, ingested_at, availability_quality, source
+               FROM (
+                   SELECT code, trade_date, close, change_pct, volume, amount,
+                          available_at, ingested_at, availability_quality, source,
+                          ROW_NUMBER() OVER (
+                              PARTITION BY code, trade_date
+                              ORDER BY available_at DESC
+                          ) AS version_rank
+                   FROM index_daily_bars
+                   WHERE code = ANY($1)
+                     AND trade_date = $2
+                     AND available_at <= $3
+               ) latest
+               WHERE version_rank = 1
+               ORDER BY code"#,
+        )
+        .bind(codes)
+        .bind(trade_date)
+        .bind(as_of)
         .fetch_all(&self.pool)
         .await?;
 

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio_cron_scheduler::{Job, JobScheduler};
 use tracing::{info, warn};
 
-use crate::analysis::market_snapshot::ingestion::PointInTimeIngestion;
+use crate::analysis::market_snapshot::{ingestion::PointInTimeIngestion, MarketSnapshotModule};
 use crate::data::provider::DataProvider;
 use crate::market_time::{beijing_today, beijing_tz};
 use crate::services::{
@@ -73,6 +73,28 @@ pub async fn run_point_in_time_trade_date_refresh_job(state: Arc<AppState>) {
             result.excluded_estimated_rows
         ),
         Err(e) => warn!("Point-in-time trade-date refresh failed: {}", e),
+    }
+}
+
+pub async fn run_market_snapshot_job(state: Arc<AppState>) {
+    let trade_date = match postgres::latest_stock_trade_date(&state.db).await {
+        Ok(Some(value)) => value,
+        Ok(None) => return,
+        Err(error) => {
+            warn!(
+                "Market snapshot skipped: latest trade date lookup failed: {}",
+                error
+            );
+            return;
+        }
+    };
+
+    let module = MarketSnapshotModule::new(state.db.clone());
+    if let Err(error) = module
+        .build_trade_date(trade_date, chrono::Utc::now())
+        .await
+    {
+        warn!("Market snapshot failed: {}", error);
     }
 }
 
