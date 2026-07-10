@@ -90,6 +90,65 @@ pub struct ClaimGraphRow {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct EventClusterRow {
+    pub event_cluster_id: Uuid,
+    pub cluster_version: i32,
+    pub canonical_title: String,
+    pub event_time: Option<DateTime<Utc>>,
+    pub first_seen_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+    pub lifecycle_status: String,
+    pub primary_evidence_id: Uuid,
+    pub representative_ids: Vec<Uuid>,
+    pub source_entropy: f64,
+    pub independent_sources: i32,
+    pub mention_count: i32,
+    pub cluster_payload: Value,
+    pub supersedes_version: Option<i32>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventDeltaRow {
+    pub event_cluster_id: Uuid,
+    pub from_version: i32,
+    pub to_version: i32,
+    pub delta_payload: Value,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventHypothesisRow {
+    pub hypothesis_id: Uuid,
+    pub event_cluster_id: Uuid,
+    pub cluster_version: i32,
+    pub hypothesis_version: i32,
+    pub schema_version: String,
+    pub graph_payload: Value,
+    pub frozen_at: DateTime<Utc>,
+    pub based_on_claim_ids: Vec<Uuid>,
+    pub review_status: String,
+    pub supersedes_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MarketObservationRow {
+    pub hypothesis_id: Uuid,
+    pub entity_type: String,
+    pub entity_id: String,
+    pub trade_date: NaiveDate,
+    pub observation_status: String,
+    pub market_alignment_score: Option<f64>,
+    pub causal_confidence: f64,
+    pub abnormal_market_return: Option<f64>,
+    pub abnormal_industry_return: Option<f64>,
+    pub market_metrics: Value,
+    pub confounding_events: Value,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct DailyEventBriefRow {
     pub trade_date: NaiveDate,
     pub brief_version: String,
@@ -135,6 +194,15 @@ pub(crate) struct ManualEvidenceInsertEffect<T> {
     pub result: T,
     pub duplicate_group: Option<DuplicateGroupRow>,
 }
+
+const MARKET_OBSERVATION_STATUSES: &[&str] = &[
+    "not_observed",
+    "market_aligned",
+    "market_contradicted",
+    "ambiguous",
+    "confounded",
+    "expired",
+];
 
 #[derive(Clone)]
 pub struct EventRepository {
@@ -414,6 +482,149 @@ impl EventRepository {
         .await?;
 
         Ok(graph.claim_graph_id)
+    }
+
+    pub async fn save_event_cluster_version(&self, row: &EventClusterRow) -> Result<()> {
+        sqlx::query(
+            r#"INSERT INTO market_event_clusters
+               (event_cluster_id, cluster_version, canonical_title, event_time,
+                first_seen_at, last_seen_at, lifecycle_status, primary_evidence_id,
+                representative_ids, source_entropy, independent_sources, mention_count,
+                cluster_payload, supersedes_version, created_at)
+               VALUES ($1, $2, $3, $4,
+                       $5, $6, $7, $8,
+                       $9, $10, $11, $12,
+                       $13, $14, $15)"#,
+        )
+        .bind(row.event_cluster_id)
+        .bind(row.cluster_version)
+        .bind(&row.canonical_title)
+        .bind(row.event_time)
+        .bind(row.first_seen_at)
+        .bind(row.last_seen_at)
+        .bind(&row.lifecycle_status)
+        .bind(row.primary_evidence_id)
+        .bind(&row.representative_ids)
+        .bind(row.source_entropy)
+        .bind(row.independent_sources)
+        .bind(row.mention_count)
+        .bind(&row.cluster_payload)
+        .bind(row.supersedes_version)
+        .bind(row.created_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn save_event_delta(&self, row: &EventDeltaRow) -> Result<()> {
+        if row.to_version != row.from_version + 1 {
+            return Err(AppError::BadRequest(format!(
+                "market event delta versions must be adjacent: {} -> {}",
+                row.from_version, row.to_version
+            )));
+        }
+
+        sqlx::query(
+            r#"INSERT INTO market_event_deltas
+               (event_cluster_id, from_version, to_version, delta_payload, created_at)
+               VALUES ($1, $2, $3, $4, $5)"#,
+        )
+        .bind(row.event_cluster_id)
+        .bind(row.from_version)
+        .bind(row.to_version)
+        .bind(&row.delta_payload)
+        .bind(row.created_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn save_frozen_hypothesis(&self, row: &EventHypothesisRow) -> Result<Uuid> {
+        sqlx::query(
+            r#"INSERT INTO market_event_hypotheses
+               (hypothesis_id, event_cluster_id, cluster_version, hypothesis_version,
+                schema_version, graph_payload, frozen_at, based_on_claim_ids,
+                review_status, supersedes_id, created_at)
+               VALUES ($1, $2, $3, $4,
+                       $5, $6, $7, $8,
+                       $9, $10, $11)"#,
+        )
+        .bind(row.hypothesis_id)
+        .bind(row.event_cluster_id)
+        .bind(row.cluster_version)
+        .bind(row.hypothesis_version)
+        .bind(&row.schema_version)
+        .bind(&row.graph_payload)
+        .bind(row.frozen_at)
+        .bind(&row.based_on_claim_ids)
+        .bind(&row.review_status)
+        .bind(row.supersedes_id)
+        .bind(row.created_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(row.hypothesis_id)
+    }
+
+    pub async fn save_market_observation(&self, row: &MarketObservationRow) -> Result<()> {
+        validate_market_observation_status(&row.observation_status)?;
+
+        sqlx::query(
+            r#"INSERT INTO market_event_market_observations
+               (hypothesis_id, entity_type, entity_id, trade_date, observation_status,
+                market_alignment_score, causal_confidence, abnormal_market_return,
+                abnormal_industry_return, market_metrics, confounding_events, created_at)
+               VALUES ($1, $2, $3, $4, $5,
+                       $6, $7, $8,
+                       $9, $10, $11, $12)"#,
+        )
+        .bind(row.hypothesis_id)
+        .bind(&row.entity_type)
+        .bind(&row.entity_id)
+        .bind(row.trade_date)
+        .bind(&row.observation_status)
+        .bind(row.market_alignment_score)
+        .bind(row.causal_confidence)
+        .bind(row.abnormal_market_return)
+        .bind(row.abnormal_industry_return)
+        .bind(&row.market_metrics)
+        .bind(&row.confounding_events)
+        .bind(row.created_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn latest_cluster_version(&self, id: Uuid) -> Result<Option<EventClusterRow>> {
+        let row = sqlx::query(
+            r#"SELECT event_cluster_id,
+                      cluster_version,
+                      canonical_title,
+                      event_time,
+                      first_seen_at,
+                      last_seen_at,
+                      lifecycle_status,
+                      primary_evidence_id,
+                      representative_ids,
+                      source_entropy::float8 AS source_entropy,
+                      independent_sources,
+                      mention_count,
+                      cluster_payload,
+                      supersedes_version,
+                      created_at
+               FROM market_event_clusters
+               WHERE event_cluster_id = $1
+               ORDER BY cluster_version DESC, created_at DESC
+               LIMIT 1"#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(event_cluster_from_row))
     }
 
     pub async fn save_daily_brief(&self, brief: &DailyEventBriefRow) -> Result<()> {
@@ -720,6 +931,17 @@ fn evidence_select_sql(where_and_order: &str) -> String {
     )
 }
 
+fn validate_market_observation_status(status: &str) -> Result<()> {
+    if MARKET_OBSERVATION_STATUSES.contains(&status) {
+        return Ok(());
+    }
+
+    Err(AppError::BadRequest(format!(
+        "market observation status must be one of: {}",
+        MARKET_OBSERVATION_STATUSES.join(", ")
+    )))
+}
+
 pub(crate) fn canonicalize_source_url(value: &str) -> Result<String> {
     let trimmed = value.trim();
     let mut url = Url::parse(trimmed).map_err(|error| {
@@ -760,6 +982,26 @@ fn daily_event_brief_from_row(row: sqlx::postgres::PgRow) -> DailyEventBriefRow 
         structured_payload: row.get("structured_payload"),
         input_fingerprint: row.get("input_fingerprint"),
         generated_at: row.get("generated_at"),
+    }
+}
+
+fn event_cluster_from_row(row: sqlx::postgres::PgRow) -> EventClusterRow {
+    EventClusterRow {
+        event_cluster_id: row.get("event_cluster_id"),
+        cluster_version: row.get("cluster_version"),
+        canonical_title: row.get("canonical_title"),
+        event_time: row.get("event_time"),
+        first_seen_at: row.get("first_seen_at"),
+        last_seen_at: row.get("last_seen_at"),
+        lifecycle_status: row.get("lifecycle_status"),
+        primary_evidence_id: row.get("primary_evidence_id"),
+        representative_ids: row.get("representative_ids"),
+        source_entropy: row.get("source_entropy"),
+        independent_sources: row.get("independent_sources"),
+        mention_count: row.get("mention_count"),
+        cluster_payload: row.get("cluster_payload"),
+        supersedes_version: row.get("supersedes_version"),
+        created_at: row.get("created_at"),
     }
 }
 
@@ -1372,10 +1614,11 @@ impl DuplicateGroupPersistenceGateHandle {
 mod tests {
     use super::{
         ClaimEvidenceRow, ClaimGraphRow, ClaimRow, DailyEventBriefRow, DuplicateGroupMemberRow,
-        DuplicateGroupRow, EventEvidenceRow, EventRepository, EventRevisionRow, ExtractionRow,
-        ManualEvidenceInsertEffect,
+        DuplicateGroupRow, EventClusterRow, EventDeltaRow, EventEvidenceRow, EventHypothesisRow,
+        EventRepository, EventRevisionRow, ExtractionRow, ManualEvidenceInsertEffect,
+        MarketObservationRow,
     };
-    use crate::error::Result;
+    use crate::error::{AppError, Result};
     use chrono::{DateTime, NaiveDate, TimeZone, Utc};
     use serde_json::{json, Value};
     use sqlx::PgPool;
@@ -1442,6 +1685,89 @@ mod tests {
             review_status: "published".to_string(),
             evidence: vec![ClaimEvidenceRow { evidence_id }],
             created_at: dt(2026, 7, 10, 12),
+        }
+    }
+
+    fn event_cluster(
+        event_cluster_id: Uuid,
+        cluster_version: i32,
+        primary_evidence_id: Uuid,
+    ) -> EventClusterRow {
+        EventClusterRow {
+            event_cluster_id,
+            cluster_version,
+            canonical_title: format!("Cluster {event_cluster_id} v{cluster_version}"),
+            event_time: Some(dt(2026, 7, 10, 9)),
+            first_seen_at: dt(2026, 7, 10, 10),
+            last_seen_at: dt(2026, 7, 10, 11 + cluster_version as u32),
+            lifecycle_status: "active".to_string(),
+            primary_evidence_id,
+            representative_ids: vec![primary_evidence_id],
+            source_entropy: 0.42,
+            independent_sources: cluster_version,
+            mention_count: cluster_version,
+            cluster_payload: json!({
+                "clusterVersion": cluster_version,
+                "title": format!("Cluster {event_cluster_id} v{cluster_version}")
+            }),
+            supersedes_version: (cluster_version > 1).then_some(cluster_version - 1),
+            created_at: dt(2026, 7, 10, 12 + cluster_version as u32),
+        }
+    }
+
+    fn event_delta(event_cluster_id: Uuid, from_version: i32, to_version: i32) -> EventDeltaRow {
+        EventDeltaRow {
+            event_cluster_id,
+            from_version,
+            to_version,
+            delta_payload: json!({
+                "fromVersion": from_version,
+                "toVersion": to_version
+            }),
+            created_at: dt(2026, 7, 10, 15),
+        }
+    }
+
+    fn frozen_hypothesis(
+        event_cluster_id: Uuid,
+        cluster_version: i32,
+        supersedes_id: Option<Uuid>,
+    ) -> EventHypothesisRow {
+        EventHypothesisRow {
+            hypothesis_id: Uuid::new_v4(),
+            event_cluster_id,
+            cluster_version,
+            hypothesis_version: 1,
+            schema_version: "hypothesis-schema-v1".to_string(),
+            graph_payload: json!({
+                "nodes": [{"id": "impact-1", "type": "CompanyOrder"}],
+                "edges": []
+            }),
+            frozen_at: dt(2026, 7, 10, 16),
+            based_on_claim_ids: vec![Uuid::new_v4()],
+            review_status: "draft".to_string(),
+            supersedes_id,
+            created_at: dt(2026, 7, 10, 16),
+        }
+    }
+
+    fn market_observation(hypothesis_id: Uuid, observation_status: &str) -> MarketObservationRow {
+        MarketObservationRow {
+            hypothesis_id,
+            entity_type: "company".to_string(),
+            entity_id: "ACME".to_string(),
+            trade_date: date(2026, 7, 13),
+            observation_status: observation_status.to_string(),
+            market_alignment_score: Some(0.67),
+            causal_confidence: 0.31,
+            abnormal_market_return: Some(0.0142),
+            abnormal_industry_return: Some(0.0084),
+            market_metrics: json!({
+                "window": "t+1",
+                "benchmark": "SPY"
+            }),
+            confounding_events: json!([]),
+            created_at: dt(2026, 7, 10, 17),
         }
     }
 
@@ -2352,6 +2678,178 @@ mod tests {
         };
         let result = repo.save_claim_graph(&duplicate).await;
         assert!(result.is_err());
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn event_cluster_versions_append_and_latest_version_is_returned(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = EventRepository::new(pool.clone());
+        let evidence_row = evidence("cluster-version-source", 1, "publishable");
+        save_evidence(&pool, &evidence_row).await;
+
+        let cluster_id = Uuid::new_v4();
+        let v1 = event_cluster(cluster_id, 1, evidence_row.evidence_id);
+        let v2 = EventClusterRow {
+            last_seen_at: dt(2026, 7, 10, 14),
+            mention_count: 2,
+            independent_sources: 2,
+            source_entropy: 0.73,
+            cluster_payload: json!({
+                "clusterVersion": 2,
+                "title": "Cluster evolved"
+            }),
+            created_at: dt(2026, 7, 10, 14),
+            ..event_cluster(cluster_id, 2, evidence_row.evidence_id)
+        };
+
+        repo.save_event_cluster_version(&v1).await.unwrap();
+        repo.save_event_cluster_version(&v2).await.unwrap();
+
+        let latest = repo
+            .latest_cluster_version(cluster_id)
+            .await
+            .unwrap()
+            .expect("latest cluster version");
+        assert_eq!(latest.cluster_version, 2);
+        assert_eq!(latest.cluster_payload["title"], json!("Cluster evolved"));
+
+        let stored_versions: Vec<i32> = sqlx::query_scalar(
+            r#"SELECT cluster_version
+               FROM market_event_clusters
+               WHERE event_cluster_id = $1
+               ORDER BY cluster_version ASC"#,
+        )
+        .bind(cluster_id)
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(stored_versions, vec![1, 2]);
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn event_deltas_persist_when_versions_are_adjacent(pool: PgPool) -> sqlx::Result<()> {
+        let repo = EventRepository::new(pool.clone());
+        let evidence_row = evidence("delta-adjacent-source", 1, "publishable");
+        save_evidence(&pool, &evidence_row).await;
+
+        let cluster_id = Uuid::new_v4();
+        repo.save_event_cluster_version(&event_cluster(cluster_id, 1, evidence_row.evidence_id))
+            .await
+            .unwrap();
+        repo.save_event_cluster_version(&event_cluster(cluster_id, 2, evidence_row.evidence_id))
+            .await
+            .unwrap();
+
+        let delta = event_delta(cluster_id, 1, 2);
+        repo.save_event_delta(&delta).await.unwrap();
+
+        let stored: (i32, i32, Value) = sqlx::query_as(
+            r#"SELECT from_version, to_version, delta_payload
+               FROM market_event_deltas
+               WHERE event_cluster_id = $1
+                 AND from_version = $2
+                 AND to_version = $3"#,
+        )
+        .bind(cluster_id)
+        .bind(1_i32)
+        .bind(2_i32)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(stored.0, 1);
+        assert_eq!(stored.1, 2);
+        assert_eq!(stored.2["toVersion"], json!(2));
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn event_deltas_reject_non_adjacent_versions_at_application_layer(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = EventRepository::new(pool.clone());
+        let evidence_row = evidence("delta-non-adjacent-source", 1, "publishable");
+        save_evidence(&pool, &evidence_row).await;
+
+        let cluster_id = Uuid::new_v4();
+        repo.save_event_cluster_version(&event_cluster(cluster_id, 1, evidence_row.evidence_id))
+            .await
+            .unwrap();
+        repo.save_event_cluster_version(&event_cluster(cluster_id, 3, evidence_row.evidence_id))
+            .await
+            .unwrap();
+
+        let error = repo
+            .save_event_delta(&event_delta(cluster_id, 1, 3))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AppError::BadRequest(_)));
+        assert!(error.to_string().contains("adjacent"));
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn frozen_hypothesis_payloads_reject_direct_update(pool: PgPool) -> sqlx::Result<()> {
+        let repo = EventRepository::new(pool.clone());
+        let evidence_row = evidence("hypothesis-immutable-source", 1, "publishable");
+        save_evidence(&pool, &evidence_row).await;
+
+        let cluster_id = Uuid::new_v4();
+        repo.save_event_cluster_version(&event_cluster(cluster_id, 1, evidence_row.evidence_id))
+            .await
+            .unwrap();
+
+        let hypothesis = frozen_hypothesis(cluster_id, 1, None);
+        repo.save_frozen_hypothesis(&hypothesis).await.unwrap();
+
+        let update_error = sqlx::query(
+            r#"UPDATE market_event_hypotheses
+               SET graph_payload = '{"nodes":[{"id":"mutated"}],"edges":[]}'::jsonb
+               WHERE hypothesis_id = $1"#,
+        )
+        .bind(hypothesis.hypothesis_id)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+        assert!(update_error.to_string().contains("append-only"));
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn market_observations_require_an_existing_hypothesis(pool: PgPool) -> sqlx::Result<()> {
+        let repo = EventRepository::new(pool);
+        let error = repo
+            .save_market_observation(&market_observation(Uuid::new_v4(), "market_aligned"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("foreign key constraint"));
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn market_observations_accept_only_configured_statuses(pool: PgPool) -> sqlx::Result<()> {
+        let repo = EventRepository::new(pool.clone());
+        let evidence_row = evidence("observation-status-source", 1, "publishable");
+        save_evidence(&pool, &evidence_row).await;
+
+        let cluster_id = Uuid::new_v4();
+        repo.save_event_cluster_version(&event_cluster(cluster_id, 1, evidence_row.evidence_id))
+            .await
+            .unwrap();
+        let hypothesis = frozen_hypothesis(cluster_id, 1, None);
+        repo.save_frozen_hypothesis(&hypothesis).await.unwrap();
+
+        let invalid = market_observation(hypothesis.hypothesis_id, "confirmed");
+        let error = repo.save_market_observation(&invalid).await.unwrap_err();
+        assert!(matches!(error, AppError::BadRequest(_)));
+        assert!(error.to_string().contains("not_observed"));
+        assert!(error.to_string().contains("market_aligned"));
+        assert!(error.to_string().contains("expired"));
+
         Ok(())
     }
 }
