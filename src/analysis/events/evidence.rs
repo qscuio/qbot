@@ -13,7 +13,7 @@ use super::{
 use crate::error::{AppError, Result};
 use crate::storage::event_repository::{
     DuplicateGroupMemberRow, DuplicateGroupRow, EventEvidenceRow, EventRepository,
-    ManualDuplicateCandidateRow,
+    ManualDuplicateCandidateRow, ManualEvidenceInsertContext, ManualEvidenceInsertEffect,
 };
 
 pub(crate) const MANUAL_SOURCE_TELEGRAM: &str = "manual:telegram";
@@ -47,6 +47,8 @@ pub(crate) struct ManualEvidenceIngestor {
     auto_near_duplicate_threshold: f64,
     #[cfg(test)]
     duplicate_lookup_barrier: Option<test_support::DuplicateLookupBarrier>,
+    #[cfg(test)]
+    duplicate_group_persistence_gate: Option<test_support::DuplicateGroupPersistenceGate>,
 }
 
 impl ManualEvidenceIngestor {
@@ -69,6 +71,8 @@ impl ManualEvidenceIngestor {
             auto_near_duplicate_threshold,
             #[cfg(test)]
             duplicate_lookup_barrier: None,
+            #[cfg(test)]
+            duplicate_group_persistence_gate: None,
         }
     }
 
@@ -130,44 +134,24 @@ impl ManualEvidenceIngestor {
             status: MANUAL_STATUS_PENDING.to_string(),
             created_at: first_seen_at,
         };
-        let insert_result = self.repo.insert_manual_evidence(&row).await?;
-
         let submitted = event_evidence_from_row(&row);
-        if insert_result.existing_rows.is_empty() {
-            return Ok(ManualEventSubmissionOutcome::Inserted(submitted));
+        let outcome = self
+            .repo
+            .insert_manual_evidence_with_effect(&row, |context| async move {
+                build_manual_submission_effect(
+                    self.auto_near_duplicate_threshold,
+                    submitted,
+                    context,
+                )
+            })
+            .await?;
+        #[cfg(test)]
+        if matches!(outcome, ManualEventSubmissionOutcome::Existing(_)) {
+            self.wait_before_duplicate_group_persistence(&content_hash)
+                .await;
         }
 
-        let decision = DuplicateDecider::new(self.auto_near_duplicate_threshold).classify(
-            &duplicate_subject_from_row(&row),
-            &duplicate_candidates_from_rows(&insert_result.existing_candidates),
-        );
-
-        if matches!(decision, DuplicateResolution::Independent) {
-            return Ok(ManualEventSubmissionOutcome::Inserted(submitted));
-        }
-
-        let duplicate_group =
-            duplicate_group_from_decision(&decision, &insert_result.existing_rows, &row);
-        self.repo.append_duplicate_group(&duplicate_group).await?;
-
-        let representative_id = decision
-            .representative_id()
-            .expect("non-independent duplicate decisions must select a representative");
-        let representative = insert_result
-            .existing_rows
-            .iter()
-            .find(|existing| existing.evidence_id == representative_id)
-            .cloned()
-            .expect(
-                "duplicate decision representative must exist in the existing-row candidate set",
-            );
-
-        Ok(ManualEventSubmissionOutcome::Existing(
-            ExistingEventEvidenceRelation {
-                submitted,
-                existing: event_evidence_from_row(&representative),
-            },
-        ))
+        Ok(outcome)
     }
 
     #[cfg(test)]
@@ -187,6 +171,25 @@ impl ManualEvidenceIngestor {
     async fn wait_after_duplicate_lookup(&self, content_hash: &str) {
         if let Some(barrier) = &self.duplicate_lookup_barrier {
             barrier.wait(content_hash).await;
+        }
+    }
+
+    #[cfg(test)]
+    fn clone_with_duplicate_group_persistence_gate_for_test(
+        &self,
+        content_hash: impl Into<String>,
+    ) -> (Self, test_support::DuplicateGroupPersistenceGateHandle) {
+        let mut clone = self.clone();
+        let (gate, handle) =
+            test_support::DuplicateGroupPersistenceGate::for_content_hash(content_hash);
+        clone.duplicate_group_persistence_gate = Some(gate);
+        (clone, handle)
+    }
+
+    #[cfg(test)]
+    async fn wait_before_duplicate_group_persistence(&self, content_hash: &str) {
+        if let Some(gate) = &self.duplicate_group_persistence_gate {
+            gate.wait(content_hash).await;
         }
     }
 }
@@ -255,6 +258,51 @@ fn duplicate_candidates_from_rows(rows: &[ManualDuplicateCandidateRow]) -> Vec<D
         .collect()
 }
 
+fn build_manual_submission_effect(
+    auto_near_duplicate_threshold: f64,
+    submitted: EventEvidence,
+    context: ManualEvidenceInsertContext,
+) -> Result<ManualEvidenceInsertEffect<ManualEventSubmissionOutcome>> {
+    if context.existing_rows.is_empty() {
+        return Ok(ManualEvidenceInsertEffect {
+            result: ManualEventSubmissionOutcome::Inserted(submitted),
+            duplicate_group: None,
+        });
+    }
+
+    let decision = DuplicateDecider::new(auto_near_duplicate_threshold).classify(
+        &duplicate_subject_from_row(&context.submitted_row),
+        &duplicate_candidates_from_rows(&context.existing_candidates),
+    );
+
+    if matches!(decision, DuplicateResolution::Independent) {
+        return Ok(ManualEvidenceInsertEffect {
+            result: ManualEventSubmissionOutcome::Inserted(submitted),
+            duplicate_group: None,
+        });
+    }
+
+    let duplicate_group =
+        duplicate_group_from_decision(&decision, &context.existing_rows, &context.submitted_row);
+    let representative_id = decision
+        .representative_id()
+        .expect("non-independent duplicate decisions must select a representative");
+    let representative = context
+        .existing_rows
+        .iter()
+        .find(|existing| existing.evidence_id == representative_id)
+        .cloned()
+        .expect("duplicate decision representative must exist in the existing-row candidate set");
+
+    Ok(ManualEvidenceInsertEffect {
+        result: ManualEventSubmissionOutcome::Existing(ExistingEventEvidenceRelation {
+            submitted,
+            existing: event_evidence_from_row(&representative),
+        }),
+        duplicate_group: Some(duplicate_group),
+    })
+}
+
 fn duplicate_group_from_decision(
     decision: &DuplicateResolution,
     existing_rows: &[EventEvidenceRow],
@@ -313,9 +361,12 @@ fn duplicate_group_id(representative_id: Uuid) -> Uuid {
 
 #[cfg(test)]
 mod test_support {
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
 
-    use tokio::sync::Barrier;
+    use tokio::sync::{Barrier, Notify};
 
     #[derive(Clone)]
     pub(super) enum DuplicateLookupBarrierScope {
@@ -344,6 +395,67 @@ mod test_support {
             if should_wait {
                 self.barrier.wait().await;
             }
+        }
+    }
+
+    #[derive(Clone)]
+    pub(super) enum DuplicateGroupPersistenceGateScope {
+        ContentHash(String),
+    }
+
+    #[derive(Clone)]
+    pub(super) struct DuplicateGroupPersistenceGate {
+        scope: DuplicateGroupPersistenceGateScope,
+        blocked: Arc<Notify>,
+        release: Arc<Notify>,
+        triggered: Arc<AtomicBool>,
+    }
+
+    #[derive(Clone)]
+    pub(super) struct DuplicateGroupPersistenceGateHandle {
+        blocked: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    impl DuplicateGroupPersistenceGate {
+        pub(super) fn for_content_hash(
+            content_hash: impl Into<String>,
+        ) -> (Self, DuplicateGroupPersistenceGateHandle) {
+            let blocked = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+
+            (
+                Self {
+                    scope: DuplicateGroupPersistenceGateScope::ContentHash(content_hash.into()),
+                    blocked: blocked.clone(),
+                    release: release.clone(),
+                    triggered: Arc::new(AtomicBool::new(false)),
+                },
+                DuplicateGroupPersistenceGateHandle { blocked, release },
+            )
+        }
+
+        pub(super) async fn wait(&self, content_hash: &str) {
+            let should_wait = match &self.scope {
+                DuplicateGroupPersistenceGateScope::ContentHash(expected_hash) => {
+                    expected_hash == content_hash
+                }
+            };
+
+            if should_wait && !self.triggered.swap(true, Ordering::SeqCst) {
+                self.blocked.notify_one();
+                self.release.notified().await;
+            }
+        }
+    }
+
+    impl DuplicateGroupPersistenceGateHandle {
+        pub(super) async fn wait_until_blocked(&self) {
+            self.blocked.notified().await;
+        }
+
+        pub(super) fn release(&self) {
+            self.release.notify_one();
         }
     }
 }
@@ -988,6 +1100,142 @@ mod tests {
 
         assert_eq!(inserted_count, 1);
         assert_eq!(existing_count, 1);
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn concurrent_different_hash_near_duplicates_share_one_duplicate_group_and_representative(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = EventRepository::new(pool.clone());
+        let base_ingestor =
+            ManualEvidenceIngestor::new(repo.clone(), Arc::new(AShareTradingDateResolver));
+
+        let base = assert_inserted(
+            base_ingestor
+                .submit_at(
+                    ManualSource::Rest,
+                    ManualEventInput {
+                        title: "Acme wins supply contract in Shenzhen".to_string(),
+                        content: Some(
+                            "Acme signed a long-term supply contract with Shenzhen transit authority today."
+                                .to_string(),
+                        ),
+                        source_url: Some("https://example.com/contracts/acme-base".to_string()),
+                        submitted_by: "operator".to_string(),
+                        published_at: Some(dt(2026, 7, 10, 6, 20, 0)),
+                    },
+                    dt(2026, 7, 10, 8, 0, 0),
+                )
+                .await
+                .unwrap(),
+        );
+
+        let left_input = ManualEventInput {
+            title: "Acme wins major supply contract in Shenzhen".to_string(),
+            content: Some(
+                "Acme signed a long-term supply contract with Shenzhen transit authority today. Follow-up market note."
+                    .to_string(),
+            ),
+            source_url: Some("https://example.com/contracts/acme-left".to_string()),
+            submitted_by: "operator".to_string(),
+            published_at: Some(dt(2026, 7, 10, 6, 30, 0)),
+        };
+        let right_input = ManualEventInput {
+            title: "Acme wins major supply contract in Shenzhen".to_string(),
+            content: Some(
+                "Acme signed a long-term supply contract with Shenzhen transit authority today. Follow-up market note with pricing context."
+                    .to_string(),
+            ),
+            source_url: Some("https://example.com/contracts/acme-right".to_string()),
+            submitted_by: "operator".to_string(),
+            published_at: Some(dt(2026, 7, 10, 6, 35, 0)),
+        };
+        let (ingestor, gate) = base_ingestor.clone_with_duplicate_group_persistence_gate_for_test(
+            content_hash(&left_input.title, left_input.content.as_deref()),
+        );
+
+        let left_worker = tokio::spawn({
+            let ingestor = ingestor.clone();
+            let input = left_input.clone();
+            async move {
+                ingestor
+                    .submit_at(ManualSource::Rest, input, dt(2026, 7, 10, 8, 5, 0))
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), gate.wait_until_blocked())
+            .await
+            .expect("left near-duplicate submission should reach the persistence gate");
+
+        let right = assert_existing(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                ingestor.submit_at(ManualSource::Rest, right_input, dt(2026, 7, 10, 8, 5, 1)),
+            )
+            .await
+            .expect("right near-duplicate submission should complete while the left is paused")
+            .unwrap(),
+        );
+
+        gate.release();
+        let left = assert_existing(
+            tokio::time::timeout(Duration::from_secs(5), left_worker)
+                .await
+                .expect("left near-duplicate worker should resume after the gate releases")
+                .unwrap()
+                .unwrap(),
+        );
+
+        let evidence_ids = vec![
+            base.evidence_id,
+            left.submitted.evidence_id,
+            right.submitted.evidence_id,
+        ];
+        let membership_counts: Vec<(Uuid, i64)> = sqlx::query_as(
+            r#"SELECT evidence_id, COUNT(DISTINCT duplicate_group_id) AS membership_count
+               FROM market_event_duplicate_members
+               WHERE evidence_id = ANY($1::uuid[])
+               GROUP BY evidence_id
+               ORDER BY evidence_id ASC"#,
+        )
+        .bind(&evidence_ids)
+        .fetch_all(&pool)
+        .await?;
+        let mut expected_membership_counts = evidence_ids
+            .iter()
+            .copied()
+            .map(|evidence_id| (evidence_id, 1))
+            .collect::<Vec<_>>();
+        expected_membership_counts.sort_by_key(|(evidence_id, _)| *evidence_id);
+        assert_eq!(membership_counts, expected_membership_counts);
+
+        let duplicate_group_id: Uuid = sqlx::query_scalar(
+            r#"SELECT duplicate_group_id
+               FROM market_event_duplicate_members
+               WHERE evidence_id = $1"#,
+        )
+        .bind(base.evidence_id)
+        .fetch_one(&pool)
+        .await?;
+        let members: Vec<(Uuid, bool)> = sqlx::query_as(
+            r#"SELECT evidence_id, is_representative
+               FROM market_event_duplicate_members
+               WHERE duplicate_group_id = $1
+               ORDER BY is_representative DESC, evidence_id ASC"#,
+        )
+        .bind(duplicate_group_id)
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(members.len(), 3);
+        assert_eq!(members[0], (base.evidence_id, true));
+        assert!(members
+            .iter()
+            .any(|member| member.0 == left.submitted.evidence_id && !member.1));
+        assert!(members
+            .iter()
+            .any(|member| member.0 == right.submitted.evidence_id && !member.1));
 
         Ok(())
     }

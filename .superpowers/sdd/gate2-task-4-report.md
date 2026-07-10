@@ -251,3 +251,49 @@
 ### Commit hash
 
 - `e48af44a3d3b2485f65e94ef4748c7c348534a37`
+
+## Fix follow-up: atomic duplicate-group persistence rereview addressed on 2026-07-10
+
+### Review issue and what changed
+
+- Issue: `EventRepository::insert_manual_evidence()` committed the inserted evidence row before duplicate classification and duplicate-group append finished in `ManualEvidenceIngestor::submit_at()`. That let a concurrent near-duplicate submission discover a fresh evidence row before its duplicate-group membership existed, derive a different representative, and split the duplicate set across multiple groups.
+- `src/storage/event_repository.rs` now owns a new transaction-scoped manual-ingestion callback path that:
+  - canonicalizes the submitted row
+  - acquires the manual duplicate discovery advisory lock
+  - discovers duplicate candidates
+  - hands analysis an owned candidate context
+  - inserts the submitted row
+  - persists the optional duplicate group with `append_duplicate_group_in_tx()`
+  - commits only after both the evidence row and duplicate-group membership are durable
+- `src/analysis/events/evidence.rs` now classifies duplicates and constructs the optional `DuplicateGroupRow` inside that repository callback through `build_manual_submission_effect()`, preserving the analysis/storage separation while moving persistence into the locked transaction scope.
+- Added a deterministic regression proving concurrent different-hash near-duplicate submissions around an existing base event collapse into exactly one duplicate group with one representative, even when the first submission is deliberately paused at the old stale-state boundary.
+
+### Red test evidence
+
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test concurrent_different_hash_near_duplicates_share_one_duplicate_group_and_representative -- --nocapture`
+  - failed before the fix
+  - membership counts showed split group attachment for the same duplicate set:
+    - left: one submitted row in `1` group, base representative in `2` groups, first concurrent submission in `2` groups
+    - right: expected all three evidence rows to belong to exactly `1` duplicate group
+
+### Green verification
+
+- `cargo fmt --all -- --check`
+  - passed
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test analysis::events::dedup -- --nocapture`
+  - passed, `10 passed; 0 failed`
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test analysis::events -- --nocapture`
+  - passed, `34 passed; 0 failed`
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test storage::event_repository -- --nocapture`
+  - passed, `14 passed; 0 failed`
+- `cargo test --all --locked config::tests::test_config_defaults`
+  - passed, `1 passed; 0 failed`
+- `git diff --check`
+  - passed
+- `cargo check --tests --locked`
+  - passed
+  - remaining warnings are the same pre-existing unused/dead-code warnings outside this Task 4 fix surface
+
+### Commit hash
+
+- `PENDING-AMEND`

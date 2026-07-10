@@ -111,6 +111,19 @@ pub struct ManualDuplicateCandidateRow {
     pub representative_evidence_id: Uuid,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ManualEvidenceInsertContext {
+    pub submitted_row: EventEvidenceRow,
+    pub existing_rows: Vec<EventEvidenceRow>,
+    pub existing_candidates: Vec<ManualDuplicateCandidateRow>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ManualEvidenceInsertEffect<T> {
+    pub result: T,
+    pub duplicate_group: Option<DuplicateGroupRow>,
+}
+
 #[derive(Clone)]
 pub struct EventRepository {
     pool: PgPool,
@@ -137,6 +150,27 @@ impl EventRepository {
         &self,
         row: &EventEvidenceRow,
     ) -> Result<ManualEvidenceInsertResult> {
+        self.insert_manual_evidence_with_effect(row, |context| async move {
+            Ok(ManualEvidenceInsertEffect {
+                result: ManualEvidenceInsertResult {
+                    existing_rows: context.existing_rows,
+                    existing_candidates: context.existing_candidates,
+                },
+                duplicate_group: None,
+            })
+        })
+        .await
+    }
+
+    pub(crate) async fn insert_manual_evidence_with_effect<T, F, Fut>(
+        &self,
+        row: &EventEvidenceRow,
+        build_effect: F,
+    ) -> Result<T>
+    where
+        F: FnOnce(ManualEvidenceInsertContext) -> Fut,
+        Fut: std::future::Future<Output = Result<ManualEvidenceInsertEffect<T>>>,
+    {
         let row = canonicalized_evidence_row(row)?;
         let mut tx = self.pool.begin().await?;
         lock_manual_duplicate_discovery_scope(&mut tx, &row).await?;
@@ -144,19 +178,25 @@ impl EventRepository {
         let existing_candidates = find_manual_duplicate_candidates_in_tx(&mut tx, &row).await?;
         #[cfg(test)]
         self.run_manual_insert_test_hook(&existing_candidates).await;
-        insert_evidence_in_tx(&mut tx, &row).await?;
-
-        tx.commit().await?;
-
         let existing_rows = existing_candidates
             .iter()
             .map(|candidate| candidate.row.clone())
             .collect();
-
-        Ok(ManualEvidenceInsertResult {
+        let effect = build_effect(ManualEvidenceInsertContext {
+            submitted_row: row.clone(),
             existing_rows,
             existing_candidates,
         })
+        .await?;
+
+        insert_evidence_in_tx(&mut tx, &row).await?;
+        if let Some(duplicate_group) = effect.duplicate_group.as_ref() {
+            append_duplicate_group_in_tx(&mut tx, duplicate_group).await?;
+        }
+
+        tx.commit().await?;
+
+        Ok(effect.result)
     }
 
     pub async fn find_existing_source_item(
@@ -192,13 +232,6 @@ impl EventRepository {
     pub async fn save_duplicate_group(&self, group: &DuplicateGroupRow) -> Result<Uuid> {
         let mut tx = self.pool.begin().await?;
         save_duplicate_group_in_tx(&mut tx, group).await?;
-        tx.commit().await?;
-        Ok(group.duplicate_group_id)
-    }
-
-    pub async fn append_duplicate_group(&self, group: &DuplicateGroupRow) -> Result<Uuid> {
-        let mut tx = self.pool.begin().await?;
-        append_duplicate_group_in_tx(&mut tx, group).await?;
         tx.commit().await?;
         Ok(group.duplicate_group_id)
     }
