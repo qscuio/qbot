@@ -377,6 +377,8 @@ def test_train_command_exports_from_explicit_json_inputs(tmp_path: Path) -> None
 
 
 def test_train_command_rejects_quarter_model_exports(tmp_path: Path) -> None:
+    output_path = tmp_path / "export.json"
+
     result = RUNNER.invoke(
         app,
         [
@@ -395,11 +397,15 @@ def test_train_command_rejects_quarter_model_exports(tmp_path: Path) -> None:
             str(tmp_path / "missing-positive.json"),
             "--failed-examples-json",
             str(tmp_path / "missing-failed.json"),
+            "--output-json",
+            str(output_path),
         ],
     )
 
     assert result.exit_code != 0
-    assert "only 'week' and 'month'" in result.stdout
+    assert "Invalid value for --horizon" in result.output
+    assert "only 'week' and 'month'" in result.output
+    assert not output_path.exists()
 
 
 def test_train_all_requires_explicit_plan_json_and_does_not_pretend_training_ran() -> None:
@@ -432,6 +438,30 @@ def test_train_all_exports_from_explicit_plan_json(tmp_path: Path) -> None:
     payload = json.loads(output_path.read_text(encoding="utf-8"))
     assert payload["exports"][0]["version_row"]["horizon"] == "month"
     assert payload["exports"][0]["version_row"]["status"] == "draft"
+
+
+def test_train_all_rejects_empty_exports_without_writing_output(tmp_path: Path) -> None:
+    plan_path = tmp_path / "plan.json"
+    output_path = tmp_path / "train-all-export.json"
+    plan_path.write_text(json.dumps({"exports": []}), encoding="utf-8")
+
+    result = RUNNER.invoke(
+        app,
+        [
+            "train-all",
+            "--as-of",
+            "2026-07-10",
+            "--plan-json",
+            str(plan_path),
+            "--output-json",
+            str(output_path),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "Invalid value" in result.output
+    assert "exports must contain at least one export item" in result.output
+    assert not output_path.exists()
 
 
 @pytest.mark.parametrize(

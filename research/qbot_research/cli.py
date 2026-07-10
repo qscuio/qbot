@@ -50,6 +50,11 @@ def train_all(
 
     plan_payload = _read_json_object(plan_json)
     export_items = _object_list_field(plan_payload, "exports")
+    if not export_items:
+        raise typer.BadParameter(
+            "exports must contain at least one export item",
+            param_hint="--plan-json",
+        )
     exported_payloads: list[dict[str, Any]] = []
     for item in export_items:
         horizon = validate_model_export_horizon(_string_field(item, "horizon"))
@@ -139,8 +144,7 @@ def train(
     try:
         model_horizon = validate_model_export_horizon(horizon)
     except ValueError as error:
-        typer.echo(str(error))
-        raise typer.Exit(2) from error
+        raise typer.BadParameter(str(error), param_hint="--horizon") from error
 
     metadata = ExportMetadata.from_payload(
         _read_json_object(metadata_json),
