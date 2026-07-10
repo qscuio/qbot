@@ -47,8 +47,6 @@ pub(crate) struct ManualEvidenceIngestor {
     auto_near_duplicate_threshold: f64,
     #[cfg(test)]
     duplicate_lookup_barrier: Option<test_support::DuplicateLookupBarrier>,
-    #[cfg(test)]
-    duplicate_group_persistence_gate: Option<test_support::DuplicateGroupPersistenceGate>,
 }
 
 impl ManualEvidenceIngestor {
@@ -71,8 +69,6 @@ impl ManualEvidenceIngestor {
             auto_near_duplicate_threshold,
             #[cfg(test)]
             duplicate_lookup_barrier: None,
-            #[cfg(test)]
-            duplicate_group_persistence_gate: None,
         }
     }
 
@@ -145,11 +141,6 @@ impl ManualEvidenceIngestor {
                 )
             })
             .await?;
-        #[cfg(test)]
-        if matches!(outcome, ManualEventSubmissionOutcome::Existing(_)) {
-            self.wait_before_duplicate_group_persistence(&content_hash)
-                .await;
-        }
 
         Ok(outcome)
     }
@@ -171,25 +162,6 @@ impl ManualEvidenceIngestor {
     async fn wait_after_duplicate_lookup(&self, content_hash: &str) {
         if let Some(barrier) = &self.duplicate_lookup_barrier {
             barrier.wait(content_hash).await;
-        }
-    }
-
-    #[cfg(test)]
-    fn clone_with_duplicate_group_persistence_gate_for_test(
-        &self,
-        content_hash: impl Into<String>,
-    ) -> (Self, test_support::DuplicateGroupPersistenceGateHandle) {
-        let mut clone = self.clone();
-        let (gate, handle) =
-            test_support::DuplicateGroupPersistenceGate::for_content_hash(content_hash);
-        clone.duplicate_group_persistence_gate = Some(gate);
-        (clone, handle)
-    }
-
-    #[cfg(test)]
-    async fn wait_before_duplicate_group_persistence(&self, content_hash: &str) {
-        if let Some(gate) = &self.duplicate_group_persistence_gate {
-            gate.wait(content_hash).await;
         }
     }
 }
@@ -282,8 +254,11 @@ fn build_manual_submission_effect(
         });
     }
 
-    let duplicate_group =
-        duplicate_group_from_decision(&decision, &context.existing_rows, &context.submitted_row);
+    let duplicate_group = duplicate_group_from_decision(
+        &decision,
+        &context.existing_candidates,
+        &context.submitted_row,
+    );
     let representative_id = decision
         .representative_id()
         .expect("non-independent duplicate decisions must select a representative");
@@ -305,7 +280,7 @@ fn build_manual_submission_effect(
 
 fn duplicate_group_from_decision(
     decision: &DuplicateResolution,
-    existing_rows: &[EventEvidenceRow],
+    existing_candidates: &[ManualDuplicateCandidateRow],
     submitted_row: &EventEvidenceRow,
 ) -> DuplicateGroupRow {
     let representative_id = decision
@@ -314,23 +289,41 @@ fn duplicate_group_from_decision(
     let confidence = decision
         .confidence()
         .expect("independent submissions must not persist duplicate groups");
-    let relation_type = decision
+    let default_relation_type = decision
         .relation_type()
         .expect("independent submissions must not persist duplicate groups");
-
-    let member_id_set: std::collections::BTreeSet<Uuid> = decision
-        .candidate_ids()
+    let candidate_ids: std::collections::BTreeSet<Uuid> =
+        decision.candidate_ids().iter().copied().collect();
+    let involved_representative_ids: std::collections::BTreeSet<Uuid> = existing_candidates
         .iter()
-        .copied()
-        .chain(decision.representative_id())
+        .filter(|candidate| {
+            candidate.row.evidence_id == representative_id
+                || candidate_ids.contains(&candidate.row.evidence_id)
+        })
+        .map(|candidate| candidate.representative_evidence_id)
+        .collect();
+    let relation_type = if involved_representative_ids.len() > 1 {
+        "review_required"
+    } else {
+        default_relation_type
+    };
+
+    let member_id_set: std::collections::BTreeSet<Uuid> = existing_candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.row.evidence_id == representative_id
+                || (candidate.representative_evidence_id == representative_id
+                    && candidate_ids.contains(&candidate.row.evidence_id))
+        })
+        .map(|candidate| candidate.row.evidence_id)
         .chain(std::iter::once(submitted_row.evidence_id))
         .collect();
-    let mut members: Vec<DuplicateGroupMemberRow> = existing_rows
+    let mut members: Vec<DuplicateGroupMemberRow> = existing_candidates
         .iter()
-        .filter(|row| member_id_set.contains(&row.evidence_id))
-        .map(|row| DuplicateGroupMemberRow {
-            evidence_id: row.evidence_id,
-            is_representative: row.evidence_id == representative_id,
+        .filter(|candidate| member_id_set.contains(&candidate.row.evidence_id))
+        .map(|candidate| DuplicateGroupMemberRow {
+            evidence_id: candidate.row.evidence_id,
+            is_representative: candidate.row.evidence_id == representative_id,
         })
         .collect();
     members.push(DuplicateGroupMemberRow {
@@ -361,12 +354,9 @@ fn duplicate_group_id(representative_id: Uuid) -> Uuid {
 
 #[cfg(test)]
 mod test_support {
-    use std::sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    };
+    use std::sync::Arc;
 
-    use tokio::sync::{Barrier, Notify};
+    use tokio::sync::Barrier;
 
     #[derive(Clone)]
     pub(super) enum DuplicateLookupBarrierScope {
@@ -395,67 +385,6 @@ mod test_support {
             if should_wait {
                 self.barrier.wait().await;
             }
-        }
-    }
-
-    #[derive(Clone)]
-    pub(super) enum DuplicateGroupPersistenceGateScope {
-        ContentHash(String),
-    }
-
-    #[derive(Clone)]
-    pub(super) struct DuplicateGroupPersistenceGate {
-        scope: DuplicateGroupPersistenceGateScope,
-        blocked: Arc<Notify>,
-        release: Arc<Notify>,
-        triggered: Arc<AtomicBool>,
-    }
-
-    #[derive(Clone)]
-    pub(super) struct DuplicateGroupPersistenceGateHandle {
-        blocked: Arc<Notify>,
-        release: Arc<Notify>,
-    }
-
-    impl DuplicateGroupPersistenceGate {
-        pub(super) fn for_content_hash(
-            content_hash: impl Into<String>,
-        ) -> (Self, DuplicateGroupPersistenceGateHandle) {
-            let blocked = Arc::new(Notify::new());
-            let release = Arc::new(Notify::new());
-
-            (
-                Self {
-                    scope: DuplicateGroupPersistenceGateScope::ContentHash(content_hash.into()),
-                    blocked: blocked.clone(),
-                    release: release.clone(),
-                    triggered: Arc::new(AtomicBool::new(false)),
-                },
-                DuplicateGroupPersistenceGateHandle { blocked, release },
-            )
-        }
-
-        pub(super) async fn wait(&self, content_hash: &str) {
-            let should_wait = match &self.scope {
-                DuplicateGroupPersistenceGateScope::ContentHash(expected_hash) => {
-                    expected_hash == content_hash
-                }
-            };
-
-            if should_wait && !self.triggered.swap(true, Ordering::SeqCst) {
-                self.blocked.notify_one();
-                self.release.notified().await;
-            }
-        }
-    }
-
-    impl DuplicateGroupPersistenceGateHandle {
-        pub(super) async fn wait_until_blocked(&self) {
-            self.blocked.notified().await;
-        }
-
-        pub(super) fn release(&self) {
-            self.release.notify_one();
         }
     }
 }
@@ -925,6 +854,174 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn matching_multiple_existing_duplicate_groups_persists_one_auditable_review_group_without_overlap(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = EventRepository::new(pool.clone());
+        let ingestor =
+            ManualEvidenceIngestor::new(repo.clone(), Arc::new(AShareTradingDateResolver));
+        let matching_title = "Acme restates quarterly guidance";
+        let matching_content = Some("Management reaffirmed the same guidance ranges.");
+
+        let first_group_representative = seeded_manual_evidence_row(
+            "split-group-a-representative",
+            "https://example.com/acme-guidance-a",
+            matching_title,
+            matching_content,
+            dt(2026, 7, 10, 7, 0, 0),
+            dt(2026, 7, 10, 7, 0, 0),
+        );
+        let first_group_member = seeded_manual_evidence_row(
+            "split-group-a-member",
+            "https://example.com/acme-guidance-a-member",
+            matching_title,
+            matching_content,
+            dt(2026, 7, 10, 7, 1, 0),
+            dt(2026, 7, 10, 7, 1, 0),
+        );
+        let second_group_representative = seeded_manual_evidence_row(
+            "split-group-b-representative",
+            "https://example.com/acme-guidance-b",
+            matching_title,
+            matching_content,
+            dt(2026, 7, 10, 7, 2, 0),
+            dt(2026, 7, 10, 7, 2, 0),
+        );
+        let second_group_member = seeded_manual_evidence_row(
+            "split-group-b-member",
+            "https://example.com/acme-guidance-b-member",
+            matching_title,
+            matching_content,
+            dt(2026, 7, 10, 7, 3, 0),
+            dt(2026, 7, 10, 7, 3, 0),
+        );
+
+        for row in [
+            &first_group_representative,
+            &first_group_member,
+            &second_group_representative,
+            &second_group_member,
+        ] {
+            repo.insert_evidence(row).await.unwrap();
+        }
+
+        repo.save_duplicate_group(&crate::storage::event_repository::DuplicateGroupRow {
+            duplicate_group_id: seeded_duplicate_group_id(first_group_representative.evidence_id),
+            relation_type: "exact".to_string(),
+            confidence: 1.0,
+            locked_by_user: false,
+            members: vec![
+                crate::storage::event_repository::DuplicateGroupMemberRow {
+                    evidence_id: first_group_representative.evidence_id,
+                    is_representative: true,
+                },
+                crate::storage::event_repository::DuplicateGroupMemberRow {
+                    evidence_id: first_group_member.evidence_id,
+                    is_representative: false,
+                },
+            ],
+            created_at: dt(2026, 7, 10, 7, 4, 0),
+        })
+        .await
+        .unwrap();
+        repo.save_duplicate_group(&crate::storage::event_repository::DuplicateGroupRow {
+            duplicate_group_id: seeded_duplicate_group_id(second_group_representative.evidence_id),
+            relation_type: "exact".to_string(),
+            confidence: 1.0,
+            locked_by_user: false,
+            members: vec![
+                crate::storage::event_repository::DuplicateGroupMemberRow {
+                    evidence_id: second_group_representative.evidence_id,
+                    is_representative: true,
+                },
+                crate::storage::event_repository::DuplicateGroupMemberRow {
+                    evidence_id: second_group_member.evidence_id,
+                    is_representative: false,
+                },
+            ],
+            created_at: dt(2026, 7, 10, 7, 5, 0),
+        })
+        .await
+        .unwrap();
+
+        let duplicate = assert_existing(
+            ingestor
+                .submit_at(
+                    ManualSource::Rest,
+                    ManualEventInput {
+                        title: matching_title.to_string(),
+                        content: matching_content.map(str::to_string),
+                        source_url: Some("https://example.com/acme-guidance-submitted".to_string()),
+                        submitted_by: "operator".to_string(),
+                        published_at: Some(dt(2026, 7, 10, 7, 10, 0)),
+                    },
+                    dt(2026, 7, 10, 7, 10, 0),
+                )
+                .await
+                .unwrap(),
+        );
+
+        assert_eq!(
+            duplicate.existing.evidence_id,
+            first_group_representative.evidence_id
+        );
+
+        let persisted_group: (Uuid, String) = sqlx::query_as(
+            r#"SELECT g.duplicate_group_id, g.relation_type
+               FROM market_event_duplicate_groups g
+               JOIN market_event_duplicate_members m
+                 ON m.duplicate_group_id = g.duplicate_group_id
+               WHERE m.evidence_id = $1"#,
+        )
+        .bind(duplicate.submitted.evidence_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(persisted_group.1, "review_required");
+
+        let persisted_members: Vec<Uuid> = sqlx::query_scalar(
+            r#"SELECT evidence_id
+               FROM market_event_duplicate_members
+               WHERE duplicate_group_id = $1
+               ORDER BY evidence_id ASC"#,
+        )
+        .bind(persisted_group.0)
+        .fetch_all(&pool)
+        .await?;
+        assert!(persisted_members.contains(&first_group_representative.evidence_id));
+        assert!(persisted_members.contains(&first_group_member.evidence_id));
+        assert!(persisted_members.contains(&duplicate.submitted.evidence_id));
+        assert!(!persisted_members.contains(&second_group_representative.evidence_id));
+        assert!(!persisted_members.contains(&second_group_member.evidence_id));
+
+        let relevant_evidence_ids = vec![
+            first_group_representative.evidence_id,
+            first_group_member.evidence_id,
+            second_group_representative.evidence_id,
+            second_group_member.evidence_id,
+            duplicate.submitted.evidence_id,
+        ];
+        let membership_counts: Vec<(Uuid, i64)> = sqlx::query_as(
+            r#"SELECT evidence_id, COUNT(DISTINCT duplicate_group_id) AS membership_count
+               FROM market_event_duplicate_members
+               WHERE evidence_id = ANY($1::uuid[])
+               GROUP BY evidence_id
+               ORDER BY evidence_id ASC"#,
+        )
+        .bind(&relevant_evidence_ids)
+        .fetch_all(&pool)
+        .await?;
+        let mut expected_membership_counts = relevant_evidence_ids
+            .iter()
+            .copied()
+            .map(|evidence_id| (evidence_id, 1))
+            .collect::<Vec<_>>();
+        expected_membership_counts.sort_by_key(|(evidence_id, _)| *evidence_id);
+        assert_eq!(membership_counts, expected_membership_counts);
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn live_manual_ingestion_uses_configured_threshold_for_review_required_duplicates(
         pool: PgPool,
     ) -> sqlx::Result<()> {
@@ -1152,9 +1249,12 @@ mod tests {
             submitted_by: "operator".to_string(),
             published_at: Some(dt(2026, 7, 10, 6, 35, 0)),
         };
-        let (ingestor, gate) = base_ingestor.clone_with_duplicate_group_persistence_gate_for_test(
-            content_hash(&left_input.title, left_input.content.as_deref()),
-        );
+        let (gated_repo, gate) = repo
+            .clone_with_manual_insert_duplicate_group_persistence_gate_for_test(content_hash(
+                &left_input.title,
+                left_input.content.as_deref(),
+            ));
+        let ingestor = ManualEvidenceIngestor::new(gated_repo, Arc::new(AShareTradingDateResolver));
 
         let left_worker = tokio::spawn({
             let ingestor = ingestor.clone();
@@ -1169,17 +1269,29 @@ mod tests {
             .await
             .expect("left near-duplicate submission should reach the persistence gate");
 
-        let right = assert_existing(
-            tokio::time::timeout(
-                Duration::from_secs(5),
-                ingestor.submit_at(ManualSource::Rest, right_input, dt(2026, 7, 10, 8, 5, 1)),
-            )
-            .await
-            .expect("right near-duplicate submission should complete while the left is paused")
-            .unwrap(),
+        let mut right_worker = tokio::spawn({
+            let ingestor = ingestor.clone();
+            async move {
+                ingestor
+                    .submit_at(ManualSource::Rest, right_input, dt(2026, 7, 10, 8, 5, 1))
+                    .await
+            }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut right_worker)
+                .await
+                .is_err(),
+            "right near-duplicate submission should still be blocked while the left transaction is paused",
         );
 
         gate.release();
+        let right = assert_existing(
+            tokio::time::timeout(Duration::from_secs(5), right_worker)
+                .await
+                .expect("right near-duplicate worker should resume after the gate releases")
+                .unwrap()
+                .unwrap(),
+        );
         let left = assert_existing(
             tokio::time::timeout(Duration::from_secs(5), left_worker)
                 .await
@@ -1416,6 +1528,53 @@ mod tests {
 
     fn normalize_for_expectation(value: &str) -> String {
         value.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    fn seeded_manual_evidence_row(
+        source_item_id: &str,
+        source_url: &str,
+        title: &str,
+        content: Option<&str>,
+        available_at: DateTime<Utc>,
+        created_at: DateTime<Utc>,
+    ) -> EventEvidenceRow {
+        EventEvidenceRow {
+            evidence_id: Uuid::new_v4(),
+            source_id: MANUAL_SOURCE_REST.to_string(),
+            source_item_id: source_item_id.to_string(),
+            source_url: Some(source_url.to_string()),
+            source_tier: "manual".to_string(),
+            source_terms_version: "terms-v1".to_string(),
+            occurred_at: Some(available_at),
+            published_at: Some(available_at),
+            first_seen_at: available_at,
+            available_at,
+            effective_trade_date: NaiveDate::from_ymd_opt(2026, 7, 10).unwrap(),
+            title: title.to_string(),
+            content: content.map(str::to_string),
+            language: "und".to_string(),
+            content_hash: content_hash(title, content),
+            raw_payload: json!({
+                "submitted_by": "seed",
+                "manual_source_id": MANUAL_SOURCE_REST,
+            }),
+            version: 1,
+            supersedes_evidence_id: None,
+            status: "pending".to_string(),
+            created_at,
+        }
+    }
+
+    fn seeded_duplicate_group_id(representative_id: Uuid) -> Uuid {
+        use sha2::{Digest, Sha256};
+
+        let digest =
+            Sha256::digest(format!("market-event-duplicate:{representative_id}").as_bytes());
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        bytes[6] = (bytes[6] & 0x0f) | 0x50;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        Uuid::from_bytes(bytes)
     }
 
     fn assert_inserted(
