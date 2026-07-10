@@ -58,6 +58,7 @@ async fn get_analysis_data_status(
     .map_err(|e| crate::api::routes::api_error(&e.to_string()))?;
 
     let capability_failures = capability_failures(capability_status.as_ref());
+    let capability_probe = capability_probe_state(capability_status.as_ref());
     let estimated_counts = estimated_row_counts(&refresh_runs);
 
     let (
@@ -114,6 +115,7 @@ async fn get_analysis_data_status(
         "availableAt": available_at,
         "inputFingerprint": input_fingerprint,
         "capabilityFailures": capability_failures,
+        "capabilityProbe": capability_probe,
         "capabilityStatus": capability_status.map(|status| status.to_json()),
         "completeness": {
             "snapshotPresent": snapshot_present,
@@ -323,7 +325,22 @@ fn capability_failures(status: Option<&AnalysisRunSummary>) -> Vec<String> {
                     .collect()
             })
             .unwrap_or_default(),
-        None => vec![POINT_IN_TIME_CAPABILITY_PROBE_RUN_TYPE.to_string()],
+        None => Vec::new(),
+    }
+}
+
+fn capability_probe_state(status: Option<&AnalysisRunSummary>) -> Value {
+    match status {
+        Some(status) => json!({
+            "persisted": true,
+            "status": status.status,
+            "completed": status.completed_at.is_some(),
+        }),
+        None => json!({
+            "persisted": false,
+            "status": "not_persisted",
+            "completed": false,
+        }),
     }
 }
 
@@ -398,6 +415,37 @@ mod tests {
             (Method::POST, "/api/jobs/analysis/snapshot"),
         ] {
             let mut router = analysis_router(state.clone());
+            let response = router
+                .call(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+        }
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn build_router_exposes_analysis_routes(pool: PgPool) -> sqlx::Result<()> {
+        let state = test_state(pool).await;
+
+        for (method, path) in [
+            (Method::GET, "/api/analysis/data-status"),
+            (Method::POST, "/api/jobs/analysis/point-in-time/refresh"),
+            (
+                Method::POST,
+                "/api/jobs/analysis/point-in-time/reference-refresh",
+            ),
+            (Method::POST, "/api/jobs/analysis/snapshot"),
+        ] {
+            let mut router = crate::api::routes::build_router(state.clone());
             let response = router
                 .call(
                     Request::builder()
@@ -496,6 +544,40 @@ mod tests {
             payload["estimatedRowCounts"]["sensitivityExcludesEstimated"],
             true
         );
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn data_status_reports_missing_capability_probe_without_capability_failure(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let state = test_state(pool).await;
+
+        let mut router = analysis_router(state);
+        let response = router
+            .call(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/analysis/data-status")
+                    .header(header::AUTHORIZATION, "Bearer test-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(payload["capabilityFailures"], json!([]));
+        assert_eq!(payload["capabilityStatus"], Value::Null);
+        assert_eq!(payload["capabilityProbe"]["persisted"], false);
+        assert_eq!(payload["capabilityProbe"]["status"], "not_persisted");
+        assert_eq!(payload["completeness"]["capabilitiesComplete"], false);
 
         Ok(())
     }

@@ -96,3 +96,39 @@
 - `README.md`
 - `src/analysis/market_snapshot/builder.rs`
 - `src/api/analysis_routes.rs`
+
+---
+
+### Task 9 Re-review Fix Follow-up
+
+**Fix summary**
+- Changed missing capability-probe rows so `capabilityFailures` is empty instead of reporting the `point_in_time_capability_probe` run type as a provider capability failure.
+- Added `capabilityProbe` to the data-status response so a missing probe row is explicit: `{"persisted": false, "status": "not_persisted", "completed": false}`.
+- Added coverage that the merged `crate::api::routes::build_router` exposes all analysis routes, catching removed or mis-mounted analysis-router merges.
+
+**RED evidence**
+- Command: `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test --locked api::analysis_routes::tests -- --nocapture`
+- Result: FAIL as expected, 5 passed and 1 failed:
+  - `data_status_reports_missing_capability_probe_without_capability_failure` saw `capabilityFailures: ["point_in_time_capability_probe"]` instead of `[]`.
+
+**GREEN evidence**
+- Command: `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test --locked api::analysis_routes::tests -- --nocapture`
+- Result: PASS, 6 passed.
+
+**Verification results**
+- Command: `cargo fmt --all -- --check`
+  - Result: PASS.
+- Command: `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test --locked api::analysis_routes::tests -- --nocapture`
+  - Result: PASS, 6 passed.
+- Command: `cargo test --locked scheduler::tests -- --nocapture`
+  - Result: PASS, 3 passed.
+- Command: `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test --all --locked -- --skip config::tests::test_config_defaults`
+  - Result: PASS, 146 passed and 1 filtered out.
+- Command: `cargo test --all --locked config::tests::test_config_defaults`
+  - Result: PASS, 1 passed and 146 filtered out.
+- Command: `git diff --check`
+  - Result: PASS.
+
+**Files changed**
+- `.superpowers/sdd/task-9-report.md`
+- `src/api/analysis_routes.rs`
