@@ -133,6 +133,9 @@ impl PatternRepository {
         if rows.is_empty() {
             return Ok(0);
         }
+        for row in rows {
+            validate_shadow_tier(&row.shadow_tier)?;
+        }
 
         let mut tx = self.pool.begin().await?;
         let mut count = 0usize;
@@ -319,6 +322,16 @@ impl PatternRepository {
                 },
             )
             .collect())
+    }
+}
+
+fn validate_shadow_tier(shadow_tier: &str) -> Result<()> {
+    match shadow_tier {
+        "shadow_a" | "shadow_b" | "watch" | "reject" => Ok(()),
+        _ => Err(AppError::Internal(format!(
+            "invalid shadow_tier {}; expected one of shadow_a, shadow_b, watch, reject",
+            shadow_tier
+        ))),
     }
 }
 
@@ -792,7 +805,7 @@ mod tests {
             similarity_score: 0.71,
             validated_lift: 0.12,
             final_score: 1.2345,
-            shadow_tier: "tier1".to_string(),
+            shadow_tier: "watch".to_string(),
             matched_features: json!({"close_strength": 1.1}),
             risk_flags: json!(["extended"]),
             supporting_signals: json!(["scan_ranker"]),
@@ -811,7 +824,7 @@ mod tests {
             similarity_score: 0.72,
             validated_lift: 0.13,
             final_score: 1.3456,
-            shadow_tier: "tier1".to_string(),
+            shadow_tier: "watch".to_string(),
             matched_features: json!({"close_strength": 1.2}),
             risk_flags: json!(["extended"]),
             supporting_signals: json!(["scan_ranker"]),
@@ -831,6 +844,38 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(membership_error, AppError::Internal(_)));
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn upsert_shadow_candidates_rejects_invalid_shadow_tier_before_sql(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = PatternRepository::new(pool);
+        let row = ShadowCandidateRow {
+            trade_date: date(2026, 7, 10),
+            code: "600001.SH".to_string(),
+            horizon: "week".to_string(),
+            pattern_version_id: Uuid::new_v4(),
+            pattern_set_id: Uuid::new_v4(),
+            pattern_type: "trend".to_string(),
+            similarity_score: 0.71,
+            validated_lift: 0.12,
+            final_score: 1.2345,
+            shadow_tier: "tier1".to_string(),
+            matched_features: json!({"close_strength": 1.1}),
+            risk_flags: json!(["extended"]),
+            supporting_signals: json!(["scan_ranker"]),
+            invalidations: json!([]),
+            input_fingerprint: "shadow-fp-invalid-tier".to_string(),
+            created_at: dt(2026, 7, 10, 10),
+        };
+
+        let error = repo.upsert_shadow_candidates(&[row]).await.unwrap_err();
+
+        assert!(matches!(error, AppError::Internal(_)));
+        assert!(error.to_string().contains("invalid shadow_tier"));
+        assert!(error.to_string().contains("tier1"));
         Ok(())
     }
 
@@ -876,7 +921,7 @@ mod tests {
             similarity_score: 0.71,
             validated_lift: 0.12,
             final_score: 1.2345,
-            shadow_tier: "tier1".to_string(),
+            shadow_tier: "watch".to_string(),
             matched_features: json!({"close_strength": 1.1}),
             risk_flags: json!(["extended"]),
             supporting_signals: json!(["scan_ranker"]),
@@ -888,7 +933,7 @@ mod tests {
         second.similarity_score = 0.92;
         second.validated_lift = 0.22;
         second.final_score = 2.3456;
-        second.shadow_tier = "tier2".to_string();
+        second.shadow_tier = "shadow_b".to_string();
         second.matched_features = json!({"close_strength": 2.2});
         second.risk_flags = json!(["none"]);
         second.supporting_signals = json!(["scan_ranker", "pattern_engine"]);
@@ -952,7 +997,7 @@ mod tests {
             similarity_score: 0.55,
             validated_lift: 0.08,
             final_score: 0.9876,
-            shadow_tier: "tier1".to_string(),
+            shadow_tier: "watch".to_string(),
             matched_features: json!({"close_strength": 0.9}),
             risk_flags: json!(["extended"]),
             supporting_signals: json!(["scan_ranker"]),
@@ -964,7 +1009,7 @@ mod tests {
         second.similarity_score = 0.83;
         second.validated_lift = 0.19;
         second.final_score = 1.8765;
-        second.shadow_tier = "tier2".to_string();
+        second.shadow_tier = "shadow_b".to_string();
         second.matched_features = json!({"close_strength": 1.8});
         second.risk_flags = json!(["none"]);
         second.supporting_signals = json!(["scan_ranker", "pattern_engine"]);

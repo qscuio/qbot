@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -21,6 +22,82 @@ use crate::storage::pattern_repository::{
 
 const SUPPORTED_PATTERN_SCHEMA_VERSION: &str = "1";
 const RISK_TRIGGER_SCORE_MULTIPLIER: f64 = 0.5;
+
+#[async_trait]
+pub(crate) trait PatternStore: Send + Sync {
+    async fn list_published_patterns(&self, pattern_set_id: Uuid)
+        -> Result<Vec<PatternVersionRow>>;
+
+    async fn upsert_shadow_candidates(&self, rows: &[ShadowCandidateRow]) -> Result<usize>;
+}
+
+#[async_trait]
+impl PatternStore for PatternRepository {
+    async fn list_published_patterns(
+        &self,
+        pattern_set_id: Uuid,
+    ) -> Result<Vec<PatternVersionRow>> {
+        PatternRepository::list_published_patterns(self, pattern_set_id).await
+    }
+
+    async fn upsert_shadow_candidates(&self, rows: &[ShadowCandidateRow]) -> Result<usize> {
+        PatternRepository::upsert_shadow_candidates(self, rows).await
+    }
+}
+
+#[async_trait]
+pub(crate) trait MarketSource: Send + Sync {
+    async fn daily_bar_history_as_of(
+        &self,
+        end: NaiveDate,
+        as_of: DateTime<Utc>,
+        lookback: i64,
+    ) -> Result<Vec<PointInTimeDailyBarVersion>>;
+
+    async fn security_status_universe_as_of(
+        &self,
+        trade_date: NaiveDate,
+        as_of: DateTime<Utc>,
+    ) -> Result<Vec<SecurityDailyStatus>>;
+
+    async fn adjustment_factors_as_of(
+        &self,
+        codes: &[String],
+        start: NaiveDate,
+        end: NaiveDate,
+        as_of: DateTime<Utc>,
+    ) -> Result<Vec<AdjustmentFactor>>;
+}
+
+#[async_trait]
+impl MarketSource for MarketRepository {
+    async fn daily_bar_history_as_of(
+        &self,
+        end: NaiveDate,
+        as_of: DateTime<Utc>,
+        lookback: i64,
+    ) -> Result<Vec<PointInTimeDailyBarVersion>> {
+        MarketRepository::daily_bar_history_as_of(self, end, as_of, lookback).await
+    }
+
+    async fn security_status_universe_as_of(
+        &self,
+        trade_date: NaiveDate,
+        as_of: DateTime<Utc>,
+    ) -> Result<Vec<SecurityDailyStatus>> {
+        MarketRepository::security_status_universe_as_of(self, trade_date, as_of).await
+    }
+
+    async fn adjustment_factors_as_of(
+        &self,
+        codes: &[String],
+        start: NaiveDate,
+        end: NaiveDate,
+        as_of: DateTime<Utc>,
+    ) -> Result<Vec<AdjustmentFactor>> {
+        MarketRepository::adjustment_factors_as_of(self, codes, start, end, as_of).await
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Invalidation {
@@ -93,13 +170,27 @@ impl PatternCandidate {
     }
 }
 
-pub struct PatternEngine {
-    pattern_repo: PatternRepository,
-    market_repo: MarketRepository,
+pub struct PatternEngine<P = PatternRepository, M = MarketRepository> {
+    pattern_repo: P,
+    market_repo: M,
 }
 
-impl PatternEngine {
+impl PatternEngine<PatternRepository, MarketRepository> {
     pub fn new(pattern_repo: PatternRepository, market_repo: MarketRepository) -> Self {
+        Self {
+            pattern_repo,
+            market_repo,
+        }
+    }
+}
+
+impl<P, M> PatternEngine<P, M>
+where
+    P: PatternStore,
+    M: MarketSource,
+{
+    #[cfg(test)]
+    fn with_sources(pattern_repo: P, market_repo: M) -> Self {
         Self {
             pattern_repo,
             market_repo,
@@ -448,10 +539,14 @@ fn risk_flags_payload(risk_conditions: &[ConditionEvaluation]) -> Value {
         .iter()
         .filter(|condition| condition.passed.is_none())
         .collect();
+    let risk_adjustment = risk_score_multiplier(risk_conditions);
     json!({
         "conditions": risk_conditions,
+        "has_triggered": !triggered.is_empty(),
+        "has_unevaluable": !unevaluable.is_empty(),
         "triggered": triggered,
         "unevaluable": unevaluable,
+        "risk_adjustment": risk_adjustment,
     })
 }
 
@@ -481,10 +576,7 @@ fn supporting_signals_payload(
 }
 
 fn risk_score_multiplier(risk_conditions: &[ConditionEvaluation]) -> f64 {
-    if risk_conditions
-        .iter()
-        .any(|condition| condition.passed == Some(true))
-    {
+    if has_triggered_or_unevaluable_risk(risk_conditions) {
         RISK_TRIGGER_SCORE_MULTIPLIER
     } else {
         1.0
@@ -492,14 +584,19 @@ fn risk_score_multiplier(risk_conditions: &[ConditionEvaluation]) -> f64 {
 }
 
 fn apply_risk_tier(shadow_tier: ShadowTier, risk_conditions: &[ConditionEvaluation]) -> ShadowTier {
-    let triggered = risk_conditions
-        .iter()
-        .any(|condition| condition.passed == Some(true));
-    if triggered && shadow_tier == ShadowTier::ShadowA {
-        ShadowTier::ShadowB
-    } else {
-        shadow_tier
+    match (
+        has_triggered_or_unevaluable_risk(risk_conditions),
+        shadow_tier,
+    ) {
+        (true, ShadowTier::ShadowA | ShadowTier::ShadowB) => ShadowTier::Watch,
+        _ => shadow_tier,
     }
+}
+
+fn has_triggered_or_unevaluable_risk(risk_conditions: &[ConditionEvaluation]) -> bool {
+    risk_conditions
+        .iter()
+        .any(|condition| condition.passed == Some(true) || condition.passed.is_none())
 }
 
 fn set_supporting_shadow_tier(payload: &mut Value, shadow_tier: ShadowTier) {
@@ -1160,7 +1257,9 @@ fn trade_date_cutoff(trade_date: NaiveDate) -> DateTime<Utc> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Mutex;
 
+    use async_trait::async_trait;
     use chrono::{Duration, NaiveDate, TimeZone, Utc};
     use serde_json::{json, Value};
     use uuid::Uuid;
@@ -1168,13 +1267,17 @@ mod tests {
     use super::super::model::{PatternModelPayload, ValidationPayload};
     use super::{
         derive_feature_vector, evaluate_pattern, load_published_patterns, similarity,
-        MarketFeatureContext, SimilarityScore, SupportedFeature,
+        MarketFeatureContext, MarketSource, PatternEngine, PatternStore, SimilarityScore,
+        SupportedFeature,
     };
-    use crate::analysis::market_snapshot::{AdjustmentFactor, AvailabilityQuality};
+    use crate::analysis::market_snapshot::{
+        AdjustmentFactor, AvailabilityQuality, SecurityDailyStatus,
+    };
     use crate::analysis::patterns::ranking::ShadowTier;
     use crate::data::types::Candle;
+    use crate::error::Result;
     use crate::storage::market_repository::PointInTimeDailyBarVersion;
-    use crate::storage::pattern_repository::PatternVersionRow;
+    use crate::storage::pattern_repository::{PatternVersionRow, ShadowCandidateRow};
 
     fn fixture_payload() -> serde_json::Value {
         serde_json::from_str(include_str!(
@@ -1228,6 +1331,109 @@ mod tests {
             available_at: timestamp,
             ingested_at: timestamp,
             source: "test".to_string(),
+        }
+    }
+
+    fn daily_row_for_code(
+        code: &str,
+        day: u32,
+        open: f64,
+        high: f64,
+        low: f64,
+        close: f64,
+        volume: i64,
+    ) -> PointInTimeDailyBarVersion {
+        let mut row = daily_row(day, open, high, low, close, volume);
+        row.code = code.to_string();
+        row
+    }
+
+    fn adjustment_factor(code: &str, day: u32) -> AdjustmentFactor {
+        let timestamp = date(day).and_hms_opt(16, 0, 0).unwrap().and_utc();
+        AdjustmentFactor {
+            code: code.to_string(),
+            trade_date: date(day),
+            adj_factor: 1.0,
+            available_at: timestamp,
+            ingested_at: timestamp,
+            availability_quality: AvailabilityQuality::Observed,
+            source: "test".to_string(),
+        }
+    }
+
+    fn active_status(code: &str, day: u32) -> SecurityDailyStatus {
+        let timestamp = date(day).and_hms_opt(16, 0, 0).unwrap().and_utc();
+        SecurityDailyStatus {
+            code: code.to_string(),
+            trade_date: date(day),
+            listed_days: Some(120),
+            is_st: false,
+            is_suspended: false,
+            price_limit_pct: Some(0.10),
+            available_at: timestamp,
+            ingested_at: timestamp,
+            availability_quality: AvailabilityQuality::Observed,
+            source: "test".to_string(),
+        }
+    }
+
+    #[derive(Debug)]
+    struct FakePatternStore {
+        rows: Vec<PatternVersionRow>,
+        saved: Mutex<Vec<ShadowCandidateRow>>,
+        listed_sets: Mutex<Vec<Uuid>>,
+    }
+
+    #[async_trait]
+    impl PatternStore for FakePatternStore {
+        async fn list_published_patterns(
+            &self,
+            pattern_set_id: Uuid,
+        ) -> Result<Vec<PatternVersionRow>> {
+            self.listed_sets.lock().unwrap().push(pattern_set_id);
+            Ok(self.rows.clone())
+        }
+
+        async fn upsert_shadow_candidates(&self, rows: &[ShadowCandidateRow]) -> Result<usize> {
+            self.saved.lock().unwrap().extend_from_slice(rows);
+            Ok(rows.len())
+        }
+    }
+
+    #[derive(Debug)]
+    struct FakeMarketSource {
+        history: Vec<PointInTimeDailyBarVersion>,
+        statuses: Vec<SecurityDailyStatus>,
+        adjustments: Vec<AdjustmentFactor>,
+    }
+
+    #[async_trait]
+    impl MarketSource for FakeMarketSource {
+        async fn daily_bar_history_as_of(
+            &self,
+            _end: NaiveDate,
+            _as_of: chrono::DateTime<Utc>,
+            _lookback: i64,
+        ) -> Result<Vec<PointInTimeDailyBarVersion>> {
+            Ok(self.history.clone())
+        }
+
+        async fn security_status_universe_as_of(
+            &self,
+            _trade_date: NaiveDate,
+            _as_of: chrono::DateTime<Utc>,
+        ) -> Result<Vec<SecurityDailyStatus>> {
+            Ok(self.statuses.clone())
+        }
+
+        async fn adjustment_factors_as_of(
+            &self,
+            _codes: &[String],
+            _start: NaiveDate,
+            _end: NaiveDate,
+            _as_of: chrono::DateTime<Utc>,
+        ) -> Result<Vec<AdjustmentFactor>> {
+            Ok(self.adjustments.clone())
         }
     }
 
@@ -1478,6 +1684,84 @@ mod tests {
         assert!(error.to_string().contains("2"));
     }
 
+    #[tokio::test]
+    async fn match_market_loads_patterns_derives_features_and_persists_shadow_candidates() {
+        let trade_date = date(21);
+        let pattern_set_id = Uuid::new_v4();
+        let pattern_version_id = Uuid::new_v4();
+        let mut row = pattern_row("1");
+        row.pattern_version_id = pattern_version_id;
+        row.model_payload["centroid"] = json!({
+            "return_20d": 0.20,
+            "relative_strength_20d": 1.0
+        });
+        row.model_payload["necessary_conditions"] = json!([]);
+        row.model_payload["risk_conditions"] = json!([]);
+
+        let code = "600000.SH";
+        let mut history = Vec::new();
+        for day in 1..=21 {
+            let close = 100.0 + f64::from(day - 1);
+            history.push(daily_row_for_code(
+                code,
+                day,
+                close,
+                close + 1.0,
+                close - 1.0,
+                close,
+                10_000 + i64::from(day),
+            ));
+        }
+        history[20].bar.as_mut().unwrap().close = 120.0;
+
+        let market = FakeMarketSource {
+            history,
+            statuses: vec![active_status(code, 21)],
+            adjustments: (1..=21).map(|day| adjustment_factor(code, day)).collect(),
+        };
+        let pattern_store = FakePatternStore {
+            rows: vec![row],
+            saved: Mutex::new(Vec::new()),
+            listed_sets: Mutex::new(Vec::new()),
+        };
+        let engine = PatternEngine::with_sources(pattern_store, market);
+
+        let candidates = engine
+            .match_market(trade_date, pattern_set_id)
+            .await
+            .unwrap();
+
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert_eq!(candidate.pattern_version_id, pattern_version_id);
+        assert_eq!(candidate.pattern_set_id, pattern_set_id);
+        assert_eq!(candidate.code, code);
+        assert!(matches!(
+            candidate.shadow_tier,
+            ShadowTier::ShadowA | ShadowTier::ShadowB | ShadowTier::Watch | ShadowTier::Reject
+        ));
+        assert_close(
+            candidate.matched_features["raw"]["return_20d"]
+                .as_f64()
+                .unwrap(),
+            0.20,
+        );
+        assert_close(
+            candidate.matched_features["raw"]["relative_strength_20d"]
+                .as_f64()
+                .unwrap(),
+            1.0,
+        );
+        let saved = engine.pattern_repo.saved.lock().unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].code, candidate.code);
+        assert_eq!(saved[0].shadow_tier, candidate.shadow_tier.as_str());
+        assert_eq!(
+            engine.pattern_repo.listed_sets.lock().unwrap().as_slice(),
+            &[pattern_set_id]
+        );
+    }
+
     #[test]
     fn validation_nested_yearly_and_regime_values_must_be_numeric() {
         let mut yearly_payload = json!({
@@ -1619,7 +1903,7 @@ mod tests {
     }
 
     #[test]
-    fn triggered_risk_condition_demotes_shadow_a_and_reduces_score() {
+    fn triggered_risk_condition_demotes_shadow_a_to_watch_and_reduces_score() {
         let mut payload = fixture_payload();
         payload["risk_conditions"] = json!([
             {"column": "return_20d", "operator": ">=", "value": 0.1}
@@ -1633,12 +1917,15 @@ mod tests {
 
         let candidate = evaluate_pattern(&model, &validation, &features);
 
-        assert_eq!(candidate.shadow_tier, ShadowTier::ShadowB);
+        assert_eq!(candidate.shadow_tier, ShadowTier::Watch);
         assert!(candidate.final_score < 2.0);
         assert_eq!(
             candidate.risk_flags["triggered"][0]["status"],
             Value::String("evaluated".to_string())
         );
+        assert_eq!(candidate.risk_flags["has_triggered"], json!(true));
+        assert_eq!(candidate.risk_flags["has_unevaluable"], json!(false));
+        assert_eq!(candidate.risk_flags["risk_adjustment"], json!(0.5));
         assert_eq!(
             candidate.supporting_signals["score_components"]["risk_adjustment"],
             json!(0.5)
@@ -1646,7 +1933,7 @@ mod tests {
     }
 
     #[test]
-    fn unevaluable_risk_condition_is_explicit_in_payloads() {
+    fn unevaluable_risk_condition_demotes_shadow_a_reduces_score_and_is_explicit_in_payloads() {
         let mut payload = fixture_payload();
         payload["risk_conditions"] = json!([
             {"column": "missing_feature", "operator": ">=", "value": 0.1}
@@ -1660,11 +1947,20 @@ mod tests {
 
         let candidate = evaluate_pattern(&model, &validation, &features);
 
-        assert_eq!(candidate.shadow_tier, ShadowTier::ShadowA);
+        assert_ne!(candidate.shadow_tier, ShadowTier::ShadowA);
+        assert_eq!(candidate.shadow_tier, ShadowTier::Watch);
+        assert!(candidate.final_score < 2.0);
+        assert_eq!(
+            candidate.supporting_signals["score_components"]["risk_adjustment"],
+            json!(0.5)
+        );
         assert_eq!(
             candidate.risk_flags["unevaluable"][0]["status"],
             Value::String("missing_feature".to_string())
         );
+        assert_eq!(candidate.risk_flags["has_triggered"], json!(false));
+        assert_eq!(candidate.risk_flags["has_unevaluable"], json!(true));
+        assert_eq!(candidate.risk_flags["risk_adjustment"], json!(0.5));
         assert_eq!(
             candidate.supporting_signals["risk_conditions"][0]["status"],
             Value::String("missing_feature".to_string())
