@@ -271,7 +271,7 @@ async fn exact_duplicate_manual_submission_detects_matching_canonical_url_across
         status: "pending".to_string(),
         created_at: dt(2026, 7, 10, 8, 0, 0),
     };
-    repo.insert_evidence(&existing).await.unwrap();
+    insert_raw_evidence_row(&pool, &existing).await?;
 
     let duplicate = assert_existing(
         ingestor
@@ -1047,6 +1047,44 @@ fn seeded_duplicate_group_id(representative_id: Uuid) -> Uuid {
     bytes[6] = (bytes[6] & 0x0f) | 0x50;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     Uuid::from_bytes(bytes)
+}
+
+async fn insert_raw_evidence_row(pool: &PgPool, row: &EventEvidenceRow) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"INSERT INTO market_event_evidence
+           (evidence_id, source_id, source_item_id, source_url, source_tier,
+            source_terms_version, occurred_at, published_at, first_seen_at,
+            available_at, effective_trade_date, title, content, language,
+            content_hash, raw_payload, version, supersedes_evidence_id, status, created_at)
+           VALUES ($1, $2, $3, $4, $5,
+                   $6, $7, $8, $9,
+                   $10, $11, $12, $13, $14,
+                   $15, $16, $17, $18, $19, $20)"#,
+    )
+    .bind(row.evidence_id)
+    .bind(&row.source_id)
+    .bind(&row.source_item_id)
+    .bind(&row.source_url)
+    .bind(&row.source_tier)
+    .bind(&row.source_terms_version)
+    .bind(row.occurred_at)
+    .bind(row.published_at)
+    .bind(row.first_seen_at)
+    .bind(row.available_at)
+    .bind(row.effective_trade_date)
+    .bind(&row.title)
+    .bind(&row.content)
+    .bind(&row.language)
+    .bind(&row.content_hash)
+    .bind(&row.raw_payload)
+    .bind(row.version)
+    .bind(row.supersedes_evidence_id)
+    .bind(&row.status)
+    .bind(row.created_at)
+    .execute(pool)
+    .await?;
+
+    Ok(())
 }
 
 fn assert_inserted(

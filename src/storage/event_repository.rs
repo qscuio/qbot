@@ -584,7 +584,8 @@ async fn find_manual_duplicate_candidates_in_tx(
                FROM market_event_evidence
                WHERE effective_trade_date = $1
                   OR content_hash = $2
-                  OR ($3::text IS NOT NULL AND source_url = $3)
+                  OR ($3::text IS NOT NULL
+                      AND market_event_canonical_source_url(source_url) = $3)
                   OR (source_id = $4 AND source_item_id = $5 AND version = $6)
            ),
            expanded AS (
@@ -1141,6 +1142,43 @@ mod tests {
             .unwrap();
     }
 
+    async fn insert_raw_evidence_row(pool: &PgPool, row: &EventEvidenceRow) {
+        sqlx::query(
+            r#"INSERT INTO market_event_evidence
+               (evidence_id, source_id, source_item_id, source_url, source_tier,
+                source_terms_version, occurred_at, published_at, first_seen_at,
+                available_at, effective_trade_date, title, content, language,
+                content_hash, raw_payload, version, supersedes_evidence_id, status, created_at)
+               VALUES ($1, $2, $3, $4, $5,
+                       $6, $7, $8, $9,
+                       $10, $11, $12, $13, $14,
+                       $15, $16, $17, $18, $19, $20)"#,
+        )
+        .bind(row.evidence_id)
+        .bind(&row.source_id)
+        .bind(&row.source_item_id)
+        .bind(&row.source_url)
+        .bind(&row.source_tier)
+        .bind(&row.source_terms_version)
+        .bind(row.occurred_at)
+        .bind(row.published_at)
+        .bind(row.first_seen_at)
+        .bind(row.available_at)
+        .bind(row.effective_trade_date)
+        .bind(&row.title)
+        .bind(&row.content)
+        .bind(&row.language)
+        .bind(&row.content_hash)
+        .bind(&row.raw_payload)
+        .bind(row.version)
+        .bind(row.supersedes_evidence_id)
+        .bind(&row.status)
+        .bind(row.created_at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum ManualDuplicateDiscoveryOutcome {
         InsertedWithoutExisting,
@@ -1509,7 +1547,7 @@ mod tests {
         existing.available_at = dt(2026, 7, 10, 10);
         existing.first_seen_at = dt(2026, 7, 10, 10);
         existing.created_at = dt(2026, 7, 10, 11);
-        save_evidence(&pool, &existing).await;
+        insert_raw_evidence_row(&pool, &existing).await;
 
         let mut duplicate = evidence("source-cross-url-submitted", 1, "pending");
         duplicate.title = "Acme contract post mirrored later".to_string();
@@ -1534,7 +1572,7 @@ mod tests {
         );
         assert_eq!(
             inserted.existing_rows[0].source_url.as_deref(),
-            Some("https://example.test/contracts/acme")
+            Some("HTTPS://Example.test:443/contracts/acme#archive")
         );
 
         Ok(())

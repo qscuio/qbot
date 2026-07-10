@@ -436,3 +436,58 @@
 
 - code fix: `bdf6b0e8d6eb2545b529176e2caef37d4b6fbdb7`
 - docs/report follow-up: recorded in the next commit for this appended report section
+
+## Fix follow-up: historical raw canonical-URL duplicate discovery addressed on 2026-07-10
+
+### Review issues addressed
+
+- Issue 1: canonical-URL exact duplicate discovery now finds pre-canonicalization historical rows instead of relying on canonicalized storage-only equality.
+  - Rewrote the repository regression in `src/storage/event_repository.rs` to seed a truly raw historical `source_url` via direct SQL instead of `insert_evidence()`/`save_evidence()`.
+  - Rewrote the live manual-ingestion regression in `src/analysis/events/evidence_duplicate_ingestion_tests.rs` to seed the historical row the same way, proving the production path resolves to `Existing` even when the stored URL text is noncanonical.
+  - Updated `migrations/015_event_evidence_mvp.sql` to define `market_event_canonical_source_url(source_url)` plus an expression index, and changed `find_manual_duplicate_candidates_in_tx()` to compare the submitted canonical URL against the canonicalized stored URL in SQL.
+- Issue 2: warning-noisy verification is no longer presented as pristine green evidence.
+  - This section supersedes earlier Task 4 report entries that listed warning-emitting cargo commands as green verification.
+  - Warning-noisy cargo commands are recorded below as passing informational evidence, not as warning-clean green proof.
+
+### Red test evidence
+
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test manual_insert_surfaces_cross_trade_date_canonical_url_exact_duplicate_candidates -- --nocapture`
+  - failed before the fix
+  - `assertion left == right failed`
+  - left: `[]`
+  - right: `[existing evidence id]`
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test exact_duplicate_manual_submission_detects_matching_canonical_url_across_trade_dates -- --nocapture`
+  - failed before the fix
+  - `expected duplicate relation, got inserted <submitted evidence id>`
+
+### Green verification
+
+- `cargo fmt --all -- --check`
+  - passed
+- `git diff --check`
+  - passed
+
+### Passing verification (warning-noisy, not green evidence)
+
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test analysis::events::dedup -- --nocapture`
+  - passed, `10 passed; 0 failed`
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test analysis::events -- --nocapture`
+  - passed, `35 passed; 0 failed`
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test storage::event_repository -- --nocapture`
+  - passed, `15 passed; 0 failed`
+- `cargo test --all --locked config::tests::test_config_defaults`
+  - passed, `1 passed; 0 failed`
+
+### Informational warning-noisy verification
+
+- `cargo check --tests --locked`
+  - passed
+  - emits the same pre-existing unused/dead-code warning set already present outside this fix
+
+### Commit hash
+
+- `TBD`
+
+### Any remaining concerns
+
+- The required cargo verification commands still emit pre-existing warning noise in untouched areas such as `src/analysis/events/mod.rs`; this fix does not hide or reinterpret those warnings.

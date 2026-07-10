@@ -111,6 +111,51 @@ CREATE TABLE market_event_daily_briefs (
     generated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE OR REPLACE FUNCTION market_event_canonical_source_url(raw_url TEXT)
+RETURNS TEXT AS $$
+DECLARE
+    trimmed TEXT;
+    parts TEXT[];
+    scheme TEXT;
+    host TEXT;
+    port TEXT;
+    path TEXT;
+    query TEXT;
+BEGIN
+    IF raw_url IS NULL THEN
+        RETURN NULL;
+    END IF;
+
+    trimmed := BTRIM(raw_url);
+    parts := regexp_match(
+        trimmed,
+        '^(https?)://([^/?#:]+)(:([0-9]+))?([^?#]*)?(\?[^#]*)?(#.*)?$',
+        'i'
+    );
+
+    IF parts IS NULL THEN
+        RETURN NULL;
+    END IF;
+
+    scheme := LOWER(parts[1]);
+    host := LOWER(parts[2]);
+    port := parts[4];
+    path := COALESCE(parts[5], '');
+    query := COALESCE(parts[6], '');
+
+    IF path = '' THEN
+        path := '/';
+    END IF;
+
+    IF (scheme = 'https' AND port = '443')
+        OR (scheme = 'http' AND port = '80') THEN
+        port := NULL;
+    END IF;
+
+    RETURN scheme || '://' || host || COALESCE(':' || port, '') || path || query;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
 CREATE INDEX idx_event_evidence_content_hash_lookup
     ON market_event_evidence(
         content_hash,
@@ -133,6 +178,13 @@ CREATE INDEX idx_event_evidence_publishable_lookup
         version,
         evidence_id
     );
+
+CREATE INDEX idx_event_evidence_canonical_source_url_lookup
+    ON market_event_evidence(
+        market_event_canonical_source_url(source_url),
+        evidence_id
+    )
+    WHERE source_url IS NOT NULL;
 
 CREATE INDEX idx_event_claims_review
     ON market_event_claims(review_status, created_at DESC);
