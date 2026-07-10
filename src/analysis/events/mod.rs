@@ -2,10 +2,13 @@ use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDate, Utc};
 
+use self::evidence::{ManualEventSubmission, ManualEvidenceIngestor, ManualSource};
 use crate::error::{AppError, Result};
 use crate::storage::event_repository::EventRepository;
 
 pub mod contracts;
+mod evidence;
+mod time;
 
 pub use contracts::{
     AShareTradingDateResolver, BriefEntity, BriefFact, BriefRevision, BriefSource,
@@ -16,7 +19,7 @@ pub use contracts::{
 trait EventExtractor: Send + Sync {}
 
 pub struct EventIntelligence {
-    _deps: EventIntelligenceDependencies,
+    deps: EventIntelligenceDependencies,
 }
 
 impl EventIntelligence {
@@ -24,8 +27,15 @@ impl EventIntelligence {
         Self::default()
     }
 
-    pub async fn submit_manual_event(&self, _input: ManualEventInput) -> Result<EventEvidence> {
-        Err(task_two_not_wired_error())
+    pub async fn submit_manual_event(&self, input: ManualEventInput) -> Result<EventEvidence> {
+        let submission = self
+            .submit_manual_event_from_source_at(ManualSource::Rest, input, Utc::now())
+            .await?;
+
+        Ok(match submission {
+            ManualEventSubmission::Inserted(evidence) => evidence,
+            ManualEventSubmission::Existing(existing) => existing.submitted,
+        })
     }
 
     pub async fn process_pending(&self, _cutoff: DateTime<Utc>) -> Result<EventProcessingSummary> {
@@ -34,6 +44,38 @@ impl EventIntelligence {
 
     pub async fn build_daily_brief(&self, _trade_date: NaiveDate) -> Result<DailyEventBrief> {
         Err(task_two_not_wired_error())
+    }
+
+    pub(crate) fn with_repository_and_resolver(
+        event_repo: EventRepository,
+        resolver: Arc<dyn TradingDateResolver>,
+    ) -> Self {
+        Self {
+            deps: EventIntelligenceDependencies::wired(event_repo, resolver),
+        }
+    }
+
+    pub(crate) async fn submit_manual_event_from_source_at(
+        &self,
+        source: ManualSource,
+        input: ManualEventInput,
+        first_seen_at: DateTime<Utc>,
+    ) -> Result<ManualEventSubmission> {
+        self.manual_ingestor()?
+            .submit_at(source, input, first_seen_at)
+            .await
+    }
+
+    fn manual_ingestor(&self) -> Result<ManualEvidenceIngestor> {
+        let repo = self
+            .deps
+            .repo
+            .clone()
+            .ok_or_else(task_two_not_wired_error)?;
+        Ok(ManualEvidenceIngestor::new(
+            repo,
+            Arc::clone(&self.deps.resolver),
+        ))
     }
 }
 
@@ -44,22 +86,30 @@ fn task_two_not_wired_error() -> AppError {
 impl Default for EventIntelligence {
     fn default() -> Self {
         Self {
-            _deps: EventIntelligenceDependencies::unwired(),
+            deps: EventIntelligenceDependencies::unwired(),
         }
     }
 }
 
 struct EventIntelligenceDependencies {
-    _repo: Option<EventRepository>,
-    _resolver: Arc<dyn TradingDateResolver>,
+    repo: Option<EventRepository>,
+    resolver: Arc<dyn TradingDateResolver>,
     _extractor: Arc<dyn EventExtractor>,
 }
 
 impl EventIntelligenceDependencies {
     fn unwired() -> Self {
         Self {
-            _repo: None,
-            _resolver: Arc::new(AShareTradingDateResolver),
+            repo: None,
+            resolver: Arc::new(AShareTradingDateResolver),
+            _extractor: Arc::new(NoopEventExtractor),
+        }
+    }
+
+    fn wired(event_repo: EventRepository, resolver: Arc<dyn TradingDateResolver>) -> Self {
+        Self {
+            repo: Some(event_repo),
+            resolver,
             _extractor: Arc::new(NoopEventExtractor),
         }
     }
