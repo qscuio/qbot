@@ -5,6 +5,7 @@ use reqwest::Url;
 use serde_json::json;
 use uuid::Uuid;
 
+use super::dedup::{DuplicateCandidate, DuplicateDecider, DuplicateDecision, DuplicateSubject};
 use super::time::{effective_trade_date_for_manual, manual_available_at};
 use super::{
     EventEvidence, ExistingEventEvidenceRelation, ManualEventInput, ManualEventSubmissionOutcome,
@@ -20,6 +21,7 @@ const MANUAL_SOURCE_TIER: &str = "manual";
 const MANUAL_SOURCE_TERMS_VERSION: &str = "terms-v1";
 const MANUAL_LANGUAGE: &str = "und";
 const MANUAL_STATUS_PENDING: &str = "pending";
+const MANUAL_AUTO_NEAR_DUPLICATE_THRESHOLD: f64 = 0.92;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ManualSource {
@@ -119,7 +121,33 @@ impl ManualEvidenceIngestor {
             return Ok(ManualEventSubmissionOutcome::Inserted(submitted));
         }
 
-        let representative = insert_result.existing_rows[0].clone();
+        let decision = DuplicateDecider::new(MANUAL_AUTO_NEAR_DUPLICATE_THRESHOLD).decide(
+            &duplicate_subject_from_row(&row),
+            &duplicate_candidates_from_rows(&insert_result.existing_rows),
+        );
+        let representative_id = match decision {
+            DuplicateDecision::Exact { representative_id }
+            | DuplicateDecision::NearDuplicate {
+                representative_id, ..
+            } => representative_id,
+            DuplicateDecision::ReviewRequired { .. } | DuplicateDecision::Independent => {
+                insert_result
+                    .existing_rows
+                    .first()
+                    .map(|existing| existing.evidence_id)
+                    .expect(
+                        "duplicate submissions must preserve at least one existing evidence row",
+                    )
+            }
+        };
+        let representative = insert_result
+            .existing_rows
+            .iter()
+            .find(|existing| existing.evidence_id == representative_id)
+            .cloned()
+            .expect(
+                "duplicate decision representative must exist in the existing-row candidate set",
+            );
         insert_result
             .duplicate_group_id
             .expect("duplicate submissions must record a duplicate group");
@@ -203,6 +231,33 @@ fn event_evidence_from_row(row: &EventEvidenceRow) -> EventEvidence {
         content_hash: row.content_hash.clone(),
         status: row.status.clone(),
     }
+}
+
+fn duplicate_subject_from_row(row: &EventEvidenceRow) -> DuplicateSubject {
+    DuplicateSubject {
+        source_id: row.source_id.clone(),
+        source_item_id: row.source_item_id.clone(),
+        version: row.version,
+        source_url: row.source_url.clone(),
+        title: row.title.clone(),
+        content: row.content.clone(),
+        content_hash: row.content_hash.clone(),
+    }
+}
+
+fn duplicate_candidates_from_rows(rows: &[EventEvidenceRow]) -> Vec<DuplicateCandidate> {
+    rows.iter()
+        .map(|row| DuplicateCandidate {
+            representative_id: row.evidence_id,
+            source_id: row.source_id.clone(),
+            source_item_id: row.source_item_id.clone(),
+            version: row.version,
+            source_url: row.source_url.clone(),
+            title: row.title.clone(),
+            content: row.content.clone(),
+            content_hash: row.content_hash.clone(),
+        })
+        .collect()
 }
 
 #[cfg(test)]

@@ -18,7 +18,6 @@ pub use contracts::{
     ExistingEventEvidenceRelation, ManualEventInput, ManualEventSubmissionOutcome,
     TradingDateResolver,
 };
-pub use dedup::DuplicateDecision;
 
 trait EventExtractor: Send + Sync {}
 

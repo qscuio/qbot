@@ -81,33 +81,20 @@ impl DuplicateDecider {
             })
             .collect();
 
-        let effective_auto_threshold = self
-            .auto_near_duplicate_threshold
-            .max(CONSERVATIVE_NEAR_DUPLICATE_FLOOR);
-        if let Some((representative_id, confidence)) = scored_candidates
-            .iter()
-            .copied()
-            .filter(|(_, score)| *score >= effective_auto_threshold)
-            .max_by(|left, right| {
-                left.1
-                    .total_cmp(&right.1)
-                    .then_with(|| left.0.cmp(&right.0))
-            })
-        {
-            return DuplicateDecision::NearDuplicate {
-                representative_id,
-                confidence,
-            };
-        }
-
-        if self.auto_near_duplicate_threshold < CONSERVATIVE_NEAR_DUPLICATE_FLOOR {
+        if self.auto_near_duplicate_threshold >= CONSERVATIVE_NEAR_DUPLICATE_FLOOR {
+            if let Some((representative_id, confidence)) =
+                best_scored_candidate(&scored_candidates, self.auto_near_duplicate_threshold)
+            {
+                return DuplicateDecision::NearDuplicate {
+                    representative_id,
+                    confidence,
+                };
+            }
+        } else {
             let candidate_ids: Vec<Uuid> = scored_candidates
                 .iter()
                 .copied()
-                .filter(|(_, score)| {
-                    *score >= self.auto_near_duplicate_threshold
-                        && *score < CONSERVATIVE_NEAR_DUPLICATE_FLOOR
-                })
+                .filter(|(_, score)| *score >= self.auto_near_duplicate_threshold)
                 .map(|(representative_id, _)| representative_id)
                 .collect();
             if !candidate_ids.is_empty() {
@@ -142,13 +129,29 @@ fn same_canonical_url(subject_url: Option<&str>, candidate_url: Option<&str>) ->
         return false;
     };
 
-    canonicalize_url(subject_url) == canonicalize_url(candidate_url)
+    let (Ok(subject_url), Ok(candidate_url)) = (
+        canonicalize_source_url(subject_url),
+        canonicalize_source_url(candidate_url),
+    ) else {
+        return false;
+    };
+
+    subject_url == candidate_url
 }
 
-fn canonicalize_url(value: &str) -> Option<String> {
-    canonicalize_source_url(value)
-        .ok()
-        .or_else(|| Some(normalize_text(value).to_lowercase()))
+fn best_scored_candidate(
+    scored_candidates: &[(Uuid, f64)],
+    minimum_score: f64,
+) -> Option<(Uuid, f64)> {
+    scored_candidates
+        .iter()
+        .copied()
+        .filter(|(_, score)| *score >= minimum_score)
+        .max_by(|left, right| {
+            left.1
+                .total_cmp(&right.1)
+                .then_with(|| left.0.cmp(&right.0))
+        })
 }
 
 fn similarity_score(subject: &DuplicateSubject, candidate: &DuplicateCandidate) -> f64 {
@@ -300,6 +303,30 @@ mod tests {
     }
 
     #[test]
+    fn does_not_treat_matching_invalid_url_text_as_exact() {
+        let subject = subject(
+            "wire:cn",
+            "story-123",
+            1,
+            Some("NOT A VALID URL"),
+            "Acme wins supply contract",
+            Some("Acme disclosed the contract award."),
+        );
+        let candidate = candidate(
+            "other-source",
+            "story-999",
+            1,
+            Some(" not a valid url "),
+            "Beta cuts factory shifts",
+            Some("Management cited export weakness in a separate filing."),
+        );
+
+        let decision = DuplicateDecider::new(0.92).decide(&subject, &[candidate]);
+
+        assert_eq!(decision, DuplicateDecision::Independent);
+    }
+
+    #[test]
     fn returns_exact_for_matching_content_hash() {
         let subject = subject(
             "wire:cn",
@@ -367,13 +394,13 @@ mod tests {
     }
 
     #[test]
-    fn returns_review_required_when_lower_threshold_would_drive_auto_match() {
+    fn returns_review_required_when_lower_threshold_would_otherwise_auto_match_above_floor() {
         let subject = subject(
             "wire:cn",
             "story-123",
             1,
             None,
-            "Acme wins supply contract Shenzhen",
+            "Acme wins major supply contract in Shenzhen",
             Some("Acme signed a long-term supply contract with Shenzhen transit authority today."),
         );
         let review = candidate(
@@ -381,11 +408,21 @@ mod tests {
             "story-999",
             1,
             None,
-            "Acme wins supply contract Shenzhen update",
-            Some("Acme signed a long-term supply contract with Shenzhen transit authority today. Later paragraphs diverge."),
+            "Acme wins major supply contract in Shenzhen market",
+            Some("Acme signed a long-term supply contract with Shenzhen transit authority today. Follow-up details differ."),
         );
 
         let decision = DuplicateDecider::new(0.90).decide(&subject, &[review.clone()]);
+
+        match DuplicateDecider::new(0.92).decide(&subject, &[review.clone()]) {
+            DuplicateDecision::NearDuplicate { confidence, .. } => {
+                assert!(
+                    confidence >= 0.92,
+                    "expected similarity above the conservative floor, got {confidence}"
+                );
+            }
+            other => panic!("expected near duplicate at conservative floor, got {other:?}"),
+        }
 
         assert_eq!(
             decision,
@@ -424,12 +461,32 @@ mod tests {
         pool: PgPool,
     ) -> sqlx::Result<()> {
         let repo = EventRepository::new(pool.clone());
-        let original_member = evidence("source-independent-original", 1);
-        let reprocessed_member = evidence("source-independent-reprocessed", 1);
+        let original_member = evidence_with_shared_content(
+            "source-independent-original",
+            1,
+            "Shared duplicate title",
+            "Shared duplicate body",
+        );
+        let duplicate_member = evidence_with_shared_content(
+            "source-independent-duplicate",
+            1,
+            "Shared duplicate title",
+            "Shared duplicate body",
+        );
+        let reprocessed_member = evidence_with_shared_content(
+            "source-independent-reprocessed",
+            1,
+            "Shared duplicate title",
+            "Shared duplicate body",
+        );
         repo.insert_evidence(&original_member).await.unwrap();
-        repo.insert_evidence(&reprocessed_member).await.unwrap();
-
-        let group_id = Uuid::new_v4();
+        let inserted = repo
+            .insert_manual_evidence(&duplicate_member)
+            .await
+            .unwrap();
+        let group_id = inserted
+            .duplicate_group_id
+            .expect("duplicate insert should create the deterministic duplicate group");
         let locked = DuplicateGroupRow {
             duplicate_group_id: group_id,
             relation_type: "independent".to_string(),
@@ -443,23 +500,11 @@ mod tests {
         };
         repo.save_duplicate_group(&locked).await.unwrap();
 
-        let reprocessed = DuplicateGroupRow {
-            relation_type: "exact".to_string(),
-            confidence: 1.0,
-            locked_by_user: false,
-            members: vec![
-                DuplicateGroupMemberRow {
-                    evidence_id: original_member.evidence_id,
-                    is_representative: false,
-                },
-                DuplicateGroupMemberRow {
-                    evidence_id: reprocessed_member.evidence_id,
-                    is_representative: true,
-                },
-            ],
-            ..locked.clone()
-        };
-        repo.save_duplicate_group(&reprocessed).await.unwrap();
+        let reprocessed = repo
+            .insert_manual_evidence(&reprocessed_member)
+            .await
+            .unwrap();
+        assert_eq!(reprocessed.duplicate_group_id, Some(group_id));
 
         let stored: (bool, String, f64) = sqlx::query_as(
             r#"SELECT locked_by_user, relation_type, confidence::float8
@@ -490,42 +535,56 @@ mod tests {
         pool: PgPool,
     ) -> sqlx::Result<()> {
         let repo = EventRepository::new(pool.clone());
-        let original_member = evidence("source-duplicate-original", 1);
-        let reprocessed_member = evidence("source-duplicate-reprocessed", 1);
+        let original_member = evidence_with_shared_content(
+            "source-duplicate-original",
+            1,
+            "Shared duplicate title",
+            "Shared duplicate body",
+        );
+        let duplicate_member = evidence_with_shared_content(
+            "source-duplicate-existing",
+            1,
+            "Shared duplicate title",
+            "Shared duplicate body",
+        );
+        let reprocessed_member = evidence_with_shared_content(
+            "source-duplicate-reprocessed",
+            1,
+            "Shared duplicate title",
+            "Shared duplicate body",
+        );
         repo.insert_evidence(&original_member).await.unwrap();
-        repo.insert_evidence(&reprocessed_member).await.unwrap();
-
-        let group_id = Uuid::new_v4();
+        let inserted = repo
+            .insert_manual_evidence(&duplicate_member)
+            .await
+            .unwrap();
+        let group_id = inserted
+            .duplicate_group_id
+            .expect("duplicate insert should create the deterministic duplicate group");
         let locked = DuplicateGroupRow {
             duplicate_group_id: group_id,
             relation_type: "exact".to_string(),
             confidence: 1.0,
             locked_by_user: true,
-            members: vec![DuplicateGroupMemberRow {
-                evidence_id: original_member.evidence_id,
-                is_representative: true,
-            }],
+            members: vec![
+                DuplicateGroupMemberRow {
+                    evidence_id: original_member.evidence_id,
+                    is_representative: true,
+                },
+                DuplicateGroupMemberRow {
+                    evidence_id: duplicate_member.evidence_id,
+                    is_representative: false,
+                },
+            ],
             created_at: dt(2026, 7, 10, 12, 0, 0),
         };
         repo.save_duplicate_group(&locked).await.unwrap();
 
-        let reprocessed = DuplicateGroupRow {
-            relation_type: "near".to_string(),
-            confidence: 0.95,
-            locked_by_user: false,
-            members: vec![
-                DuplicateGroupMemberRow {
-                    evidence_id: original_member.evidence_id,
-                    is_representative: false,
-                },
-                DuplicateGroupMemberRow {
-                    evidence_id: reprocessed_member.evidence_id,
-                    is_representative: true,
-                },
-            ],
-            ..locked.clone()
-        };
-        repo.save_duplicate_group(&reprocessed).await.unwrap();
+        let reprocessed = repo
+            .insert_manual_evidence(&reprocessed_member)
+            .await
+            .unwrap();
+        assert_eq!(reprocessed.duplicate_group_id, Some(group_id));
 
         let stored: (bool, String, f64) = sqlx::query_as(
             r#"SELECT locked_by_user, relation_type, confidence::float8
@@ -546,7 +605,9 @@ mod tests {
         .bind(group_id)
         .fetch_all(&pool)
         .await?;
-        assert_eq!(members, vec![(original_member.evidence_id, true)]);
+        assert_eq!(members.len(), 2);
+        assert!(members.contains(&(original_member.evidence_id, true)));
+        assert!(members.contains(&(duplicate_member.evidence_id, false)));
 
         Ok(())
     }
@@ -590,9 +651,13 @@ mod tests {
         }
     }
 
-    fn evidence(source_item_id: &str, version: i32) -> EventEvidenceRow {
-        let title = format!("Evidence {source_item_id}");
-        let content = Some(format!("Normalized content {source_item_id}"));
+    fn evidence_with_shared_content(
+        source_item_id: &str,
+        version: i32,
+        title: &str,
+        content: &str,
+    ) -> EventEvidenceRow {
+        let content = Some(content.to_string());
         EventEvidenceRow {
             evidence_id: Uuid::new_v4(),
             source_id: "manual:rest".to_string(),
@@ -605,7 +670,7 @@ mod tests {
             first_seen_at: dt(2026, 7, 10, 8, 0, 0),
             available_at: dt(2026, 7, 10, 8, 0, 0),
             effective_trade_date: dt(2026, 7, 10, 8, 0, 0).date_naive(),
-            title: title.clone(),
+            title: title.to_string(),
             content: content.clone(),
             language: "und".to_string(),
             content_hash: content_hash(&title, content.as_deref()),
