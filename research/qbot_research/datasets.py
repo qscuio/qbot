@@ -6,7 +6,7 @@ import os
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any, Final, Protocol, cast
 
 import duckdb
 import polars as pl
@@ -18,7 +18,7 @@ from qbot_research.contracts import DatasetManifest, Horizon
 SCHEMA_VERSION = "1"
 FEATURE_VERSION = "1"
 DEFAULT_DATABASE_URL = "postgresql://qbot:qbot@127.0.0.1/qbot"
-POSTGRES_ATTACH_ALIAS = "source_db"
+PUBLISHABLE_HORIZONS: Final[frozenset[Horizon]] = frozenset({"week", "month"})
 
 STAGING_ONLY_COLUMNS = [
     "exclusion_reason",
@@ -32,6 +32,7 @@ STAGING_ONLY_COLUMNS = [
     "adjustment_factor",
     "adjustment_available_at",
     "status_available_at",
+    "master_available_at",
     "sector_valid_from",
     "sector_valid_to",
     "sector_available_at",
@@ -54,6 +55,11 @@ FINGERPRINT_COLUMNS = [
     "is_suspended",
     "price_limit_pct",
     "status_available_at",
+    "name",
+    "list_status",
+    "list_date",
+    "delist_date",
+    "master_available_at",
     "sector_code",
     "sector_name",
     "sector_type",
@@ -176,6 +182,7 @@ class PostgresRegistrationTarget:
 
 
 def build_dataset(horizon: Horizon, as_of: date, output_dir: Path) -> DatasetManifest:
+    validate_publishable_horizon(horizon)
     database_url = os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL)
     output_path = Path(output_dir)
     available_at_cutoff = datetime.combine(as_of, time.max, tzinfo=UTC)
@@ -200,6 +207,7 @@ def build_dataset_for_connection(
     registration_target: RegistrationTarget | None = None,
     source_prefix: str = "",
 ) -> DatasetBuildResult:
+    validate_publishable_horizon(horizon)
     available_at_cutoff = datetime.combine(as_of, time.max, tzinfo=UTC)
     raw_frame = _load_dataset_frame(
         connection=connection,
@@ -260,14 +268,6 @@ def build_dataset_for_connection(
         excluded_row_count=excluded_frame.height,
         excluded_rows_by_reason=excluded_rows_by_reason,
     )
-
-
-def _attach_postgres_source(connection: duckdb.DuckDBPyConnection, database_url: str) -> str:
-    escaped_database_url = database_url.replace("'", "''")
-    connection.execute("INSTALL postgres")
-    connection.execute("LOAD postgres")
-    connection.execute(f"ATTACH '{escaped_database_url}' AS {POSTGRES_ATTACH_ALIAS} (TYPE POSTGRES)")
-    return f"{POSTGRES_ATTACH_ALIAS}.public."
 
 
 def _stage_postgres_source(
@@ -481,6 +481,12 @@ def normalize_horizon(value: str) -> Horizon:
     return cast(Horizon, value)
 
 
+def validate_publishable_horizon(value: Horizon) -> Horizon:
+    if value not in PUBLISHABLE_HORIZONS:
+        raise ValueError("only 'week' and 'month' horizons may publish datasets")
+    return value
+
+
 def _load_dataset_frame(
     connection: duckdb.DuckDBPyConnection,
     as_of: date,
@@ -560,6 +566,7 @@ def _load_dataset_frame(
                     list_status,
                     list_date,
                     delist_date,
+                    available_at AS master_available_at,
                     ROW_NUMBER() OVER (
                         PARTITION BY code
                         ORDER BY available_at DESC
@@ -681,6 +688,7 @@ def _load_dataset_frame(
             master.list_status,
             master.list_date,
             master.delist_date,
+            master.master_available_at,
             sectors.sector_code,
             sectors.sector_name,
             sectors.sector_type,

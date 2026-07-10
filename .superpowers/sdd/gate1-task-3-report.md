@@ -205,3 +205,67 @@ Results:
 ### Concerns
 
 - The public production path is now unit-tested without DuckDB PostgreSQL extensions, but this pass still did not run against a live PostgreSQL instance.
+
+## Second review fix
+
+### RED evidence
+
+Added failing review-fix tests in `research/tests/test_datasets.py` before changing the implementation again.
+
+Ran:
+
+```bash
+cd research
+.venv/bin/python -m pytest tests/test_datasets.py -q
+```
+
+Observed the expected blocking failures on the pre-fix implementation:
+
+- `test_build_dataset_input_fingerprint_changes_when_security_master_inputs_change[name-'Alpha Prime']`
+  - failed because changing `security_master_versions.name` did not change `manifest.input_fingerprint`
+- `test_build_dataset_input_fingerprint_changes_when_security_master_inputs_change[available_at-?]`
+  - failed because changing only `security_master_versions.available_at` did not change `manifest.input_fingerprint`
+- `test_build_dataset_for_connection_rejects_non_publishable_horizons_before_writes_or_registration[quarter]`
+- `test_build_dataset_for_connection_rejects_non_publishable_horizons_before_writes_or_registration[year]`
+  - both failed because `build_dataset_for_connection(...)` still wrote publish outputs for `quarter` and `year`
+- `test_build_dataset_rejects_non_publishable_horizons_before_staging[quarter]`
+- `test_build_dataset_rejects_non_publishable_horizons_before_staging[year]`
+  - both failed because public `build_dataset(...)` still staged source tables before rejecting non-publishable horizons
+- `test_cli_build_dataset_command_rejects_non_publishable_horizons[quarter]`
+- `test_cli_build_dataset_command_rejects_non_publishable_horizons[year]`
+  - both failed because the CLI still allowed the builder path to run for `quarter` and `year`
+
+The tightened schema test also ran in this RED cycle and stayed green, which confirmed the dtype assertions matched the persisted output and did not require a production change.
+
+### GREEN evidence
+
+Implemented the second review fixes in `research/qbot_research/datasets.py` and `research/qbot_research/cli.py`:
+
+- added a shared publishability gate so only `week` and `month` can reach `build_dataset(...)`, `build_dataset_for_connection(...)`, and the `build-dataset` CLI command
+- enforced the gate before staging, writing, or registration side effects
+- removed the dead legacy DuckDB PostgreSQL attach helper and its related constant
+- extended the staged security-master projection with `master_available_at`
+- added `name`, `list_status`, `list_date`, `delist_date`, and `master_available_at` to the deterministic `input_fingerprint`
+- tightened schema coverage to assert full Polars and persisted Parquet dtypes for all required columns
+
+Ran:
+
+```bash
+cd research
+.venv/bin/python -m pytest tests/test_datasets.py -q
+```
+
+Result:
+
+- `14 passed in 2.02s`
+
+### Files changed
+
+- `research/qbot_research/datasets.py`
+- `research/qbot_research/cli.py`
+- `research/tests/test_datasets.py`
+- `.superpowers/sdd/gate1-task-3-report.md`
+
+### Concerns
+
+- None beyond the previously noted lack of a live PostgreSQL integration run.

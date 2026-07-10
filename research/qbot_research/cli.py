@@ -4,7 +4,7 @@ from typing import Annotated
 
 import typer
 
-from qbot_research.datasets import build_dataset, normalize_horizon
+from qbot_research.datasets import build_dataset, normalize_horizon, validate_publishable_horizon
 
 app = typer.Typer(help="Independent qbot research worker scaffold.")
 
@@ -62,12 +62,17 @@ def build_dataset_command(
         raise typer.BadParameter(str(error), param_hint="--horizon") from error
 
     try:
+        publishable_horizon = validate_publishable_horizon(normalized_horizon)
+    except ValueError as error:
+        raise typer.BadParameter(str(error), param_hint="--horizon") from error
+
+    try:
         as_of_date = date.fromisoformat(as_of)
     except ValueError as error:
         raise typer.BadParameter("expected YYYY-MM-DD", param_hint="--as-of") from error
 
     manifest = build_dataset(
-        horizon=normalized_horizon,
+        horizon=publishable_horizon,
         as_of=as_of_date,
         output_dir=output_dir,
     )

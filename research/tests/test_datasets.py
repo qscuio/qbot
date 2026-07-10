@@ -360,47 +360,47 @@ def test_build_dataset_for_connection_persists_required_frame_and_parquet_schema
         output_dir=tmp_path,
     )
 
-    expected_columns = [
-        "trade_date",
-        "code",
-        "adjusted_open",
-        "adjusted_high",
-        "adjusted_low",
-        "adjusted_close",
-        "amount",
-        "turnover",
-        "listed_days",
-        "is_st",
-        "is_suspended",
-        "price_limit_pct",
-        "name",
-        "list_status",
-        "list_date",
-        "delist_date",
-        "sector_code",
-        "sector_name",
-        "sector_type",
-        "sse_change_pct",
-        "szse_change_pct",
-        "chinext_change_pct",
-        "star50_change_pct",
-        "breadth_up_count",
-        "breadth_down_count",
-        "breadth_flat_count",
-        "breadth_above_ma20_count",
-        "breadth_new_high_20_count",
-        "breadth_new_low_20_count",
-        "breadth_limit_up_count",
-        "breadth_limit_down_count",
-        "market_data_complete",
-        "market_snapshot_version",
-        "available_at_cutoff",
-        "dataset_version",
-        "horizon",
-        "year",
-    ]
+    expected_schema = {
+        "trade_date": pl.Date,
+        "code": pl.String,
+        "adjusted_open": pl.Float64,
+        "adjusted_high": pl.Float64,
+        "adjusted_low": pl.Float64,
+        "adjusted_close": pl.Float64,
+        "amount": pl.Float64,
+        "turnover": pl.Float64,
+        "listed_days": pl.Int32,
+        "is_st": pl.Boolean,
+        "is_suspended": pl.Boolean,
+        "price_limit_pct": pl.Float64,
+        "name": pl.String,
+        "list_status": pl.String,
+        "list_date": pl.Date,
+        "delist_date": pl.Date,
+        "sector_code": pl.String,
+        "sector_name": pl.String,
+        "sector_type": pl.String,
+        "sse_change_pct": pl.Float64,
+        "szse_change_pct": pl.Float64,
+        "chinext_change_pct": pl.Float64,
+        "star50_change_pct": pl.Float64,
+        "breadth_up_count": pl.Int32,
+        "breadth_down_count": pl.Int32,
+        "breadth_flat_count": pl.Int32,
+        "breadth_above_ma20_count": pl.Int32,
+        "breadth_new_high_20_count": pl.Int32,
+        "breadth_new_low_20_count": pl.Int32,
+        "breadth_limit_up_count": pl.Int32,
+        "breadth_limit_down_count": pl.Int32,
+        "market_data_complete": pl.Boolean,
+        "market_snapshot_version": pl.String,
+        "available_at_cutoff": pl.Datetime(time_zone="Etc/UTC"),
+        "dataset_version": pl.String,
+        "horizon": pl.String,
+        "year": pl.Int32,
+    }
 
-    assert result.frame.columns == expected_columns
+    assert result.frame.schema == expected_schema
 
     parquet_frame = pl.read_parquet(
         tmp_path
@@ -409,7 +409,7 @@ def test_build_dataset_for_connection_persists_required_frame_and_parquet_schema
         / "year=2026"
         / "part-000.parquet"
     )
-    assert parquet_frame.columns == expected_columns
+    assert parquet_frame.schema == expected_schema
     assert parquet_frame.row(0, named=True)["available_at_cutoff"] == result.manifest.available_at_cutoff
 
 
@@ -488,6 +488,58 @@ def test_build_dataset_input_fingerprint_changes_when_dataset_inputs_change(tmp_
     assert changed_result.manifest.input_fingerprint != baseline_result.manifest.input_fingerprint
 
 
+@pytest.mark.parametrize("field_name, replacement", [("name", "'Alpha Prime'"), ("available_at", "?")])
+def test_build_dataset_input_fingerprint_changes_when_security_master_inputs_change(
+    tmp_path: Path,
+    field_name: str,
+    replacement: str,
+) -> None:
+    baseline_connection = duckdb.connect(database=":memory:")
+    changed_connection = duckdb.connect(database=":memory:")
+
+    try:
+        _seed_dataset_source(baseline_connection)
+        _seed_dataset_source(changed_connection)
+
+        changed_connection.execute("DELETE FROM security_master_versions WHERE code = 'AAA'")
+        if field_name == "available_at":
+            changed_connection.execute(
+                """
+                INSERT INTO security_master_versions
+                VALUES ('AAA', 'Alpha', 'L', DATE '2020-01-01', NULL, ?)
+                """,
+                [dt(2026, 1, 1, 1)],
+            )
+        else:
+            changed_connection.execute(
+                f"""
+                INSERT INTO security_master_versions
+                VALUES ('AAA', {replacement}, 'L', DATE '2020-01-01', NULL, ?)
+                """,
+                [dt(2026, 1, 1, 0)],
+            )
+
+        baseline_result = build_dataset_for_connection(
+            connection=baseline_connection,
+            horizon="week",
+            as_of=date(2026, 7, 10),
+            output_dir=tmp_path / f"baseline-{field_name}",
+            registration_target=RecordingRegistrationTarget(records=[]),
+        )
+        changed_result = build_dataset_for_connection(
+            connection=changed_connection,
+            horizon="week",
+            as_of=date(2026, 7, 10),
+            output_dir=tmp_path / f"changed-{field_name}",
+            registration_target=RecordingRegistrationTarget(records=[]),
+        )
+    finally:
+        baseline_connection.close()
+        changed_connection.close()
+
+    assert changed_result.manifest.input_fingerprint != baseline_result.manifest.input_fingerprint
+
+
 def test_build_dataset_public_path_uses_staged_source_loader(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -495,9 +547,6 @@ def test_build_dataset_public_path_uses_staged_source_loader(
     import qbot_research.datasets as datasets_module
 
     registration_target = RecordingRegistrationTarget(records=[])
-
-    def fail_legacy_attach(*args: Any, **kwargs: Any) -> str:
-        raise AssertionError("legacy DuckDB postgres attach path should not run")
 
     def fake_stage_postgres_source(
         connection: duckdb.DuckDBPyConnection,
@@ -511,7 +560,6 @@ def test_build_dataset_public_path_uses_staged_source_loader(
         _seed_dataset_source(connection)
 
     monkeypatch.setenv("DATABASE_URL", "postgresql://stubbed.example/qbot")
-    monkeypatch.setattr(datasets_module, "_attach_postgres_source", fail_legacy_attach)
     monkeypatch.setattr(
         datasets_module,
         "_stage_postgres_source",
@@ -528,6 +576,47 @@ def test_build_dataset_public_path_uses_staged_source_loader(
 
     assert manifest.row_count == 3
     assert registration_target.records[0]["manifest"].dataset_version == manifest.dataset_version
+
+
+@pytest.mark.parametrize("horizon", ["quarter", "year"])
+def test_build_dataset_for_connection_rejects_non_publishable_horizons_before_writes_or_registration(
+    dataset_connection: duckdb.DuckDBPyConnection,
+    tmp_path: Path,
+    horizon: str,
+) -> None:
+    registration_target = RecordingRegistrationTarget(records=[])
+
+    with pytest.raises(ValueError, match="only 'week' and 'month' horizons may publish datasets"):
+        build_dataset_for_connection(
+            connection=dataset_connection,
+            horizon=horizon,  # type: ignore[arg-type]
+            as_of=date(2026, 7, 10),
+            output_dir=tmp_path,
+            registration_target=registration_target,
+        )
+
+    assert registration_target.records == []
+    assert not any(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("horizon", ["quarter", "year"])
+def test_build_dataset_rejects_non_publishable_horizons_before_staging(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    horizon: str,
+) -> None:
+    import qbot_research.datasets as datasets_module
+
+    def fail_stage_postgres_source(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("staging should not run for non-publishable horizons")
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://stubbed.example/qbot")
+    monkeypatch.setattr(datasets_module, "_stage_postgres_source", fail_stage_postgres_source)
+
+    with pytest.raises(ValueError, match="only 'week' and 'month' horizons may publish datasets"):
+        build_dataset(horizon, date(2026, 7, 10), tmp_path)  # type: ignore[arg-type]
+
+    assert not any(tmp_path.iterdir())
 
 
 def test_cli_build_dataset_command_invokes_builder(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -567,3 +656,24 @@ def test_cli_build_dataset_command_invokes_builder(monkeypatch: pytest.MonkeyPat
         "output_dir": tmp_path,
     }
     assert "ptf-v1-week-20260710" in result.stdout
+
+
+@pytest.mark.parametrize("horizon", ["quarter", "year"])
+def test_cli_build_dataset_command_rejects_non_publishable_horizons(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    horizon: str,
+) -> None:
+    def fail_build_dataset(*args: Any, **kwargs: Any) -> DatasetManifest:
+        raise AssertionError("builder should not run for non-publishable horizons")
+
+    monkeypatch.setattr("qbot_research.cli.build_dataset", fail_build_dataset)
+
+    result = RUNNER.invoke(
+        app,
+        ["build-dataset", "--horizon", horizon, "--as-of", "2026-07-10", "--output-dir", str(tmp_path)],
+    )
+
+    assert result.exit_code != 0
+    assert "Invalid value for --horizon" in result.output
+    assert "only 'week' and 'month' horizons may publish" in result.output
