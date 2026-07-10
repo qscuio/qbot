@@ -180,6 +180,20 @@ def test_label_samples_keeps_feature_date_fields_and_adds_expected_label_columns
     )
 
 
+def test_label_samples_supports_month_publishable_horizon() -> None:
+    labeled = label_samples(
+        _make_linear_frame(21).with_columns(pl.lit("month").alias("horizon")),
+        "month",
+    )
+
+    first_row = labeled.row(0, named=True)
+    assert first_row["future_return"] == pytest.approx(2.0)
+    assert first_row["future_market_excess"] == pytest.approx(2.0)
+    assert first_row["future_industry_excess"] == pytest.approx(0.0)
+    assert first_row["tradable_sample"] is True
+    assert first_row["is_positive"] is False
+
+
 @pytest.mark.parametrize(
     ("horizon", "length"),
     [
