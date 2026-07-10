@@ -9,8 +9,10 @@ use self::extraction::{EventExtractionInput, EventExtractionOutput, EventExtract
 use crate::error::{AppError, Result};
 use crate::storage::event_repository::EventRepository;
 
+pub(crate) mod claims;
 pub mod contracts;
 mod dedup;
+pub(crate) mod entity_linking;
 mod evidence;
 pub(crate) mod extraction;
 mod time;
