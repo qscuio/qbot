@@ -308,7 +308,7 @@ git commit -m "feat: add event intelligence contracts"
 - Produces normalized immutable evidence from manual input.
 - Uses trading calendar to calculate effective trade date.
 
-- [ ] **Step 1: Write normalization tests**
+- [x] **Step 1: Write normalization tests**
 
 Assert:
 
@@ -317,7 +317,7 @@ Assert:
 - content hash is stable.
 - repeated submission returns the existing evidence relation instead of creating silent duplicates.
 
-- [ ] **Step 2: Implement evidence normalization**
+- [x] **Step 2: Implement evidence normalization**
 
 ```rust
 fn normalize_text(value: &str) -> String {
@@ -338,7 +338,7 @@ fn content_hash(title: &str, content: Option<&str>) -> String {
 
 Add `sha2 = "0.10"` to `Cargo.toml`.
 
-- [ ] **Step 3: Implement immutable insertion**
+- [x] **Step 3: Implement immutable insertion**
 
 Manual source ID:
 
@@ -349,7 +349,7 @@ manual:rest
 
 Source item ID is a UUID generated at ingestion; repeated content is linked through duplicate handling rather than reusing the ID.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ```bash
 cargo test analysis::events::evidence
