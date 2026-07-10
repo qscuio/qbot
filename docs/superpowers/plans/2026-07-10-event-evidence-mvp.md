@@ -726,7 +726,7 @@ git commit -m "feat: expose market-event evidence workflows"
 - Pushes facts only.
 - Event score remains zero.
 
-- [ ] **Step 1: Write report golden tests**
+- [x] **Step 1: Write report golden tests**
 
 Output sections:
 
@@ -740,11 +740,11 @@ Output sections:
 
 Assert every fact includes at least one source reference.
 
-- [ ] **Step 2: Implement report builder**
+- [x] **Step 2: Implement report builder**
 
 Do not ask an LLM to compose the fact brief. Render from structured claims and sources. LLM use is limited to extraction.
 
-- [ ] **Step 3: Add jobs**
+- [x] **Step 3: Add jobs**
 
 ```rust
 pub async fn run_event_ingestion_job(state: Arc<AppState>);
@@ -760,11 +760,11 @@ fact brief: 17:50 trading days
 
 The hourly job must use provider cursor state and be idempotent.
 
-- [ ] **Step 4: Add failure isolation**
+- [x] **Step 4: Add failure isolation**
 
 A failed event source or extraction must not fail the existing daily market report.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 cargo fmt --all -- --check
@@ -783,9 +783,9 @@ git commit -m "feat: publish daily evidence-backed market facts"
 - [x] Retention policy is enforced.
 - [x] Evidence versions are immutable.
 - [x] Exact and near duplicates are conservative and auditable.
-- [ ] Every published fact has evidence.
+- [x] Every published fact has evidence.
 - [x] Direct entity mapping does not guess ambiguous stocks.
-- [ ] ClaimGraph contains facts only.
-- [ ] No GDELT or complex clustering exists yet.
-- [ ] No event score reaches candidate ranking.
-- [ ] No non-direct beneficiary stock list is generated.
+- [x] ClaimGraph contains facts only.
+- [x] No GDELT or complex clustering exists yet.
+- [x] No event score reaches candidate ranking.
+- [x] No non-direct beneficiary stock list is generated.
