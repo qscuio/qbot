@@ -52,3 +52,7 @@ Gate 1 Task 6: complete (commits 19e87d2..093e417, review clean after validation
 Gate 1 Task 7: complete (commits 3b1ddbb..68783b6, review clean after as-of cutoff, UUID contract, immutable payload, JSON error, empty-plan, and CLI parameter fixes; verification: research pytest 76/76 passed, ruff passed, mypy passed, diff check passed)
 Gate 1 Task 8: complete (commits c4bbcf2..e1a8d37, review clean after feature coverage, schema-version, full metric parameters, risk tiering, direct engine coverage, tier persistence, name output, and additive scoring fixes; verification: analysis::patterns 30/30 passed, storage::pattern_repository 11/11 passed with DATABASE_URL, research contract/export pytest 39/39 passed, ruff passed, mypy passed, diff check passed)
 Gate 1 Task 9: complete (commits 18c603c..e6372a7, review clean after trading-table safety coverage fix; verification: scheduler pattern shadow job tests 4/4 passed with DATABASE_URL, pattern routes 4/4 passed with DATABASE_URL, analysis matcher focused tests passed, fmt check passed, diff check passed)
+
+## Gate 2: Event Evidence MVP
+
+Gate 2 Task 1: complete (commits 80b62a6..d2b0298, review clean after immutability, locked duplicate, published-claim evidence, duplicate-member replacement, and lookup-index fixes; verification: storage::event_repository 11/11 passed with DATABASE_URL, full suite split 211/211 + config 1/1 passed, fmt check passed, diff check passed)

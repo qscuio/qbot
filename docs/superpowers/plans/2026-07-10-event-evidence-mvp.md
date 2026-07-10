@@ -33,7 +33,7 @@
 **Interfaces:**
 - Produces immutable evidence, duplicate groups, extraction, claims, entities, ClaimGraph, revision, and brief tables.
 
-- [ ] **Step 1: Create the migration**
+- [x] **Step 1: Create the migration**
 
 ```sql
 CREATE TABLE market_event_evidence (
@@ -159,7 +159,7 @@ CREATE INDEX idx_event_entities_canonical
     ON market_event_entities(canonical_type, canonical_id, review_status);
 ```
 
-- [ ] **Step 2: Add SQLx tests**
+- [x] **Step 2: Add SQLx tests**
 
 Verify:
 
@@ -168,7 +168,7 @@ Verify:
 - user-locked duplicate groups remain locked after upsert.
 - daily brief upserts by trade date.
 
-- [ ] **Step 3: Implement `EventRepository`**
+- [x] **Step 3: Implement `EventRepository`**
 
 Public methods:
 
@@ -183,7 +183,7 @@ pub async fn save_daily_brief(&self, brief: &DailyEventBriefRow) -> Result<()>;
 pub async fn list_publishable_evidence(&self, trade_date: NaiveDate) -> Result<Vec<EventEvidenceRow>>;
 ```
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ```bash
 cargo test storage::event_repository -- --nocapture
