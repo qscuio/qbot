@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use reqwest::Url;
 use serde_json::json;
 use uuid::Uuid;
 
@@ -209,22 +208,7 @@ pub(crate) fn content_hash(title: &str, content: Option<&str>) -> String {
 }
 
 pub(crate) fn canonicalize_source_url(value: &str) -> Result<String> {
-    let trimmed = value.trim();
-    let mut url = Url::parse(trimmed).map_err(|error| {
-        AppError::Internal(format!("manual event source URL is invalid: {error}"))
-    })?;
-    url.set_fragment(None);
-    if matches!(
-        (url.scheme(), url.port()),
-        ("https", Some(443)) | ("http", Some(80))
-    ) {
-        let _ = url.set_port(None);
-    }
-    if url.path().is_empty() {
-        url.set_path("/");
-    }
-
-    Ok(url.to_string())
+    crate::storage::event_repository::canonicalize_source_url(value)
 }
 
 fn event_evidence_from_row(row: &EventEvidenceRow) -> EventEvidence {
@@ -370,6 +354,7 @@ mod tests {
     use std::time::Duration;
 
     use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+    use serde_json::json;
     use sha2::{Digest, Sha256};
     use sqlx::PgPool;
     use tokio::task::yield_now;
@@ -383,7 +368,7 @@ mod tests {
         AShareTradingDateResolver, EventIntelligence, ExistingEventEvidenceRelation,
         ManualEventInput, ManualEventSubmissionOutcome,
     };
-    use crate::storage::event_repository::EventRepository;
+    use crate::storage::event_repository::{EventEvidenceRow, EventRepository};
 
     #[sqlx::test(migrations = "./migrations")]
     async fn manual_ingestion_normalizes_text_url_hash_and_trade_date(
@@ -662,6 +647,70 @@ mod tests {
             duplicate.existing.effective_trade_date,
             chrono::NaiveDate::from_ymd_opt(2026, 7, 10).unwrap()
         );
+        assert_eq!(
+            duplicate.submitted.effective_trade_date,
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 13).unwrap()
+        );
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn exact_duplicate_manual_submission_detects_matching_canonical_url_across_trade_dates(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = EventRepository::new(pool.clone());
+        let ingestor =
+            ManualEvidenceIngestor::new(repo.clone(), Arc::new(AShareTradingDateResolver));
+
+        let existing = EventEvidenceRow {
+            evidence_id: Uuid::new_v4(),
+            source_id: MANUAL_SOURCE_REST.to_string(),
+            source_item_id: "legacy-canonical-url".to_string(),
+            source_url: Some("HTTPS://Example.com:443/contracts/acme#primary".to_string()),
+            source_tier: "manual".to_string(),
+            source_terms_version: "terms-v1".to_string(),
+            occurred_at: Some(dt(2026, 7, 10, 6, 30, 0)),
+            published_at: Some(dt(2026, 7, 10, 6, 30, 0)),
+            first_seen_at: dt(2026, 7, 10, 8, 0, 0),
+            available_at: dt(2026, 7, 10, 8, 0, 0),
+            effective_trade_date: NaiveDate::from_ymd_opt(2026, 7, 10).unwrap(),
+            title: "Archived Acme contract bulletin".to_string(),
+            content: Some("Legacy bulletin wording from the first post.".to_string()),
+            language: "und".to_string(),
+            content_hash: content_hash(
+                "Archived Acme contract bulletin",
+                Some("Legacy bulletin wording from the first post."),
+            ),
+            raw_payload: json!({
+                "submitted_by": "operator",
+                "manual_source_id": MANUAL_SOURCE_REST,
+            }),
+            version: 1,
+            supersedes_evidence_id: None,
+            status: "pending".to_string(),
+            created_at: dt(2026, 7, 10, 8, 0, 0),
+        };
+        repo.insert_evidence(&existing).await.unwrap();
+
+        let duplicate = assert_existing(
+            ingestor
+                .submit_at(
+                    ManualSource::Rest,
+                    ManualEventInput {
+                        title: "Mirror of Acme contract bulletin".to_string(),
+                        content: Some("Later repost with different body text.".to_string()),
+                        source_url: Some("https://example.com/contracts/acme".to_string()),
+                        submitted_by: "operator".to_string(),
+                        published_at: Some(dt(2026, 7, 10, 7, 30, 0)),
+                    },
+                    dt(2026, 7, 10, 8, 5, 0),
+                )
+                .await
+                .unwrap(),
+        );
+
+        assert_eq!(duplicate.existing.evidence_id, existing.evidence_id);
         assert_eq!(
             duplicate.submitted.effective_trade_date,
             chrono::NaiveDate::from_ymd_opt(2026, 7, 13).unwrap()

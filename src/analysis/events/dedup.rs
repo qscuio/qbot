@@ -323,7 +323,6 @@ fn normalized_prefix(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::{fs, path::PathBuf};
 
     use chrono::{TimeZone, Utc};
     use sqlx::PgPool;
@@ -774,45 +773,46 @@ mod tests {
 
     #[test]
     fn duplicate_decision_public_shape_matches_task_brief() {
-        let source = fs::read_to_string(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/analysis/events/dedup.rs"),
-        )
-        .unwrap();
+        let exact = DuplicateDecision::Exact {
+            representative_id: Uuid::nil(),
+        };
+        let near = DuplicateDecision::NearDuplicate {
+            representative_id: Uuid::nil(),
+            confidence: 0.92,
+        };
+        let review = DuplicateDecision::ReviewRequired {
+            candidate_ids: vec![Uuid::nil()],
+        };
 
-        let enum_body = source
-            .split("pub enum DuplicateDecision {")
-            .nth(1)
-            .and_then(|rest| rest.split("\n}\n\nimpl DuplicateDecision").next())
-            .expect("DuplicateDecision enum body");
-        let exact_block = enum_body
-            .split("Exact {")
-            .nth(1)
-            .and_then(|rest| rest.split("},").next())
-            .expect("Exact block");
-        let near_block = enum_body
-            .split("NearDuplicate {")
-            .nth(1)
-            .and_then(|rest| rest.split("},").next())
-            .expect("NearDuplicate block");
-        let review_block = enum_body
-            .split("ReviewRequired {")
-            .nth(1)
-            .and_then(|rest| rest.split("},").next())
-            .expect("ReviewRequired block");
+        match exact {
+            DuplicateDecision::Exact { representative_id } => {
+                let _: Uuid = representative_id;
+            }
+            _ => panic!("expected exact variant"),
+        }
 
-        assert!(exact_block.contains("representative_id: Uuid,"));
-        assert!(!exact_block.contains("candidate_ids"));
-        assert!(!exact_block.contains("confidence"));
+        match near {
+            DuplicateDecision::NearDuplicate {
+                representative_id,
+                confidence,
+            } => {
+                let _: Uuid = representative_id;
+                let _: f64 = confidence;
+            }
+            _ => panic!("expected near-duplicate variant"),
+        }
 
-        assert!(near_block.contains("representative_id: Uuid,"));
-        assert!(near_block.contains("confidence: f64,"));
-        assert!(!near_block.contains("candidate_ids"));
+        assert!(matches!(
+            DuplicateDecision::Independent,
+            DuplicateDecision::Independent
+        ));
 
-        assert!(enum_body.contains("Independent,"));
-
-        assert!(review_block.contains("candidate_ids: Vec<Uuid>,"));
-        assert!(!review_block.contains("representative_id"));
-        assert!(!review_block.contains("confidence"));
+        match review {
+            DuplicateDecision::ReviewRequired { candidate_ids } => {
+                let _: Vec<Uuid> = candidate_ids;
+            }
+            _ => panic!("expected review-required variant"),
+        }
     }
 
     fn subject(

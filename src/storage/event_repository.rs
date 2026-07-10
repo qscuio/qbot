@@ -1,4 +1,5 @@
 use chrono::{DateTime, NaiveDate, Utc};
+use reqwest::Url;
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
@@ -127,7 +128,8 @@ impl EventRepository {
     }
 
     pub async fn insert_evidence(&self, row: &EventEvidenceRow) -> Result<Uuid> {
-        insert_evidence_in_txless(&self.pool, row).await?;
+        let row = canonicalized_evidence_row(row)?;
+        insert_evidence_in_txless(&self.pool, &row).await?;
         Ok(row.evidence_id)
     }
 
@@ -135,13 +137,14 @@ impl EventRepository {
         &self,
         row: &EventEvidenceRow,
     ) -> Result<ManualEvidenceInsertResult> {
+        let row = canonicalized_evidence_row(row)?;
         let mut tx = self.pool.begin().await?;
-        lock_manual_duplicate_discovery_scope(&mut tx, row).await?;
+        lock_manual_duplicate_discovery_scope(&mut tx, &row).await?;
 
-        let existing_candidates = find_manual_duplicate_candidates_in_tx(&mut tx, row).await?;
+        let existing_candidates = find_manual_duplicate_candidates_in_tx(&mut tx, &row).await?;
         #[cfg(test)]
         self.run_manual_insert_test_hook(&existing_candidates).await;
-        insert_evidence_in_tx(&mut tx, row).await?;
+        insert_evidence_in_tx(&mut tx, &row).await?;
 
         tx.commit().await?;
 
@@ -379,6 +382,38 @@ fn evidence_select_sql(where_and_order: &str) -> String {
            FROM market_event_evidence
            {where_and_order}"#
     )
+}
+
+pub(crate) fn canonicalize_source_url(value: &str) -> Result<String> {
+    let trimmed = value.trim();
+    let mut url = Url::parse(trimmed).map_err(|error| {
+        AppError::Internal(format!("manual event source URL is invalid: {error}"))
+    })?;
+    url.set_fragment(None);
+    if matches!(
+        (url.scheme(), url.port()),
+        ("https", Some(443)) | ("http", Some(80))
+    ) {
+        let _ = url.set_port(None);
+    }
+    if url.path().is_empty() {
+        url.set_path("/");
+    }
+
+    Ok(url.to_string())
+}
+
+fn canonicalized_evidence_row(row: &EventEvidenceRow) -> Result<EventEvidenceRow> {
+    let source_url = row
+        .source_url
+        .as_deref()
+        .map(canonicalize_source_url)
+        .transpose()?;
+
+    Ok(EventEvidenceRow {
+        source_url,
+        ..row.clone()
+    })
 }
 
 async fn insert_evidence_in_txless(pool: &PgPool, row: &EventEvidenceRow) -> Result<()> {
@@ -1186,6 +1221,52 @@ mod tests {
         assert_eq!(
             inserted.existing_rows[0].effective_trade_date,
             date(2026, 7, 10)
+        );
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn manual_insert_surfaces_cross_trade_date_canonical_url_exact_duplicate_candidates(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = EventRepository::new(pool.clone());
+        let mut existing = evidence("source-cross-url-existing", 1, "pending");
+        existing.title = "Acme contract post from archive".to_string();
+        existing.content = Some("Archived copy with legacy formatting.".to_string());
+        existing.content_hash =
+            "3c8d4cf22f5a8ab349a0d1238b531f8cbe9a2459f1bfd4f64d2c7d90840bbce1".to_string();
+        existing.source_url = Some("HTTPS://Example.test:443/contracts/acme#archive".to_string());
+        existing.effective_trade_date = date(2026, 7, 10);
+        existing.available_at = dt(2026, 7, 10, 10);
+        existing.first_seen_at = dt(2026, 7, 10, 10);
+        existing.created_at = dt(2026, 7, 10, 11);
+        save_evidence(&pool, &existing).await;
+
+        let mut duplicate = evidence("source-cross-url-submitted", 1, "pending");
+        duplicate.title = "Acme contract post mirrored later".to_string();
+        duplicate.content = Some("Mirror copy after formatting changes.".to_string());
+        duplicate.content_hash =
+            "d1d0d4f6e86dcb0df4ccf5b00b1588f2bba4f43c516a2de0060d44e0f8ef4614".to_string();
+        duplicate.source_url = Some("https://example.test/contracts/acme".to_string());
+        duplicate.effective_trade_date = date(2026, 7, 13);
+        duplicate.available_at = dt(2026, 7, 10, 13);
+        duplicate.first_seen_at = dt(2026, 7, 10, 13);
+        duplicate.created_at = dt(2026, 7, 10, 13);
+
+        let inserted = repo.insert_manual_evidence(&duplicate).await.unwrap();
+
+        assert_eq!(
+            inserted
+                .existing_rows
+                .iter()
+                .map(|row| row.evidence_id)
+                .collect::<Vec<_>>(),
+            vec![existing.evidence_id]
+        );
+        assert_eq!(
+            inserted.existing_rows[0].source_url.as_deref(),
+            Some("https://example.test/contracts/acme")
         );
 
         Ok(())
