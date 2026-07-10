@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timezone
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +14,7 @@ from typer.testing import CliRunner
 
 from qbot_research.cli import app
 from qbot_research.contracts import DatasetManifest
-from qbot_research.datasets import DatasetBuildResult, build_dataset_for_connection
+from qbot_research.datasets import DatasetBuildResult, build_dataset, build_dataset_for_connection
 
 RUNNER = CliRunner()
 
@@ -44,10 +44,7 @@ class RecordingRegistrationTarget:
         )
 
 
-@pytest.fixture()
-def dataset_connection() -> duckdb.DuckDBPyConnection:
-    connection = duckdb.connect(database=":memory:")
-
+def _create_source_tables(connection: duckdb.DuckDBPyConnection) -> None:
     connection.execute(
         """
         CREATE TABLE stock_daily_bar_versions (
@@ -140,6 +137,9 @@ def dataset_connection() -> duckdb.DuckDBPyConnection:
         )
         """
     )
+
+
+def _create_manifest_table(connection: duckdb.DuckDBPyConnection) -> None:
     connection.execute(
         """
         CREATE TABLE analysis_dataset_manifests (
@@ -158,6 +158,10 @@ def dataset_connection() -> duckdb.DuckDBPyConnection:
         )
         """
     )
+
+
+def _seed_dataset_source(connection: duckdb.DuckDBPyConnection) -> None:
+    _create_source_tables(connection)
 
     connection.executemany(
         """
@@ -272,6 +276,13 @@ def dataset_connection() -> duckdb.DuckDBPyConnection:
         ],
     )
 
+
+@pytest.fixture()
+def dataset_connection() -> duckdb.DuckDBPyConnection:
+    connection = duckdb.connect(database=":memory:")
+    _seed_dataset_source(connection)
+    _create_manifest_table(connection)
+
     try:
         yield connection
     finally:
@@ -338,6 +349,70 @@ def test_build_dataset_for_connection_obeys_point_in_time_rules_and_writes_outpu
     assert registration_record["manifest_payload"]["excluded_rows_by_reason"]["missing_status"] == 1
 
 
+def test_build_dataset_for_connection_persists_required_frame_and_parquet_schema(
+    dataset_connection: duckdb.DuckDBPyConnection,
+    tmp_path: Path,
+) -> None:
+    result = build_dataset_for_connection(
+        connection=dataset_connection,
+        horizon="week",
+        as_of=date(2026, 7, 10),
+        output_dir=tmp_path,
+    )
+
+    expected_columns = [
+        "trade_date",
+        "code",
+        "adjusted_open",
+        "adjusted_high",
+        "adjusted_low",
+        "adjusted_close",
+        "amount",
+        "turnover",
+        "listed_days",
+        "is_st",
+        "is_suspended",
+        "price_limit_pct",
+        "name",
+        "list_status",
+        "list_date",
+        "delist_date",
+        "sector_code",
+        "sector_name",
+        "sector_type",
+        "sse_change_pct",
+        "szse_change_pct",
+        "chinext_change_pct",
+        "star50_change_pct",
+        "breadth_up_count",
+        "breadth_down_count",
+        "breadth_flat_count",
+        "breadth_above_ma20_count",
+        "breadth_new_high_20_count",
+        "breadth_new_low_20_count",
+        "breadth_limit_up_count",
+        "breadth_limit_down_count",
+        "market_data_complete",
+        "market_snapshot_version",
+        "available_at_cutoff",
+        "dataset_version",
+        "horizon",
+        "year",
+    ]
+
+    assert result.frame.columns == expected_columns
+
+    parquet_frame = pl.read_parquet(
+        tmp_path
+        / f"dataset_version={result.manifest.dataset_version}"
+        / "horizon=week"
+        / "year=2026"
+        / "part-000.parquet"
+    )
+    assert parquet_frame.columns == expected_columns
+    assert parquet_frame.row(0, named=True)["available_at_cutoff"] == result.manifest.available_at_cutoff
+
+
 def test_build_dataset_for_connection_registers_manifest_contents_in_duckdb(
     dataset_connection: duckdb.DuckDBPyConnection,
     tmp_path: Path,
@@ -366,6 +441,93 @@ def test_build_dataset_for_connection_registers_manifest_contents_in_duckdb(
     assert stored_manifest["dataset_version"] == result.manifest.dataset_version
     assert stored_manifest["excluded_row_count"] == 2
     assert stored[4] == result.manifest.input_fingerprint
+
+
+def test_build_dataset_input_fingerprint_changes_when_dataset_inputs_change(tmp_path: Path) -> None:
+    baseline_connection = duckdb.connect(database=":memory:")
+    changed_connection = duckdb.connect(database=":memory:")
+
+    try:
+        _seed_dataset_source(baseline_connection)
+        _seed_dataset_source(changed_connection)
+
+        changed_connection.execute(
+            """
+            DELETE FROM stock_adjustment_factors
+            WHERE code = 'AAA' AND trade_date = DATE '2026-07-10'
+            """
+        )
+        changed_connection.execute(
+            """
+            INSERT INTO stock_adjustment_factors
+            VALUES ('AAA', DATE '2026-07-10', 1.25, ?)
+            """,
+            [dt(2026, 7, 10, 18)],
+        )
+
+        baseline_result = build_dataset_for_connection(
+            connection=baseline_connection,
+            horizon="week",
+            as_of=date(2026, 7, 10),
+            output_dir=tmp_path / "baseline",
+            registration_target=RecordingRegistrationTarget(records=[]),
+        )
+        changed_result = build_dataset_for_connection(
+            connection=changed_connection,
+            horizon="week",
+            as_of=date(2026, 7, 10),
+            output_dir=tmp_path / "changed",
+            registration_target=RecordingRegistrationTarget(records=[]),
+        )
+    finally:
+        baseline_connection.close()
+        changed_connection.close()
+
+    assert baseline_result.frame.row(2, named=True)["adjusted_close"] == pytest.approx(12.0)
+    assert changed_result.frame.row(2, named=True)["adjusted_close"] == pytest.approx(12.5)
+    assert changed_result.manifest.input_fingerprint != baseline_result.manifest.input_fingerprint
+
+
+def test_build_dataset_public_path_uses_staged_source_loader(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import qbot_research.datasets as datasets_module
+
+    registration_target = RecordingRegistrationTarget(records=[])
+
+    def fail_legacy_attach(*args: Any, **kwargs: Any) -> str:
+        raise AssertionError("legacy DuckDB postgres attach path should not run")
+
+    def fake_stage_postgres_source(
+        connection: duckdb.DuckDBPyConnection,
+        database_url: str,
+        as_of: date,
+        available_at_cutoff: datetime,
+    ) -> None:
+        assert database_url == "postgresql://stubbed.example/qbot"
+        assert as_of == date(2026, 7, 10)
+        assert available_at_cutoff == datetime.combine(date(2026, 7, 10), time.max, tzinfo=timezone.utc)
+        _seed_dataset_source(connection)
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://stubbed.example/qbot")
+    monkeypatch.setattr(datasets_module, "_attach_postgres_source", fail_legacy_attach)
+    monkeypatch.setattr(
+        datasets_module,
+        "_stage_postgres_source",
+        fake_stage_postgres_source,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        datasets_module,
+        "PostgresRegistrationTarget",
+        lambda database_url: registration_target,
+    )
+
+    manifest = build_dataset("week", date(2026, 7, 10), tmp_path)
+
+    assert manifest.row_count == 3
+    assert registration_target.records[0]["manifest"].dataset_version == manifest.dataset_version
 
 
 def test_cli_build_dataset_command_invokes_builder(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

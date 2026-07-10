@@ -19,6 +19,67 @@ SCHEMA_VERSION = "1"
 FEATURE_VERSION = "1"
 DEFAULT_DATABASE_URL = "postgresql://qbot:qbot@127.0.0.1/qbot"
 POSTGRES_ATTACH_ALIAS = "source_db"
+
+STAGING_ONLY_COLUMNS = [
+    "exclusion_reason",
+    "snapshot_input_fingerprint",
+    "snapshot_available_at",
+    "bar_open",
+    "bar_high",
+    "bar_low",
+    "bar_close",
+    "bar_available_at",
+    "adjustment_factor",
+    "adjustment_available_at",
+    "status_available_at",
+    "sector_valid_from",
+    "sector_valid_to",
+    "sector_available_at",
+]
+
+FINGERPRINT_COLUMNS = [
+    "trade_date",
+    "code",
+    "bar_open",
+    "bar_high",
+    "bar_low",
+    "bar_close",
+    "amount",
+    "turnover",
+    "bar_available_at",
+    "adjustment_factor",
+    "adjustment_available_at",
+    "listed_days",
+    "is_st",
+    "is_suspended",
+    "price_limit_pct",
+    "status_available_at",
+    "sector_code",
+    "sector_name",
+    "sector_type",
+    "sector_valid_from",
+    "sector_valid_to",
+    "sector_available_at",
+    "sse_change_pct",
+    "szse_change_pct",
+    "chinext_change_pct",
+    "star50_change_pct",
+    "breadth_up_count",
+    "breadth_down_count",
+    "breadth_flat_count",
+    "breadth_above_ma20_count",
+    "breadth_new_high_20_count",
+    "breadth_new_low_20_count",
+    "breadth_limit_up_count",
+    "breadth_limit_down_count",
+    "market_data_complete",
+    "market_snapshot_version",
+    "snapshot_available_at",
+    "snapshot_input_fingerprint",
+    "exclusion_reason",
+]
+
+
 @dataclass(frozen=True)
 class DatasetBuildResult:
     manifest: DatasetManifest
@@ -117,16 +178,16 @@ class PostgresRegistrationTarget:
 def build_dataset(horizon: Horizon, as_of: date, output_dir: Path) -> DatasetManifest:
     database_url = os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL)
     output_path = Path(output_dir)
+    available_at_cutoff = datetime.combine(as_of, time.max, tzinfo=UTC)
 
     with duckdb.connect(database=":memory:") as connection:
-        source_prefix = _attach_postgres_source(connection, database_url)
+        _stage_postgres_source(connection, database_url, as_of, available_at_cutoff)
         result = build_dataset_for_connection(
             connection=connection,
             horizon=horizon,
             as_of=as_of,
             output_dir=output_path,
             registration_target=PostgresRegistrationTarget(database_url),
-            source_prefix=source_prefix,
         )
     return result.manifest
 
@@ -153,7 +214,7 @@ def build_dataset_for_connection(
     }
     frame = (
         raw_frame.filter(pl.col("exclusion_reason").is_null())
-        .drop(["exclusion_reason", "snapshot_input_fingerprint"])
+        .drop(STAGING_ONLY_COLUMNS)
         .with_columns(
             [
                 pl.lit(_dataset_version(horizon, as_of)).alias("dataset_version"),
@@ -209,6 +270,206 @@ def _attach_postgres_source(connection: duckdb.DuckDBPyConnection, database_url:
     return f"{POSTGRES_ATTACH_ALIAS}.public."
 
 
+def _stage_postgres_source(
+    connection: duckdb.DuckDBPyConnection,
+    database_url: str,
+    as_of: date,
+    available_at_cutoff: datetime,
+) -> None:
+    with psycopg.connect(database_url) as source_connection:
+        with source_connection.cursor() as cursor:
+            _stage_query_results(
+                connection=connection,
+                cursor=cursor,
+                table_name="stock_daily_bar_versions",
+                create_sql="""
+                    CREATE TABLE stock_daily_bar_versions (
+                        code VARCHAR,
+                        trade_date DATE,
+                        open DOUBLE,
+                        high DOUBLE,
+                        low DOUBLE,
+                        close DOUBLE,
+                        volume BIGINT,
+                        amount DOUBLE,
+                        turnover DOUBLE,
+                        pe DOUBLE,
+                        pb DOUBLE,
+                        available_at TIMESTAMPTZ
+                    )
+                """,
+                select_sql="""
+                    SELECT code, trade_date, open, high, low, close, volume, amount,
+                           turnover, pe, pb, available_at
+                    FROM public.stock_daily_bar_versions
+                    WHERE available_at <= %s
+                      AND trade_date <= %s
+                    ORDER BY trade_date, code, available_at
+                """,
+                parameters=(available_at_cutoff, as_of),
+            )
+            _stage_query_results(
+                connection=connection,
+                cursor=cursor,
+                table_name="stock_adjustment_factors",
+                create_sql="""
+                    CREATE TABLE stock_adjustment_factors (
+                        code VARCHAR,
+                        trade_date DATE,
+                        adj_factor DOUBLE,
+                        available_at TIMESTAMPTZ
+                    )
+                """,
+                select_sql="""
+                    SELECT code, trade_date, adj_factor, available_at
+                    FROM public.stock_adjustment_factors
+                    WHERE available_at <= %s
+                      AND trade_date <= %s
+                    ORDER BY trade_date, code, available_at
+                """,
+                parameters=(available_at_cutoff, as_of),
+            )
+            _stage_query_results(
+                connection=connection,
+                cursor=cursor,
+                table_name="security_daily_status",
+                create_sql="""
+                    CREATE TABLE security_daily_status (
+                        code VARCHAR,
+                        trade_date DATE,
+                        listed_days INTEGER,
+                        is_st BOOLEAN,
+                        is_suspended BOOLEAN,
+                        price_limit_pct DOUBLE,
+                        available_at TIMESTAMPTZ
+                    )
+                """,
+                select_sql="""
+                    SELECT code, trade_date, listed_days, is_st, is_suspended,
+                           price_limit_pct, available_at
+                    FROM public.security_daily_status
+                    WHERE available_at <= %s
+                      AND trade_date <= %s
+                    ORDER BY trade_date, code, available_at
+                """,
+                parameters=(available_at_cutoff, as_of),
+            )
+            _stage_query_results(
+                connection=connection,
+                cursor=cursor,
+                table_name="stock_sector_membership",
+                create_sql="""
+                    CREATE TABLE stock_sector_membership (
+                        code VARCHAR,
+                        sector_code VARCHAR,
+                        sector_name VARCHAR,
+                        sector_type VARCHAR,
+                        valid_from DATE,
+                        valid_to DATE,
+                        available_at TIMESTAMPTZ
+                    )
+                """,
+                select_sql="""
+                    SELECT code, sector_code, sector_name, sector_type, valid_from,
+                           valid_to, available_at
+                    FROM public.stock_sector_membership
+                    WHERE available_at <= %s
+                      AND valid_from <= %s
+                    ORDER BY code, valid_from, available_at
+                """,
+                parameters=(available_at_cutoff, as_of),
+            )
+            _stage_query_results(
+                connection=connection,
+                cursor=cursor,
+                table_name="index_daily_bars",
+                create_sql="""
+                    CREATE TABLE index_daily_bars (
+                        code VARCHAR,
+                        trade_date DATE,
+                        close DOUBLE,
+                        change_pct DOUBLE,
+                        volume BIGINT,
+                        amount DOUBLE,
+                        available_at TIMESTAMPTZ
+                    )
+                """,
+                select_sql="""
+                    SELECT code, trade_date, close, change_pct, volume, amount, available_at
+                    FROM public.index_daily_bars
+                    WHERE available_at <= %s
+                      AND trade_date <= %s
+                    ORDER BY trade_date, code, available_at
+                """,
+                parameters=(available_at_cutoff, as_of),
+            )
+            _stage_query_results(
+                connection=connection,
+                cursor=cursor,
+                table_name="market_daily_snapshots",
+                create_sql="""
+                    CREATE TABLE market_daily_snapshots (
+                        trade_date DATE,
+                        snapshot_version VARCHAR,
+                        available_at TIMESTAMPTZ,
+                        data_complete BOOLEAN,
+                        metrics JSON,
+                        missing_inputs JSON,
+                        input_fingerprint VARCHAR
+                    )
+                """,
+                select_sql="""
+                    SELECT trade_date, snapshot_version, available_at, data_complete,
+                           metrics::text, missing_inputs::text, input_fingerprint
+                    FROM public.market_daily_snapshots
+                    WHERE available_at <= %s
+                      AND trade_date <= %s
+                    ORDER BY trade_date, available_at, snapshot_version
+                """,
+                parameters=(available_at_cutoff, as_of),
+            )
+            _stage_query_results(
+                connection=connection,
+                cursor=cursor,
+                table_name="security_master_versions",
+                create_sql="""
+                    CREATE TABLE security_master_versions (
+                        code VARCHAR,
+                        name VARCHAR,
+                        list_status VARCHAR,
+                        list_date DATE,
+                        delist_date DATE,
+                        available_at TIMESTAMPTZ
+                    )
+                """,
+                select_sql="""
+                    SELECT code, name, list_status, list_date, delist_date, available_at
+                    FROM public.security_master_versions
+                    WHERE available_at <= %s
+                    ORDER BY code, available_at
+                """,
+                parameters=(available_at_cutoff,),
+            )
+
+
+def _stage_query_results(
+    connection: duckdb.DuckDBPyConnection,
+    cursor: psycopg.Cursor[Any],
+    table_name: str,
+    create_sql: str,
+    select_sql: str,
+    parameters: tuple[object, ...],
+) -> None:
+    cursor.execute(select_sql, parameters)
+    rows = cursor.fetchall()
+    connection.execute(create_sql)
+    if not rows:
+        return
+
+    placeholders = ", ".join(["?"] * len(rows[0]))
+    connection.executemany(f"INSERT INTO {table_name} VALUES ({placeholders})", rows)
+
+
 def _dataset_version(horizon: Horizon, as_of: date) -> str:
     return f"ptf-v1-{horizon}-{as_of:%Y%m%d}"
 
@@ -258,6 +519,7 @@ def _load_dataset_frame(
                     code,
                     trade_date,
                     CAST(adj_factor AS DOUBLE) AS adj_factor,
+                    available_at,
                     ROW_NUMBER() OVER (
                         PARTITION BY code, trade_date
                         ORDER BY available_at DESC
@@ -278,6 +540,7 @@ def _load_dataset_frame(
                     is_st,
                     is_suspended,
                     CAST(price_limit_pct AS DOUBLE) AS price_limit_pct,
+                    available_at,
                     ROW_NUMBER() OVER (
                         PARTITION BY code, trade_date
                         ORDER BY available_at DESC
@@ -339,7 +602,10 @@ def _load_dataset_frame(
                 trade_date,
                 sector_code,
                 sector_name,
-                sector_type
+                sector_type,
+                valid_from,
+                valid_to,
+                available_at
             FROM (
                 SELECT
                     bars.code,
@@ -347,6 +613,9 @@ def _load_dataset_frame(
                     memberships.sector_code,
                     memberships.sector_name,
                     memberships.sector_type,
+                    memberships.valid_from,
+                    memberships.valid_to,
+                    memberships.available_at,
                     ROW_NUMBER() OVER (
                         PARTITION BY bars.code, bars.trade_date
                         ORDER BY
@@ -376,6 +645,7 @@ def _load_dataset_frame(
                     data_complete,
                     metrics,
                     input_fingerprint,
+                    available_at,
                     ROW_NUMBER() OVER (
                         PARTITION BY trade_date
                         ORDER BY available_at DESC, snapshot_version DESC
@@ -389,6 +659,13 @@ def _load_dataset_frame(
         SELECT
             bars.trade_date,
             bars.code,
+            bars.open AS bar_open,
+            bars.high AS bar_high,
+            bars.low AS bar_low,
+            bars.close AS bar_close,
+            bars.available_at AS bar_available_at,
+            adjustments.adj_factor AS adjustment_factor,
+            adjustments.available_at AS adjustment_available_at,
             bars.open * adjustments.adj_factor AS adjusted_open,
             bars.high * adjustments.adj_factor AS adjusted_high,
             bars.low * adjustments.adj_factor AS adjusted_low,
@@ -399,6 +676,7 @@ def _load_dataset_frame(
             statuses.is_st,
             statuses.is_suspended,
             statuses.price_limit_pct,
+            statuses.available_at AS status_available_at,
             master.name,
             master.list_status,
             master.list_date,
@@ -406,6 +684,9 @@ def _load_dataset_frame(
             sectors.sector_code,
             sectors.sector_name,
             sectors.sector_type,
+            sectors.valid_from AS sector_valid_from,
+            sectors.valid_to AS sector_valid_to,
+            sectors.available_at AS sector_available_at,
             indices.sse_change_pct,
             indices.szse_change_pct,
             indices.chinext_change_pct,
@@ -420,6 +701,7 @@ def _load_dataset_frame(
             CAST(JSON_EXTRACT_STRING(snapshot.metrics, '$.breadth.limit_down_count') AS INTEGER) AS breadth_limit_down_count,
             snapshot.data_complete AS market_data_complete,
             snapshot.snapshot_version AS market_snapshot_version,
+            snapshot.available_at AS snapshot_available_at,
             snapshot.input_fingerprint AS snapshot_input_fingerprint,
             ? AS available_at_cutoff,
             CASE
@@ -507,16 +789,21 @@ def _input_fingerprint(
     as_of: date,
     available_at_cutoff: datetime,
 ) -> str:
-    payload = {
+    hasher = hashlib.sha256()
+    metadata_payload = {
         "horizon": horizon,
         "as_of": as_of.isoformat(),
         "available_at_cutoff": available_at_cutoff.isoformat(),
-        "snapshot_input_fingerprints": sorted(
-            {
-                value
-                for value in raw_frame.get_column("snapshot_input_fingerprint").drop_nulls().to_list()
-            }
-        ),
         "row_count": raw_frame.height,
     }
-    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+    hasher.update(json.dumps(metadata_payload, sort_keys=True).encode("utf-8"))
+
+    fingerprint_frame = raw_frame.select(FINGERPRINT_COLUMNS).sort(["trade_date", "code"])
+    for row in fingerprint_frame.iter_rows(named=True):
+        canonical_row = {
+            key: (value.isoformat() if isinstance(value, (date, datetime)) else value)
+            for key, value in row.items()
+        }
+        hasher.update(json.dumps(canonical_row, sort_keys=True).encode("utf-8"))
+
+    return hasher.hexdigest()
