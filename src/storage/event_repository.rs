@@ -213,6 +213,11 @@ impl EventRepository {
         .execute(&mut *tx)
         .await?;
 
+        let member_ids: Vec<Uuid> = group
+            .members
+            .iter()
+            .map(|member| member.evidence_id)
+            .collect();
         for member in &group.members {
             sqlx::query(
                 r#"INSERT INTO market_event_duplicate_members
@@ -227,6 +232,16 @@ impl EventRepository {
             .execute(&mut *tx)
             .await?;
         }
+
+        sqlx::query(
+            r#"DELETE FROM market_event_duplicate_members
+               WHERE duplicate_group_id = $1
+                 AND NOT (evidence_id = ANY($2::uuid[]))"#,
+        )
+        .bind(group.duplicate_group_id)
+        .bind(&member_ids)
+        .execute(&mut *tx)
+        .await?;
 
         tx.commit().await?;
         Ok(group.duplicate_group_id)
@@ -776,6 +791,72 @@ mod tests {
         ];
         expected_members.sort_by_key(|member| member.0);
         assert_eq!(members, expected_members);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn unlocked_duplicate_groups_remove_omitted_members_on_resave(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = EventRepository::new(pool.clone());
+        let retained_member = evidence("source-duplicate-retained", 1, "publishable");
+        let omitted_member = evidence("source-duplicate-omitted", 1, "publishable");
+        save_evidence(&pool, &retained_member).await;
+        save_evidence(&pool, &omitted_member).await;
+
+        let group_id = Uuid::new_v4();
+        let original = DuplicateGroupRow {
+            duplicate_group_id: group_id,
+            relation_type: "exact".to_string(),
+            confidence: 0.55,
+            locked_by_user: false,
+            members: vec![
+                DuplicateGroupMemberRow {
+                    evidence_id: retained_member.evidence_id,
+                    is_representative: false,
+                },
+                DuplicateGroupMemberRow {
+                    evidence_id: omitted_member.evidence_id,
+                    is_representative: true,
+                },
+            ],
+            created_at: dt(2026, 7, 10, 12),
+        };
+        repo.save_duplicate_group(&original).await.unwrap();
+
+        let updated = DuplicateGroupRow {
+            relation_type: "near".to_string(),
+            confidence: 0.85,
+            members: vec![DuplicateGroupMemberRow {
+                evidence_id: retained_member.evidence_id,
+                is_representative: true,
+            }],
+            ..original
+        };
+        repo.save_duplicate_group(&updated).await.unwrap();
+
+        let stored: (bool, String, f64) = sqlx::query_as(
+            r#"SELECT locked_by_user, relation_type, confidence::float8
+               FROM market_event_duplicate_groups
+               WHERE duplicate_group_id = $1"#,
+        )
+        .bind(group_id)
+        .fetch_one(&pool)
+        .await?;
+        assert!(!stored.0);
+        assert_eq!(stored.1, "near");
+        assert_eq!(stored.2, 0.85);
+
+        let members: Vec<(Uuid, bool)> = sqlx::query_as(
+            r#"SELECT evidence_id, is_representative
+               FROM market_event_duplicate_members
+               WHERE duplicate_group_id = $1
+               ORDER BY evidence_id ASC"#,
+        )
+        .bind(group_id)
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(members, vec![(retained_member.evidence_id, true)]);
         Ok(())
     }
 
