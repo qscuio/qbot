@@ -86,6 +86,9 @@ mod tests {
         assert_eq!(adjusted[0].low, 4.5);
         assert_eq!(adjusted[0].close, 5.25);
         assert_eq!(adjusted[1].close, 11.5);
+        assert_eq!(adjusted[1].open, 11.0);
+        assert_eq!(adjusted[1].high, 12.0);
+        assert_eq!(adjusted[1].low, 10.0);
         assert_eq!(adjusted[0].trade_date, bars[0].trade_date);
         assert_eq!(adjusted[1].trade_date, bars[1].trade_date);
         assert_eq!(adjusted[0].volume, bars[0].volume);
