@@ -67,7 +67,7 @@ mod tests {
     }
 
     #[test]
-    fn adjusts_ohlc_to_latest_factor_without_changing_volume() {
+    fn adjusts_ohlc_to_latest_factor_preserving_non_price_fields() {
         let bars = vec![
             candle("2026-07-08", 10.0, 11.0, 9.0, 10.5, 1000),
             candle("2026-07-09", 11.0, 12.0, 10.0, 11.5, 1200),
@@ -76,9 +76,23 @@ mod tests {
 
         let adjusted = adjust_candles(&bars, &factors).unwrap();
 
+        assert_eq!(adjusted[0].open, 5.0);
+        assert_eq!(adjusted[0].high, 5.5);
+        assert_eq!(adjusted[0].low, 4.5);
         assert_eq!(adjusted[0].close, 5.25);
-        assert_eq!(adjusted[0].volume, 1000);
         assert_eq!(adjusted[1].close, 11.5);
+        assert_eq!(adjusted[0].trade_date, bars[0].trade_date);
+        assert_eq!(adjusted[1].trade_date, bars[1].trade_date);
+        assert_eq!(adjusted[0].volume, bars[0].volume);
+        assert_eq!(adjusted[1].volume, bars[1].volume);
+        assert_eq!(adjusted[0].amount, bars[0].amount);
+        assert_eq!(adjusted[1].amount, bars[1].amount);
+        assert_eq!(adjusted[0].turnover, bars[0].turnover);
+        assert_eq!(adjusted[1].turnover, bars[1].turnover);
+        assert_eq!(adjusted[0].pe, bars[0].pe);
+        assert_eq!(adjusted[1].pe, bars[1].pe);
+        assert_eq!(adjusted[0].pb, bars[0].pb);
+        assert_eq!(adjusted[1].pb, bars[1].pb);
     }
 
     #[test]
@@ -87,5 +101,18 @@ mod tests {
             adjust_candles(&[candle("2026-07-08", 10.0, 11.0, 9.0, 10.5, 1000)], &[]).unwrap_err();
 
         assert!(error.to_string().contains("missing adjustment factor"));
+    }
+
+    #[test]
+    fn rejects_missing_factor_for_a_bar_when_factors_are_not_empty() {
+        let error = adjust_candles(
+            &[candle("2026-07-08", 10.0, 11.0, 9.0, 10.5, 1000)],
+            &[factor("2026-07-09", 2.0)],
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("missing adjustment factor for 2026-07-08"));
     }
 }
