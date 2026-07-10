@@ -498,7 +498,7 @@ git commit -m "feat: add official market-event source adapter"
 - Outputs candidate claims only.
 - Invalid Schema never reaches the published layer.
 
-- [ ] **Step 1: Define strict Rust Schema**
+- [x] **Step 1: Define strict Rust Schema**
 
 Use `#[serde(deny_unknown_fields)]`:
 
@@ -533,7 +533,7 @@ rumor
 unknown
 ```
 
-- [ ] **Step 2: Add Schema tests**
+- [x] **Step 2: Add Schema tests**
 
 Assert:
 
@@ -542,7 +542,7 @@ Assert:
 - unknown JSON fields fail.
 - a fixture round-trips.
 
-- [ ] **Step 3: Implement the LLM adapter**
+- [x] **Step 3: Implement the LLM adapter**
 
 Reuse OpenAI-compatible HTTP settings but use a dedicated system prompt and temperature `0`.
 
@@ -554,7 +554,7 @@ The adapter must:
 4. Return a validation error after the second failure.
 5. Save prompt version and model parameters.
 
-- [ ] **Step 4: Add deterministic validation**
+- [x] **Step 4: Add deterministic validation**
 
 Validate:
 
@@ -563,7 +563,7 @@ Validate:
 - direct stock codes map to known `stock_info`.
 - rumor/opinion claims cannot be promoted to facts.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 cargo test analysis::events::extraction -- --nocapture
