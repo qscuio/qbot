@@ -739,7 +739,7 @@ git commit -m "feat: add point-in-time market repository"
 - Existing fallback providers remain unchanged.
 - Missing critical capabilities block Phase 1 instead of triggering inferred history.
 
-- [ ] **Step 1: Add the capability and provider contracts**
+- [x] **Step 1: Add the capability and provider contracts**
 
 ```rust
 use async_trait::async_trait;
@@ -814,7 +814,7 @@ Export from `src/data/mod.rs`:
 pub mod point_in_time_provider;
 ```
 
-- [ ] **Step 2: Add bounded capability probes and parser tests**
+- [x] **Step 2: Add bounded capability probes and parser tests**
 
 The probe performs small sample requests and records unsupported or unauthorized capabilities without substituting current-state data.
 
@@ -833,7 +833,7 @@ assert!(!capabilities.historical_sector_membership);
 assert!(capabilities.details["historical_sector_membership"].contains("unauthorized"));
 ```
 
-- [ ] **Step 3: Implement verified Tushare methods**
+- [x] **Step 3: Implement verified Tushare methods**
 
 Use private Tushare calls for capabilities confirmed by the probe. Map `available_at` to the actual QBot fetch time:
 
@@ -845,7 +845,7 @@ Live fetches use `AvailabilityQuality::Observed`. Historical backfills whose tru
 
 If security master history, corporate actions, daily basics, historical membership, or daily status is unsupported, return an explicit `AppError::DataProvider` from that method. Never derive historical membership from current `stock_info.industry`, never infer historical ST state from the current security name, and never approximate market cap from price alone.
 
-- [ ] **Step 4: Wire the dedicated provider into state**
+- [x] **Step 4: Wire the dedicated provider into state**
 
 Add to `AppState`:
 
@@ -869,11 +869,11 @@ let point_in_time_provider:
 
 Pass `point_in_time_provider` into `AppState`.
 
-- [ ] **Step 5: Persist and expose capability status**
+- [x] **Step 5: Persist and expose capability status**
 
 Store the latest probe result in `analysis_data_runs.details` with `run_type='point_in_time_capability_probe'`. Add it to `/api/analysis/data-status` so Phase 1 can show exactly which prerequisite is missing.
 
-- [ ] **Step 6: Run tests**
+- [x] **Step 6: Run tests**
 
 Run:
 
@@ -884,7 +884,7 @@ cargo test config::tests::test_config_defaults
 
 Expected: PASS, including explicit unsupported-capability behavior.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/data src/state.rs src/main.rs
