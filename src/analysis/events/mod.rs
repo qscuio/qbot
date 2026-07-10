@@ -100,30 +100,30 @@ impl EventIntelligence {
 
         let reviewed_at = Utc::now();
         let next = reviewed_event_row(&current, &reviewed_by, reviewed_at, action);
-        self.deps.repo.insert_evidence(&next).await?;
+        let revision = EventRevisionRow {
+            revision_id: Uuid::new_v4(),
+            object_type: "market_event_evidence_review".to_string(),
+            object_id: next.evidence_id,
+            previous_payload: json!({
+                "evidenceId": current.evidence_id,
+                "processingStatus": current.status,
+                "version": current.version,
+            }),
+            revised_payload: json!({
+                "evidenceId": next.evidence_id,
+                "processingStatus": next.status,
+                "version": next.version,
+                "reviewAction": review_action_label(action),
+                "reviewedBy": reviewed_by.clone(),
+                "reviewedAt": reviewed_at,
+            }),
+            revised_by: reviewed_by.clone(),
+            reason: format!("manual {} review", review_action_label(action)),
+            created_at: reviewed_at,
+        };
         self.deps
             .repo
-            .save_revision(&EventRevisionRow {
-                revision_id: Uuid::new_v4(),
-                object_type: "market_event_evidence_review".to_string(),
-                object_id: next.evidence_id,
-                previous_payload: json!({
-                    "evidenceId": current.evidence_id,
-                    "processingStatus": current.status,
-                    "version": current.version,
-                }),
-                revised_payload: json!({
-                    "evidenceId": next.evidence_id,
-                    "processingStatus": next.status,
-                    "version": next.version,
-                    "reviewAction": review_action_label(action),
-                    "reviewedBy": reviewed_by.clone(),
-                    "reviewedAt": reviewed_at,
-                }),
-                revised_by: reviewed_by.clone(),
-                reason: format!("manual {} review", review_action_label(action)),
-                created_at: reviewed_at,
-            })
+            .save_reviewed_evidence_revision(&next, &revision)
             .await?;
 
         Ok(EventReviewResult {

@@ -158,6 +158,19 @@ impl EventRepository {
         Ok(row.evidence_id)
     }
 
+    pub async fn save_reviewed_evidence_revision(
+        &self,
+        row: &EventEvidenceRow,
+        revision: &EventRevisionRow,
+    ) -> Result<Uuid> {
+        let row = canonicalized_evidence_row(row)?;
+        let mut tx = self.pool.begin().await?;
+        insert_evidence_in_tx(&mut tx, &row).await?;
+        save_revision_in_tx(&mut tx, revision).await?;
+        tx.commit().await?;
+        Ok(row.evidence_id)
+    }
+
     pub async fn insert_manual_evidence(
         &self,
         row: &EventEvidenceRow,
@@ -450,7 +463,7 @@ impl EventRepository {
                     r#"SELECT trade_date, brief_version, content, structured_payload,
                               input_fingerprint, generated_at
                        FROM market_event_daily_briefs
-                       ORDER BY generated_at DESC, trade_date DESC
+                       ORDER BY trade_date DESC, generated_at DESC
                        LIMIT 1"#,
                 )
                 .fetch_optional(&self.pool)
@@ -536,24 +549,9 @@ impl EventRepository {
     }
 
     pub async fn save_revision(&self, revision: &EventRevisionRow) -> Result<Uuid> {
-        sqlx::query(
-            r#"INSERT INTO market_event_revisions
-               (revision_id, object_type, object_id, previous_payload, revised_payload,
-                revised_by, reason, created_at)
-               VALUES ($1, $2, $3, $4, $5,
-                       $6, $7, $8)"#,
-        )
-        .bind(revision.revision_id)
-        .bind(&revision.object_type)
-        .bind(revision.object_id)
-        .bind(&revision.previous_payload)
-        .bind(&revision.revised_payload)
-        .bind(&revision.revised_by)
-        .bind(&revision.reason)
-        .bind(revision.created_at)
-        .execute(&self.pool)
-        .await?;
-
+        let mut tx = self.pool.begin().await?;
+        save_revision_in_tx(&mut tx, revision).await?;
+        tx.commit().await?;
         Ok(revision.revision_id)
     }
 
@@ -719,6 +717,31 @@ async fn insert_evidence_in_tx(
     .bind(row.supersedes_evidence_id)
     .bind(&row.status)
     .bind(row.created_at)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
+}
+
+async fn save_revision_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    revision: &EventRevisionRow,
+) -> Result<()> {
+    sqlx::query(
+        r#"INSERT INTO market_event_revisions
+           (revision_id, object_type, object_id, previous_payload, revised_payload,
+            revised_by, reason, created_at)
+           VALUES ($1, $2, $3, $4, $5,
+                   $6, $7, $8)"#,
+    )
+    .bind(revision.revision_id)
+    .bind(&revision.object_type)
+    .bind(revision.object_id)
+    .bind(&revision.previous_payload)
+    .bind(&revision.revised_payload)
+    .bind(&revision.revised_by)
+    .bind(&revision.reason)
+    .bind(revision.created_at)
     .execute(&mut **tx)
     .await?;
 
@@ -1213,7 +1236,7 @@ impl DuplicateGroupPersistenceGateHandle {
 mod tests {
     use super::{
         ClaimEvidenceRow, ClaimGraphRow, ClaimRow, DailyEventBriefRow, DuplicateGroupMemberRow,
-        DuplicateGroupRow, EventEvidenceRow, EventRepository, ExtractionRow,
+        DuplicateGroupRow, EventEvidenceRow, EventRepository, EventRevisionRow, ExtractionRow,
         ManualEvidenceInsertEffect,
     };
     use crate::error::Result;
@@ -1980,6 +2003,167 @@ mod tests {
         assert_eq!(stored.2, json!({"facts": ["second"]}));
         assert_eq!(stored.3, "fp-2");
         assert_eq!(stored.4, dt(2026, 7, 10, 14));
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn reviewed_evidence_and_revision_are_persisted_together(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = EventRepository::new(pool.clone());
+        let current = evidence("review-source", 1, "pending");
+        repo.insert_evidence(&current).await.unwrap();
+
+        let reviewed = EventEvidenceRow {
+            evidence_id: Uuid::new_v4(),
+            version: 2,
+            supersedes_evidence_id: Some(current.evidence_id),
+            status: "publishable".to_string(),
+            created_at: dt(2026, 7, 10, 12),
+            ..current.clone()
+        };
+        let revision = EventRevisionRow {
+            revision_id: Uuid::new_v4(),
+            object_type: "market_event_evidence_review".to_string(),
+            object_id: reviewed.evidence_id,
+            previous_payload: json!({
+                "evidenceId": current.evidence_id,
+                "processingStatus": current.status,
+                "version": current.version,
+            }),
+            revised_payload: json!({
+                "evidenceId": reviewed.evidence_id,
+                "processingStatus": reviewed.status,
+                "version": reviewed.version,
+            }),
+            revised_by: "reviewer".to_string(),
+            reason: "manual publish review".to_string(),
+            created_at: dt(2026, 7, 10, 12),
+        };
+
+        repo.save_reviewed_evidence_revision(&reviewed, &revision)
+            .await
+            .unwrap();
+
+        let stored = repo
+            .latest_evidence_for_source_item(&reviewed.source_id, &reviewed.source_item_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.evidence_id, reviewed.evidence_id);
+        assert_eq!(stored.version, 2);
+
+        let stored_revision: (Uuid, Value) = sqlx::query_as(
+            r#"SELECT object_id, revised_payload
+               FROM market_event_revisions
+               WHERE revision_id = $1"#,
+        )
+        .bind(revision.revision_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(stored_revision.0, reviewed.evidence_id);
+        assert_eq!(stored_revision.1["evidenceId"], json!(reviewed.evidence_id));
+        assert_eq!(stored_revision.1["version"], json!(2));
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn reviewed_evidence_insert_rolls_back_when_revision_insert_fails(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = EventRepository::new(pool.clone());
+        let current = evidence("review-rollback", 1, "pending");
+        repo.insert_evidence(&current).await.unwrap();
+
+        let reviewed = EventEvidenceRow {
+            evidence_id: Uuid::new_v4(),
+            version: 2,
+            supersedes_evidence_id: Some(current.evidence_id),
+            status: "publishable".to_string(),
+            created_at: dt(2026, 7, 10, 12),
+            ..current.clone()
+        };
+        let revision = EventRevisionRow {
+            revision_id: Uuid::new_v4(),
+            object_type: "market_event_evidence_review".to_string(),
+            object_id: reviewed.evidence_id,
+            previous_payload: json!({
+                "evidenceId": current.evidence_id,
+                "processingStatus": current.status,
+                "version": current.version,
+            }),
+            revised_payload: json!({
+                "evidenceId": reviewed.evidence_id,
+                "processingStatus": reviewed.status,
+                "version": reviewed.version,
+            }),
+            revised_by: "r".repeat(101),
+            reason: "manual publish review".to_string(),
+            created_at: dt(2026, 7, 10, 12),
+        };
+
+        let error = repo
+            .save_reviewed_evidence_revision(&reviewed, &revision)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("too long"));
+
+        let latest = repo
+            .latest_evidence_for_source_item(&current.source_id, &current.source_item_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.evidence_id, current.evidence_id);
+        assert_eq!(latest.version, 1);
+        assert!(repo
+            .find_evidence_by_id(reviewed.evidence_id)
+            .await
+            .unwrap()
+            .is_none());
+
+        let revision_count: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*)
+               FROM market_event_revisions
+               WHERE revision_id = $1"#,
+        )
+        .bind(revision.revision_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(revision_count, 0);
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn default_daily_brief_lookup_prefers_latest_trade_date(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = EventRepository::new(pool.clone());
+        let older_trade_date = DailyEventBriefRow {
+            trade_date: date(2026, 7, 10),
+            brief_version: "v1".to_string(),
+            content: "older trade date".to_string(),
+            structured_payload: json!({"facts": ["older"]}),
+            input_fingerprint: "older-fp".to_string(),
+            generated_at: dt(2026, 7, 11, 15),
+        };
+        let newer_trade_date = DailyEventBriefRow {
+            trade_date: date(2026, 7, 11),
+            brief_version: "v2".to_string(),
+            content: "newer trade date".to_string(),
+            structured_payload: json!({"facts": ["newer"]}),
+            input_fingerprint: "newer-fp".to_string(),
+            generated_at: dt(2026, 7, 11, 14),
+        };
+
+        repo.save_daily_brief(&older_trade_date).await.unwrap();
+        repo.save_daily_brief(&newer_trade_date).await.unwrap();
+
+        let latest = repo.find_daily_brief(None).await.unwrap().unwrap();
+        assert_eq!(latest.trade_date, newer_trade_date.trade_date);
+        assert_eq!(latest.brief_version, newer_trade_date.brief_version);
+
         Ok(())
     }
 

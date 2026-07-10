@@ -40,8 +40,9 @@ Added:
 - Manual submission `sourceReadable` is only returned as known when trimmed content is actually present; URL-only/manual title submissions return `null` until content is fetched or read.
 - Manual submission `manualReviewNeeded` remains `null` unless the domain exposes a concrete review-required outcome.
 - Review appends a new immutable evidence version with `status = "publishable"` or `status = "rejected"` and `supersedes_evidence_id` set to the reviewed version.
+- Review persistence now saves the reviewed evidence row and revision row in one SQL transaction; repository coverage includes a rollback regression when revision persistence fails.
 - HTTP review now requires an explicit `action` of `publish` or `reject`; missing, blank, and unsupported actions are rejected as `unauthorized review action`.
-- Daily brief reads persisted brief rows only; no synthetic brief generation was added in Task 8.
+- Daily brief reads persisted brief rows only; default lookup now prefers the latest `trade_date` before `generated_at`, and no synthetic brief generation was added in Task 8.
 
 ## Verification
 
