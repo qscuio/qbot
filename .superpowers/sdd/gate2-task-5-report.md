@@ -199,3 +199,59 @@ Observed warning noise during test runs:
 ### Concerns
 
 - Required verification passed, but the targeted test commands still emit the existing crate-wide warning and future-incompatibility noise for `redis v0.25.4` and `sqlx-postgres v0.7.4`.
+
+## Fix subagent follow-up 3
+
+### Summary
+
+- Normalized `OFFICIAL_EVENT_FEED_URL` and `OFFICIAL_EVENT_FEED_API_KEY` through the existing nonblank env helper in `Config::from_env()`.
+- Added a focused regression proving whitespace-only `OFFICIAL_EVENT_FEED_URL` disables official-source construction instead of flowing into URL parsing.
+- Added a focused regression proving whitespace-only `OFFICIAL_EVENT_FEED_API_KEY` becomes `None` when a feed URL is configured.
+- Updated the verification record so cargo-based proof is explicitly marked as warning-noisy rather than pristine output.
+
+### RED
+
+- Added `from_config_treats_blank_feed_url_from_env_as_disabled` in `src/analysis/adapters/official_event_source.rs`.
+- Added `test_config_normalizes_blank_official_event_api_key` in `src/config.rs`.
+- RED command 1:
+  - `cargo test from_config_treats_blank_feed_url_from_env_as_disabled -- --nocapture`
+  - failed with assertion mismatch:
+    - `left: Some("   ")`
+    - `right: None`
+- RED command 2:
+  - `cargo test test_config_normalizes_blank_official_event_api_key -- --nocapture`
+  - failed with assertion mismatch:
+    - `left: Some("   ")`
+    - `right: None`
+- These failures proved blank optional official-source env values were still being preserved by `Config::from_env()`.
+
+### GREEN
+
+- Updated `src/config.rs` so both `OFFICIAL_EVENT_FEED_URL` and `OFFICIAL_EVENT_FEED_API_KEY` load through `optional_nonblank_env_var(...)`.
+- GREEN command 1:
+  - `cargo test from_config_treats_blank_feed_url_from_env_as_disabled -- --nocapture`
+  - result: `1 passed; 0 failed`
+- GREEN command 2:
+  - `cargo test test_config_normalizes_blank_official_event_api_key -- --nocapture`
+  - result: `1 passed; 0 failed`
+
+### Final verification
+
+- `cargo fmt --all -- --check` -> pass after one formatting correction in `src/config.rs`
+- `cargo test analysis::adapters::official_event_source -- --nocapture` -> warning-noisy pass (`10 passed; 0 failed`; crate emitted 25 existing warnings and Cargo printed future-incompatibility notices for `redis v0.25.4` and `sqlx-postgres v0.7.4`)
+- `cargo test --all --locked config::tests::test_config_defaults -- --nocapture` -> warning-noisy pass (`1 passed; 0 failed`; same existing warnings and future-incompatibility notices)
+- `git diff --check` -> pass
+
+### Files changed
+
+- `src/config.rs`
+- `src/analysis/adapters/official_event_source.rs`
+- `.superpowers/sdd/gate2-task-5-report.md`
+
+### Commit hash
+
+- Final `HEAD` is reported alongside task completion because embedding a commit's own final hash in committed content would change that hash again.
+
+### Concerns
+
+- Required verification passed, but the targeted cargo test commands remain warning-noisy because of existing crate-wide unused/dead-code warnings plus Cargo future-incompatibility notices for `redis v0.25.4` and `sqlx-postgres v0.7.4`.

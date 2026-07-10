@@ -388,6 +388,22 @@ mod tests {
     }
 
     #[test]
+    fn from_config_treats_blank_feed_url_from_env_as_disabled() {
+        std::env::set_var("TUSHARE_TOKEN", "test_token");
+        std::env::set_var("TELEGRAM_BOT_TOKEN", "123:abc");
+        std::env::set_var("OFFICIAL_EVENT_FEED_URL", "   ");
+        std::env::remove_var("OFFICIAL_EVENT_FEED_API_KEY");
+        std::env::remove_var("OFFICIAL_EVENT_SOURCE_ID");
+        std::env::remove_var("OFFICIAL_EVENT_STORE_FULL_CONTENT");
+
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.official_event_feed_url, None);
+        assert!(OfficialEventSource::from_config(&config).unwrap().is_none());
+
+        std::env::remove_var("OFFICIAL_EVENT_FEED_URL");
+    }
+
+    #[test]
     fn parse_response_body_filters_items_after_until_cutoff() {
         let source = OfficialEventSource::new(
             "official:market_event",
