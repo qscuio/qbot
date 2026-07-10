@@ -628,11 +628,11 @@ git commit -m "feat: export validated pattern versions"
 - Consumes published model payloads.
 - Writes shadow candidates only.
 
-- [ ] **Step 1: Define Rust model contract**
+- [x] **Step 1: Define Rust model contract**
 
 Mirror Python fields exactly with `serde(deny_unknown_fields)`.
 
-- [ ] **Step 2: Add golden fixture test**
+- [x] **Step 2: Add golden fixture test**
 
 Place a JSON fixture under:
 
@@ -647,7 +647,7 @@ Assert:
 - missing feature rejects.
 - fixed feature vector produces fixed similarity.
 
-- [ ] **Step 3: Implement matching**
+- [x] **Step 3: Implement matching**
 
 ```rust
 pub struct PatternEngine {
@@ -666,7 +666,7 @@ impl PatternEngine {
 
 No event inputs.
 
-- [ ] **Step 4: Implement tiers**
+- [x] **Step 4: Implement tiers**
 
 ```text
 shadow_a
@@ -677,11 +677,11 @@ reject
 
 A model validation Lift is part of the score; similarity alone cannot create `shadow_a`.
 
-- [ ] **Step 5: Persist output**
+- [x] **Step 5: Persist output**
 
 Use `analysis_shadow_candidates`, never `signal_strategy_candidates`.
 
-- [ ] **Step 6: Verify and commit**
+- [x] **Step 6: Verify and commit**
 
 ```bash
 cargo test analysis::patterns -- --nocapture
