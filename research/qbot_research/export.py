@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
+from types import MappingProxyType
 from typing import Any, Mapping, Protocol, Sequence, cast
 from uuid import UUID
 
@@ -76,8 +77,8 @@ class PatternVersionRow:
     feature_version: str
     logic_version: str
     dataset_version: str
-    model_payload: dict[str, Any]
-    validation_payload: dict[str, Any]
+    model_payload: Mapping[str, Any]
+    validation_payload: Mapping[str, Any]
     trained_from: date
     trained_until: date
     available_at_cutoff: datetime
@@ -86,6 +87,12 @@ class PatternVersionRow:
     created_at: datetime
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "model_payload", _freeze_json_like(self.model_payload))
+        object.__setattr__(
+            self,
+            "validation_payload",
+            _freeze_json_like(self.validation_payload),
+        )
         AnalysisPatternVersionPayload.model_validate(self.payload())
 
     def payload(self) -> dict[str, Any]:
@@ -99,8 +106,8 @@ class PatternVersionRow:
             "feature_version": self.feature_version,
             "logic_version": self.logic_version,
             "dataset_version": self.dataset_version,
-            "model_payload": self.model_payload,
-            "validation_payload": self.validation_payload,
+            "model_payload": _thaw_json_like(self.model_payload),
+            "validation_payload": _thaw_json_like(self.validation_payload),
             "trained_from": self.trained_from,
             "trained_until": self.trained_until,
             "available_at_cutoff": self.available_at_cutoff,
@@ -117,9 +124,10 @@ class PatternExampleRow:
     code: str
     trade_date: date
     similarity: float | None
-    metadata: dict[str, object]
+    metadata: Mapping[str, object]
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "metadata", _freeze_json_like(self.metadata))
         AnalysisPatternExamplePayload.model_validate(self.payload())
 
     def payload(self) -> dict[str, Any]:
@@ -129,7 +137,7 @@ class PatternExampleRow:
             "code": self.code,
             "trade_date": self.trade_date,
             "similarity": self.similarity,
-            "metadata": self.metadata,
+            "metadata": _thaw_json_like(self.metadata),
         }
 
 
@@ -205,6 +213,7 @@ def export_pattern_version(
 
 def insert_pattern_version_export(cursor: ExecuteCursor, exported: PatternVersionExport) -> None:
     row = exported.version_row
+    row_payload = row.payload()
     cursor.execute(
         """
         INSERT INTO analysis_pattern_versions
@@ -223,8 +232,8 @@ def insert_pattern_version_export(cursor: ExecuteCursor, exported: PatternVersio
             row.feature_version,
             row.logic_version,
             row.dataset_version,
-            Jsonb(row.model_payload),
-            Jsonb(row.validation_payload),
+            Jsonb(row_payload["model_payload"]),
+            Jsonb(row_payload["validation_payload"]),
             row.trained_from,
             row.trained_until,
             row.available_at_cutoff,
@@ -234,6 +243,7 @@ def insert_pattern_version_export(cursor: ExecuteCursor, exported: PatternVersio
         ),
     )
     for example in exported.example_rows:
+        example_payload = example.payload()
         cursor.execute(
             """
             INSERT INTO analysis_pattern_examples
@@ -246,7 +256,7 @@ def insert_pattern_version_export(cursor: ExecuteCursor, exported: PatternVersio
                 example.code,
                 example.trade_date,
                 example.similarity,
-                Jsonb(example.metadata),
+                Jsonb(example_payload["metadata"]),
             ),
         )
 
@@ -326,3 +336,19 @@ def _required_value(payload: Mapping[str, object], field_name: str) -> object:
     if field_name not in payload:
         raise ValueError(f"{field_name} is required")
     return payload[field_name]
+
+
+def _freeze_json_like(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze_json_like(item) for key, item in value.items()})
+    if isinstance(value, list | tuple):
+        return tuple(_freeze_json_like(item) for item in value)
+    return value
+
+
+def _thaw_json_like(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _thaw_json_like(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_json_like(item) for item in value]
+    return value

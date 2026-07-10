@@ -2,6 +2,7 @@ import json
 from datetime import date
 from pathlib import Path
 from typing import Annotated, Any, Mapping, cast
+from uuid import UUID
 
 import typer
 
@@ -42,7 +43,7 @@ def train_all(
         ),
     ] = None,
 ) -> None:
-    _parse_date(as_of, "--as-of")
+    as_of_date = _parse_date(as_of, "--as-of")
     if plan_json is None:
         typer.echo("train-all requires --plan-json with explicit export inputs. No training ran.")
         raise typer.Exit(2)
@@ -57,6 +58,7 @@ def train_all(
             horizon=horizon,
             dataset_version=_string_field(item, "dataset_version"),
         )
+        _validate_export_metadata_cutoff(metadata, as_of_date)
         exported = export_pattern_version(
             candidate_payload=_mapping_field(item, "candidate"),
             validation_payload=_mapping_field(item, "validation"),
@@ -207,17 +209,27 @@ def build_dataset_command(
 
 
 def _read_json_object(path: Path) -> dict[str, object]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload = _read_json_payload(path)
     if not isinstance(payload, dict):
         raise typer.BadParameter(f"{path} must contain a JSON object")
     return cast(dict[str, object], payload)
 
 
 def _read_json_mapping_list(path: Path) -> list[Mapping[str, object]]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload = _read_json_payload(path)
     if not isinstance(payload, list) or not all(isinstance(item, dict) for item in payload):
         raise typer.BadParameter(f"{path} must contain a JSON object list")
     return [cast(Mapping[str, object], item) for item in payload]
+
+
+def _read_json_payload(path: Path) -> object:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except OSError as error:
+        message = error.strerror or str(error)
+        raise typer.BadParameter(f"could not read JSON file {path}: {message}") from error
+    except json.JSONDecodeError as error:
+        raise typer.BadParameter(f"malformed JSON in {path}: {error.msg}") from error
 
 
 def _parse_date(value: str, param_hint: str) -> date:
@@ -252,6 +264,19 @@ def _mapping_list_field(payload: Mapping[str, object], field_name: str) -> list[
     return _object_list_field(payload, field_name)
 
 
+def _validate_export_metadata_cutoff(metadata: ExportMetadata, as_of: date) -> None:
+    if metadata.trained_until > as_of:
+        raise typer.BadParameter(
+            "trained_until must be on or before --as-of",
+            param_hint="--plan-json",
+        )
+    if metadata.available_at_cutoff.date() > as_of:
+        raise typer.BadParameter(
+            "available_at_cutoff date must be on or before --as-of",
+            param_hint="--plan-json",
+        )
+
+
 def _emit_json(payload: Mapping[str, Any], output_json: Path | None) -> None:
     encoded = json.dumps(payload, default=_json_default, sort_keys=True)
     if output_json is None:
@@ -264,4 +289,6 @@ def _emit_json(payload: Mapping[str, Any], output_json: Path | None) -> None:
 def _json_default(value: object) -> str:
     if isinstance(value, date):
         return value.isoformat()
+    if isinstance(value, UUID):
+        return str(value)
     raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")

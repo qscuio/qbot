@@ -134,6 +134,35 @@ def _export(status: str = "validated") -> PatternVersionExport:
     )
 
 
+def _train_all_plan(**metadata_overrides: Any) -> dict[str, Any]:
+    metadata = {
+        "pattern_version_id": "11111111-1111-4111-8111-111111111111",
+        "pattern_id": "trend-kmeans-c0",
+        "pattern_type": "trend",
+        "schema_version": "1",
+        "feature_version": "1",
+        "logic_version": "logic-v1",
+        "trained_from": "2026-01-01",
+        "trained_until": "2026-07-10",
+        "available_at_cutoff": "2026-07-10T23:00:00+00:00",
+        "created_at": "2026-07-10T23:00:00+00:00",
+    }
+    metadata.update(metadata_overrides)
+    return {
+        "exports": [
+            {
+                "horizon": "month",
+                "dataset_version": "ptf-v1-month-20260710",
+                "metadata": metadata,
+                "candidate": _candidate_payload(),
+                "validation": _validation_payload("draft"),
+                "typical_positive_examples": _positive_examples(),
+                "failed_examples": _failed_examples(),
+            }
+        ]
+    }
+
+
 def test_export_pattern_version_builds_validated_immutable_rows_and_examples() -> None:
     exported = _export()
 
@@ -226,6 +255,62 @@ def test_insert_pattern_version_export_writes_exact_version_and_example_columns(
     example_types = [parameters[1] for _, parameters in cursor.calls[1:]]
     assert example_types == ["typical_positive", "failed"]
     assert all("INSERT INTO analysis_pattern_examples" in sql for sql, _ in cursor.calls[1:])
+
+
+def test_export_pattern_version_is_isolated_from_input_and_payload_mutation() -> None:
+    candidate = _candidate_payload()
+    validation = _validation_payload("validated")
+    positives = _positive_examples()
+    failures = _failed_examples()
+
+    exported = export_pattern_version(
+        candidate_payload=candidate,
+        validation_payload=validation,
+        metadata=_metadata(),
+        typical_positive_examples=positives,
+        failed_examples=failures,
+    )
+
+    candidate["required_features"].append("poisoned_input")
+    validation["yearly_results"]["2026"]["precision"] = 0.01
+    positives[0]["metadata"]["rank"] = 99
+
+    first_payload = exported.payload()
+    assert first_payload["version_row"]["model_payload"]["required_features"] == [
+        "return_20d",
+        "relative_strength_20d",
+    ]
+    assert first_payload["version_row"]["validation_payload"]["yearly_results"]["2026"][
+        "precision"
+    ] == 0.75
+    assert first_payload["example_rows"][0]["metadata"]["rank"] == 1
+
+    first_payload["version_row"]["model_payload"]["required_features"].append("poisoned_payload")
+    first_payload["version_row"]["validation_payload"]["yearly_results"]["2026"][
+        "precision"
+    ] = 0.02
+    first_payload["example_rows"][0]["metadata"]["rank"] = 100
+
+    second_payload = exported.payload()
+    assert second_payload["version_row"]["model_payload"]["required_features"] == [
+        "return_20d",
+        "relative_strength_20d",
+    ]
+    assert second_payload["version_row"]["validation_payload"]["yearly_results"]["2026"][
+        "precision"
+    ] == 0.75
+    assert second_payload["example_rows"][0]["metadata"]["rank"] == 1
+
+    cursor = RecordingCursor(calls=[])
+    insert_pattern_version_export(cursor, exported)
+    version_parameters = cursor.calls[0][1]
+    positive_parameters = cursor.calls[1][1]
+    assert version_parameters[9].obj["required_features"] == [
+        "return_20d",
+        "relative_strength_20d",
+    ]
+    assert version_parameters[10].obj["yearly_results"]["2026"]["precision"] == 0.75
+    assert positive_parameters[5].obj["rank"] == 1
 
 
 def test_train_command_exports_from_explicit_json_inputs(tmp_path: Path) -> None:
@@ -328,36 +413,7 @@ def test_train_all_requires_explicit_plan_json_and_does_not_pretend_training_ran
 def test_train_all_exports_from_explicit_plan_json(tmp_path: Path) -> None:
     plan_path = tmp_path / "plan.json"
     output_path = tmp_path / "train-all-export.json"
-    plan_path.write_text(
-        json.dumps(
-            {
-                "exports": [
-                    {
-                        "horizon": "month",
-                        "dataset_version": "ptf-v1-month-20260710",
-                        "metadata": {
-                            "pattern_version_id": "11111111-1111-4111-8111-111111111111",
-                            "pattern_id": "trend-kmeans-c0",
-                            "pattern_type": "trend",
-                            "schema_version": "1",
-                            "feature_version": "1",
-                            "logic_version": "logic-v1",
-                            "trained_from": "2026-01-01",
-                            "trained_until": "2026-07-10",
-                            "available_at_cutoff": "2026-07-10T23:00:00+00:00",
-                            "created_at": "2026-07-10T23:00:00+00:00",
-                        },
-                        "candidate": _candidate_payload(),
-                        "validation": _validation_payload("draft"),
-                        "typical_positive_examples": _positive_examples(),
-                        "failed_examples": _failed_examples(),
-                    }
-                ]
-            },
-            default=str,
-        ),
-        encoding="utf-8",
-    )
+    plan_path.write_text(json.dumps(_train_all_plan(), default=str), encoding="utf-8")
 
     result = RUNNER.invoke(
         app,
@@ -376,3 +432,68 @@ def test_train_all_exports_from_explicit_plan_json(tmp_path: Path) -> None:
     payload = json.loads(output_path.read_text(encoding="utf-8"))
     assert payload["exports"][0]["version_row"]["horizon"] == "month"
     assert payload["exports"][0]["version_row"]["status"] == "draft"
+
+
+@pytest.mark.parametrize(
+    ("metadata_overrides", "expected_message"),
+    [
+        ({"trained_until": "2026-07-11"}, "trained_until must be on or before --as-of"),
+        (
+            {"available_at_cutoff": "2026-07-11T00:00:00+00:00"},
+            "available_at_cutoff date must be on or before",
+        ),
+    ],
+)
+def test_train_all_rejects_plan_items_after_as_of(
+    tmp_path: Path,
+    metadata_overrides: dict[str, str],
+    expected_message: str,
+) -> None:
+    plan_path = tmp_path / "plan.json"
+    output_path = tmp_path / "train-all-export.json"
+    plan_path.write_text(
+        json.dumps(_train_all_plan(**metadata_overrides), default=str),
+        encoding="utf-8",
+    )
+
+    result = RUNNER.invoke(
+        app,
+        [
+            "train-all",
+            "--as-of",
+            "2026-07-10",
+            "--plan-json",
+            str(plan_path),
+            "--output-json",
+            str(output_path),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert expected_message in result.output
+    assert not output_path.exists()
+
+
+def test_train_all_reports_malformed_json_as_bad_parameter(tmp_path: Path) -> None:
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text("{not json", encoding="utf-8")
+
+    result = RUNNER.invoke(
+        app,
+        ["train-all", "--as-of", "2026-07-10", "--plan-json", str(plan_path)],
+    )
+
+    assert result.exit_code != 0
+    assert "malformed JSON" in result.output
+
+
+def test_train_all_reports_missing_json_as_bad_parameter(tmp_path: Path) -> None:
+    plan_path = tmp_path / "missing.json"
+
+    result = RUNNER.invoke(
+        app,
+        ["train-all", "--as-of", "2026-07-10", "--plan-json", str(plan_path)],
+    )
+
+    assert result.exit_code != 0
+    assert "could not read JSON file" in result.output

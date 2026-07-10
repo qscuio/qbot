@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from typing import Literal, TypeAlias
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
@@ -113,7 +114,7 @@ class ValidationPayload(ContractModel):
 
 
 class AnalysisPatternVersionPayload(ContractModel):
-    pattern_version_id: str
+    pattern_version_id: UUID
     pattern_id: str
     horizon: ModelExportHorizon
     pattern_type: PatternType
@@ -141,7 +142,7 @@ class AnalysisPatternVersionPayload(ContractModel):
 
 
 class AnalysisPatternExamplePayload(ContractModel):
-    pattern_version_id: str
+    pattern_version_id: UUID
     example_type: ExampleType
     code: str
     trade_date: date
