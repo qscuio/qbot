@@ -67,10 +67,12 @@ A-share stock analysis bot. Fetches daily market data from Tushare, runs 24 sign
 ### Engineering Reviews and Research
 
 - [Signal, paper-trading, and chart-line assessment](docs/reviews/2026-07-10-signal-trading-assessment.md)
+- [Analysis-platform review resolution](docs/reviews/2026-07-10-analysis-platform-review-resolution.md)
 - [Market-event framework research](docs/research/2026-07-10-market-event-framework-research.md)
 - [Analysis platform architecture](docs/superpowers/specs/2026-07-10-analysis-platform-architecture-design.md)
-- [Strong-stock pattern engine design](docs/superpowers/specs/2026-07-10-strong-stock-pattern-engine-design.md)
-- [Market-event reasoning design](docs/superpowers/specs/2026-07-10-market-event-reasoning-design.md)
+- [Strong-stock pattern shadow design](docs/superpowers/specs/2026-07-10-strong-stock-pattern-engine-design.md)
+- [Market-event intelligence design](docs/superpowers/specs/2026-07-10-market-event-reasoning-design.md)
+- [Analysis-platform implementation roadmap](docs/superpowers/plans/2026-07-10-analysis-platform-roadmap.md)
 
 ---
 

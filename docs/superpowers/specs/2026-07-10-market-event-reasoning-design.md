@@ -1,387 +1,439 @@
-# 市场事件与逻辑链分析设计
+# 市场事件智能与底层逻辑链设计
 
+> Review 决议：[QBot 分析平台 Review 决议](../../reviews/2026-07-10-analysis-platform-review-resolution.md)
+>
 > 调研依据：[市场事件采集与分析框架调研](../../research/2026-07-10-market-event-framework-research.md)
 >
-> 本设计吸收 GDELT、Event Registry、RavenPack、Bloomberg NSTM、实时事件检测、中文金融文档抽取、因果知识图谱和金融事件研究中的成熟模式，但不绑定任何单一供应商。
+> 总体架构：[QBot 分析平台总体架构设计](2026-07-10-analysis-platform-architecture-design.md)
 
 ## 1. 目标
 
-每天自动收集市场事件，保留原始证据，识别事件实体和方向，并结合市场、板块和个股数据生成可追溯的底层逻辑链。
+每天收集市场事件，保留原始证据，识别新增事实，并以可追溯方式展示事件可能如何影响市场。
 
-系统需要回答：
+系统必须区分：
 
-- 今天真正新增了哪些事件？
-- 哪些是同一事件的重复报道？
-- 哪些内容是事实，哪些是媒体判断，哪些是系统推断？
-- 事件首先改变了什么经济变量？
-- 如何沿产业链传导到收入、成本、利润、估值和风险偏好？
-- 哪些行业和股票类型可能受益或受损？
-- 当日市场是否确认该逻辑？
-- 需要观察哪些后续指标？
-- 什么条件出现时应判定逻辑失效？
+- 来源事实。
+- 媒体引用。
+- 媒体观点。
+- 系统计算。
+- 系统影响假设。
+- 市场后续观察。
+- 尚未知信息。
+
+第一版不做事件驱动选股，只生成事实简报和解释上下文。
 
 ## 2. 设计原则
 
-- 原始证据先于分析结论。
-- 自动新闻源和人工输入使用同一个数据模型。
-- 大模型只做结构化抽取和语言表达。
-- 因果链由确定性模板、实体映射和市场数据共同生成。
-- 不把新闻情绪直接转换成买入信号。
-- 同一事件可以有多种情景，不强行输出单一方向。
-- 所有结论都必须回指来源、计算数据和逻辑版本。
-- 无法确认的内容明确标记为未知，而不是补全。
+- 原始证据先于分析。
+- `available_at` 决定历史回放能否使用。
+- 复制稿不等于独立证据。
+- 事实图与影响假设图严格分离。
+- 市场走势与假设一致不等于存在因果。
+- 初始影响假设必须在观察市场反应前冻结。
+- 大模型不能生成无来源事实。
+- 人工修订追加版本，不覆盖历史。
+- 第一版不自动生成非直接实体的“受益股名单”。
+- 事件权重第一版为 0。
 
-## 3. 事件来源
+## 3. 分阶段范围
 
-采用混合模式。
+### 3.1 Phase 2：事件证据 MVP
 
-### 3.1 自动来源
+只实现：
 
-通过 `NewsSource` 接口接入：
+- Telegram/REST 人工输入。
+- 一个官方事实源。
+- 原始证据。
+- 精确和近重复。
+- 固定事件 Schema。
+- 直接实体映射。
+- ClaimGraph。
+- 每日事实简报。
 
-- 官方政策和监管公告。
-- 交易所和上市公司公告。
-- 宏观数据发布。
-- 主流财经新闻。
-- 行业协会和产业数据。
-- 海外宏观、商品和地缘事件。
+不实现：
 
-第一版来源组合固定为：
+- GDELT。
+- 跨来源复杂事件簇。
+- ImpactHypothesisGraph 自动发布。
+- 市场异常收益。
+- 事件选股。
 
-1. 一个官方公告或政策事实源。
-2. GDELT 全球宏观与地缘补充源。
-3. Telegram/REST 人工输入。
+### 3.2 Phase 3：事件演化和市场观察
 
-Event Registry、RavenPack 或其他商业源保留为可选适配器。业务模型不得依赖某个供应商的私有字段。正文持久化必须遵守来源许可；不允许长期保存正文的来源只存元数据、哈希、许可范围内摘要和原始链接。
+增加：
 
-### 3.2 人工来源
+- GDELT 宏观补充。
+- EventMention。
+- EventCluster。
+- 两阶段聚类。
+- EventDelta。
+- ImpactHypothesisGraph。
+- 市场异常收益和板块观察。
+- 事件类型历史基线。
 
-支持：
+## 4. 来源策略
 
-- Telegram 转发或粘贴新闻。
-- Telegram 提交链接。
-- REST API 提交标题、正文、来源和备注。
-- 人工修改事件优先级、实体、方向和合并关系。
+### 4.1 第一版来源
 
-人工修改不能覆盖原始记录，只生成修订版本。
+1. Telegram/REST 人工输入。
+2. 一个官方政策、监管、交易所或上市公司公告源。
 
-## 4. 来源接口
+官方源选择标准：
+
+- 许可允许系统访问和保存必要内容。
+- 有稳定 ID、发布时间和原始链接。
+- 可明确区分正文和附件。
+- 有可验证的发布时间。
+
+### 4.2 后续来源
+
+- GDELT：全球宏观、地缘和供应链补充。
+- Event Registry、RavenPack 或其他商业源：可选适配器。
+- 行业数据和商品源：后续按需求增加。
+
+业务模型不得依赖供应商私有字段。
+
+### 4.3 内容许可
+
+每个来源保存：
 
 ```text
-trait NewsSource {
+content_retention_policy
+allowed_fields
+allowed_retention_days
+redistribution_allowed
+source_terms_version
+```
+
+若不允许长期保存全文，只保存：
+
+- 元数据。
+- 哈希。
+- 许可范围内摘要。
+- 原始链接。
+- 必要结构化事实。
+
+## 5. 来源接口
+
+```text
+trait EventSource {
     source_id() -> str
     fetch(cursor, until) -> FetchBatch
 }
 ```
 
-`FetchBatch` 必须包含：
+`FetchBatch`：
 
-- 来源游标。
-- 原始项目。
-- 拉取时间。
-- 是否还有下一页。
-- 部分失败信息。
+```text
+items
+next_cursor
+has_more
+fetched_at
+partial_failures
+```
 
-适配器内部负责认证、分页、限流和源格式解析。业务模块不感知具体新闻供应商。
+适配器内部处理：
 
-## 5. 原始证据模型
+- 认证。
+- 分页。
+- 限流。
+- 重试。
+- 源格式。
+- 内容许可。
 
-### 5.1 `market_event_evidence`
+业务模块不感知具体供应商。
+
+## 6. 时间语义
+
+每条证据必须保存：
+
+```text
+occurred_at
+published_at
+first_seen_at
+available_at
+effective_trade_date
+source_updated_at
+```
+
+规则：
+
+- `published_at` 来自来源。
+- `first_seen_at` 是 QBot 首次获取时间。
+- `available_at` 是系统历史回放允许使用的最早时间。
+- 来源后续修订产生新版本。
+- 收盘后发布的信息只能用于下一交易日。
+- 非交易日发布的信息映射到下一交易日。
+- 无法确定发布时间的内容不能进入高置信历史事件研究。
+
+## 7. 原始证据
+
+### 7.1 `EventEvidence`
 
 建议字段：
 
 ```text
-id
+evidence_id
 source_id
 source_item_id
 source_url
 source_tier
+source_terms_version
+occurred_at
 published_at
-collected_at
+first_seen_at
+available_at
+effective_trade_date
 title
 content
 language
 content_hash
-raw_payload JSONB
+raw_payload
+version
+supersedes_evidence_id
 status
 created_at
-UNIQUE (source_id, source_item_id)
+UNIQUE (source_id, source_item_id, version)
 ```
 
-其中：
+原始证据不可覆盖。
 
-- `published_at` 是来源发布时间。
-- `collected_at` 是系统首次看到的时间。
-- `content_hash` 用于跨来源去重。
-- `raw_payload` 保存来源原始字段。
-- 原始正文只追加，不原地修改。
+### 7.2 来源等级
 
-### 5.2 来源等级
-
-建议配置化：
-
-| 等级 | 典型来源 | 默认可信度 |
+| 等级 | 来源 | 默认范围 |
 |---|---|---:|
 | A | 政府、监管、交易所、公司正式公告 | 0.95-1.00 |
-| B | 权威数据机构、主流财经媒体原始采访 | 0.80-0.95 |
-| C | 二次报道、行业媒体、研究摘要 | 0.60-0.85 |
+| B | 权威数据机构、原始采访 | 0.80-0.95 |
+| C | 二次报道、行业媒体 | 0.60-0.85 |
 | D | 社交媒体、未确认传闻 | 0.20-0.60 |
 
-可信度不是事实真伪的最终结论，只是分析输入之一。
+来源等级只是输入，不是事实真伪的最终结论。
 
-## 6. 去重、提及与事件聚合
+## 8. 重复和近重复
 
-成熟系统必须区分“复制内容”和“同一现实事件的不同报道”。QBot 使用三层模型：
+### 8.1 `DuplicateGroup`
 
-```text
-EventEvidence -> DuplicateGroup -> EventMention -> EventCluster
-```
+复制或近复制内容进入同一组。
 
-### 6.1 `DuplicateGroup`
-
-只聚合复制或近复制内容。多个转载稿只计算为一个独立证据源，避免用转载数量虚增事件重要性。
-
-去重顺序：
+检测顺序：
 
 1. 来源内 ID。
 2. 标准化 URL。
 3. 正文哈希。
-4. 标题与正文近重复模型。
-5. 人工锁定的重复关系。
+4. 标题和正文近重复。
+5. 人工锁定关系。
 
-### 6.2 `EventMention`
+多个转载稿只计算为一个独立证据源。
 
-每条非重复证据对现实事件形成一个提及。提及保留：
+### 8.2 第一版行为
 
-- 证据来源。
-- 提及时间。
-- 提及的实体和动作。
-- 是否带来新增事实。
-- 是否只是评论或引用。
-- 来源独立性。
+第一版不尝试复杂现实事件聚类，只提供：
 
-### 6.3 `EventCluster`
+- `duplicate`
+- `near_duplicate`
+- `independent`
 
-事件簇代表同一现实事件，可以包含不同来源、不同语言和不同角度的报道。
+中等置信关系保存为候选，不自动合并。
 
-建议表字段：
+## 9. 双轨抽取
+
+### 9.1 正式公告轨道
+
+适用于：
+
+- 政府政策。
+- 监管公告。
+- 交易所公告。
+- 上市公司公告。
+
+要求：
+
+- 文档级抽取。
+- 同一文档支持多个事件。
+- 支持跨句主体、客体、金额、日期和条件。
+- 数字、日期和证券代码确定性校验。
+- 附件和正文引用可追踪。
+
+### 9.2 一般输入轨道
+
+适用于：
+
+- 人工粘贴新闻。
+- 人工提交链接。
+- 后续媒体和 GDELT。
+
+区分：
 
 ```text
-event_cluster_id
-canonical_title
-event_time
-first_seen_at
-last_seen_at
-lifecycle_status
-primary_evidence_id
-representative_evidence_ids
-source_entropy
-mention_count
-independent_source_count
-cluster_version
-created_at
-updated_at
+fact
+direct_quote
+third_party_claim
+journalist_interpretation
+rumor
+unknown
 ```
 
-事件生命周期：
+观点、传闻和未知不得进入 ClaimGraph 的事实节点。
 
-```text
-emerging -> active -> confirmed -> cooling -> closed
-                    \-> contradicted
-```
+## 10. LLM 结构化抽取
 
-新证据可以更新事件簇，但不能覆盖历史版本。
+### 10.1 职责
 
-### 6.4 两阶段聚类
-
-#### 采集阶段
-
-使用低成本逻辑快速建立候选事件：
-
-- 时间邻近。
-- 实体重叠。
-- 动作或事件类型重叠。
-- 轻量语义相似度。
-
-该阶段追求低延迟，允许事件被拆成多个小簇。
-
-#### 收盘精炼阶段
-
-使用更严格的：
-
-- 实体消歧结果。
-- 动作和对象。
-- 时间、地点和数量。
-- 语义相似度。
-- 来源独立性。
-
-对候选簇进行合并或拆分。精炼结果必须保留旧簇重定向记录。
-
-### 6.5 事件重要性
-
-重要性不能只用报道数量。至少分开保存：
-
-- 独立来源数量。
-- 来源熵。
-- 来源质量。
-- 实体重要性。
-- 新增事实数量。
-- 新颖度。
-- 市场覆盖范围。
-
-### 6.6 错误合并保护
-
-自动合并只在高置信度下执行。中等置信度关系保存为候选关联，允许人工确认。人工锁定的拆分或合并关系优先于自动任务。
-
-## 7. 双轨结构化抽取
-
-正式公告与一般新闻使用不同抽取路径，最终映射到统一事件 Schema。
-
-### 7.1 正式文档轨道
-
-适用于政府、监管、交易所和上市公司公告：
-
-- 文档级抽取，而不是只分析标题或单句。
-- 支持同一文档中的多个事件。
-- 支持跨句分散的主体、客体、金额、日期、标的和条件。
-- 数字、日期和证券代码进行确定性校验。
-- 通过固定的事件 Schema 生成高可信事实节点。
-
-### 7.2 一般新闻轨道
-
-适用于媒体、行业和聚合新闻：
-
-- 区分记者陈述、直接引用、第三方观点和未经确认传闻。
-- 通过跨来源事件簇增强或削弱事实可信度。
-- 媒体判断不得直接进入事实节点。
-- 不确定内容保留为待验证声明。
-
-## 8. LLM 结构化抽取
-
-### 8.1 输入
-
-- 事件组内高质量证据。
-- 来源元数据。
-- 已知证券、公司、行业和宏观实体字典。
-- 严格 JSON Schema。
-
-### 8.2 输出 Schema
+大模型只生成候选结构：
 
 ```json
 {
   "event_type": "policy",
   "event_subtype": "subsidy",
-  "facts": [
+  "claims": [
     {
-      "claim": "fact text",
+      "claim_type": "fact",
+      "text": "...",
       "evidence_ids": [123],
       "confidence": 0.96
     }
   ],
-  "entities": [
-    {
-      "type": "industry",
-      "name": "example",
-      "canonical_id": "optional",
-      "role": "affected"
-    }
-  ],
-  "actions": [],
-  "direction": "mixed",
-  "time_horizon": "medium",
-  "novelty": 0.7,
+  "entities": [],
+  "amounts": [],
+  "dates": [],
   "uncertainties": [],
   "missing_information": []
 }
 ```
 
-### 8.3 强制规则
+### 10.2 强制规则
 
-- 每条事实必须引用一个或多个 `evidence_id`。
-- 没有证据的内容只能进入 `uncertainties` 或 `missing_information`。
-- 输出必须通过 Schema 校验。
-- LLM 输出不能直接写入已发布分析表。
-- 同一输入、Prompt 版本和模型参数必须保存。
+- 每个事实引用至少一个 `evidence_id`。
+- 无证据内容进入不确定字段。
+- 输出必须通过 JSON Schema。
+- Prompt、模型和参数必须保存。
+- LLM 输出先进入候选层，不直接发布。
+- 数字、日期和证券代码必须经过确定性校验。
 
-### 8.4 失败降级
+### 10.3 失败降级
 
-- JSON 不合法：最多重试一次修复请求。
-- 仍失败：事件保持 `collected`，等待人工处理。
-- LLM 不可用：不阻塞证据采集和去重。
-- 低可信来源：抽取后仍保持低来源权重。
+- 非法 JSON 最多重试一次修复。
+- 仍失败则保持待人工处理。
+- LLM 不可用不阻塞采集和证据保存。
+- 低可信来源不会因为 LLM 抽取而升级来源可信度。
 
-## 9. 实体与行业映射
+## 11. 实体映射
 
-### 9.1 规范实体
+### 11.1 第一版实体
 
-建议维护：
+- 直接涉及的上市公司。
+- 政府和监管机构。
+- 一级行业。
+- 商品或宏观变量。
 
-- 上市公司与股票代码。
-- 行业和概念代码。
-- 商品。
-- 宏观变量。
-- 国家和地区。
-- 政策机构。
-- 产业链环节。
+第一版不根据模糊产业链关系自动映射具体受益股票。
 
-### 9.2 映射来源
-
-- `stock_info` 中的公司和行业。
-- `sector_daily` 中的行业和概念。
-- 人工维护的产业链关系。
-- 公司别名词典。
-- 事件中出现的证券代码。
-
-### 9.3 映射置信度
-
-实体映射应保存：
+### 11.2 `EntityLink`
 
 ```text
 raw_name
 canonical_type
 canonical_id
+role
 match_method
 confidence
 review_status
+evidence_ids
 ```
 
-名称相似但无法确认时，不自动映射到具体股票。
+名称相似但无法确认时，不自动映射。
 
-### 9.4 `EventEntityLink`
+### 11.3 方向限制
 
-事件的方向、相关性和新颖度必须绑定到具体实体，而不是绑定整篇文章。
-
-建议字段：
+事件方向绑定到具体实体：
 
 ```text
-event_cluster_id
-entity_type
+event_id
 entity_id
 role
-source_confidence
-evidence_independence
-entity_relevance
-event_novelty
 expected_direction
 expected_horizon
-logic_confidence
-review_status
+entity_relevance
+source_confidence
 ```
 
-同一个事件可以：
+禁止给整篇文章一个统一情绪分后应用到所有实体。
 
-- 对上游供给方为正面。
-- 对下游采购方为负面。
-- 对被顺带提及的公司保持低相关性。
+## 12. ClaimGraph
 
-禁止使用一个“整篇新闻情绪分”覆盖上述差异。
+ClaimGraph 只保存有证据支持的事实。
 
-## 10. 确定性逻辑链
-
-### 10.1 逻辑节点类型
+### 12.1 节点
 
 ```text
-EventFact
+PolicyFact
+CompanyFact
+MacroDataFact
+SupplyFact
+DemandFact
+PriceFact
+OperationalFact
+RegulatoryFact
+```
+
+### 12.2 边
+
+```text
+issued_by
+applies_to
+affects_directly
+reports
+acquires
+supplies
+purchases
+increases_from
+decreases_from
+effective_on
+located_in
+```
+
+### 12.3 证据要求
+
+每个节点和边保存：
+
+```text
+evidence_ids
+extraction_method
+confidence
+review_status
+schema_version
+```
+
+没有证据的推断不得进入 ClaimGraph。
+
+## 13. EventDelta
+
+Phase 3 增加 `EventDelta`，但数据合同在第一版预留。
+
+它表示相对上一版本新增的内容：
+
+```text
+new_claims
+repeated_claims
+revised_values
+removed_claims
+status_changes
+expectation_gap
+new_uncertainties
+resolved_uncertainties
+```
+
+每日简报优先展示增量，不重复长篇介绍同一事件。
+
+## 14. ImpactHypothesisGraph
+
+Phase 3 实现。
+
+它保存系统推断，不保存来源事实。
+
+### 14.1 节点
+
+```text
 PolicyVariable
 DemandVariable
 SupplyVariable
@@ -395,499 +447,389 @@ CashFlowImpact
 ValuationImpact
 IndustryImpact
 StockArchetypeImpact
-MarketConfirmation
-RiskOrInvalidation
+ObservableIndicator
+InvalidationCondition
 ```
 
-### 10.2 逻辑边类型
+### 14.2 边
 
 ```text
 increases
 decreases
-restricts
-subsidizes
-raises_cost
-reduces_cost
-expands_demand
-reduces_supply
-improves_margin
-compresses_margin
-raises_risk_premium
-lowers_risk_premium
 depends_on
+may_expand_demand
+may_reduce_supply
+may_raise_cost
+may_reduce_cost
+may_improve_margin
+may_compress_margin
+may_raise_risk_premium
+may_lower_risk_premium
 contradicted_by
-confirmed_by
+observed_by
+invalidated_by
 ```
 
-### 10.3 规则模板
-
-第一版采用少量明确模板：
-
-#### 政策补贴
+### 14.3 每条边保存
 
 ```text
-补贴或税收优惠
--> 终端成本下降或企业现金流改善
--> 需求提升或利润改善
--> 直接受益行业
--> 上游需求传导
--> 财政持续性和政策执行风险
-```
-
-#### 供给收缩
-
-```text
-停产、限产、制裁或产能退出
--> 有效供给下降
--> 商品或产品价格压力向上
--> 上游生产者受益
--> 下游成本上升
--> 替代供给和库存构成失效条件
-```
-
-#### 需求冲击
-
-```text
-订单、销量、出口或基建需求变化
--> 收入预期变化
--> 产能利用率变化
--> 毛利和现金流变化
--> 产业链库存变化
-```
-
-#### 利率与流动性
-
-```text
-利率、准备金、财政投放或汇率变化
--> 融资成本和流动性
--> 风险偏好和估值折现率
--> 高久期资产、金融和出口链差异化影响
-```
-
-#### 公司事件
-
-```text
-业绩、订单、回购、并购、事故或治理变化
--> 收入、成本、股本、资产或风险变化
--> 公司直接影响
--> 供应商、客户或同行间接影响
-```
-
-### 10.4 生成方式
-
-1. 根据结构化事件选择模板。
-2. 使用实体关系补全允许的产业链节点。
-3. 根据规则计算正负方向。
-4. 将未知依赖保留为条件节点。
-5. 生成多情景分支。
-6. 使用市场数据添加确认或矛盾节点。
-
-LLM 可以将这张图转写为自然语言，但不能创建图中不存在的事实节点。
-
-## 11. 多情景分析
-
-事件结论至少支持：
-
-- 基准情景。
-- 乐观情景。
-- 悲观情景。
-
-每个情景包含：
-
-```text
-assumptions
-logic_chain
-beneficiaries
-losers
-observable_indicators
-invalidation_conditions
+source_claim_ids
+generation_method
+logic_rule_id
 confidence
+assumptions
+expected_horizon
+observable_indicators
+counter_scenario
+invalidation_conditions
+frozen_at
 ```
 
-例如政策利好不一定直接产生正面市场影响，还要区分：
-
-- 政策是否新增。
-- 规模是否超预期。
-- 是否已有提前交易。
-- 执行时间是否太长。
-- 行业是否存在过剩产能。
-- 利好是否只改善收入但恶化利润。
-
-## 12. 市场影响与确认
-
-事件本身不进入选股分数，必须先经过市场数据验证。股票上涨不等于事件导致上涨；验证必须尽量扣除市场、行业和已知风险因子的共同影响。
-
-### 12.1 确认数据
-
-- 股票相对市场的异常收益。
-- 股票相对行业的异常收益。
-- 行业相对市场收益。
-- 行业成交额异常。
-- 行业上涨家数比例。
-- 行业内龙头相对强度。
-- 涨停、炸板和冲高回落。
-- 上下游是否同步或分化。
-- 相关商品、汇率、利率或海外指数变化。
-- 事件发生前是否已经存在明显预期交易。
-
-### 12.2 事件窗口
-
-按事件类型选择短窗口，避免长期收益被其他因素污染：
-
-- 即时突发：`[0,1]`、`[0,3]` 个交易日。
-- 政策和产业事件：`[0,5]`、`[0,20]` 个交易日。
-- 公司基本面事件：使用短期市场窗口，并另外跟踪后续经营指标。
-
-同一窗口内存在财报、停复牌、监管处罚或重大宏观事件时，必须标记 `confounded`，不得输出高置信因果判断。
-
-### 12.3 确认状态
+`generation_method`：
 
 ```text
-unconfirmed
-partially_confirmed
-confirmed
-contradicted
+domain_rule
+historical_analogy
+analyst_override
+llm_candidate
+```
+
+LLM 候选边只有经过规则或人工审核后才能发布。
+
+## 15. 初始假设冻结
+
+流程：
+
+```text
+event available
+-> build ClaimGraph
+-> build initial hypothesis
+-> freeze hypothesis
+-> observe future market
+-> append observations
+```
+
+禁止：
+
+```text
+observe market rally
+-> rewrite initial hypothesis as bullish
+```
+
+若后续新增事实改变逻辑，应创建新假设版本并引用 `EventDelta`。
+
+## 16. 市场观察
+
+Phase 3 实现。
+
+### 16.1 状态
+
+```text
+not_observed
+market_aligned
+market_contradicted
+ambiguous
 confounded
 expired
 ```
 
-### 12.4 维度分数
+不要使用 `confirmed` 表示因果确认。
 
-禁止用一个总分覆盖不同含义。分别保存：
+### 16.2 独立置信度
+
+保存：
 
 ```text
 source_confidence
-evidence_independence
 entity_relevance
-event_novelty
-event_importance
 logic_confidence
-market_confirmation
+causal_confidence
+market_alignment_score
 crowding_score
 ```
 
-`market_confirmation` 由确定性计算产生，输入包括异常收益、板块宽度、成交额、龙头和跨资产验证。
+价格一致只能提高 `market_alignment_score`，不能自动提高 `causal_confidence`。
 
-### 12.5 事件类型历史基线
+### 16.3 观察指标
 
-每种事件类型建立历史统计：
+- 股票相对市场异常收益。
+- 股票相对行业异常收益。
+- 行业相对市场收益。
+- 行业成交额异常。
+- 行业上涨宽度。
+- 龙头相对强度。
+- 上下游同步或分化。
+- 相关商品、汇率、利率和海外指数。
+- 事件前是否已有明显预期交易。
+
+### 16.4 事件窗口
+
+- 突发事件：`[0,1]` 和 `[0,3]`。
+- 政策和产业事件：`[0,5]` 和 `[0,20]`。
+- 公司基本面事件：短期市场窗口加后续经营指标。
+
+同一窗口出现财报、停复牌、处罚或重大宏观冲击时标记 `confounded`。
+
+## 17. 事件历史基线
+
+Phase 3 保存：
 
 ```text
+event_type
+event_subtype
+entity_type
+window
 sample_count
 median_abnormal_return
 positive_rate
 turnover_response
-sector_breadth_response
+breadth_response
 time_to_peak
 failure_rate
+data_cutoff
+logic_version
 ```
 
-当前事件的影响评价应说明它相对同类历史事件处于什么位置，而不是只依赖模型主观判断。
+当前事件只与当时以前可获得的历史事件比较。
 
-市场确认分不等于买入分。它只能通过模式匹配模块的有限权重影响候选排序。
+## 18. 每日事实简报
 
-## 13. 事件因子存储
+Phase 2 输出固定结构：
 
-完整数据链为：
+### 18.1 今日新增事实
+
+- 官方来源事实。
+- 人工提交且已验证的事实。
+- 发布时间和首次发现时间。
+- 直接涉及实体。
+
+### 18.2 今日修订
+
+- 数字变化。
+- 生效时间变化。
+- 状态变化。
+- 原事实撤回或更正。
+
+### 18.3 未确认内容
+
+- 第三方声明。
+- 传闻。
+- 缺失信息。
+
+### 18.4 直接影响范围
+
+只输出：
+
+- 直接公司。
+- 一级行业。
+- 明确的上游或下游方向。
+- 需要观察的股票类型。
+
+不输出非直接实体“受益股名单”。
+
+### 18.5 来源
+
+- 主要原始来源。
+- 代表性证据。
+- 重复关系。
+- 来源等级。
+- 内容许可状态。
+
+## 19. Phase 3 市场逻辑简报
+
+在事实简报基础上增加：
+
+- EventDelta。
+- 初始影响假设。
+- 市场对齐、矛盾或混杂。
+- 可观察指标。
+- 反向情景。
+- 失效条件。
+- 同类历史事件基线。
+
+所有推断必须明确标记为推断。
+
+## 20. 存储层次
 
 ```text
 SourceItem
 -> EventEvidence
 -> DuplicateGroup
+-> ExtractedClaim
+-> EntityLink
+-> ClaimGraph
+-> EventDelta
 -> EventMention
 -> EventCluster
--> EventEntityLink
--> EventLogicGraph
+-> ImpactHypothesisGraph
 -> EventMarketObservation
 -> EventTypeStatistics
--> DailyMarketBrief
+-> DailyEventBrief
 ```
 
-每一层保留独立主键、版本和上游引用，禁止为了查询方便把所有状态压入一个 JSON 字段。
+每一层有独立主键、版本和上游引用。
 
-### 13.1 `market_event_extractions`
+## 21. API 和 Telegram
 
-保存：
-
-- 事件组。
-- Schema 版本。
-- Prompt 版本。
-- 模型。
-- 温度和参数。
-- 结构化输出。
-- 校验状态。
-- 输入指纹。
-
-### 13.2 `market_event_analyses`
-
-保存：
-
-- 逻辑版本。
-- 逻辑图 JSON。
-- 情景。
-- 受益和受损映射。
-- 未知和失效条件。
-- 总体置信度。
-- 发布状态。
-
-### 13.3 `market_event_confirmations`
-
-按交易日保存：
-
-```text
-event_cluster_id
-entity_type
-entity_id
-trade_date
-confirmation_status
-confirmation_score
-abnormal_return_market
-abnormal_return_industry
-market_metrics JSONB
-contradictions JSONB
-confounding_events JSONB
-created_at
-PRIMARY KEY (event_cluster_id, entity_type, entity_id, trade_date)
-```
-
-### 13.4 `market_event_type_statistics`
-
-保存各事件类型和观察窗口的历史异常收益、成交额、宽度和失败率统计。统计必须记录样本截止日期和计算版本。
-
-### 13.5 `market_event_revisions`
-
-人工修改采用追加记录：
-
-- 修改前后内容。
-- 修改人。
-- 原因。
-- 时间。
-- 被替代版本。
-
-## 14. 每日市场事件报告
-
-报告顺序固定：
-
-### 14.1 今日新增事实
-
-只写来源支持的事实，并标明来源等级和发布时间。
-
-### 14.2 主要逻辑链
-
-按影响范围和置信度排序，每个事件展示：
-
-```text
-事实
--> 第一层变量
--> 企业基本面传导
--> 行业和股票类型
--> 市场确认
-```
-
-### 14.3 板块与风格影响
-
-- 已确认受益。
-- 已确认受损。
-- 尚未确认。
-- 市场走势与事件相矛盾。
-
-### 14.4 明日观察指标
-
-- 价格和成交额。
-- 政策细则。
-- 商品或汇率。
-- 龙头和板块宽度。
-- 上下游验证。
-
-### 14.5 风险和失效条件
-
-明确说明哪些条件会推翻当前逻辑。
-
-### 14.6 来源列表
-
-报告中的事件必须可以打开原始来源。每个事件至少展示：
-
-- 主要原始证据。
-- 代表性报道。
-- 独立来源数量和来源熵。
-- 是否存在相互矛盾的报道。
-- 当前事件生命周期状态。
-
-Telegram 受长度限制时提供摘要和事件详情按钮。
-
-## 15. API 与 Telegram
-
-建议新增：
+### 21.1 Phase 2 API
 
 ```text
 POST /api/analysis/events/manual
 GET  /api/analysis/events
 GET  /api/analysis/events/:id
 POST /api/analysis/events/:id/review
-GET  /api/analysis/daily-brief
+GET  /api/analysis/events/daily-brief
 ```
 
-Telegram：
+### 21.2 Telegram
 
 ```text
 /event <文本或链接>
 /events
 /event_detail <id>
 /event_review <id>
-/market_logic
+/market_facts
 ```
 
-人工提交时立即回复：
+人工提交后立即返回：
 
-- 是否已存在。
-- 来源是否可读取。
-- 当前状态。
-- 是否等待抽取或人工修订。
+- 是否重复。
+- 是否可以读取来源。
+- 证据 ID。
+- 当前处理状态。
+- 是否需要人工复核。
 
-## 16. 调度
+## 22. 调度
 
-### 16.1 自动采集
+### Phase 2
 
-建议每 30-60 分钟拉取一次，最高频率不高于来源限制。
+```text
+周期采集官方源
+-> 保存证据
+-> 精确/近重复
+-> 抽取和校验
+-> ClaimGraph
+-> 18:00 事实简报
+```
 
-### 16.2 收盘分析
+### Phase 3
 
-行情数据完整后：
+```text
+周期采集
+-> 增量候选聚类
+-> 收盘精炼
+-> EventDelta
+-> 初始假设或新版本
+-> 市场观察
+-> 市场逻辑简报
+```
 
-1. 汇总当天事件。
-2. 更新事件组。
-3. 抽取待处理高优先级事件。
-4. 构建或更新逻辑链。
-5. 用收盘行情确认。
-6. 发布每日报告。
+第一版使用 PostgreSQL 状态机和幂等任务，不引入 Kafka、Flink 或图数据库。
 
-### 16.3 次日更新
+## 23. 与 `AiAnalysisService` 的关系
 
-事件可能持续多日。系统每日更新确认状态，直到：
+现有服务不再扩展。
 
-- 逻辑被确认。
-- 逻辑被市场否定。
-- 事件过期。
-- 人工关闭。
+迁移：
 
-### 16.4 第一版基础设施约束
+```text
+/api/market/overview
+-> 新 MarketSnapshot + DailyEventBrief
+-> 保持兼容响应
+-> 一个发布周期后删除自由 Prompt 逻辑
+```
 
-第一版使用：
+新事件模块不得调用旧 `build_ai_prompt()` 生成事实和逻辑。
 
-- PostgreSQL 保存证据、聚类、状态和审计。
-- 可重入的异步批任务。
-- 数据库任务锁和幂等键。
-- 失败重试和死信状态。
+## 24. 与选股的关系
 
-第一版不引入 Kafka、Flink 或图数据库。模块接口必须保持可迁移性：当每日证据量、实时延迟或多消费者重放需求超过单机能力时，可以把 `EventEvidence` 接入事件流，而不改变上层领域合同。
+### Phase 2 和 Phase 3 初期
 
-## 17. 与现有 `AiAnalysisService` 的关系
+- 事件权重为 0。
+- 事件只显示在候选解释中。
+- 不生成额外股票候选。
+- 不写入自动交易候选表。
 
-现有模块将指数、涨跌家数、板块和单只涨幅股拼入 Prompt，由大模型自由生成文字。
+### 未来有限融合
 
-迁移后：
+达到事件质量和历史验证门槛后：
 
-- 市场事实采集迁入分析快照。
-- 事件采集和证据保存进入 `EventIngestionModule`。
-- 大模型调用迁入 `LlmExtractionAdapter`。
-- 因果分析进入 `EventReasoningModule`。
-- 日报由结构化结果渲染。
+- 最高 `±5` 分。
+- 只有直接实体或确定性行业映射可参与。
+- 不能越过硬过滤。
+- 每个边际分可审计。
+- 事件不能单独把 Reject 提升为 A。
 
-`AiAnalysisService` 最终应被缩小为兼容适配器，或在调用方迁移后删除。禁止在新旧模块中长期保留两套市场分析逻辑。
+## 25. 错误和降级
 
-## 18. 错误处理和可观测性
+- 来源失败：保留其他来源和人工输入。
+- 内容许可不允许保存：只保存允许字段。
+- LLM 不可用：保存证据，等待处理。
+- Schema 失败：不发布。
+- 实体映射歧义：保持未知。
+- 无证据事实：拒绝发布。
+- 初始假设未冻结：禁止市场观察任务。
+- 市场数据不足：状态保持 `not_observed`。
+- 单个事件失败：日报部分成功。
 
-记录指标：
+## 26. 测试
 
-- 每个来源抓取成功率和延迟。
-- 新增证据数。
-- 去重率。
-- LLM 抽取成功率。
-- Schema 失败率。
-- 人工修订率。
-- 事件到分析的处理延迟。
-- 无来源事实数量，正常应为零。
-- 事件确认和矛盾分布。
+### 26.1 时间
 
-错误分类：
+- `published_at`、`first_seen_at` 和 `available_at` 不混用。
+- 收盘后信息映射到下一交易日。
+- 修订版本不回写历史。
 
-- 来源认证失败。
-- 来源限流。
-- 内容无法读取。
-- 时间戳无效。
-- 去重冲突。
-- LLM 超时或非法输出。
-- 实体映射歧义。
-- 行情确认数据不足。
+### 26.2 重复
 
-日报不得因为单个来源或单个事件失败而整体失败。
+- 完全相同正文进入同一组。
+- 近重复公告被识别。
+- 独立来源不被错误合并。
+- 人工锁定不被自动任务覆盖。
 
-## 19. 测试
+### 26.3 抽取
 
-### 19.1 采集测试
+- 公告跨句参数组成同一事件。
+- 同一公告多个事件不混合。
+- 事实、引用、观点和传闻区分。
+- 每个事实有证据。
+- 数字和证券代码校验。
+- Prompt 注入不能覆盖系统指令。
 
-- 游标和分页。
-- 重复请求幂等。
-- 来源发布时间和采集时间区分。
-- 手工输入和自动输入合同一致。
+### 26.4 ClaimGraph
 
-### 19.2 去重与聚类测试
+- 无证据节点不能创建。
+- 每条边有证据。
+- 事实和影响假设不会混入同一图。
+- 修订产生新版本。
 
-- 完全相同正文进入同一 `DuplicateGroup`。
-- 不同标题的同一公告被识别为近重复。
-- 同一事件的不同原创报道进入同一 `EventCluster`，但保持独立提及。
-- 同一公司不同事件不能错误合并。
-- 在线小簇能被收盘精炼任务正确合并。
-- 错误大簇能被收盘精炼任务拆分。
-- 已发布事件簇合并或拆分保留审计和重定向。
-- 来源熵不被同一来源大量转载虚增。
+### 26.5 假设冻结
 
-### 19.3 抽取测试
+- 市场观察前存在 frozen 版本。
+- 观察结果不能修改 frozen 图。
+- 新事实创建新版本。
 
-- 固定事件 fixture 的 Schema。
-- 正式公告中的跨句参数能够组成同一事件。
-- 同一公告中的多个事件不会互相混合。
-- 新闻中的事实、引用、观点和传闻能够区分。
-- 每条事实有来源引用。
-- 模糊内容进入未知字段。
-- Prompt 注入文本不能改变系统指令。
+### 26.6 市场观察
 
-### 19.4 逻辑链测试
+- 原始收益和异常收益分别计算。
+- 行业基准正确。
+- 混杂事件标记 `confounded`。
+- 一只股票上涨不代表行业对齐。
+- 市场对齐不自动提高因果置信度。
 
-- 政策、供给、需求、流动性和公司事件模板。
-- 上下游方向正确。
-- 多情景和失效条件完整。
-- LLM 文案不能新增事实节点。
+## 27. 第一版验收
 
-### 19.5 市场确认测试
-
-- 原始收益与市场调整异常收益分别计算。
-- 股票收益能够使用行业基准进一步调整。
-- 相关板块强于指数时增加确认。
-- 板块下跌且宽度恶化时生成矛盾。
-- 事件前已有明显上涨时增加拥挤或预期交易扣分。
-- 混杂事件窗口标记为 `confounded`。
-- 旧事件随时间衰减。
-- 单只股票上涨不能代表整个行业确认。
-- 同类历史事件基线只使用当时可获得的历史样本。
-
-## 20. 第一版验收标准
-
-- 支持 Telegram/REST 人工提交事件。
-- 接入一个官方公告或政策事实源。
-- 接入 GDELT 宏观和地缘补充源。
-- 所有原始证据持久化并可追溯，且遵守来源许可。
-- 复制稿能够进入 `DuplicateGroup`，不会虚增独立来源数量。
-- 相同现实事件能够跨来源聚合为 `EventCluster`。
-- 在线候选聚类能够在收盘被精炼。
-- 事件具有生命周期、代表性证据和来源熵。
-- 正式公告和一般新闻使用不同抽取轨道。
-- 大模型输出严格通过 Schema，事实必须引用证据。
-- 事件与具体实体之间分别保存相关性、新颖度、方向和期限。
-- 能生成至少五类事件的逻辑链。
-- 能展示事实、推断、未知、前提和失效条件。
-- 能计算市场和行业调整后的异常收益。
-- 能用市场、板块、成交和宽度数据给出确认、矛盾或混杂状态。
-- 能积累事件类型历史影响基线。
-- 能生成每日事件市场报告。
-- 事件不能绕过模式和风险模块直接生成交易动作。
+- 支持 Telegram/REST 人工事件。
+- 接入一个官方事实源。
+- 所有原始证据可追溯。
+- `available_at` 正确。
+- 精确和近重复可识别。
+- 正式公告和一般输入使用不同抽取路径。
+- 每个发布事实引用证据。
+- 直接实体映射精确率目标不低于 95%。
+- 无证据事实进入日报数量为 0。
+- 非法 Schema 进入发布层数量为 0。
+- 能生成 ClaimGraph。
+- 能生成每日事实简报。
+- 不生成非直接实体股票名单。
+- 不影响选股分数和自动交易。
