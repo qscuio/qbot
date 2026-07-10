@@ -11,42 +11,63 @@ const CONTENT_PREFIX_LIMIT: usize = 256;
 pub enum DuplicateDecision {
     Exact {
         representative_id: Uuid,
-        candidate_ids: Vec<Uuid>,
     },
     NearDuplicate {
         representative_id: Uuid,
         confidence: f64,
-        candidate_ids: Vec<Uuid>,
     },
     Independent,
     ReviewRequired {
-        representative_id: Uuid,
-        confidence: f64,
         candidate_ids: Vec<Uuid>,
     },
 }
 
-impl DuplicateDecision {
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum DuplicateResolution {
+    Exact(DuplicateMatch),
+    NearDuplicate(DuplicateMatch),
+    Independent,
+    ReviewRequired(DuplicateMatch),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DuplicateMatch {
+    pub(crate) representative_id: Uuid,
+    pub(crate) confidence: f64,
+    pub(crate) candidate_ids: Vec<Uuid>,
+}
+
+impl DuplicateResolution {
+    pub(crate) fn public_decision(&self) -> DuplicateDecision {
+        match self {
+            Self::Exact(duplicate_match) => DuplicateDecision::Exact {
+                representative_id: duplicate_match.representative_id,
+            },
+            Self::NearDuplicate(duplicate_match) => DuplicateDecision::NearDuplicate {
+                representative_id: duplicate_match.representative_id,
+                confidence: duplicate_match.confidence,
+            },
+            Self::Independent => DuplicateDecision::Independent,
+            Self::ReviewRequired(duplicate_match) => DuplicateDecision::ReviewRequired {
+                candidate_ids: duplicate_match.candidate_ids.clone(),
+            },
+        }
+    }
+
     pub(crate) fn representative_id(&self) -> Option<Uuid> {
         match self {
-            Self::Exact {
-                representative_id, ..
-            }
-            | Self::NearDuplicate {
-                representative_id, ..
-            }
-            | Self::ReviewRequired {
-                representative_id, ..
-            } => Some(*representative_id),
+            Self::Exact(duplicate_match)
+            | Self::NearDuplicate(duplicate_match)
+            | Self::ReviewRequired(duplicate_match) => Some(duplicate_match.representative_id),
             Self::Independent => None,
         }
     }
 
     pub(crate) fn confidence(&self) -> Option<f64> {
         match self {
-            Self::Exact { .. } => Some(1.0),
-            Self::NearDuplicate { confidence, .. } | Self::ReviewRequired { confidence, .. } => {
-                Some(*confidence)
+            Self::Exact(_) => Some(1.0),
+            Self::NearDuplicate(duplicate_match) | Self::ReviewRequired(duplicate_match) => {
+                Some(duplicate_match.confidence)
             }
             Self::Independent => None,
         }
@@ -54,18 +75,18 @@ impl DuplicateDecision {
 
     pub(crate) fn relation_type(&self) -> Option<&'static str> {
         match self {
-            Self::Exact { .. } => Some("exact"),
-            Self::NearDuplicate { .. } => Some("near"),
-            Self::ReviewRequired { .. } => Some("review_required"),
+            Self::Exact(_) => Some("exact"),
+            Self::NearDuplicate(_) => Some("near"),
+            Self::ReviewRequired(_) => Some("review_required"),
             Self::Independent => None,
         }
     }
 
     pub(crate) fn candidate_ids(&self) -> &[Uuid] {
         match self {
-            Self::Exact { candidate_ids, .. }
-            | Self::NearDuplicate { candidate_ids, .. }
-            | Self::ReviewRequired { candidate_ids, .. } => candidate_ids.as_slice(),
+            Self::Exact(duplicate_match)
+            | Self::NearDuplicate(duplicate_match)
+            | Self::ReviewRequired(duplicate_match) => duplicate_match.candidate_ids.as_slice(),
             Self::Independent => &[],
         }
     }
@@ -84,6 +105,7 @@ pub(crate) struct DuplicateSubject {
 
 #[derive(Debug, Clone)]
 pub(crate) struct DuplicateCandidate {
+    pub(crate) evidence_id: Uuid,
     pub(crate) representative_id: Uuid,
     pub(crate) source_id: String,
     pub(crate) source_item_id: String,
@@ -111,52 +133,64 @@ impl DuplicateDecider {
         subject: &DuplicateSubject,
         candidates: &[DuplicateCandidate],
     ) -> DuplicateDecision {
-        let exact_matches: Vec<Uuid> = candidates
+        self.classify(subject, candidates).public_decision()
+    }
+
+    pub(crate) fn classify(
+        &self,
+        subject: &DuplicateSubject,
+        candidates: &[DuplicateCandidate],
+    ) -> DuplicateResolution {
+        let exact_matches: Vec<&DuplicateCandidate> = candidates
             .iter()
             .filter(|candidate| is_exact_match(subject, candidate))
-            .map(|candidate| candidate.representative_id)
             .collect();
-        if let Some(representative_id) = exact_matches.first().copied() {
-            return DuplicateDecision::Exact {
+        if let Some(representative_id) = exact_matches
+            .first()
+            .map(|candidate| candidate.representative_id)
+        {
+            return DuplicateResolution::Exact(DuplicateMatch {
                 representative_id,
-                candidate_ids: exact_matches,
-            };
+                confidence: 1.0,
+                candidate_ids: exact_matches
+                    .into_iter()
+                    .map(|candidate| candidate.evidence_id)
+                    .collect(),
+            });
         }
 
-        let scored_candidates: Vec<(Uuid, f64)> = candidates
+        let scored_candidates: Vec<ScoredCandidate> = candidates
             .iter()
-            .map(|candidate| {
-                (
-                    candidate.representative_id,
-                    similarity_score(subject, candidate),
-                )
+            .map(|candidate| ScoredCandidate {
+                evidence_id: candidate.evidence_id,
+                representative_id: candidate.representative_id,
+                confidence: similarity_score(subject, candidate),
             })
             .collect();
 
         if self.auto_near_duplicate_threshold >= CONSERVATIVE_NEAR_DUPLICATE_FLOOR {
-            if let Some((representative_id, confidence, candidate_ids)) =
+            if let Some(duplicate_match) =
                 matching_scored_candidates(&scored_candidates, self.auto_near_duplicate_threshold)
             {
-                return DuplicateDecision::NearDuplicate {
-                    representative_id,
-                    confidence,
-                    candidate_ids,
-                };
+                return DuplicateResolution::NearDuplicate(duplicate_match);
             }
         } else {
-            if let Some((representative_id, confidence, candidate_ids)) =
+            if let Some(duplicate_match) =
                 matching_scored_candidates(&scored_candidates, self.auto_near_duplicate_threshold)
             {
-                return DuplicateDecision::ReviewRequired {
-                    representative_id,
-                    confidence,
-                    candidate_ids,
-                };
+                return DuplicateResolution::ReviewRequired(duplicate_match);
             }
         }
 
-        DuplicateDecision::Independent
+        DuplicateResolution::Independent
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScoredCandidate {
+    evidence_id: Uuid,
+    representative_id: Uuid,
+    confidence: f64,
 }
 
 fn is_exact_match(subject: &DuplicateSubject, candidate: &DuplicateCandidate) -> bool {
@@ -193,33 +227,29 @@ fn same_canonical_url(subject_url: Option<&str>, candidate_url: Option<&str>) ->
 }
 
 fn matching_scored_candidates(
-    scored_candidates: &[(Uuid, f64)],
+    scored_candidates: &[ScoredCandidate],
     minimum_score: f64,
-) -> Option<(Uuid, f64, Vec<Uuid>)> {
-    let mut matching_candidates: Vec<(Uuid, f64)> = scored_candidates
+) -> Option<DuplicateMatch> {
+    let mut matching_candidates: Vec<ScoredCandidate> = scored_candidates
         .iter()
         .copied()
-        .filter(|(_, score)| *score >= minimum_score)
+        .filter(|candidate| candidate.confidence >= minimum_score)
         .collect();
     matching_candidates.sort_by(|left, right| {
         right
-            .1
-            .total_cmp(&left.1)
-            .then_with(|| left.0.cmp(&right.0))
+            .confidence
+            .total_cmp(&left.confidence)
+            .then_with(|| left.evidence_id.cmp(&right.evidence_id))
     });
 
-    matching_candidates
-        .first()
-        .map(|(representative_id, confidence)| {
-            (
-                *representative_id,
-                *confidence,
-                matching_candidates
-                    .iter()
-                    .map(|(candidate_id, _)| *candidate_id)
-                    .collect(),
-            )
-        })
+    matching_candidates.first().map(|candidate| DuplicateMatch {
+        representative_id: candidate.representative_id,
+        confidence: candidate.confidence,
+        candidate_ids: matching_candidates
+            .iter()
+            .map(|candidate| candidate.evidence_id)
+            .collect(),
+    })
 }
 
 fn similarity_score(subject: &DuplicateSubject, candidate: &DuplicateCandidate) -> f64 {
@@ -293,6 +323,7 @@ fn normalized_prefix(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::{fs, path::PathBuf};
 
     use chrono::{TimeZone, Utc};
     use sqlx::PgPool;
@@ -326,6 +357,7 @@ mod tests {
             Some("Different body"),
         );
         let exact = DuplicateCandidate {
+            evidence_id: Uuid::new_v4(),
             representative_id: Uuid::new_v4(),
             source_id: subject.source_id.clone(),
             source_item_id: subject.source_item_id.clone(),
@@ -342,7 +374,6 @@ mod tests {
             decision,
             DuplicateDecision::Exact {
                 representative_id: exact.representative_id,
-                candidate_ids: vec![exact.representative_id],
             }
         );
     }
@@ -372,7 +403,6 @@ mod tests {
             decision,
             DuplicateDecision::Exact {
                 representative_id: exact.representative_id,
-                candidate_ids: vec![exact.representative_id],
             }
         );
     }
@@ -412,6 +442,7 @@ mod tests {
             Some("Acme disclosed the contract award."),
         );
         let exact = DuplicateCandidate {
+            evidence_id: Uuid::new_v4(),
             representative_id: Uuid::new_v4(),
             source_id: "other-source".to_string(),
             source_item_id: "story-999".to_string(),
@@ -428,7 +459,6 @@ mod tests {
             decision,
             DuplicateDecision::Exact {
                 representative_id: exact.representative_id,
-                candidate_ids: vec![exact.representative_id],
             }
         );
     }
@@ -458,14 +488,12 @@ mod tests {
             DuplicateDecision::NearDuplicate {
                 representative_id,
                 confidence,
-                candidate_ids,
             } => {
                 assert_eq!(representative_id, near.representative_id);
                 assert!(
                     confidence >= 0.92,
                     "expected conservative confidence, got {confidence}"
                 );
-                assert_eq!(candidate_ids, vec![near.representative_id]);
             }
             other => panic!("expected near duplicate, got {other:?}"),
         }
@@ -505,9 +533,7 @@ mod tests {
         assert_eq!(
             decision,
             DuplicateDecision::ReviewRequired {
-                representative_id: review.representative_id,
-                confidence: 0.9375,
-                candidate_ids: vec![review.representative_id],
+                candidate_ids: vec![review.evidence_id],
             }
         );
     }
@@ -746,6 +772,49 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn duplicate_decision_public_shape_matches_task_brief() {
+        let source = fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/analysis/events/dedup.rs"),
+        )
+        .unwrap();
+
+        let enum_body = source
+            .split("pub enum DuplicateDecision {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n\nimpl DuplicateDecision").next())
+            .expect("DuplicateDecision enum body");
+        let exact_block = enum_body
+            .split("Exact {")
+            .nth(1)
+            .and_then(|rest| rest.split("},").next())
+            .expect("Exact block");
+        let near_block = enum_body
+            .split("NearDuplicate {")
+            .nth(1)
+            .and_then(|rest| rest.split("},").next())
+            .expect("NearDuplicate block");
+        let review_block = enum_body
+            .split("ReviewRequired {")
+            .nth(1)
+            .and_then(|rest| rest.split("},").next())
+            .expect("ReviewRequired block");
+
+        assert!(exact_block.contains("representative_id: Uuid,"));
+        assert!(!exact_block.contains("candidate_ids"));
+        assert!(!exact_block.contains("confidence"));
+
+        assert!(near_block.contains("representative_id: Uuid,"));
+        assert!(near_block.contains("confidence: f64,"));
+        assert!(!near_block.contains("candidate_ids"));
+
+        assert!(enum_body.contains("Independent,"));
+
+        assert!(review_block.contains("candidate_ids: Vec<Uuid>,"));
+        assert!(!review_block.contains("representative_id"));
+        assert!(!review_block.contains("confidence"));
+    }
+
     fn subject(
         source_id: &str,
         source_item_id: &str,
@@ -774,6 +843,7 @@ mod tests {
         content: Option<&str>,
     ) -> DuplicateCandidate {
         DuplicateCandidate {
+            evidence_id: Uuid::new_v4(),
             representative_id: Uuid::new_v4(),
             source_id: source_id.to_string(),
             source_item_id: source_item_id.to_string(),

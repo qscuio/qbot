@@ -5,7 +5,7 @@ use reqwest::Url;
 use serde_json::json;
 use uuid::Uuid;
 
-use super::dedup::{DuplicateCandidate, DuplicateDecider, DuplicateDecision, DuplicateSubject};
+use super::dedup::{DuplicateCandidate, DuplicateDecider, DuplicateResolution, DuplicateSubject};
 use super::time::{effective_trade_date_for_manual, manual_available_at};
 use super::{
     EventEvidence, ExistingEventEvidenceRelation, ManualEventInput, ManualEventSubmissionOutcome,
@@ -14,6 +14,7 @@ use super::{
 use crate::error::{AppError, Result};
 use crate::storage::event_repository::{
     DuplicateGroupMemberRow, DuplicateGroupRow, EventEvidenceRow, EventRepository,
+    ManualDuplicateCandidateRow,
 };
 
 pub(crate) const MANUAL_SOURCE_TELEGRAM: &str = "manual:telegram";
@@ -44,15 +45,29 @@ impl ManualSource {
 pub(crate) struct ManualEvidenceIngestor {
     repo: EventRepository,
     resolver: Arc<dyn TradingDateResolver>,
+    auto_near_duplicate_threshold: f64,
     #[cfg(test)]
     duplicate_lookup_barrier: Option<test_support::DuplicateLookupBarrier>,
 }
 
 impl ManualEvidenceIngestor {
     pub(crate) fn new(repo: EventRepository, resolver: Arc<dyn TradingDateResolver>) -> Self {
+        Self::with_auto_near_duplicate_threshold(
+            repo,
+            resolver,
+            MANUAL_AUTO_NEAR_DUPLICATE_THRESHOLD,
+        )
+    }
+
+    pub(crate) fn with_auto_near_duplicate_threshold(
+        repo: EventRepository,
+        resolver: Arc<dyn TradingDateResolver>,
+        auto_near_duplicate_threshold: f64,
+    ) -> Self {
         Self {
             repo,
             resolver,
+            auto_near_duplicate_threshold,
             #[cfg(test)]
             duplicate_lookup_barrier: None,
         }
@@ -123,18 +138,18 @@ impl ManualEvidenceIngestor {
             return Ok(ManualEventSubmissionOutcome::Inserted(submitted));
         }
 
-        let decision = DuplicateDecider::new(MANUAL_AUTO_NEAR_DUPLICATE_THRESHOLD).decide(
+        let decision = DuplicateDecider::new(self.auto_near_duplicate_threshold).classify(
             &duplicate_subject_from_row(&row),
-            &duplicate_candidates_from_rows(&insert_result.existing_rows),
+            &duplicate_candidates_from_rows(&insert_result.existing_candidates),
         );
 
-        if matches!(decision, DuplicateDecision::Independent) {
+        if matches!(decision, DuplicateResolution::Independent) {
             return Ok(ManualEventSubmissionOutcome::Inserted(submitted));
         }
 
         let duplicate_group =
             duplicate_group_from_decision(&decision, &insert_result.existing_rows, &row);
-        self.repo.save_duplicate_group(&duplicate_group).await?;
+        self.repo.append_duplicate_group(&duplicate_group).await?;
 
         let representative_id = decision
             .representative_id()
@@ -163,10 +178,9 @@ impl ManualEvidenceIngestor {
         parties: usize,
     ) -> Self {
         let mut clone = self.clone();
-        clone.duplicate_lookup_barrier = Some(test_support::DuplicateLookupBarrier::new(
-            content_hash,
-            parties,
-        ));
+        clone.duplicate_lookup_barrier = Some(
+            test_support::DuplicateLookupBarrier::for_content_hash(content_hash, parties),
+        );
         clone
     }
 
@@ -241,23 +255,24 @@ fn duplicate_subject_from_row(row: &EventEvidenceRow) -> DuplicateSubject {
     }
 }
 
-fn duplicate_candidates_from_rows(rows: &[EventEvidenceRow]) -> Vec<DuplicateCandidate> {
+fn duplicate_candidates_from_rows(rows: &[ManualDuplicateCandidateRow]) -> Vec<DuplicateCandidate> {
     rows.iter()
-        .map(|row| DuplicateCandidate {
-            representative_id: row.evidence_id,
-            source_id: row.source_id.clone(),
-            source_item_id: row.source_item_id.clone(),
-            version: row.version,
-            source_url: row.source_url.clone(),
-            title: row.title.clone(),
-            content: row.content.clone(),
-            content_hash: row.content_hash.clone(),
+        .map(|candidate| DuplicateCandidate {
+            evidence_id: candidate.row.evidence_id,
+            representative_id: candidate.representative_evidence_id,
+            source_id: candidate.row.source_id.clone(),
+            source_item_id: candidate.row.source_item_id.clone(),
+            version: candidate.row.version,
+            source_url: candidate.row.source_url.clone(),
+            title: candidate.row.title.clone(),
+            content: candidate.row.content.clone(),
+            content_hash: candidate.row.content_hash.clone(),
         })
         .collect()
 }
 
 fn duplicate_group_from_decision(
-    decision: &DuplicateDecision,
+    decision: &DuplicateResolution,
     existing_rows: &[EventEvidenceRow],
     submitted_row: &EventEvidenceRow,
 ) -> DuplicateGroupRow {
@@ -275,6 +290,7 @@ fn duplicate_group_from_decision(
         .candidate_ids()
         .iter()
         .copied()
+        .chain(decision.representative_id())
         .chain(std::iter::once(submitted_row.evidence_id))
         .collect();
     let mut members: Vec<DuplicateGroupMemberRow> = existing_rows
@@ -318,21 +334,30 @@ mod test_support {
     use tokio::sync::Barrier;
 
     #[derive(Clone)]
+    pub(super) enum DuplicateLookupBarrierScope {
+        ContentHash(String),
+    }
+
+    #[derive(Clone)]
     pub(super) struct DuplicateLookupBarrier {
-        content_hash: String,
+        scope: DuplicateLookupBarrierScope,
         barrier: Arc<Barrier>,
     }
 
     impl DuplicateLookupBarrier {
-        pub(super) fn new(content_hash: impl Into<String>, parties: usize) -> Self {
+        pub(super) fn for_content_hash(content_hash: impl Into<String>, parties: usize) -> Self {
             Self {
-                content_hash: content_hash.into(),
+                scope: DuplicateLookupBarrierScope::ContentHash(content_hash.into()),
                 barrier: Arc::new(Barrier::new(parties)),
             }
         }
-
         pub(super) async fn wait(&self, content_hash: &str) {
-            if self.content_hash == content_hash {
+            let should_wait = match &self.scope {
+                DuplicateLookupBarrierScope::ContentHash(expected_hash) => {
+                    expected_hash == content_hash
+                }
+            };
+            if should_wait {
                 self.barrier.wait().await;
             }
         }
@@ -587,6 +612,226 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn exact_duplicate_manual_submission_detects_matching_content_hash_across_trade_dates(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = EventRepository::new(pool.clone());
+        let ingestor =
+            ManualEvidenceIngestor::new(repo.clone(), Arc::new(AShareTradingDateResolver));
+
+        let first = assert_inserted(
+            ingestor
+                .submit_at(
+                    ManualSource::Rest,
+                    ManualEventInput {
+                        title: "Acme restates quarterly guidance".to_string(),
+                        content: Some(
+                            "Management reaffirmed the same guidance ranges.".to_string(),
+                        ),
+                        source_url: Some("https://example.com/acme-guidance-initial".to_string()),
+                        submitted_by: "operator".to_string(),
+                        published_at: Some(dt(2026, 7, 10, 6, 30, 0)),
+                    },
+                    dt(2026, 7, 10, 8, 0, 0),
+                )
+                .await
+                .unwrap(),
+        );
+
+        let duplicate = assert_existing(
+            ingestor
+                .submit_at(
+                    ManualSource::Rest,
+                    ManualEventInput {
+                        title: "Acme restates quarterly guidance".to_string(),
+                        content: Some(
+                            "Management reaffirmed the same guidance ranges.".to_string(),
+                        ),
+                        source_url: Some("https://example.com/acme-guidance-later".to_string()),
+                        submitted_by: "operator".to_string(),
+                        published_at: Some(dt(2026, 7, 10, 7, 30, 0)),
+                    },
+                    dt(2026, 7, 10, 8, 5, 0),
+                )
+                .await
+                .unwrap(),
+        );
+
+        assert_eq!(duplicate.existing.evidence_id, first.evidence_id);
+        assert_eq!(
+            duplicate.existing.effective_trade_date,
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 10).unwrap()
+        );
+        assert_eq!(
+            duplicate.submitted.effective_trade_date,
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 13).unwrap()
+        );
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn appending_duplicate_through_ingestion_preserves_older_unlocked_group_members(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = EventRepository::new(pool.clone());
+        let ingestor =
+            ManualEvidenceIngestor::new(repo.clone(), Arc::new(AShareTradingDateResolver));
+
+        let first = assert_inserted(
+            ingestor
+                .submit_at(
+                    ManualSource::Rest,
+                    ManualEventInput {
+                        title: "Acme wins major supply contract in Shenzhen".to_string(),
+                        content: Some(
+                            "Acme signed a long-term supply contract with Shenzhen transit authority today.".to_string(),
+                        ),
+                        source_url: Some("https://example.com/contracts/acme-primary".to_string()),
+                        submitted_by: "operator".to_string(),
+                        published_at: Some(dt(2026, 7, 10, 6, 30, 0)),
+                    },
+                    dt(2026, 7, 10, 8, 0, 0),
+                )
+                .await
+                .unwrap(),
+        );
+        let second = assert_existing(
+            ingestor
+                .submit_at(
+                    ManualSource::Rest,
+                    ManualEventInput {
+                        title: "Acme wins major supply contract in Shenzhen market".to_string(),
+                        content: Some(
+                            "Acme signed a long-term supply contract with Shenzhen transit authority today. Follow-up details differ.".to_string(),
+                        ),
+                        source_url: Some("https://example.com/contracts/acme-follow-up".to_string()),
+                        submitted_by: "operator".to_string(),
+                        published_at: Some(dt(2026, 7, 10, 6, 35, 0)),
+                    },
+                    dt(2026, 7, 10, 8, 5, 0),
+                )
+                .await
+                .unwrap(),
+        );
+        let original_group_id: Uuid = sqlx::query_scalar(
+            r#"SELECT duplicate_group_id
+               FROM market_event_duplicate_members
+               WHERE evidence_id = $1"#,
+        )
+        .bind(second.submitted.evidence_id)
+        .fetch_one(&pool)
+        .await?;
+
+        let third = assert_existing(
+            ingestor
+                .submit_at(
+                    ManualSource::Rest,
+                    ManualEventInput {
+                        title: "Acme wins major supply contract in Shenzhen market".to_string(),
+                        content: Some(
+                            "Acme signed a long-term supply contract with Shenzhen transit authority today. Follow-up details differ.".to_string(),
+                        ),
+                        source_url: Some("https://example.com/contracts/acme-follow-up-later".to_string()),
+                        submitted_by: "operator".to_string(),
+                        published_at: Some(dt(2026, 7, 10, 7, 35, 0)),
+                    },
+                    dt(2026, 7, 10, 8, 10, 0),
+                )
+                .await
+                .unwrap(),
+        );
+
+        let members: Vec<(Uuid, bool)> = sqlx::query_as(
+            r#"SELECT evidence_id, is_representative
+               FROM market_event_duplicate_members
+               WHERE duplicate_group_id = $1
+               ORDER BY is_representative DESC, evidence_id ASC"#,
+        )
+        .bind(original_group_id)
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(members.len(), 3);
+        assert!(members.contains(&(first.evidence_id, true)));
+        assert!(members
+            .iter()
+            .any(|member| member.0 == second.submitted.evidence_id && !member.1));
+        assert!(members
+            .iter()
+            .any(|member| member.0 == third.submitted.evidence_id && !member.1));
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn live_manual_ingestion_uses_configured_threshold_for_review_required_duplicates(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = EventRepository::new(pool.clone());
+        let ingestor = ManualEvidenceIngestor::with_auto_near_duplicate_threshold(
+            repo.clone(),
+            Arc::new(AShareTradingDateResolver),
+            0.90,
+        );
+
+        let first = assert_inserted(
+            ingestor
+                .submit_at(
+                    ManualSource::Rest,
+                    ManualEventInput {
+                        title: "Acme wins major supply contract in Shenzhen".to_string(),
+                        content: Some(
+                            "Acme signed a long-term supply contract with Shenzhen transit authority today.".to_string(),
+                        ),
+                        source_url: Some("https://example.com/contracts/acme-primary".to_string()),
+                        submitted_by: "operator".to_string(),
+                        published_at: Some(dt(2026, 7, 10, 7, 30, 0)),
+                    },
+                    dt(2026, 7, 10, 8, 0, 0),
+                )
+                .await
+                .unwrap(),
+        );
+
+        let duplicate = assert_existing(
+            ingestor
+                .submit_at(
+                    ManualSource::Rest,
+                    ManualEventInput {
+                        title: "Acme wins major supply contract in Shenzhen market".to_string(),
+                        content: Some(
+                            "Acme signed a long-term supply contract with Shenzhen transit authority today. Follow-up details differ.".to_string(),
+                        ),
+                        source_url: Some("https://example.com/contracts/acme-follow-up".to_string()),
+                        submitted_by: "operator".to_string(),
+                        published_at: Some(dt(2026, 7, 10, 7, 35, 0)),
+                    },
+                    dt(2026, 7, 10, 8, 5, 0),
+                )
+                .await
+                .unwrap(),
+        );
+
+        assert_eq!(duplicate.existing.evidence_id, first.evidence_id);
+
+        let stored_group: (String, f64) = sqlx::query_as(
+            r#"SELECT relation_type, confidence::float8
+               FROM market_event_duplicate_groups g
+               INNER JOIN market_event_duplicate_members m
+                   ON m.duplicate_group_id = g.duplicate_group_id
+               WHERE m.evidence_id = $1"#,
+        )
+        .bind(duplicate.submitted.evidence_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(stored_group.0, "review_required");
+        assert!(stored_group.1 >= 0.90);
+        assert!(stored_group.1 < 1.0);
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn concurrent_identical_manual_submissions_report_one_insert_and_one_existing(
         pool: PgPool,
     ) -> sqlx::Result<()> {
@@ -629,6 +874,71 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(same_hash.len(), 2);
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn concurrent_different_hash_near_duplicates_do_not_both_return_inserted(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = EventRepository::new(pool.clone())
+            .clone_with_manual_insert_sleep_after_candidate_discovery_for_test(
+                Duration::from_millis(200),
+            );
+        let ingestor = ManualEvidenceIngestor::new(repo, Arc::new(AShareTradingDateResolver));
+
+        let left_input = ManualEventInput {
+            title: "Acme wins major supply contract in Shenzhen".to_string(),
+            content: Some(
+                "Acme signed a long-term supply contract with Shenzhen transit authority today."
+                    .to_string(),
+            ),
+            source_url: Some("https://example.com/contracts/acme-primary".to_string()),
+            submitted_by: "operator".to_string(),
+            published_at: Some(dt(2026, 7, 10, 6, 30, 0)),
+        };
+        let right_input = ManualEventInput {
+            title: "Acme wins major supply contract in Shenzhen market".to_string(),
+            content: Some(
+                "Acme signed a long-term supply contract with Shenzhen transit authority today. Follow-up details differ.".to_string(),
+            ),
+            source_url: Some("https://example.com/contracts/acme-follow-up".to_string()),
+            submitted_by: "operator".to_string(),
+            published_at: Some(dt(2026, 7, 10, 6, 35, 0)),
+        };
+
+        let first = tokio::spawn({
+            let ingestor = ingestor.clone();
+            async move {
+                ingestor
+                    .submit_at(ManualSource::Rest, left_input, dt(2026, 7, 10, 8, 0, 0))
+                    .await
+            }
+        });
+        yield_now().await;
+        let second = tokio::spawn(async move {
+            ingestor
+                .submit_at(ManualSource::Rest, right_input, dt(2026, 7, 10, 8, 0, 1))
+                .await
+        });
+
+        let outcomes = [
+            first.await.unwrap().unwrap(),
+            second.await.unwrap().unwrap(),
+        ];
+
+        let inserted_count = outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, ManualEventSubmissionOutcome::Inserted(_)))
+            .count();
+        let existing_count = outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, ManualEventSubmissionOutcome::Existing(_)))
+            .count();
+
+        assert_eq!(inserted_count, 1);
+        assert_eq!(existing_count, 1);
 
         Ok(())
     }

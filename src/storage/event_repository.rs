@@ -101,16 +101,29 @@ pub struct DailyEventBriefRow {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ManualEvidenceInsertResult {
     pub existing_rows: Vec<EventEvidenceRow>,
+    pub existing_candidates: Vec<ManualDuplicateCandidateRow>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ManualDuplicateCandidateRow {
+    pub row: EventEvidenceRow,
+    pub representative_evidence_id: Uuid,
 }
 
 #[derive(Clone)]
 pub struct EventRepository {
     pool: PgPool,
+    #[cfg(test)]
+    manual_insert_test_hook: Option<ManualInsertTestHook>,
 }
 
 impl EventRepository {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            #[cfg(test)]
+            manual_insert_test_hook: None,
+        }
     }
 
     pub async fn insert_evidence(&self, row: &EventEvidenceRow) -> Result<Uuid> {
@@ -123,14 +136,24 @@ impl EventRepository {
         row: &EventEvidenceRow,
     ) -> Result<ManualEvidenceInsertResult> {
         let mut tx = self.pool.begin().await?;
-        lock_content_hash(&mut tx, &row.content_hash).await?;
+        lock_manual_duplicate_discovery_scope(&mut tx, row).await?;
 
-        let existing_rows = find_manual_duplicate_candidates_in_tx(&mut tx, row).await?;
+        let existing_candidates = find_manual_duplicate_candidates_in_tx(&mut tx, row).await?;
+        #[cfg(test)]
+        self.run_manual_insert_test_hook(&existing_candidates).await;
         insert_evidence_in_tx(&mut tx, row).await?;
 
         tx.commit().await?;
 
-        Ok(ManualEvidenceInsertResult { existing_rows })
+        let existing_rows = existing_candidates
+            .iter()
+            .map(|candidate| candidate.row.clone())
+            .collect();
+
+        Ok(ManualEvidenceInsertResult {
+            existing_rows,
+            existing_candidates,
+        })
     }
 
     pub async fn find_existing_source_item(
@@ -168,6 +191,32 @@ impl EventRepository {
         save_duplicate_group_in_tx(&mut tx, group).await?;
         tx.commit().await?;
         Ok(group.duplicate_group_id)
+    }
+
+    pub async fn append_duplicate_group(&self, group: &DuplicateGroupRow) -> Result<Uuid> {
+        let mut tx = self.pool.begin().await?;
+        append_duplicate_group_in_tx(&mut tx, group).await?;
+        tx.commit().await?;
+        Ok(group.duplicate_group_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clone_with_manual_insert_sleep_after_candidate_discovery_for_test(
+        &self,
+        duration: std::time::Duration,
+    ) -> Self {
+        let mut clone = self.clone();
+        clone.manual_insert_test_hook = Some(
+            ManualInsertTestHook::with_sleep_after_candidate_discovery(duration),
+        );
+        clone
+    }
+
+    #[cfg(test)]
+    async fn run_manual_insert_test_hook(&self, candidates: &[ManualDuplicateCandidateRow]) {
+        if let Some(hook) = &self.manual_insert_test_hook {
+            hook.wait(candidates).await;
+        }
     }
 
     pub async fn save_extraction(&self, extraction: &ExtractionRow) -> Result<Uuid> {
@@ -414,23 +463,95 @@ async fn insert_evidence_in_tx(
 async fn find_manual_duplicate_candidates_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     row: &EventEvidenceRow,
-) -> Result<Vec<EventEvidenceRow>> {
-    let sql = evidence_select_sql(
-        r#"WHERE effective_trade_date = $1
-           ORDER BY available_at ASC, source_id ASC,
-                    source_item_id ASC, version ASC, evidence_id ASC"#,
+) -> Result<Vec<ManualDuplicateCandidateRow>> {
+    let sql = format!(
+        r#"WITH matched AS (
+               SELECT evidence_id
+               FROM market_event_evidence
+               WHERE effective_trade_date = $1
+                  OR content_hash = $2
+                  OR ($3::text IS NOT NULL AND source_url = $3)
+                  OR (source_id = $4 AND source_item_id = $5 AND version = $6)
+           ),
+           expanded AS (
+               SELECT evidence_id
+               FROM matched
+               UNION
+               SELECT representative.representative_evidence_id
+               FROM matched
+               JOIN LATERAL (
+                   SELECT representative_member.evidence_id AS representative_evidence_id
+                   FROM market_event_duplicate_members matched_member
+                   JOIN market_event_duplicate_members representative_member
+                     ON representative_member.duplicate_group_id = matched_member.duplicate_group_id
+                    AND representative_member.is_representative = TRUE
+                   WHERE matched_member.evidence_id = matched.evidence_id
+                   ORDER BY representative_member.evidence_id ASC
+                   LIMIT 1
+               ) AS representative ON TRUE
+           )
+           SELECT evidence_id,
+                  source_id,
+                  source_item_id,
+                  source_url,
+                  source_tier,
+                  source_terms_version,
+                  occurred_at,
+                  published_at,
+                  first_seen_at,
+                  available_at,
+                  effective_trade_date,
+                  title,
+                  content,
+                  language,
+                  content_hash,
+                  raw_payload,
+                  version,
+                  supersedes_evidence_id,
+                  status,
+                  created_at,
+                  COALESCE(representative.representative_evidence_id, evidence_id)
+                      AS representative_evidence_id
+           FROM market_event_evidence
+           LEFT JOIN LATERAL (
+               SELECT representative_member.evidence_id AS representative_evidence_id
+               FROM market_event_duplicate_members matched_member
+               JOIN market_event_duplicate_members representative_member
+                 ON representative_member.duplicate_group_id = matched_member.duplicate_group_id
+                AND representative_member.is_representative = TRUE
+               WHERE matched_member.evidence_id = market_event_evidence.evidence_id
+               ORDER BY representative_member.evidence_id ASC
+               LIMIT 1
+           ) AS representative ON TRUE
+           WHERE evidence_id IN (SELECT evidence_id FROM expanded)
+           ORDER BY effective_trade_date ASC, available_at ASC, source_id ASC,
+                    source_item_id ASC, version ASC, evidence_id ASC"#
     );
     let rows = sqlx::query(&sql)
         .bind(row.effective_trade_date)
+        .bind(&row.content_hash)
+        .bind(&row.source_url)
+        .bind(&row.source_id)
+        .bind(&row.source_item_id)
+        .bind(row.version)
         .fetch_all(&mut **tx)
         .await?;
 
-    Ok(rows.into_iter().map(event_evidence_from_row).collect())
+    Ok(rows
+        .into_iter()
+        .map(|row| ManualDuplicateCandidateRow {
+            representative_evidence_id: row.get("representative_evidence_id"),
+            row: event_evidence_from_row(row),
+        })
+        .collect())
 }
 
-async fn lock_content_hash(tx: &mut Transaction<'_, Postgres>, content_hash: &str) -> Result<()> {
+async fn lock_manual_duplicate_discovery_scope(
+    tx: &mut Transaction<'_, Postgres>,
+    row: &EventEvidenceRow,
+) -> Result<()> {
     sqlx::query(r#"SELECT pg_advisory_xact_lock($1::bigint)"#)
-        .bind(advisory_lock_key(content_hash))
+        .bind(manual_duplicate_scope_lock_key(row))
         .fetch_one(&mut **tx)
         .await?;
 
@@ -507,10 +628,109 @@ async fn save_duplicate_group_in_tx(
     Ok(())
 }
 
-fn advisory_lock_key(content_hash: &str) -> i64 {
+async fn append_duplicate_group_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    group: &DuplicateGroupRow,
+) -> Result<()> {
+    let existing_locked = sqlx::query_scalar::<_, bool>(
+        r#"SELECT locked_by_user
+           FROM market_event_duplicate_groups
+           WHERE duplicate_group_id = $1
+           FOR UPDATE"#,
+    )
+    .bind(group.duplicate_group_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .unwrap_or(false);
+
+    if existing_locked {
+        return Ok(());
+    }
+
+    sqlx::query(
+        r#"INSERT INTO market_event_duplicate_groups
+           (duplicate_group_id, relation_type, confidence, locked_by_user, created_at)
+           VALUES ($1, $2, $3, $4, $5)
+           ON CONFLICT (duplicate_group_id) DO UPDATE SET
+               relation_type = EXCLUDED.relation_type,
+               confidence = EXCLUDED.confidence,
+               locked_by_user = market_event_duplicate_groups.locked_by_user
+                                OR EXCLUDED.locked_by_user"#,
+    )
+    .bind(group.duplicate_group_id)
+    .bind(&group.relation_type)
+    .bind(group.confidence)
+    .bind(group.locked_by_user)
+    .bind(group.created_at)
+    .execute(&mut **tx)
+    .await?;
+
+    let existing_members: Vec<(Uuid, bool)> = sqlx::query_as(
+        r#"SELECT evidence_id, is_representative
+           FROM market_event_duplicate_members
+           WHERE duplicate_group_id = $1"#,
+    )
+    .bind(group.duplicate_group_id)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    let mut merged_members = std::collections::BTreeMap::new();
+    for (evidence_id, is_representative) in existing_members {
+        merged_members.insert(evidence_id, is_representative);
+    }
+    for member in &group.members {
+        merged_members.insert(member.evidence_id, member.is_representative);
+    }
+
+    let representative_id = group
+        .members
+        .iter()
+        .find(|member| member.is_representative)
+        .map(|member| member.evidence_id)
+        .or_else(|| {
+            merged_members
+                .iter()
+                .find_map(|(evidence_id, is_representative)| {
+                    (*is_representative).then_some(*evidence_id)
+                })
+        });
+    if let Some(representative_id) = representative_id {
+        for is_representative in merged_members.values_mut() {
+            *is_representative = false;
+        }
+        if let Some(is_representative) = merged_members.get_mut(&representative_id) {
+            *is_representative = true;
+        }
+    }
+
+    for (evidence_id, is_representative) in merged_members {
+        sqlx::query(
+            r#"INSERT INTO market_event_duplicate_members
+               (duplicate_group_id, evidence_id, is_representative)
+               VALUES ($1, $2, $3)
+               ON CONFLICT (duplicate_group_id, evidence_id) DO UPDATE SET
+                   is_representative = EXCLUDED.is_representative"#,
+        )
+        .bind(group.duplicate_group_id)
+        .bind(evidence_id)
+        .bind(is_representative)
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    Ok(())
+}
+
+fn manual_duplicate_scope_lock_key(row: &EventEvidenceRow) -> i64 {
     use sha2::{Digest, Sha256};
 
-    let digest = Sha256::digest(format!("market-event-manual-evidence:{content_hash}").as_bytes());
+    let digest = Sha256::digest(
+        format!(
+            "market-event-manual-duplicate-scope:{}:{}",
+            row.source_tier, row.effective_trade_date
+        )
+        .as_bytes(),
+    );
     let mut bytes = [0_u8; 8];
     bytes.copy_from_slice(&digest[..8]);
     i64::from_be_bytes(bytes)
@@ -538,6 +758,27 @@ fn event_evidence_from_row(row: sqlx::postgres::PgRow) -> EventEvidenceRow {
         supersedes_evidence_id: row.get("supersedes_evidence_id"),
         status: row.get("status"),
         created_at: row.get("created_at"),
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ManualInsertTestHook {
+    sleep_after_candidate_discovery: Option<std::time::Duration>,
+}
+
+#[cfg(test)]
+impl ManualInsertTestHook {
+    fn with_sleep_after_candidate_discovery(duration: std::time::Duration) -> Self {
+        Self {
+            sleep_after_candidate_discovery: Some(duration),
+        }
+    }
+
+    async fn wait(&self, _candidates: &[ManualDuplicateCandidateRow]) {
+        if let Some(duration) = self.sleep_after_candidate_discovery {
+            tokio::time::sleep(duration).await;
+        }
     }
 }
 
@@ -900,6 +1141,51 @@ mod tests {
         assert_ne!(
             inserted.existing_rows[0].content_hash,
             near_duplicate.content_hash
+        );
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn manual_insert_surfaces_cross_trade_date_exact_duplicate_candidates(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = EventRepository::new(pool.clone());
+        let mut existing = evidence("source-cross-date-existing", 1, "pending");
+        existing.title = "Acme restates quarterly guidance".to_string();
+        existing.content = Some("Management reaffirmed the same guidance ranges.".to_string());
+        existing.content_hash =
+            "a4efde61076cb7ceb4c12e2e262019d8526e8b556dc8055c66263fe56bf0851d".to_string();
+        existing.source_url = Some("https://example.test/existing-guidance".to_string());
+        existing.effective_trade_date = date(2026, 7, 10);
+        existing.available_at = dt(2026, 7, 10, 10);
+        existing.first_seen_at = dt(2026, 7, 10, 10);
+        existing.created_at = dt(2026, 7, 10, 11);
+        save_evidence(&pool, &existing).await;
+
+        let mut duplicate = evidence("source-cross-date-submitted", 1, "pending");
+        duplicate.title = "Acme restates quarterly guidance".to_string();
+        duplicate.content = Some("Management reaffirmed the same guidance ranges.".to_string());
+        duplicate.content_hash = existing.content_hash.clone();
+        duplicate.source_url = Some("https://example.test/submitted-guidance".to_string());
+        duplicate.effective_trade_date = date(2026, 7, 13);
+        duplicate.available_at = dt(2026, 7, 10, 13);
+        duplicate.first_seen_at = dt(2026, 7, 10, 13);
+        duplicate.created_at = dt(2026, 7, 10, 13);
+
+        let inserted = repo.insert_manual_evidence(&duplicate).await.unwrap();
+
+        assert_eq!(
+            inserted
+                .existing_rows
+                .iter()
+                .map(|row| row.evidence_id)
+                .collect::<Vec<_>>(),
+            vec![existing.evidence_id]
+        );
+        assert_eq!(
+            inserted.existing_rows[0].effective_trade_date,
+            date(2026, 7, 10)
         );
 
         Ok(())

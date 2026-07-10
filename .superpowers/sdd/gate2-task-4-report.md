@@ -94,4 +94,111 @@
 
 ### Commit hash
 
-- `51f7e9f10ec7d9642ae9d39c54a72a153da9f8e4`
+- `4482e96dadad804476d5e262c1b8e5d39466c760`
+
+## Fix follow-up: live near-duplicate ingestion wired on 2026-07-10
+
+### Review issue and what changed
+
+- Remaining issue: the live manual-ingestion path only queried `content_hash` matches inside `EventRepository::insert_manual_evidence`, then persisted an `"exact"` duplicate group before `DuplicateDecider` ran. That made `NearDuplicate` and `ReviewRequired` unreachable in production ingestion.
+- Changed `EventRepository::insert_manual_evidence` to return a broader, deterministic candidate set scoped by `effective_trade_date`, while preserving the existing content-hash advisory lock used by the concurrent manual duplicate path.
+- Moved duplicate-group persistence behind `DuplicateDecision` in `ManualEvidenceIngestor`. The decision now drives whether a group is saved, its relation type, confidence, representative, members, and whether the public result is `Inserted` or `Existing`.
+- Expanded `DuplicateDecision` in `src/analysis/events/dedup.rs` so exact/near/review decisions carry the candidate IDs needed to persist the chosen duplicate representation deterministically.
+- Added the missing live-path regression test for a non-hash near duplicate and a repository-boundary test proving broader candidate discovery.
+
+### Red test evidence
+
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test manual_insert_surfaces_same_trade_date_near_duplicate_candidates -- --nocapture`
+  - failed
+  - `assertion left == right failed`
+  - left: `[]`
+  - right: `[existing evidence id]`
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test near_duplicate_manual_submission_reaches_live_ingest_path -- --nocapture`
+  - failed
+  - `expected duplicate relation, got inserted <submitted evidence id>`
+
+### Green verification
+
+- `cargo fmt --all -- --check`
+  - passed
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test analysis::events::dedup -- --nocapture`
+  - passed, `9 passed; 0 failed`
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test analysis::events -- --nocapture`
+  - passed, `27 passed; 0 failed`
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test storage::event_repository -- --nocapture`
+  - passed, `12 passed; 0 failed`
+- `cargo test --all --locked config::tests::test_config_defaults`
+  - passed, `1 passed; 0 failed`
+- `git diff --check`
+  - passed
+- `cargo check --tests --locked`
+  - passed
+  - remaining warnings are pre-existing dead-code/unused warnings outside this Task 4 fix
+
+### Commit hash
+
+- `387bae5ce8aea840c9bf43dd3d0b52c5bc693bd6`
+
+## Fix follow-up: final rereview issues addressed on 2026-07-10
+
+### Review issues and changes
+
+- Issue 1: exact duplicate discovery now spans the required global scope.
+  - `src/storage/event_repository.rs` now discovers manual duplicate candidates from the union of:
+    - same `effective_trade_date` rows for near-duplicate review
+    - global exact-match rows by `content_hash`, canonical `source_url`, and `source_id` + `source_item_id` + `version`
+  - candidate expansion also pulls the current representative row for any matched duplicate-group member so live ingestion can resolve to the right existing representative.
+- Issue 2: ingestion now appends into unlocked duplicate groups instead of replacing members.
+  - kept `save_duplicate_group` replacement semantics unchanged for the explicit repository tests
+  - added a separate ingestion path, `append_duplicate_group`, that merges new members into the existing unlocked group, preserves older members, and retains the representative correctly.
+- Issue 3: `ReviewRequired` is now driven by an injectable ingestion threshold instead of a single hardcoded live-path value.
+  - `ManualEvidenceIngestor` now accepts an injected auto-near-duplicate threshold through `with_auto_near_duplicate_threshold`
+  - the live-path test proves a threshold below `0.92` persists a `review_required` duplicate group while still returning the existing duplicate relation.
+- Issue 4: manual-ingestion locking now serializes the same scope used for near-duplicate discovery.
+  - replaced the content-hash-only advisory lock with a deterministic transaction-scoped advisory lock keyed by the manual duplicate discovery scope (`source_tier` + `effective_trade_date`)
+  - added a deterministic live-path concurrency test with an insertion delay after candidate discovery so different-hash near duplicates cannot both return inserted.
+- Issue 5: `DuplicateDecision` is back to the briefed public shape.
+  - restored the public enum variants to:
+    - `Exact { representative_id: Uuid }`
+    - `NearDuplicate { representative_id: Uuid, confidence: f64 }`
+    - `Independent`
+    - `ReviewRequired { candidate_ids: Vec<Uuid> }`
+  - moved persistence metadata into the private/internal `DuplicateResolution` + `DuplicateMatch` helpers used only inside Task 4 ingestion flow.
+
+### Red test evidence
+
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test manual_insert_surfaces_cross_trade_date_exact_duplicate_candidates -- --nocapture`
+  - failed before the fix
+  - `left: []`
+  - `right: [existing evidence id]`
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test exact_duplicate_manual_submission_detects_matching_content_hash_across_trade_dates -- --nocapture`
+  - failed before the fix
+  - `expected duplicate relation, got inserted <submitted evidence id>`
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test appending_duplicate_through_ingestion_preserves_older_unlocked_group_members -- --nocapture`
+  - failed before the fix
+  - `expected duplicate relation, got inserted <submitted evidence id>`
+- `cargo test duplicate_decision_public_shape_matches_task_brief -- --nocapture`
+  - failed before the fix
+  - assertion showed `DuplicateDecision::Exact` still exposed `candidate_ids`
+
+### Green verification
+
+- `cargo fmt --all -- --check`
+  - passed
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test analysis::events::dedup -- --nocapture`
+  - passed, `10 passed; 0 failed`
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test analysis::events -- --nocapture`
+  - passed, `32 passed; 0 failed`
+- `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test storage::event_repository -- --nocapture`
+  - passed, `13 passed; 0 failed`
+- `cargo test --all --locked config::tests::test_config_defaults`
+  - passed, `1 passed; 0 failed`
+- `git diff --check`
+  - passed
+- `cargo check --tests --locked`
+  - passed
+  - remaining warnings are pre-existing unused/dead-code warnings outside Task 4's touched surface
+
+### Commit hash
+
+- `pending final commit creation`
