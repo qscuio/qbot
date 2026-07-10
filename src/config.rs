@@ -67,7 +67,7 @@ impl Config {
             ai_base_url: std::env::var("AI_BASE_URL")
                 .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
             ai_model: std::env::var("AI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string()),
-            data_proxy: std::env::var("DATA_PROXY").ok(),
+            data_proxy: optional_nonblank_env_var("DATA_PROXY"),
             official_event_feed_url: std::env::var("OFFICIAL_EVENT_FEED_URL").ok(),
             official_event_feed_api_key: std::env::var("OFFICIAL_EVENT_FEED_API_KEY").ok(),
             official_event_source_id: std::env::var("OFFICIAL_EVENT_SOURCE_ID")
@@ -92,6 +92,12 @@ impl Config {
                 == "true",
         })
     }
+}
+
+fn optional_nonblank_env_var(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 #[cfg(test)]

@@ -147,3 +147,55 @@ Observed warning noise during test runs:
 ### Concerns
 
 - Existing crate warning noise remains during test runs, but the required commands passed and the adapter now honors timeout/proxy configuration without a silent fallback.
+
+## Fix subagent follow-up 2
+
+### Summary
+
+- Normalized blank and whitespace-only `DATA_PROXY` values to `None` in `Config::from_env()`.
+- Kept `OfficialEventSource` proxy-aware client construction defensive by treating whitespace-only proxy strings as no proxy while still rejecting invalid nonblank proxy URLs with `AppError::Config`.
+- Left official-source selection, retention behavior, timeout, and proxy-aware fetch behavior unchanged.
+
+### RED
+
+- Added `from_config_treats_blank_data_proxy_from_env_as_no_proxy` in `src/analysis/adapters/official_event_source.rs`.
+- RED command:
+  - `cargo test from_config_treats_blank_data_proxy_from_env_as_no_proxy -- --nocapture`
+- RED result:
+  - failed with assertion `left == right` mismatch
+  - `left: Some("   ")`
+  - `right: None`
+- This proved `Config::from_env()` was still preserving whitespace-only `DATA_PROXY`, reproducing the review issue before the fix.
+
+### GREEN
+
+- Updated `src/config.rs` to load `DATA_PROXY` through a nonblank-only env helper.
+- Updated `src/analysis/adapters/official_event_source.rs` so `build_client()` skips whitespace-only proxy strings but still validates any nonblank proxy URL.
+- GREEN command:
+  - `cargo test from_config_treats_blank_data_proxy_from_env_as_no_proxy -- --nocapture`
+- GREEN result:
+  - `1 passed; 0 failed`
+
+### Final verification
+
+- `cargo fmt --all -- --check` -> pass
+- `cargo test analysis::adapters::official_event_source -- --nocapture` -> pass (`9 passed; 0 failed`)
+- `cargo test --all --locked config::tests::test_config_defaults -- --nocapture` -> pass (`1 passed; 0 failed`)
+- `git diff --check` -> pass
+
+### Files changed
+
+- `src/config.rs`
+- `src/analysis/adapters/official_event_source.rs`
+- `.superpowers/sdd/gate2-task-5-report.md`
+
+### Commit hash
+
+- Interim hashes during report finalization:
+  - `0b01fe4`
+  - `dda5c9d`
+- Final `HEAD` is reported alongside task completion because embedding a commit's own final hash in committed content would change that hash again.
+
+### Concerns
+
+- Required verification passed, but the targeted test commands still emit the existing crate-wide warning and future-incompatibility noise for `redis v0.25.4` and `sqlx-postgres v0.7.4`.

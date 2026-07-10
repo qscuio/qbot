@@ -149,7 +149,7 @@ struct OfficialFeedResponse {
 fn build_client(data_proxy: Option<&str>) -> Result<Client> {
     let mut builder = Client::builder().timeout(OFFICIAL_EVENT_SOURCE_TIMEOUT);
 
-    if let Some(proxy_url) = data_proxy {
+    if let Some(proxy_url) = data_proxy.filter(|proxy_url| !proxy_url.trim().is_empty()) {
         let proxy = reqwest::Proxy::all(proxy_url).map_err(|error| {
             AppError::Config(format!(
                 "DATA_PROXY must be a valid proxy URL for official event source: {error}"
@@ -362,6 +362,29 @@ mod tests {
             Ok(_) => panic!("expected config error, got Ok result"),
             Err(other) => panic!("expected config error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn from_config_treats_blank_data_proxy_from_env_as_no_proxy() {
+        std::env::set_var("TUSHARE_TOKEN", "test_token");
+        std::env::set_var("TELEGRAM_BOT_TOKEN", "123:abc");
+        std::env::set_var("OFFICIAL_EVENT_FEED_URL", "https://example.test/feed");
+        std::env::set_var("DATA_PROXY", "   ");
+        std::env::remove_var("OFFICIAL_EVENT_FEED_API_KEY");
+        std::env::remove_var("OFFICIAL_EVENT_SOURCE_ID");
+        std::env::remove_var("OFFICIAL_EVENT_STORE_FULL_CONTENT");
+
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.data_proxy, None);
+
+        let source = OfficialEventSource::from_config(&config)
+            .unwrap()
+            .expect("configured official source");
+
+        assert_eq!(source.source_id(), "official:market_event");
+
+        std::env::remove_var("DATA_PROXY");
+        std::env::remove_var("OFFICIAL_EVENT_FEED_URL");
     }
 
     #[test]
