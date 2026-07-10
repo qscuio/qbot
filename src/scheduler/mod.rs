@@ -1,8 +1,15 @@
 use chrono::{Datelike, Duration, Utc};
+use redis::AsyncCommands;
 use std::sync::Arc;
 use tokio_cron_scheduler::{Job, JobScheduler};
 use tracing::{info, warn};
 
+use crate::analysis::adapters::official_event_source::OfficialEventSource;
+use crate::analysis::adapters::{EventSource, FetchedEvent};
+use crate::analysis::events::extraction::StockCodeDirectory;
+use crate::analysis::events::{
+    render_daily_brief, AShareTradingDateResolver, EventIntelligence, TradingDateResolver,
+};
 use crate::analysis::market_snapshot::{
     ingestion::PointInTimeIngestion, MarketSnapshotModule, MARKET_SNAPSHOT_VERSION,
 };
@@ -15,6 +22,7 @@ use crate::services::{
     stock_history::StockHistoryService,
 };
 use crate::state::AppState;
+use crate::storage::event_repository::{DailyEventBriefRow, EventEvidenceRow, EventRepository};
 use crate::storage::market_repository::MarketRepository;
 use crate::storage::pattern_repository::PatternRepository;
 use crate::storage::postgres;
@@ -25,6 +33,8 @@ const POINT_IN_TIME_TRADE_DATE_JOB_CRON: &str = "0 10 17 * * Mon,Tue,Wed,Thu,Fri
 const MARKET_SNAPSHOT_JOB_CRON: &str = "0 20 17 * * Mon,Tue,Wed,Thu,Fri";
 const SCAN_JOB_CRON: &str = "0 30 17 * * Mon,Tue,Wed,Thu,Fri";
 const PATTERN_SHADOW_JOB_CRON: &str = "0 40 17 * * Mon,Tue,Wed,Thu,Fri";
+const EVENT_INGESTION_JOB_CRON: &str = "0 5 9-17 * * Mon,Tue,Wed,Thu,Fri";
+const EVENT_FACT_BRIEF_JOB_CRON: &str = "0 50 17 * * Mon,Tue,Wed,Thu,Fri";
 const DAILY_SIGNAL_ARCHIVE_JOB_CRON: &str = "0 5 20 * * Mon,Tue,Wed,Thu,Fri";
 const DAILY_REPORT_JOB_CRON: &str = "0 0 18 * * Mon,Tue,Wed,Thu,Fri";
 const WEEKLY_REPORT_JOB_CRON: &str = "0 0 20 * * Fri";
@@ -245,6 +255,149 @@ pub async fn run_daily_signal_archive_job(state: Arc<AppState>) {
             summary.scan_date, summary.rows, summary.codes, summary.signals
         ),
         Err(e) => warn!("Daily signal archive failed: {}", e),
+    }
+}
+
+pub async fn run_event_ingestion_job(state: Arc<AppState>) {
+    let _guard = state.analysis_job_lock.lock().await;
+    let now = Utc::now();
+    let source = match OfficialEventSource::from_config(state.config.as_ref()) {
+        Ok(Some(source)) => source,
+        Ok(None) => {
+            info!("Event ingestion skipped: OFFICIAL_EVENT_FEED_URL is not configured");
+            return;
+        }
+        Err(error) => {
+            warn!(
+                "Event ingestion skipped: official source config failed: {}",
+                error
+            );
+            return;
+        }
+    };
+
+    let cursor_key = event_cursor_key(source.source_id());
+    let current_cursor = match event_cursor_get(state.redis.clone(), &cursor_key).await {
+        Ok(cursor) => cursor,
+        Err(error) => {
+            warn!("Event ingestion skipped: cursor read failed: {}", error);
+            return;
+        }
+    };
+
+    let batch = match source.fetch(current_cursor.clone(), now).await {
+        Ok(batch) => batch,
+        Err(error) => {
+            warn!("Event ingestion fetch failed: {}", error);
+            return;
+        }
+    };
+
+    let repo = EventRepository::new(state.db.clone());
+    for item in &batch.items {
+        if let Err(error) = ingest_fetched_event(&repo, &source, item, now).await {
+            warn!(
+                "Event ingestion upsert failed for source={} item={}: {}",
+                source.source_id(),
+                item.source_item_id,
+                error
+            );
+        }
+    }
+
+    if let Some(next_cursor) = batch.next_cursor.as_deref() {
+        if let Err(error) = event_cursor_set(state.redis.clone(), &cursor_key, next_cursor).await {
+            warn!("Event ingestion cursor write failed: {}", error);
+            return;
+        }
+    }
+
+    let stock_list = match state.provider.get_stock_list().await {
+        Ok(stocks) => stocks,
+        Err(error) => {
+            warn!(
+                "Event ingestion extraction skipped: stock directory load failed: {}",
+                error
+            );
+            return;
+        }
+    };
+    let extractor =
+        match crate::analysis::adapters::llm_event_extractor::LlmEventExtractor::from_config(
+            state.config.as_ref(),
+            Arc::new(StockCodeDirectory::from_known_codes(
+                stock_list.iter().map(|stock| stock.code.as_str()),
+            )),
+        ) {
+            Ok(extractor) => Arc::new(extractor),
+            Err(error) => {
+                warn!(
+                    "Event ingestion extraction skipped: extractor config failed: {}",
+                    error
+                );
+                return;
+            }
+        };
+    let intelligence = EventIntelligence::with_repository_resolver_and_extractor(
+        repo,
+        Arc::new(AShareTradingDateResolver),
+        extractor,
+    );
+    if let Err(error) = intelligence.process_pending(now).await {
+        warn!("Event ingestion extraction failed: {}", error);
+    }
+}
+
+pub async fn run_event_fact_brief_job(state: Arc<AppState>) {
+    let _guard = state.daily_report_job_lock.lock().await;
+    let trade_date = beijing_today();
+    let intelligence = EventIntelligence::new(state.db.clone());
+    let brief = match intelligence.build_daily_brief(trade_date).await {
+        Ok(brief) => brief,
+        Err(error) => {
+            warn!(
+                "Event fact brief failed to build for {}: {}",
+                trade_date, error
+            );
+            return;
+        }
+    };
+    let content = match render_daily_brief(&brief) {
+        Ok(content) => content,
+        Err(error) => {
+            warn!(
+                "Event fact brief failed to render for {}: {}",
+                trade_date, error
+            );
+            return;
+        }
+    };
+
+    let row = DailyEventBriefRow {
+        trade_date,
+        brief_version: "daily_event_brief_v1".to_string(),
+        content,
+        structured_payload: match serde_json::to_value(&brief) {
+            Ok(payload) => payload,
+            Err(error) => {
+                warn!(
+                    "Event fact brief failed to serialize for {}: {}",
+                    trade_date, error
+                );
+                return;
+            }
+        },
+        input_fingerprint: brief.input_fingerprint.clone(),
+        generated_at: Utc::now(),
+    };
+    if let Err(error) = EventRepository::new(state.db.clone())
+        .save_daily_brief(&row)
+        .await
+    {
+        warn!(
+            "Event fact brief persistence failed for {}: {}",
+            trade_date, error
+        );
     }
 }
 
@@ -471,6 +624,36 @@ pub async fn start_scheduler(
             .await?;
     }
 
+    // hourly weekdays during configured event-ingestion hours
+    {
+        let s = state.clone();
+        sched
+            .add(Job::new_async_tz(
+                EVENT_INGESTION_JOB_CRON,
+                beijing_tz(),
+                move |_, _| {
+                    let s = s.clone();
+                    Box::pin(async move { run_event_ingestion_job(s).await })
+                },
+            )?)
+            .await?;
+    }
+
+    // 17:50 weekdays
+    {
+        let s = state.clone();
+        sched
+            .add(Job::new_async_tz(
+                EVENT_FACT_BRIEF_JOB_CRON,
+                beijing_tz(),
+                move |_, _| {
+                    let s = s.clone();
+                    Box::pin(async move { run_event_fact_brief_job(s).await })
+                },
+            )?)
+            .await?;
+    }
+
     // 18:00 weekdays
     {
         let s = state.clone();
@@ -525,7 +708,7 @@ pub async fn start_scheduler(
     }
 
     sched.start().await?;
-    info!("Scheduler started with 9 jobs");
+    info!("Scheduler started with 11 jobs");
     Ok(sched)
 }
 
@@ -537,10 +720,140 @@ fn production_job_crons_in_registration_order() -> Vec<&'static str> {
         MARKET_SNAPSHOT_JOB_CRON,
         SCAN_JOB_CRON,
         PATTERN_SHADOW_JOB_CRON,
+        EVENT_INGESTION_JOB_CRON,
+        EVENT_FACT_BRIEF_JOB_CRON,
         DAILY_REPORT_JOB_CRON,
         WEEKLY_REPORT_JOB_CRON,
         DAILY_SIGNAL_ARCHIVE_JOB_CRON,
     ]
+}
+
+fn event_cursor_key(source_id: &str) -> String {
+    format!("market_event:provider_cursor:{source_id}")
+}
+
+async fn event_cursor_get(
+    mut redis: redis::aio::ConnectionManager,
+    key: &str,
+) -> crate::error::Result<Option<String>> {
+    redis.get(key).await.map_err(crate::error::AppError::Redis)
+}
+
+async fn event_cursor_set(
+    mut redis: redis::aio::ConnectionManager,
+    key: &str,
+    value: &str,
+) -> crate::error::Result<()> {
+    redis
+        .set::<_, _, ()>(key, value)
+        .await
+        .map_err(crate::error::AppError::Redis)?;
+    Ok(())
+}
+
+async fn ingest_fetched_event(
+    repo: &EventRepository,
+    source: &impl EventSource,
+    item: &FetchedEvent,
+    first_seen_at: chrono::DateTime<Utc>,
+) -> crate::error::Result<()> {
+    let canonical_source_url =
+        crate::storage::event_repository::canonicalize_source_url(&item.source_url)?;
+    let content_hash = event_content_hash(&item.title, item.content.as_deref());
+    let available_at = item.published_at;
+    let effective_trade_date = AShareTradingDateResolver.effective_trade_date(available_at)?;
+
+    if let Some(latest) = repo
+        .latest_evidence_for_source_item(source.source_id(), &item.source_item_id)
+        .await?
+    {
+        if latest_event_matches_fetched(
+            &latest,
+            item,
+            canonical_source_url.as_str(),
+            content_hash.as_str(),
+        ) {
+            return Ok(());
+        }
+
+        repo.insert_evidence(&EventEvidenceRow {
+            evidence_id: uuid::Uuid::new_v4(),
+            source_id: source.source_id().to_string(),
+            source_item_id: item.source_item_id.clone(),
+            source_url: Some(canonical_source_url),
+            source_tier: "official".to_string(),
+            source_terms_version: "terms-v1".to_string(),
+            occurred_at: Some(item.published_at),
+            published_at: Some(item.published_at),
+            first_seen_at,
+            available_at,
+            effective_trade_date,
+            title: item.title.clone(),
+            content: item.content.clone(),
+            language: "und".to_string(),
+            content_hash,
+            raw_payload: item.raw_payload.clone(),
+            version: latest.version + 1,
+            supersedes_evidence_id: Some(latest.evidence_id),
+            status: "pending".to_string(),
+            created_at: first_seen_at,
+        })
+        .await?;
+        return Ok(());
+    }
+
+    repo.insert_evidence(&EventEvidenceRow {
+        evidence_id: uuid::Uuid::new_v4(),
+        source_id: source.source_id().to_string(),
+        source_item_id: item.source_item_id.clone(),
+        source_url: Some(canonical_source_url),
+        source_tier: "official".to_string(),
+        source_terms_version: "terms-v1".to_string(),
+        occurred_at: Some(item.published_at),
+        published_at: Some(item.published_at),
+        first_seen_at,
+        available_at,
+        effective_trade_date,
+        title: item.title.clone(),
+        content: item.content.clone(),
+        language: "und".to_string(),
+        content_hash,
+        raw_payload: item.raw_payload.clone(),
+        version: 1,
+        supersedes_evidence_id: None,
+        status: "pending".to_string(),
+        created_at: first_seen_at,
+    })
+    .await?;
+
+    Ok(())
+}
+
+fn latest_event_matches_fetched(
+    latest: &EventEvidenceRow,
+    fetched: &FetchedEvent,
+    canonical_source_url: &str,
+    content_hash: &str,
+) -> bool {
+    latest.source_url.as_deref() == Some(canonical_source_url)
+        && latest.published_at == Some(fetched.published_at)
+        && latest.title == fetched.title
+        && latest.content.as_deref() == fetched.content.as_deref()
+        && latest.content_hash == content_hash
+        && latest.raw_payload == fetched.raw_payload
+}
+
+fn event_content_hash(title: &str, content: Option<&str>) -> String {
+    use sha2::{Digest, Sha256};
+
+    let normalize = |value: &str| value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut hasher = Sha256::new();
+    hasher.update(normalize(title));
+    if let Some(content) = content {
+        hasher.update([0]);
+        hasher.update(normalize(content));
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 #[cfg(test)]
@@ -562,6 +875,9 @@ mod tests {
     use crate::data::point_in_time_provider::{PointInTimeCapabilities, PointInTimeDataProvider};
     use crate::data::types::{Candle, IndexData, LimitUpStock, SectorData, StockInfo};
     use crate::error::Result;
+    use crate::storage::event_repository::{
+        ClaimEvidenceRow, ClaimRow, EventRepository, ExtractionRow,
+    };
     use crate::storage::market_repository::MarketRepository;
 
     #[test]
@@ -586,6 +902,12 @@ mod tests {
     }
 
     #[test]
+    fn event_jobs_run_before_the_daily_market_report() {
+        assert_eq!(EVENT_INGESTION_JOB_CRON, "0 5 9-17 * * Mon,Tue,Wed,Thu,Fri");
+        assert_eq!(EVENT_FACT_BRIEF_JOB_CRON, "0 50 17 * * Mon,Tue,Wed,Thu,Fri");
+    }
+
+    #[test]
     fn weekly_report_schedule_stays_on_friday_evening() {
         assert_eq!(WEEKLY_REPORT_JOB_CRON, "0 0 20 * * Fri");
         assert_eq!(POINT_IN_TIME_REFERENCE_JOB_CRON, "0 15 17 * * Fri");
@@ -602,6 +924,8 @@ mod tests {
                 "0 20 17 * * Mon,Tue,Wed,Thu,Fri",
                 "0 30 17 * * Mon,Tue,Wed,Thu,Fri",
                 "0 40 17 * * Mon,Tue,Wed,Thu,Fri",
+                "0 5 9-17 * * Mon,Tue,Wed,Thu,Fri",
+                "0 50 17 * * Mon,Tue,Wed,Thu,Fri",
                 "0 0 18 * * Mon,Tue,Wed,Thu,Fri",
                 "0 0 20 * * Fri",
                 "0 5 20 * * Mon,Tue,Wed,Thu,Fri",
@@ -731,6 +1055,96 @@ mod tests {
         Ok(())
     }
 
+    #[sqlx::test(migrations = "./migrations")]
+    async fn event_ingestion_job_returns_cleanly_when_official_source_config_is_invalid(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let state = test_state(pool.clone()).await;
+        let mut config = (*state.config).clone();
+        config.official_event_feed_url = Some("https://example.test/feed".to_string());
+        config.official_event_source_id = "official:unsupported".to_string();
+        let state = Arc::new(AppState {
+            config: Arc::new(config),
+            ..(*state).clone()
+        });
+
+        run_event_ingestion_job(state).await;
+
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM market_event_evidence")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(count, 0);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn event_fact_brief_job_keeps_failures_isolated_and_does_not_persist_bad_briefs(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let state = test_state(pool.clone()).await;
+        let repo = EventRepository::new(pool.clone());
+        let published = event_evidence(
+            "official:market_event",
+            "notice-brief-001",
+            1,
+            "publishable",
+            date(2026, 7, 10),
+        );
+        let unrelated = event_evidence(
+            "official:market_event",
+            "notice-brief-999",
+            1,
+            "pending",
+            date(2026, 7, 9),
+        );
+        repo.insert_evidence(&published).await.unwrap();
+        repo.insert_evidence(&unrelated).await.unwrap();
+        repo.save_extraction(&ExtractionRow {
+            extraction_id: Uuid::new_v4(),
+            evidence_id: published.evidence_id,
+            schema_version: "event-schema-v1".to_string(),
+            prompt_version: Some("prompt-v1".to_string()),
+            model_name: Some("test-model".to_string()),
+            model_parameters: json!({"temperature": 0}),
+            extracted_payload: json!({
+                "event_type": "issuer_disclosure",
+                "event_subtype": null,
+                "claims": [],
+                "entities": [],
+                "amounts": [],
+                "dates": [],
+                "uncertainties": [],
+                "missing_information": []
+            }),
+            validation_status: "valid".to_string(),
+            validation_errors: json!([]),
+            input_fingerprint: "fingerprint-v1".to_string(),
+            claims: vec![ClaimRow {
+                claim_id: Uuid::new_v4(),
+                claim_type: "fact".to_string(),
+                claim_text: "公司披露新的正式事项。".to_string(),
+                confidence: 0.98,
+                review_status: "published".to_string(),
+                evidence: vec![ClaimEvidenceRow {
+                    evidence_id: unrelated.evidence_id,
+                }],
+                created_at: Utc::now(),
+            }],
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+        run_event_fact_brief_job(state).await;
+
+        assert!(repo
+            .find_daily_brief(Some(date(2026, 7, 10)))
+            .await
+            .unwrap()
+            .is_none());
+        Ok(())
+    }
+
     #[test]
     fn scheduler_does_not_reference_auto_trading_candidate_table() {
         let source = include_str!("mod.rs");
@@ -740,6 +1154,37 @@ mod tests {
             .expect("scheduler source includes implementation before tests");
         let forbidden_table = concat!("signal", "_strategy", "_candidates");
         assert!(!implementation_source.contains(forbidden_table));
+    }
+
+    fn event_evidence(
+        source_id: &str,
+        source_item_id: &str,
+        version: i32,
+        status: &str,
+        effective_trade_date: NaiveDate,
+    ) -> EventEvidenceRow {
+        EventEvidenceRow {
+            evidence_id: Uuid::new_v4(),
+            source_id: source_id.to_string(),
+            source_item_id: source_item_id.to_string(),
+            source_url: Some(format!("https://example.test/{source_item_id}")),
+            source_tier: "official".to_string(),
+            source_terms_version: "terms-v1".to_string(),
+            occurred_at: Some(dt(2026, 7, 10, 8)),
+            published_at: Some(dt(2026, 7, 10, 8)),
+            first_seen_at: dt(2026, 7, 10, 9),
+            available_at: dt(2026, 7, 10, 8),
+            effective_trade_date,
+            title: format!("Title {source_item_id}"),
+            content: Some(format!("Content {source_item_id}")),
+            language: "und".to_string(),
+            content_hash: format!("hash-{source_item_id}-{version}"),
+            raw_payload: json!({"source_item_id": source_item_id, "version": version}),
+            version,
+            supersedes_evidence_id: None,
+            status: status.to_string(),
+            created_at: dt(2026, 7, 10, 9),
+        }
     }
 
     fn date(year: i32, month: u32, day: u32) -> NaiveDate {

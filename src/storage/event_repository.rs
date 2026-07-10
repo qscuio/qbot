@@ -474,6 +474,125 @@ impl EventRepository {
         Ok(row.map(daily_event_brief_from_row))
     }
 
+    pub async fn list_latest_pending_evidence(
+        &self,
+        cutoff: DateTime<Utc>,
+    ) -> Result<Vec<EventEvidenceRow>> {
+        let sql = evidence_select_sql(
+            r#"WHERE available_at <= $1
+                 AND status = 'pending'
+                 AND (source_id, source_item_id, version) IN (
+                     SELECT source_id, source_item_id, MAX(version) AS version
+                     FROM market_event_evidence
+                     GROUP BY source_id, source_item_id
+                 )
+               ORDER BY available_at ASC, first_seen_at ASC, source_id ASC,
+                        source_item_id ASC, version ASC, evidence_id ASC"#,
+        );
+        let rows = sqlx::query(&sql).bind(cutoff).fetch_all(&self.pool).await?;
+
+        Ok(rows.into_iter().map(event_evidence_from_row).collect())
+    }
+
+    pub async fn list_latest_extractions_for_evidence_ids(
+        &self,
+        evidence_ids: &[Uuid],
+    ) -> Result<Vec<ExtractionRow>> {
+        if evidence_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let extraction_rows = sqlx::query(
+            r#"SELECT DISTINCT ON (evidence_id)
+                      extraction_id,
+                      evidence_id,
+                      schema_version,
+                      prompt_version,
+                      model_name,
+                      model_parameters,
+                      extracted_payload,
+                      validation_status,
+                      validation_errors,
+                      input_fingerprint,
+                      created_at
+               FROM market_event_extractions
+               WHERE evidence_id = ANY($1)
+               ORDER BY evidence_id ASC, created_at DESC, extraction_id DESC"#,
+        )
+        .bind(evidence_ids)
+        .fetch_all(&self.pool)
+        .await?;
+
+        if extraction_rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut extraction_by_id = std::collections::BTreeMap::new();
+        let mut extraction_order = Vec::new();
+        for row in extraction_rows {
+            let extraction = extraction_from_row(row);
+            extraction_order.push(extraction.extraction_id);
+            extraction_by_id.insert(extraction.extraction_id, extraction);
+        }
+
+        let extraction_ids = extraction_order.clone();
+        let claim_rows = sqlx::query(
+            r#"SELECT c.claim_id,
+                      c.extraction_id,
+                      c.claim_type,
+                      c.claim_text,
+                      c.confidence::float8 AS confidence,
+                      c.review_status,
+                      c.created_at,
+                      ce.evidence_id
+               FROM market_event_claims c
+               LEFT JOIN market_event_claim_evidence ce
+                 ON ce.claim_id = c.claim_id
+               WHERE c.extraction_id = ANY($1)
+               ORDER BY c.extraction_id ASC, c.created_at ASC, c.claim_id ASC, ce.evidence_id ASC"#,
+        )
+        .bind(&extraction_ids)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut claims_by_extraction =
+            std::collections::BTreeMap::<Uuid, std::collections::BTreeMap<Uuid, ClaimRow>>::new();
+        for row in claim_rows {
+            let extraction_id: Uuid = row.get("extraction_id");
+            let claim_id: Uuid = row.get("claim_id");
+            let claim_entry = claims_by_extraction
+                .entry(extraction_id)
+                .or_default()
+                .entry(claim_id)
+                .or_insert_with(|| ClaimRow {
+                    claim_id,
+                    claim_type: row.get("claim_type"),
+                    claim_text: row.get("claim_text"),
+                    confidence: row.get("confidence"),
+                    review_status: row.get("review_status"),
+                    evidence: Vec::new(),
+                    created_at: row.get("created_at"),
+                });
+            let evidence_id: Option<Uuid> = row.get("evidence_id");
+            if let Some(evidence_id) = evidence_id {
+                claim_entry.evidence.push(ClaimEvidenceRow { evidence_id });
+            }
+        }
+
+        let mut extractions = Vec::new();
+        for extraction_id in extraction_order {
+            if let Some(mut extraction) = extraction_by_id.remove(&extraction_id) {
+                extraction.claims = claims_by_extraction
+                    .remove(&extraction.extraction_id)
+                    .map(|claims| claims.into_values().collect())
+                    .unwrap_or_default();
+                extractions.push(extraction);
+            }
+        }
+
+        Ok(extractions)
+    }
+
     pub async fn find_evidence_by_id(&self, evidence_id: Uuid) -> Result<Option<EventEvidenceRow>> {
         let sql = evidence_select_sql("WHERE evidence_id = $1");
         let row = sqlx::query(&sql)
@@ -641,6 +760,23 @@ fn daily_event_brief_from_row(row: sqlx::postgres::PgRow) -> DailyEventBriefRow 
         structured_payload: row.get("structured_payload"),
         input_fingerprint: row.get("input_fingerprint"),
         generated_at: row.get("generated_at"),
+    }
+}
+
+fn extraction_from_row(row: sqlx::postgres::PgRow) -> ExtractionRow {
+    ExtractionRow {
+        extraction_id: row.get("extraction_id"),
+        evidence_id: row.get("evidence_id"),
+        schema_version: row.get("schema_version"),
+        prompt_version: row.get("prompt_version"),
+        model_name: row.get("model_name"),
+        model_parameters: row.get("model_parameters"),
+        extracted_payload: row.get("extracted_payload"),
+        validation_status: row.get("validation_status"),
+        validation_errors: row.get("validation_errors"),
+        input_fingerprint: row.get("input_fingerprint"),
+        claims: Vec::new(),
+        created_at: row.get("created_at"),
     }
 }
 

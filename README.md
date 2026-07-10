@@ -1,6 +1,6 @@
 # qbot
 
-A-share stock analysis bot. Fetches daily market data from Tushare, runs 24 signal detectors, generates reports, archives daily signal snapshots, and pushes reports to a Telegram channel on a cron schedule.
+A-share stock analysis bot. Fetches daily market data from Tushare, runs 24 signal detectors, ingests official market-event evidence, publishes a daily fact brief, archives daily signal snapshots, and pushes reports to a Telegram channel on a cron schedule.
 
 ---
 
@@ -53,7 +53,7 @@ A-share stock analysis bot. Fetches daily market data from Tushare, runs 24 sign
 | Path | Purpose |
 |------|---------|
 | `src/main.rs` | Boot sequence, `--run-now` flag |
-| `src/scheduler/mod.rs` | 8 cron jobs + reusable job functions |
+| `src/scheduler/mod.rs` | 11 cron jobs + reusable job functions |
 | `src/api/routes.rs` | REST API routes incl. job trigger endpoints |
 | `src/signals/` | All 24 signal detectors |
 | `src/services/` | Business logic (scanner, reports, limit-up, etc.) |
@@ -104,6 +104,10 @@ Copy `.env.example` to `.env` and fill in:
 | `AI_BASE_URL` | No | Chat Completions base URL (default `https://api.openai.com/v1`) |
 | `AI_MODEL` | No | AI model name for narrative generation (default `gpt-4o-mini`) |
 | `DATA_PROXY` | No | HTTP/SOCKS5 proxy for Tushare/Sina (e.g. `socks5://127.0.0.1:1080`) |
+| `OFFICIAL_EVENT_FEED_URL` | No | Official market-event feed URL used by the hourly event ingestion job |
+| `OFFICIAL_EVENT_FEED_API_KEY` | No | Optional API key sent as `x-api-key` to the official event feed |
+| `OFFICIAL_EVENT_SOURCE_ID` | No | Official event source adapter id (default `official:market_event`) |
+| `OFFICIAL_EVENT_STORE_FULL_CONTENT` | No | Persist full official feed content instead of summary-only retention (`true`/`false`, default `false`) |
 | `DATABASE_URL` | Yes | PostgreSQL URL (default: `postgresql://qbot:qbot@127.0.0.1/qbot`) |
 | `REDIS_URL` | Yes | Redis URL (default: `redis://127.0.0.1:6379`) |
 | `API_PORT` | No | REST API port (default: `8080`) |
@@ -176,6 +180,8 @@ Jobs are scheduled with fixed `UTC+08:00` in code (`Job::new_async_tz`).
 | 17:20 | Mon–Fri | Build point-in-time market snapshot |
 | 17:30 | Mon–Fri | Run full signal scan, cache to Redis |
 | 17:40 | Mon–Fri | Match latest published patterns against the latest complete market snapshot and persist shadow candidates |
+| Hourly at `:05` from 09:00 to 17:00 | Mon–Fri | Ingest official market-event feed with Redis-backed provider cursor state, run structured extraction, and publish eligible evidence |
+| 17:50 | Mon–Fri | Build and persist the daily evidence-backed market fact brief |
 | 18:00 | Mon–Fri | Generate daily report, push to Telegram |
 | 20:00 | Friday | Generate weekly report, push to Telegram |
 | 20:05 | Mon–Fri | Run full signal scan and archive triggered hits to `daily_signal_scan_results` |
