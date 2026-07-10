@@ -172,12 +172,12 @@ Jobs are scheduled with fixed `UTC+08:00` in code (`Job::new_async_tz`).
 |----------------|------|-----|
 | 17:00 | Mon–Fri | Fetch OHLCV, limit-up stocks, sector data |
 | 17:10 | Mon–Fri | Refresh point-in-time trade-date inputs |
+| 17:15 | Friday | Refresh point-in-time reference inputs |
 | 17:20 | Mon–Fri | Build point-in-time market snapshot |
 | 17:30 | Mon–Fri | Run full signal scan, cache to Redis |
 | 18:00 | Mon–Fri | Generate daily report, push to Telegram |
 | 20:00 | Friday | Generate weekly report, push to Telegram |
 | 20:05 | Mon–Fri | Run full signal scan and archive triggered hits to `daily_signal_scan_results` |
-| 20:30 | Friday | Refresh point-in-time reference inputs |
 
 Time basis:
 - Runtime date/time logic uses fixed `UTC+08:00` (`Asia/Shanghai` equivalent), not server local timezone.

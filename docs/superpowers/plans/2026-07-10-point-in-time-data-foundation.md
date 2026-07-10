@@ -1430,6 +1430,8 @@ const MARKET_SNAPSHOT_JOB_CRON: &str = "0 20 17 * * Mon,Tue,Wed,Thu,Fri";
 const POINT_IN_TIME_REFERENCE_JOB_CRON: &str = "0 30 20 * * Fri";
 ```
 
+Final review resolution: the reference refresh runs at `0 15 17 * * Fri` so the phase completion requirement that weekly refresh runs before snapshot generation is satisfied.
+
 Add to `AppState`:
 
 ```rust
