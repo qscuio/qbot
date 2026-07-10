@@ -1,8 +1,9 @@
-use chrono::{Datelike, Duration};
+use chrono::{Datelike, Duration, Utc};
 use std::sync::Arc;
 use tokio_cron_scheduler::{Job, JobScheduler};
 use tracing::{info, warn};
 
+use crate::analysis::market_snapshot::ingestion::PointInTimeIngestion;
 use crate::data::provider::DataProvider;
 use crate::market_time::{beijing_today, beijing_tz};
 use crate::services::{
@@ -40,6 +41,38 @@ pub async fn run_fetch_job(state: Arc<AppState>, provider: Arc<dyn DataProvider>
     let sector_svc = SectorService::new(state.clone(), provider.clone());
     if let Err(e) = sector_svc.fetch_and_save(today).await {
         warn!("Sector data failed: {}", e);
+    }
+}
+
+pub async fn run_point_in_time_reference_refresh_job(state: Arc<AppState>) {
+    let ingestion =
+        PointInTimeIngestion::new(state.point_in_time_provider.clone(), state.db.clone());
+    match ingestion.refresh_reference_data(Utc::now()).await {
+        Ok(result) => info!(
+            "Point-in-time reference refresh: status={:?}, inserted={}, estimated={}, excluded={}",
+            result.status,
+            result.inserted_rows,
+            result.estimated_rows,
+            result.excluded_estimated_rows
+        ),
+        Err(e) => warn!("Point-in-time reference refresh failed: {}", e),
+    }
+}
+
+pub async fn run_point_in_time_trade_date_refresh_job(state: Arc<AppState>) {
+    let trade_date = beijing_today();
+    let ingestion =
+        PointInTimeIngestion::new(state.point_in_time_provider.clone(), state.db.clone());
+    match ingestion.refresh_trade_date(trade_date, Utc::now()).await {
+        Ok(result) => info!(
+            "Point-in-time trade-date refresh: date={}, status={:?}, inserted={}, estimated={}, excluded={}",
+            trade_date,
+            result.status,
+            result.inserted_rows,
+            result.estimated_rows,
+            result.excluded_estimated_rows
+        ),
+        Err(e) => warn!("Point-in-time trade-date refresh failed: {}", e),
     }
 }
 

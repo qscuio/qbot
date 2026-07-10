@@ -259,6 +259,8 @@ async fn main() -> Result<()> {
     if std::env::args().any(|a| a == "--run-now") {
         info!("--run-now: firing all jobs sequentially");
         scheduler::run_fetch_job(state.clone(), provider.clone()).await;
+        scheduler::run_point_in_time_reference_refresh_job(state.clone()).await;
+        scheduler::run_point_in_time_trade_date_refresh_job(state.clone()).await;
         scheduler::run_scan_job(state.clone()).await;
         scheduler::run_daily_report_job(state.clone(), provider.clone(), pusher.clone()).await;
         scheduler::run_weekly_report_job(state.clone(), provider.clone(), pusher.clone()).await;

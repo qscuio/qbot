@@ -12,6 +12,9 @@ use crate::data::types::{Candle, LimitUpStock, SectorData};
 use crate::error::Result;
 
 pub const POINT_IN_TIME_CAPABILITY_PROBE_RUN_TYPE: &str = "point_in_time_capability_probe";
+pub const POINT_IN_TIME_REFERENCE_REFRESH_RUN_TYPE: &str = "point_in_time_reference_refresh";
+pub const POINT_IN_TIME_TRADE_DATE_REFRESH_RUN_TYPE: &str = "point_in_time_trade_date_refresh";
+pub const POINT_IN_TIME_BACKFILL_RUN_TYPE: &str = "point_in_time_backfill";
 
 #[derive(Debug, Clone)]
 pub struct AnalysisDataStatus {
@@ -124,6 +127,153 @@ impl MarketRepository {
                 }
             },
         ))
+    }
+
+    pub async fn record_analysis_data_run(
+        &self,
+        run_type: &str,
+        trade_date: Option<NaiveDate>,
+        status: &str,
+        details: Value,
+        error_message: Option<String>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"INSERT INTO analysis_data_runs
+               (run_id, run_type, trade_date, status, details, error_message, completed_at)
+               VALUES ($1, $2, $3, $4, $5, $6, NOW())"#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(run_type)
+        .bind(trade_date)
+        .bind(status)
+        .bind(details)
+        .bind(error_message)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn latest_security_master_payload_unchanged(
+        &self,
+        row: &SecurityMasterVersion,
+    ) -> Result<bool> {
+        let (unchanged,): (bool,) = sqlx::query_as(
+            r#"SELECT COALESCE((
+                   SELECT name = $2
+                      AND market IS NOT DISTINCT FROM $3
+                      AND exchange IS NOT DISTINCT FROM $4
+                      AND list_status = $5
+                      AND list_date IS NOT DISTINCT FROM $6
+                      AND delist_date IS NOT DISTINCT FROM $7
+                      AND source = $8
+                   FROM security_master_versions
+                   WHERE code = $1
+                   ORDER BY available_at DESC
+                   LIMIT 1
+               ), FALSE)"#,
+        )
+        .bind(&row.code)
+        .bind(&row.name)
+        .bind(&row.market)
+        .bind(&row.exchange)
+        .bind(&row.list_status)
+        .bind(row.list_date)
+        .bind(row.delist_date)
+        .bind(&row.source)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(unchanged)
+    }
+
+    pub async fn latest_corporate_action_payload_unchanged(
+        &self,
+        row: &CorporateAction,
+    ) -> Result<bool> {
+        let (unchanged,): (bool,) = sqlx::query_as(
+            r#"SELECT COALESCE((
+                   SELECT code = $3
+                      AND action_type = $4
+                      AND announcement_date IS NOT DISTINCT FROM $5
+                      AND record_date IS NOT DISTINCT FROM $6
+                      AND ex_date IS NOT DISTINCT FROM $7
+                      AND pay_date IS NOT DISTINCT FROM $8
+                      AND cash_dividend::float8 IS NOT DISTINCT FROM $9
+                      AND stock_ratio::float8 IS NOT DISTINCT FROM $10
+                      AND rights_ratio::float8 IS NOT DISTINCT FROM $11
+                      AND rights_price::float8 IS NOT DISTINCT FROM $12
+                   FROM corporate_action_versions
+                   WHERE source = $1
+                     AND action_key = $2
+                   ORDER BY available_at DESC
+                   LIMIT 1
+               ), FALSE)"#,
+        )
+        .bind(&row.source)
+        .bind(&row.action_key)
+        .bind(&row.code)
+        .bind(&row.action_type)
+        .bind(row.announcement_date)
+        .bind(row.record_date)
+        .bind(row.ex_date)
+        .bind(row.pay_date)
+        .bind(row.cash_dividend)
+        .bind(row.stock_ratio)
+        .bind(row.rights_ratio)
+        .bind(row.rights_price)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(unchanged)
+    }
+
+    pub async fn latest_sector_membership_payload_unchanged(
+        &self,
+        row: &SectorMembership,
+    ) -> Result<bool> {
+        let (unchanged,): (bool,) = sqlx::query_as(
+            r#"SELECT COALESCE((
+                   SELECT sector_name = $4
+                      AND sector_type = $5
+                      AND valid_to IS NOT DISTINCT FROM $6
+                      AND source = $7
+                   FROM stock_sector_membership
+                   WHERE code = $1
+                     AND sector_code = $2
+                     AND valid_from = $3
+                   ORDER BY available_at DESC
+                   LIMIT 1
+               ), FALSE)"#,
+        )
+        .bind(&row.code)
+        .bind(&row.sector_code)
+        .bind(row.valid_from)
+        .bind(&row.sector_name)
+        .bind(&row.sector_type)
+        .bind(row.valid_to)
+        .bind(&row.source)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(unchanged)
+    }
+
+    pub async fn task5_version_writes_exist(
+        &self,
+        trade_date: NaiveDate,
+    ) -> Result<(bool, bool, bool)> {
+        let (daily_bars, sector_versions, limit_up_versions): (bool, bool, bool) = sqlx::query_as(
+            r#"SELECT
+                   EXISTS(SELECT 1 FROM stock_daily_bar_versions WHERE trade_date = $1),
+                   EXISTS(SELECT 1 FROM sector_daily_versions WHERE trade_date = $1),
+                   EXISTS(SELECT 1 FROM limit_up_stock_versions WHERE trade_date = $1)"#,
+        )
+        .bind(trade_date)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok((daily_bars, sector_versions, limit_up_versions))
     }
 
     pub async fn append_daily_bar_versions(
