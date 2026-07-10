@@ -30,6 +30,19 @@ pub struct EventEvidence {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExistingEventEvidenceRelation {
+    pub submitted: EventEvidence,
+    pub existing: EventEvidence,
+    pub duplicate_group_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ManualEventSubmissionOutcome {
+    Inserted(EventEvidence),
+    Existing(ExistingEventEvidenceRelation),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BriefFact {
     pub fact_id: Uuid,
     pub summary: String,

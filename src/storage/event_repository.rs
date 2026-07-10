@@ -1,9 +1,11 @@
 use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::Value;
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
+
+const EXACT_DUPLICATE_RELATION: &str = "exact";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EventEvidenceRow {
@@ -98,6 +100,12 @@ pub struct DailyEventBriefRow {
     pub generated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ManualEvidenceInsertResult {
+    pub existing_rows: Vec<EventEvidenceRow>,
+    pub duplicate_group_id: Option<Uuid>,
+}
+
 #[derive(Clone)]
 pub struct EventRepository {
     pool: PgPool,
@@ -109,41 +117,45 @@ impl EventRepository {
     }
 
     pub async fn insert_evidence(&self, row: &EventEvidenceRow) -> Result<Uuid> {
-        sqlx::query(
-            r#"INSERT INTO market_event_evidence
-               (evidence_id, source_id, source_item_id, source_url, source_tier,
-                source_terms_version, occurred_at, published_at, first_seen_at,
-                available_at, effective_trade_date, title, content, language,
-                content_hash, raw_payload, version, supersedes_evidence_id, status, created_at)
-               VALUES ($1, $2, $3, $4, $5,
-                       $6, $7, $8, $9,
-                       $10, $11, $12, $13, $14,
-                       $15, $16, $17, $18, $19, $20)"#,
-        )
-        .bind(row.evidence_id)
-        .bind(&row.source_id)
-        .bind(&row.source_item_id)
-        .bind(&row.source_url)
-        .bind(&row.source_tier)
-        .bind(&row.source_terms_version)
-        .bind(row.occurred_at)
-        .bind(row.published_at)
-        .bind(row.first_seen_at)
-        .bind(row.available_at)
-        .bind(row.effective_trade_date)
-        .bind(&row.title)
-        .bind(&row.content)
-        .bind(&row.language)
-        .bind(&row.content_hash)
-        .bind(&row.raw_payload)
-        .bind(row.version)
-        .bind(row.supersedes_evidence_id)
-        .bind(&row.status)
-        .bind(row.created_at)
-        .execute(&self.pool)
-        .await?;
-
+        insert_evidence_in_txless(&self.pool, row).await?;
         Ok(row.evidence_id)
+    }
+
+    pub async fn insert_manual_evidence(
+        &self,
+        row: &EventEvidenceRow,
+    ) -> Result<ManualEvidenceInsertResult> {
+        let mut tx = self.pool.begin().await?;
+        lock_content_hash(&mut tx, &row.content_hash).await?;
+
+        let existing_rows = find_by_content_hash_in_tx(&mut tx, &row.content_hash).await?;
+        insert_evidence_in_tx(&mut tx, row).await?;
+
+        let duplicate_group_id = if existing_rows.is_empty() {
+            None
+        } else {
+            let duplicate_group_id = duplicate_group_id(&row.content_hash);
+            save_duplicate_group_in_tx(
+                &mut tx,
+                &DuplicateGroupRow {
+                    duplicate_group_id,
+                    relation_type: EXACT_DUPLICATE_RELATION.to_string(),
+                    confidence: 1.0,
+                    locked_by_user: false,
+                    members: duplicate_group_members(&existing_rows, row.evidence_id),
+                    created_at: row.created_at,
+                },
+            )
+            .await?;
+            Some(duplicate_group_id)
+        };
+
+        tx.commit().await?;
+
+        Ok(ManualEvidenceInsertResult {
+            existing_rows,
+            duplicate_group_id,
+        })
     }
 
     pub async fn find_existing_source_item(
@@ -178,71 +190,7 @@ impl EventRepository {
 
     pub async fn save_duplicate_group(&self, group: &DuplicateGroupRow) -> Result<Uuid> {
         let mut tx = self.pool.begin().await?;
-
-        let existing_locked = sqlx::query_scalar::<_, bool>(
-            r#"SELECT locked_by_user
-               FROM market_event_duplicate_groups
-               WHERE duplicate_group_id = $1
-               FOR UPDATE"#,
-        )
-        .bind(group.duplicate_group_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .unwrap_or(false);
-
-        if existing_locked {
-            tx.commit().await?;
-            return Ok(group.duplicate_group_id);
-        }
-
-        sqlx::query(
-            r#"INSERT INTO market_event_duplicate_groups
-               (duplicate_group_id, relation_type, confidence, locked_by_user, created_at)
-               VALUES ($1, $2, $3, $4, $5)
-               ON CONFLICT (duplicate_group_id) DO UPDATE SET
-                   relation_type = EXCLUDED.relation_type,
-                   confidence = EXCLUDED.confidence,
-                   locked_by_user = market_event_duplicate_groups.locked_by_user
-                                    OR EXCLUDED.locked_by_user"#,
-        )
-        .bind(group.duplicate_group_id)
-        .bind(&group.relation_type)
-        .bind(group.confidence)
-        .bind(group.locked_by_user)
-        .bind(group.created_at)
-        .execute(&mut *tx)
-        .await?;
-
-        let member_ids: Vec<Uuid> = group
-            .members
-            .iter()
-            .map(|member| member.evidence_id)
-            .collect();
-        for member in &group.members {
-            sqlx::query(
-                r#"INSERT INTO market_event_duplicate_members
-                   (duplicate_group_id, evidence_id, is_representative)
-                   VALUES ($1, $2, $3)
-                   ON CONFLICT (duplicate_group_id, evidence_id) DO UPDATE SET
-                       is_representative = EXCLUDED.is_representative"#,
-            )
-            .bind(group.duplicate_group_id)
-            .bind(member.evidence_id)
-            .bind(member.is_representative)
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        sqlx::query(
-            r#"DELETE FROM market_event_duplicate_members
-               WHERE duplicate_group_id = $1
-                 AND NOT (evidence_id = ANY($2::uuid[]))"#,
-        )
-        .bind(group.duplicate_group_id)
-        .bind(&member_ids)
-        .execute(&mut *tx)
-        .await?;
-
+        save_duplicate_group_in_tx(&mut tx, group).await?;
         tx.commit().await?;
         Ok(group.duplicate_group_id)
     }
@@ -407,6 +355,220 @@ fn evidence_select_sql(where_and_order: &str) -> String {
            FROM market_event_evidence
            {where_and_order}"#
     )
+}
+
+async fn insert_evidence_in_txless(pool: &PgPool, row: &EventEvidenceRow) -> Result<()> {
+    sqlx::query(
+        r#"INSERT INTO market_event_evidence
+           (evidence_id, source_id, source_item_id, source_url, source_tier,
+            source_terms_version, occurred_at, published_at, first_seen_at,
+            available_at, effective_trade_date, title, content, language,
+            content_hash, raw_payload, version, supersedes_evidence_id, status, created_at)
+           VALUES ($1, $2, $3, $4, $5,
+                   $6, $7, $8, $9,
+                   $10, $11, $12, $13, $14,
+                   $15, $16, $17, $18, $19, $20)"#,
+    )
+    .bind(row.evidence_id)
+    .bind(&row.source_id)
+    .bind(&row.source_item_id)
+    .bind(&row.source_url)
+    .bind(&row.source_tier)
+    .bind(&row.source_terms_version)
+    .bind(row.occurred_at)
+    .bind(row.published_at)
+    .bind(row.first_seen_at)
+    .bind(row.available_at)
+    .bind(row.effective_trade_date)
+    .bind(&row.title)
+    .bind(&row.content)
+    .bind(&row.language)
+    .bind(&row.content_hash)
+    .bind(&row.raw_payload)
+    .bind(row.version)
+    .bind(row.supersedes_evidence_id)
+    .bind(&row.status)
+    .bind(row.created_at)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+async fn insert_evidence_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    row: &EventEvidenceRow,
+) -> Result<()> {
+    sqlx::query(
+        r#"INSERT INTO market_event_evidence
+           (evidence_id, source_id, source_item_id, source_url, source_tier,
+            source_terms_version, occurred_at, published_at, first_seen_at,
+            available_at, effective_trade_date, title, content, language,
+            content_hash, raw_payload, version, supersedes_evidence_id, status, created_at)
+           VALUES ($1, $2, $3, $4, $5,
+                   $6, $7, $8, $9,
+                   $10, $11, $12, $13, $14,
+                   $15, $16, $17, $18, $19, $20)"#,
+    )
+    .bind(row.evidence_id)
+    .bind(&row.source_id)
+    .bind(&row.source_item_id)
+    .bind(&row.source_url)
+    .bind(&row.source_tier)
+    .bind(&row.source_terms_version)
+    .bind(row.occurred_at)
+    .bind(row.published_at)
+    .bind(row.first_seen_at)
+    .bind(row.available_at)
+    .bind(row.effective_trade_date)
+    .bind(&row.title)
+    .bind(&row.content)
+    .bind(&row.language)
+    .bind(&row.content_hash)
+    .bind(&row.raw_payload)
+    .bind(row.version)
+    .bind(row.supersedes_evidence_id)
+    .bind(&row.status)
+    .bind(row.created_at)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
+}
+
+async fn find_by_content_hash_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    hash: &str,
+) -> Result<Vec<EventEvidenceRow>> {
+    let sql = evidence_select_sql(
+        r#"WHERE content_hash = $1
+           ORDER BY effective_trade_date ASC, available_at ASC, source_id ASC,
+                    source_item_id ASC, version ASC, evidence_id ASC"#,
+    );
+    let rows = sqlx::query(&sql).bind(hash).fetch_all(&mut **tx).await?;
+
+    Ok(rows.into_iter().map(event_evidence_from_row).collect())
+}
+
+async fn lock_content_hash(tx: &mut Transaction<'_, Postgres>, content_hash: &str) -> Result<()> {
+    sqlx::query(r#"SELECT pg_advisory_xact_lock($1::bigint)"#)
+        .bind(advisory_lock_key(content_hash))
+        .fetch_one(&mut **tx)
+        .await?;
+
+    Ok(())
+}
+
+async fn save_duplicate_group_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    group: &DuplicateGroupRow,
+) -> Result<()> {
+    let existing_locked = sqlx::query_scalar::<_, bool>(
+        r#"SELECT locked_by_user
+           FROM market_event_duplicate_groups
+           WHERE duplicate_group_id = $1
+           FOR UPDATE"#,
+    )
+    .bind(group.duplicate_group_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .unwrap_or(false);
+
+    if existing_locked {
+        return Ok(());
+    }
+
+    sqlx::query(
+        r#"INSERT INTO market_event_duplicate_groups
+           (duplicate_group_id, relation_type, confidence, locked_by_user, created_at)
+           VALUES ($1, $2, $3, $4, $5)
+           ON CONFLICT (duplicate_group_id) DO UPDATE SET
+               relation_type = EXCLUDED.relation_type,
+               confidence = EXCLUDED.confidence,
+               locked_by_user = market_event_duplicate_groups.locked_by_user
+                                OR EXCLUDED.locked_by_user"#,
+    )
+    .bind(group.duplicate_group_id)
+    .bind(&group.relation_type)
+    .bind(group.confidence)
+    .bind(group.locked_by_user)
+    .bind(group.created_at)
+    .execute(&mut **tx)
+    .await?;
+
+    let member_ids: Vec<Uuid> = group
+        .members
+        .iter()
+        .map(|member| member.evidence_id)
+        .collect();
+    for member in &group.members {
+        sqlx::query(
+            r#"INSERT INTO market_event_duplicate_members
+               (duplicate_group_id, evidence_id, is_representative)
+               VALUES ($1, $2, $3)
+               ON CONFLICT (duplicate_group_id, evidence_id) DO UPDATE SET
+                   is_representative = EXCLUDED.is_representative"#,
+        )
+        .bind(group.duplicate_group_id)
+        .bind(member.evidence_id)
+        .bind(member.is_representative)
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    sqlx::query(
+        r#"DELETE FROM market_event_duplicate_members
+           WHERE duplicate_group_id = $1
+             AND NOT (evidence_id = ANY($2::uuid[]))"#,
+    )
+    .bind(group.duplicate_group_id)
+    .bind(&member_ids)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
+}
+
+fn duplicate_group_id(content_hash: &str) -> Uuid {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(format!("market-event-duplicate:{content_hash}").as_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
+fn duplicate_group_members(
+    existing_rows: &[EventEvidenceRow],
+    submitted_evidence_id: Uuid,
+) -> Vec<DuplicateGroupMemberRow> {
+    let representative_evidence_id = existing_rows
+        .first()
+        .map(|row| row.evidence_id)
+        .expect("existing duplicate rows are present");
+    let mut members: Vec<DuplicateGroupMemberRow> = existing_rows
+        .iter()
+        .map(|row| DuplicateGroupMemberRow {
+            evidence_id: row.evidence_id,
+            is_representative: row.evidence_id == representative_evidence_id,
+        })
+        .collect();
+    members.push(DuplicateGroupMemberRow {
+        evidence_id: submitted_evidence_id,
+        is_representative: false,
+    });
+    members
+}
+
+fn advisory_lock_key(content_hash: &str) -> i64 {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(format!("market-event-manual-evidence:{content_hash}").as_bytes());
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    i64::from_be_bytes(bytes)
 }
 
 fn event_evidence_from_row(row: sqlx::postgres::PgRow) -> EventEvidenceRow {

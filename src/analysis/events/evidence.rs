@@ -6,11 +6,12 @@ use serde_json::json;
 use uuid::Uuid;
 
 use super::time::{effective_trade_date_for_manual, manual_available_at};
-use super::{EventEvidence, ManualEventInput, TradingDateResolver};
-use crate::error::{AppError, Result};
-use crate::storage::event_repository::{
-    DuplicateGroupMemberRow, DuplicateGroupRow, EventEvidenceRow, EventRepository,
+use super::{
+    EventEvidence, ExistingEventEvidenceRelation, ManualEventInput, ManualEventSubmissionOutcome,
+    TradingDateResolver,
 };
+use crate::error::{AppError, Result};
+use crate::storage::event_repository::{EventEvidenceRow, EventRepository};
 
 pub(crate) const MANUAL_SOURCE_TELEGRAM: &str = "manual:telegram";
 pub(crate) const MANUAL_SOURCE_REST: &str = "manual:rest";
@@ -19,7 +20,6 @@ const MANUAL_SOURCE_TIER: &str = "manual";
 const MANUAL_SOURCE_TERMS_VERSION: &str = "terms-v1";
 const MANUAL_LANGUAGE: &str = "und";
 const MANUAL_STATUS_PENDING: &str = "pending";
-const EXACT_DUPLICATE_RELATION: &str = "exact";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ManualSource {
@@ -34,19 +34,6 @@ impl ManualSource {
             Self::Rest => MANUAL_SOURCE_REST,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ExistingEvidenceRelation {
-    pub submitted: EventEvidence,
-    pub existing: EventEvidence,
-    pub duplicate_group_id: Uuid,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ManualEventSubmission {
-    Inserted(EventEvidence),
-    Existing(ExistingEvidenceRelation),
 }
 
 #[derive(Clone)]
@@ -65,7 +52,7 @@ impl ManualEvidenceIngestor {
         source: ManualSource,
         input: ManualEventInput,
         first_seen_at: DateTime<Utc>,
-    ) -> Result<ManualEventSubmission> {
+    ) -> Result<ManualEventSubmissionOutcome> {
         let normalized_title = normalize_text(&input.title);
         if normalized_title.is_empty() {
             return Err(AppError::Internal(
@@ -87,7 +74,11 @@ impl ManualEvidenceIngestor {
         let available_at = manual_available_at(input.published_at, first_seen_at);
         let effective_trade_date =
             effective_trade_date_for_manual(self.resolver.as_ref(), available_at)?;
-        let existing_rows = self.repo.find_by_content_hash(&content_hash).await?;
+        #[cfg(test)]
+        {
+            let _ = self.repo.find_by_content_hash(&content_hash).await?;
+            wait_after_duplicate_lookup().await;
+        }
 
         let row = EventEvidenceRow {
             evidence_id: Uuid::new_v4(),
@@ -114,32 +105,25 @@ impl ManualEvidenceIngestor {
             status: MANUAL_STATUS_PENDING.to_string(),
             created_at: first_seen_at,
         };
-        self.repo.insert_evidence(&row).await?;
+        let insert_result = self.repo.insert_manual_evidence(&row).await?;
 
         let submitted = event_evidence_from_row(&row);
-        if existing_rows.is_empty() {
-            return Ok(ManualEventSubmission::Inserted(submitted));
+        if insert_result.existing_rows.is_empty() {
+            return Ok(ManualEventSubmissionOutcome::Inserted(submitted));
         }
 
-        let representative = existing_rows[0].clone();
-        let duplicate_group_id = duplicate_group_id(&content_hash);
-        let members = duplicate_group_members(&existing_rows, row.evidence_id);
-        self.repo
-            .save_duplicate_group(&DuplicateGroupRow {
-                duplicate_group_id,
-                relation_type: EXACT_DUPLICATE_RELATION.to_string(),
-                confidence: 1.0,
-                locked_by_user: false,
-                members,
-                created_at: first_seen_at,
-            })
-            .await?;
+        let representative = insert_result.existing_rows[0].clone();
+        let duplicate_group_id = insert_result
+            .duplicate_group_id
+            .expect("duplicate submissions must record a duplicate group");
 
-        Ok(ManualEventSubmission::Existing(ExistingEvidenceRelation {
-            submitted,
-            existing: event_evidence_from_row(&representative),
-            duplicate_group_id,
-        }))
+        Ok(ManualEventSubmissionOutcome::Existing(
+            ExistingEventEvidenceRelation {
+                submitted,
+                existing: event_evidence_from_row(&representative),
+                duplicate_group_id,
+            },
+        ))
     }
 }
 
@@ -178,39 +162,6 @@ fn canonicalize_source_url(value: &str) -> Result<String> {
     Ok(url.to_string())
 }
 
-fn duplicate_group_id(content_hash: &str) -> Uuid {
-    use sha2::{Digest, Sha256};
-
-    let digest = Sha256::digest(format!("market-event-duplicate:{content_hash}").as_bytes());
-    let mut bytes = [0_u8; 16];
-    bytes.copy_from_slice(&digest[..16]);
-    bytes[6] = (bytes[6] & 0x0f) | 0x50;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    Uuid::from_bytes(bytes)
-}
-
-fn duplicate_group_members(
-    existing_rows: &[EventEvidenceRow],
-    submitted_evidence_id: Uuid,
-) -> Vec<DuplicateGroupMemberRow> {
-    let representative_evidence_id = existing_rows
-        .first()
-        .map(|row| row.evidence_id)
-        .expect("existing duplicate rows are present");
-    let mut members: Vec<DuplicateGroupMemberRow> = existing_rows
-        .iter()
-        .map(|row| DuplicateGroupMemberRow {
-            evidence_id: row.evidence_id,
-            is_representative: row.evidence_id == representative_evidence_id,
-        })
-        .collect();
-    members.push(DuplicateGroupMemberRow {
-        evidence_id: submitted_evidence_id,
-        is_representative: false,
-    });
-    members
-}
-
 fn event_evidence_from_row(row: &EventEvidenceRow) -> EventEvidence {
     EventEvidence {
         evidence_id: row.evidence_id,
@@ -228,6 +179,51 @@ fn event_evidence_from_row(row: &EventEvidenceRow) -> EventEvidence {
 }
 
 #[cfg(test)]
+async fn wait_after_duplicate_lookup() {
+    test_support::wait_after_duplicate_lookup().await;
+}
+
+#[cfg(test)]
+mod test_support {
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use tokio::sync::Barrier;
+
+    static AFTER_DUPLICATE_LOOKUP_BARRIER: OnceLock<Mutex<Option<Arc<Barrier>>>> = OnceLock::new();
+
+    pub(super) struct DuplicateLookupBarrierGuard;
+
+    pub(super) fn install_duplicate_lookup_barrier(parties: usize) -> DuplicateLookupBarrierGuard {
+        let barrier = Arc::new(Barrier::new(parties));
+        let mut slot = barrier_slot().lock().unwrap();
+        assert!(slot.replace(barrier).is_none());
+        DuplicateLookupBarrierGuard
+    }
+
+    pub(super) async fn wait_after_duplicate_lookup() {
+        let barrier = {
+            let slot = barrier_slot().lock().unwrap();
+            slot.clone()
+        };
+
+        if let Some(barrier) = barrier {
+            barrier.wait().await;
+        }
+    }
+
+    impl Drop for DuplicateLookupBarrierGuard {
+        fn drop(&mut self) {
+            let mut slot = barrier_slot().lock().unwrap();
+            *slot = None;
+        }
+    }
+
+    fn barrier_slot() -> &'static Mutex<Option<Arc<Barrier>>> {
+        AFTER_DUPLICATE_LOOKUP_BARRIER.get_or_init(|| Mutex::new(None))
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
@@ -237,10 +233,13 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        ExistingEvidenceRelation, ManualEventSubmission, ManualEvidenceIngestor, ManualSource,
+        test_support::install_duplicate_lookup_barrier, ManualEvidenceIngestor, ManualSource,
         MANUAL_SOURCE_REST, MANUAL_SOURCE_TELEGRAM,
     };
-    use crate::analysis::events::{AShareTradingDateResolver, EventIntelligence, ManualEventInput};
+    use crate::analysis::events::{
+        AShareTradingDateResolver, EventIntelligence, ExistingEventEvidenceRelation,
+        ManualEventInput, ManualEventSubmissionOutcome,
+    };
     use crate::storage::event_repository::EventRepository;
 
     #[sqlx::test(migrations = "./migrations")]
@@ -373,6 +372,52 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn concurrent_identical_manual_submissions_report_one_insert_and_one_existing(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = EventRepository::new(pool.clone());
+        let ingestor =
+            ManualEvidenceIngestor::new(repo.clone(), Arc::new(AShareTradingDateResolver));
+        let input = ManualEventInput {
+            title: " ACME   wins   contract ".to_string(),
+            content: Some("Order value\n exceeds guidance".to_string()),
+            source_url: Some("https://example.com/contracts/acme".to_string()),
+            submitted_by: "operator".to_string(),
+            published_at: Some(dt(2026, 7, 10, 7, 30, 0)),
+        };
+        let _barrier = install_duplicate_lookup_barrier(2);
+
+        let (left, right) = tokio::join!(
+            ingestor.submit_at(ManualSource::Rest, input.clone(), dt(2026, 7, 10, 8, 0, 0)),
+            ingestor.submit_at(ManualSource::Rest, input, dt(2026, 7, 10, 8, 0, 1)),
+        );
+        let outcomes = [left.unwrap(), right.unwrap()];
+
+        let inserted_count = outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, ManualEventSubmissionOutcome::Inserted(_)))
+            .count();
+        let existing_relations: Vec<ExistingEventEvidenceRelation> = outcomes
+            .iter()
+            .filter_map(|outcome| match outcome {
+                ManualEventSubmissionOutcome::Inserted(_) => None,
+                ManualEventSubmissionOutcome::Existing(existing) => Some(existing.clone()),
+            })
+            .collect();
+
+        assert_eq!(inserted_count, 1);
+        assert_eq!(existing_relations.len(), 1);
+
+        let same_hash = repo
+            .find_by_content_hash(&existing_relations[0].existing.content_hash)
+            .await
+            .unwrap();
+        assert_eq!(same_hash.len(), 2);
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn event_intelligence_submit_manual_event_uses_rest_source(
         pool: PgPool,
     ) -> sqlx::Result<()> {
@@ -381,16 +426,18 @@ mod tests {
             Arc::new(AShareTradingDateResolver),
         );
 
-        let evidence = intelligence
-            .submit_manual_event(ManualEventInput {
-                title: " REST submitted event ".to_string(),
-                content: None,
-                source_url: None,
-                submitted_by: "api-user".to_string(),
-                published_at: None,
-            })
-            .await
-            .unwrap();
+        let evidence = assert_public_inserted(
+            intelligence
+                .submit_manual_event(ManualEventInput {
+                    title: " REST submitted event ".to_string(),
+                    content: None,
+                    source_url: None,
+                    submitted_by: "api-user".to_string(),
+                    published_at: None,
+                })
+                .await
+                .unwrap(),
+        );
 
         assert_eq!(evidence.source_id, MANUAL_SOURCE_REST);
 
@@ -400,6 +447,37 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].title, "REST submitted event");
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn event_intelligence_submit_manual_event_exposes_existing_relation_publicly(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let intelligence = EventIntelligence::with_repository_and_resolver(
+            EventRepository::new(pool),
+            Arc::new(AShareTradingDateResolver),
+        );
+        let input = ManualEventInput {
+            title: " REST submitted duplicate ".to_string(),
+            content: Some("same payload".to_string()),
+            source_url: None,
+            submitted_by: "api-user".to_string(),
+            published_at: None,
+        };
+
+        let first = assert_public_inserted(
+            intelligence
+                .submit_manual_event(input.clone())
+                .await
+                .unwrap(),
+        );
+        let duplicate =
+            assert_public_existing(intelligence.submit_manual_event(input).await.unwrap());
+
+        assert_eq!(duplicate.existing.evidence_id, first.evidence_id);
+        assert_ne!(duplicate.submitted.evidence_id, first.evidence_id);
 
         Ok(())
     }
@@ -423,10 +501,12 @@ mod tests {
         value.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
-    fn assert_inserted(outcome: ManualEventSubmission) -> crate::analysis::events::EventEvidence {
+    fn assert_inserted(
+        outcome: ManualEventSubmissionOutcome,
+    ) -> crate::analysis::events::EventEvidence {
         match outcome {
-            ManualEventSubmission::Inserted(evidence) => evidence,
-            ManualEventSubmission::Existing(existing) => {
+            ManualEventSubmissionOutcome::Inserted(evidence) => evidence,
+            ManualEventSubmissionOutcome::Existing(existing) => {
                 panic!(
                     "expected inserted evidence, got duplicate relation for {}",
                     existing.existing.evidence_id
@@ -435,15 +515,43 @@ mod tests {
         }
     }
 
-    fn assert_existing(outcome: ManualEventSubmission) -> ExistingEvidenceRelation {
+    fn assert_existing(outcome: ManualEventSubmissionOutcome) -> ExistingEventEvidenceRelation {
         match outcome {
-            ManualEventSubmission::Inserted(evidence) => {
+            ManualEventSubmissionOutcome::Inserted(evidence) => {
                 panic!(
                     "expected duplicate relation, got inserted {}",
                     evidence.evidence_id
                 )
             }
-            ManualEventSubmission::Existing(existing) => existing,
+            ManualEventSubmissionOutcome::Existing(existing) => existing,
+        }
+    }
+
+    fn assert_public_inserted(
+        outcome: crate::analysis::events::ManualEventSubmissionOutcome,
+    ) -> crate::analysis::events::EventEvidence {
+        match outcome {
+            crate::analysis::events::ManualEventSubmissionOutcome::Inserted(evidence) => evidence,
+            crate::analysis::events::ManualEventSubmissionOutcome::Existing(existing) => {
+                panic!(
+                    "expected public inserted evidence, got duplicate relation for {}",
+                    existing.existing.evidence_id
+                )
+            }
+        }
+    }
+
+    fn assert_public_existing(
+        outcome: crate::analysis::events::ManualEventSubmissionOutcome,
+    ) -> crate::analysis::events::ExistingEventEvidenceRelation {
+        match outcome {
+            crate::analysis::events::ManualEventSubmissionOutcome::Inserted(evidence) => {
+                panic!(
+                    "expected public duplicate relation, got inserted {}",
+                    evidence.evidence_id
+                )
+            }
+            crate::analysis::events::ManualEventSubmissionOutcome::Existing(existing) => existing,
         }
     }
 }

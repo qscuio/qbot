@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDate, Utc};
 
-use self::evidence::{ManualEventSubmission, ManualEvidenceIngestor, ManualSource};
+use self::evidence::{ManualEvidenceIngestor, ManualSource};
 use crate::error::{AppError, Result};
 use crate::storage::event_repository::EventRepository;
 
@@ -12,7 +12,8 @@ mod time;
 
 pub use contracts::{
     AShareTradingDateResolver, BriefEntity, BriefFact, BriefRevision, BriefSource,
-    BriefUnconfirmed, DailyEventBrief, EventEvidence, EventProcessingSummary, ManualEventInput,
+    BriefUnconfirmed, DailyEventBrief, EventEvidence, EventProcessingSummary,
+    ExistingEventEvidenceRelation, ManualEventInput, ManualEventSubmissionOutcome,
     TradingDateResolver,
 };
 
@@ -27,15 +28,12 @@ impl EventIntelligence {
         Self::default()
     }
 
-    pub async fn submit_manual_event(&self, input: ManualEventInput) -> Result<EventEvidence> {
-        let submission = self
-            .submit_manual_event_from_source_at(ManualSource::Rest, input, Utc::now())
-            .await?;
-
-        Ok(match submission {
-            ManualEventSubmission::Inserted(evidence) => evidence,
-            ManualEventSubmission::Existing(existing) => existing.submitted,
-        })
+    pub async fn submit_manual_event(
+        &self,
+        input: ManualEventInput,
+    ) -> Result<ManualEventSubmissionOutcome> {
+        self.submit_manual_event_from_source_at(ManualSource::Rest, input, Utc::now())
+            .await
     }
 
     pub async fn process_pending(&self, _cutoff: DateTime<Utc>) -> Result<EventProcessingSummary> {
@@ -60,7 +58,7 @@ impl EventIntelligence {
         source: ManualSource,
         input: ManualEventInput,
         first_seen_at: DateTime<Utc>,
-    ) -> Result<ManualEventSubmission> {
+    ) -> Result<ManualEventSubmissionOutcome> {
         self.manual_ingestor()?
             .submit_at(source, input, first_seen_at)
             .await
