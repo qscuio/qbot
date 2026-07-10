@@ -286,7 +286,7 @@ GREEN results:
 
 ### Re-review commit hash
 
-- Fix commit: pending
+- Fix commit: `0acdd42`
 
 ### Re-review concerns
 
