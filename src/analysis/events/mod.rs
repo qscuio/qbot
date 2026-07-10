@@ -674,19 +674,25 @@ fn build_brief_entity_records(
     Ok(parsed
         .entities
         .into_iter()
-        .filter_map(|entity| match entity.entity_type.as_str() {
-            "industry" | "sector" => Some(BriefEntityRecord {
-                entity_id: format!("industry:{}", entity.text),
-                display_name: entity.text,
-            }),
-            "organization" | "company" | "issuer" => Some(BriefEntityRecord {
-                entity_id: entity
-                    .stock_code
-                    .clone()
-                    .unwrap_or_else(|| format!("company:{}", entity.text)),
-                display_name: entity.text,
-            }),
-            _ => None,
+        .filter_map(|entity| {
+            if entity.role != "subject" {
+                return None;
+            }
+
+            match entity.entity_type.as_str() {
+                "industry" | "sector" => Some(BriefEntityRecord {
+                    entity_id: format!("industry:{}", entity.text),
+                    display_name: entity.text,
+                }),
+                "organization" | "company" | "issuer" => Some(BriefEntityRecord {
+                    entity_id: entity
+                        .stock_code
+                        .clone()
+                        .unwrap_or_else(|| format!("company:{}", entity.text)),
+                    display_name: entity.text,
+                }),
+                _ => None,
+            }
         })
         .collect())
 }
@@ -791,9 +797,18 @@ impl EventExtractor for NoopEventExtractor {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{collections::BTreeMap, fs, path::PathBuf};
 
-    use super::EventIntelligence;
+    use chrono::Utc;
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use super::{
+        build_brief_entity_records,
+        extraction::{EventExtractionV1, ExtractedEntity},
+        BriefEntityRecord, EventIntelligence,
+    };
+    use crate::storage::event_repository::ExtractionRow;
 
     #[test]
     fn event_intelligence_exposes_a_small_public_constructor() {
@@ -813,6 +828,75 @@ mod tests {
         assert!(!module_source
             .lines()
             .any(|line| line.trim() == "pub repo: EventRepository,"));
+    }
+
+    #[test]
+    fn brief_entity_records_exclude_beneficiaries_and_keep_direct_subjects() {
+        let extraction = extraction_row_with_entities(vec![
+            ExtractedEntity {
+                text: "Kweichow Moutai".to_string(),
+                entity_type: "issuer".to_string(),
+                role: "subject".to_string(),
+                stock_code: Some("600519.SH".to_string()),
+            },
+            ExtractedEntity {
+                text: "Liquor".to_string(),
+                entity_type: "industry".to_string(),
+                role: "subject".to_string(),
+                stock_code: None,
+            },
+            ExtractedEntity {
+                text: "Beneficiary Holdings".to_string(),
+                entity_type: "company".to_string(),
+                role: "beneficiary".to_string(),
+                stock_code: Some("000001.SZ".to_string()),
+            },
+        ]);
+
+        let records = build_brief_entity_records(&extraction, &BTreeMap::new()).unwrap();
+
+        assert_eq!(
+            records,
+            vec![
+                BriefEntityRecord {
+                    entity_id: "600519.SH".to_string(),
+                    display_name: "Kweichow Moutai".to_string(),
+                },
+                BriefEntityRecord {
+                    entity_id: "industry:Liquor".to_string(),
+                    display_name: "Liquor".to_string(),
+                },
+            ]
+        );
+    }
+
+    fn extraction_row_with_entities(entities: Vec<ExtractedEntity>) -> ExtractionRow {
+        let evidence_id = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+
+        ExtractionRow {
+            extraction_id: Uuid::parse_str("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").unwrap(),
+            evidence_id,
+            schema_version: "event_extraction_v1".to_string(),
+            prompt_version: Some("prompt-v1".to_string()),
+            model_name: Some("test-model".to_string()),
+            model_parameters: json!({}),
+            extracted_payload: serde_json::to_value(EventExtractionV1 {
+                event_type: "issuer_disclosure".to_string(),
+                event_subtype: None,
+                claims: Vec::new(),
+                entities,
+                amounts: Vec::new(),
+                dates: Vec::new(),
+                uncertainties: Vec::new(),
+                missing_information: Vec::new(),
+            })
+            .unwrap(),
+            validation_status: "valid".to_string(),
+            validation_errors: json!([]),
+            input_fingerprint: "test-input-fingerprint".to_string(),
+            claims: Vec::new(),
+            created_at: Utc::now(),
+        }
     }
 
     fn module_source_path() -> PathBuf {
