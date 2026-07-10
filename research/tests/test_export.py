@@ -34,6 +34,7 @@ def _candidate_payload() -> dict[str, Any]:
         "scaler_scale": {"return_20d": 0.04, "relative_strength_20d": 0.12},
         "centroid": {"return_20d": 0.18, "relative_strength_20d": 1.41},
         "distance_metric": "euclidean",
+        "cluster_parameters": {},
         "similarity_thresholds": {"shadow_a": 0.88, "shadow_b": 0.80},
         "necessary_conditions": [
             {"column": "return_20d", "operator": ">=", "value": 0.10},
@@ -177,6 +178,7 @@ def test_export_pattern_version_builds_validated_immutable_rows_and_examples() -
     payload = AnalysisPatternVersionPayload.model_validate(exported.version_row_payload())
     assert payload.status == "validated"
     assert payload.model_payload.required_features == ["return_20d", "relative_strength_20d"]
+    assert payload.model_payload.cluster_parameters.model_dump(exclude_none=True) == {}
     assert payload.validation_payload.candidate_status == "validated"
 
     with pytest.raises(AttributeError):
@@ -190,6 +192,32 @@ def test_export_pattern_version_accepts_draft_and_rejects_published_status() -> 
 
     with pytest.raises(ValidationError, match="candidate_status"):
         _export("published")
+
+
+def test_export_pattern_version_rejects_missing_non_euclidean_cluster_parameters() -> None:
+    candidate = _candidate_payload()
+    candidate["distance_metric"] = "mahalanobis"
+
+    with pytest.raises(ValidationError, match="covariance"):
+        export_pattern_version(
+            candidate_payload=candidate,
+            validation_payload=_validation_payload("validated"),
+            metadata=_metadata(),
+            typical_positive_examples=_positive_examples(),
+            failed_examples=_failed_examples(),
+        )
+
+    candidate = _candidate_payload()
+    candidate["distance_metric"] = "gmm_probability"
+
+    with pytest.raises(ValidationError, match="mixture_mean"):
+        export_pattern_version(
+            candidate_payload=candidate,
+            validation_payload=_validation_payload("validated"),
+            metadata=_metadata(),
+            typical_positive_examples=_positive_examples(),
+            failed_examples=_failed_examples(),
+        )
 
 
 def test_export_pattern_version_rejects_non_model_export_horizons() -> None:

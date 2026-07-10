@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+from math import isfinite
 from typing import Literal, TypeAlias
 from uuid import UUID
 
@@ -13,10 +14,18 @@ DistanceMetric: TypeAlias = Literal["euclidean", "mahalanobis", "gmm_probability
 ConditionPayload: TypeAlias = dict[str, object]
 PatternVersionStatus: TypeAlias = Literal["draft", "validated"]
 ExampleType: TypeAlias = Literal["typical_positive", "failed"]
+CovarianceMatrix: TypeAlias = list[list[float]]
 
 
 class ContractModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class ClusterParameters(ContractModel):
+    covariance: CovarianceMatrix | None = None
+    mixture_mean: dict[str, float] | None = None
+    mixture_covariance: CovarianceMatrix | None = None
+    mixture_weight: float | None = None
 
 
 class DatasetManifest(ContractModel):
@@ -49,6 +58,7 @@ class PatternModelPayload(ContractModel):
     scaler_scale: dict[str, float]
     centroid: dict[str, float]
     distance_metric: DistanceMetric
+    cluster_parameters: ClusterParameters
     similarity_thresholds: dict[str, float]
     necessary_conditions: list[ConditionPayload]
     risk_conditions: list[ConditionPayload]
@@ -77,6 +87,74 @@ class PatternModelPayload(ContractModel):
                 f"{info.field_name} must include values for required_features: {missing_csv}"
             )
         return value
+
+    @model_validator(mode="after")
+    def validate_cluster_parameters(self) -> PatternModelPayload:
+        dimension = len(self.required_features)
+        if self.distance_metric == "euclidean":
+            return self
+
+        if self.distance_metric == "mahalanobis":
+            if self.cluster_parameters.covariance is None:
+                raise ValueError("cluster_parameters.covariance is required for mahalanobis")
+            _validate_covariance_matrix(
+                "cluster_parameters.covariance",
+                self.cluster_parameters.covariance,
+                dimension,
+            )
+            return self
+
+        if self.cluster_parameters.mixture_mean is None:
+            raise ValueError("cluster_parameters.mixture_mean is required for gmm_probability")
+        if self.cluster_parameters.mixture_covariance is None:
+            raise ValueError("cluster_parameters.mixture_covariance is required for gmm_probability")
+        if self.cluster_parameters.mixture_weight is None:
+            raise ValueError("cluster_parameters.mixture_weight is required for gmm_probability")
+        _validate_required_feature_map(
+            "cluster_parameters.mixture_mean",
+            self.cluster_parameters.mixture_mean,
+            self.required_features,
+        )
+        _validate_covariance_matrix(
+            "cluster_parameters.mixture_covariance",
+            self.cluster_parameters.mixture_covariance,
+            dimension,
+        )
+        if not isfinite(self.cluster_parameters.mixture_weight):
+            raise ValueError("cluster_parameters.mixture_weight must be finite")
+        if self.cluster_parameters.mixture_weight <= 0.0:
+            raise ValueError("cluster_parameters.mixture_weight must be positive")
+        return self
+
+
+def _validate_required_feature_map(
+    field_name: str,
+    payload: dict[str, float],
+    required_features: list[str],
+) -> None:
+    missing = [feature for feature in required_features if feature not in payload]
+    if missing:
+        missing_csv = ", ".join(missing)
+        raise ValueError(f"{field_name} must include values for required_features: {missing_csv}")
+    for feature in required_features:
+        if not isfinite(payload[feature]):
+            raise ValueError(f"{field_name} must contain finite values: {feature}")
+
+
+def _validate_covariance_matrix(
+    field_name: str,
+    matrix: CovarianceMatrix,
+    dimension: int,
+) -> None:
+    if not matrix:
+        raise ValueError(f"{field_name} must have positive dimension")
+    if len(matrix) != dimension:
+        raise ValueError(f"{field_name} dimensions must match required_features")
+    for row in matrix:
+        if len(row) != len(matrix):
+            raise ValueError(f"{field_name} must be square")
+        if any(not isfinite(value) for value in row):
+            raise ValueError(f"{field_name} must contain finite values")
 
 
 class ValidationPayload(ContractModel):

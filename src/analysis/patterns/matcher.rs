@@ -9,7 +9,10 @@ use uuid::Uuid;
 
 use super::explanation::{evaluate_condition, ConditionEvaluation};
 pub use super::model::FeatureVector;
-use super::model::{CandidateStatus, DistanceMetric, PatternModelPayload, ValidationPayload};
+use super::model::{
+    mahalanobis_distance_squared, CandidateStatus, DistanceMetric, PatternModelPayload,
+    ValidationPayload,
+};
 use super::ranking::{final_score, rank_candidate, ShadowTier};
 use crate::analysis::market_snapshot::adjustment::adjust_candles;
 use crate::analysis::market_snapshot::{AdjustmentFactor, SecurityDailyStatus};
@@ -362,7 +365,20 @@ pub fn similarity(
     model: &PatternModelPayload,
     features: &FeatureVector,
 ) -> Result<SimilarityScore> {
-    let mut squared_distance = 0.0;
+    let comparison_center = match model.distance_metric {
+        DistanceMetric::Euclidean | DistanceMetric::Mahalanobis => &model.centroid,
+        DistanceMetric::GmmProbability => model
+            .cluster_parameters
+            .mixture_mean
+            .as_ref()
+            .ok_or_else(|| {
+                AppError::Internal(
+                    "cluster_parameters.mixture_mean is required for gmm_probability".to_string(),
+                )
+            })?,
+    };
+    let mut scaled_squared_distance = 0.0;
+    let mut raw_feature_deltas = Vec::with_capacity(model.required_features.len());
     let mut scaled_features = FeatureVector::new();
     let mut scaled_centroid = FeatureVector::new();
     let mut feature_contributions = FeatureVector::new();
@@ -378,24 +394,63 @@ pub fn similarity(
         }
         let mean = model.scaler_mean[feature];
         let scale = model.scaler_scale[feature];
-        let centroid = model.centroid[feature];
+        let centroid = *comparison_center.get(feature).ok_or_else(|| {
+            AppError::Internal(format!(
+                "comparison center must include required feature: {}",
+                feature
+            ))
+        })?;
         let scaled_value = (value - mean) / scale;
         let scaled_center = (centroid - mean) / scale;
         let contribution = (scaled_value - scaled_center).powi(2);
-        squared_distance += contribution;
+        scaled_squared_distance += contribution;
+        raw_feature_deltas.push(value - centroid);
         scaled_features.insert(feature.clone(), scaled_value);
         scaled_centroid.insert(feature.clone(), scaled_center);
         feature_contributions.insert(feature.clone(), contribution);
     }
 
-    let distance = squared_distance.sqrt();
-    let similarity = match model.distance_metric {
-        // Euclidean and diagonal Mahalanobis both use feature deltas after the
-        // contract scaler transform: (value - mean) / scale.
-        DistanceMetric::Euclidean | DistanceMetric::Mahalanobis => 1.0 / (1.0 + distance),
-        // GMM payloads do not carry covariance weights in the Python contract,
-        // so Rust uses a deterministic diagonal unit Gaussian similarity.
-        DistanceMetric::GmmProbability => (-0.5 * squared_distance).exp(),
+    let (distance, similarity) = match model.distance_metric {
+        DistanceMetric::Euclidean => {
+            let distance = scaled_squared_distance.sqrt();
+            (distance, 1.0 / (1.0 + distance))
+        }
+        DistanceMetric::Mahalanobis => {
+            let covariance = model
+                .cluster_parameters
+                .covariance
+                .as_ref()
+                .ok_or_else(|| {
+                    AppError::Internal(
+                        "cluster_parameters.covariance is required for mahalanobis".to_string(),
+                    )
+                })?;
+            let distance_squared = mahalanobis_distance_squared(&raw_feature_deltas, covariance)?;
+            let distance = distance_squared.sqrt();
+            (distance, 1.0 / (1.0 + distance))
+        }
+        DistanceMetric::GmmProbability => {
+            let covariance = model
+                .cluster_parameters
+                .mixture_covariance
+                .as_ref()
+                .ok_or_else(|| {
+                    AppError::Internal(
+                        "cluster_parameters.mixture_covariance is required for gmm_probability"
+                            .to_string(),
+                    )
+                })?;
+            let weight = model.cluster_parameters.mixture_weight.ok_or_else(|| {
+                AppError::Internal(
+                    "cluster_parameters.mixture_weight is required for gmm_probability".to_string(),
+                )
+            })?;
+            let distance_squared = mahalanobis_distance_squared(&raw_feature_deltas, covariance)?;
+            let distance = distance_squared.sqrt();
+            // Bounded deterministic GMM score for one exported component:
+            // mixture weight times the full-covariance Gaussian kernel.
+            (distance, weight * (-0.5 * distance_squared).exp())
+        }
     };
     Ok(SimilarityScore {
         distance_metric: model.distance_metric.as_str().to_string(),
@@ -1286,9 +1341,10 @@ mod tests {
         .unwrap()
     }
 
-    fn model_with_metric(metric: &str) -> PatternModelPayload {
+    fn model_with_metric(metric: &str, cluster_parameters: Value) -> PatternModelPayload {
         let mut payload = fixture_payload();
         payload["distance_metric"] = json!(metric);
+        payload["cluster_parameters"] = cluster_parameters;
         PatternModelPayload::from_value(payload).unwrap()
     }
 
@@ -1637,11 +1693,40 @@ mod tests {
             .any(|invalidation| invalidation.reason == "missing_required_feature"));
     }
     #[test]
-    fn mahalanobis_similarity_uses_diagonal_scaled_distance() {
-        let model = model_with_metric("mahalanobis");
+    fn mahalanobis_payload_requires_full_covariance() {
+        let mut payload = fixture_payload();
+        payload["distance_metric"] = json!("mahalanobis");
+        payload["cluster_parameters"] = json!({});
+
+        let error = PatternModelPayload::from_value(payload).unwrap_err();
+
+        assert!(error.to_string().contains("covariance"));
+    }
+
+    #[test]
+    fn mahalanobis_payload_rejects_singular_covariance() {
+        let mut payload = fixture_payload();
+        payload["distance_metric"] = json!("mahalanobis");
+        payload["cluster_parameters"] = json!({
+            "covariance": [[1.0, 1.0], [1.0, 1.0]]
+        });
+
+        let error = PatternModelPayload::from_value(payload).unwrap_err();
+
+        assert!(error.to_string().contains("positive definite"));
+    }
+
+    #[test]
+    fn mahalanobis_similarity_uses_full_covariance() {
+        let model = model_with_metric(
+            "mahalanobis",
+            json!({
+                "covariance": [[0.01, 0.004], [0.004, 0.04]]
+            }),
+        );
         let features = BTreeMap::from([
-            ("return_20d".to_string(), 0.15),
-            ("relative_strength_20d".to_string(), 1.10),
+            ("return_20d".to_string(), 0.25),
+            ("relative_strength_20d".to_string(), 1.20),
         ]);
 
         let SimilarityScore {
@@ -1652,23 +1737,87 @@ mod tests {
         } = similarity(&model, &features).unwrap();
 
         assert_eq!(distance_metric, "mahalanobis");
-        assert_close(distance, 2.236_067_977_499_79);
-        assert_close(similarity, 1.0 / (1.0 + 2.236_067_977_499_79));
+        assert_close(distance, 0.790_569_415_042_094_9);
+        assert_close(similarity, 1.0 / (1.0 + 0.790_569_415_042_094_9));
     }
 
     #[test]
-    fn gmm_probability_similarity_uses_diagonal_gaussian_similarity() {
-        let model = model_with_metric("gmm_probability");
+    fn gmm_probability_payload_requires_full_mixture_parameters() {
+        let mut payload = fixture_payload();
+        payload["distance_metric"] = json!("gmm_probability");
+        payload["cluster_parameters"] = json!({
+            "mixture_covariance": [[1.0, 0.0], [0.0, 1.0]],
+            "mixture_weight": 0.7
+        });
+
+        let error = PatternModelPayload::from_value(payload).unwrap_err();
+
+        assert!(error.to_string().contains("mixture_mean"));
+    }
+
+    #[test]
+    fn gmm_probability_similarity_uses_full_mixture_parameters() {
+        let model = model_with_metric(
+            "gmm_probability",
+            json!({
+                "mixture_mean": {
+                    "return_20d": 0.20,
+                    "relative_strength_20d": 1.20
+                },
+                "mixture_covariance": [[0.01, 0.004], [0.004, 0.04]],
+                "mixture_weight": 0.8
+            }),
+        );
         let features = BTreeMap::from([
-            ("return_20d".to_string(), 0.15),
-            ("relative_strength_20d".to_string(), 1.10),
+            ("return_20d".to_string(), 0.25),
+            ("relative_strength_20d".to_string(), 1.20),
         ]);
 
         let score = similarity(&model, &features).unwrap();
 
         assert_eq!(score.distance_metric, "gmm_probability");
-        assert_close(score.distance, 2.236_067_977_499_79);
-        assert_close(score.similarity, (-0.5_f64 * 5.0_f64).exp());
+        assert_close(score.distance, 0.510_310_363_079_828_8);
+        assert_close(
+            score.similarity,
+            0.8 * (-0.5_f64 * 0.260_416_666_666_666_7_f64).exp(),
+        );
+    }
+
+    #[test]
+    fn gmm_probability_similarity_changes_with_covariance_and_weight() {
+        let mut payload = fixture_payload();
+        payload["distance_metric"] = json!("gmm_probability");
+        payload["cluster_parameters"] = json!({
+            "mixture_mean": {
+                "return_20d": 0.20,
+                "relative_strength_20d": 1.20
+            },
+            "mixture_covariance": [[0.01, 0.004], [0.004, 0.04]],
+            "mixture_weight": 0.8
+        });
+        let base_model = PatternModelPayload::from_value(payload.clone()).unwrap();
+        payload["cluster_parameters"] = json!({
+            "mixture_mean": {
+                "return_20d": 0.20,
+                "relative_strength_20d": 1.20
+            },
+            "mixture_covariance": [[0.04, 0.0], [0.0, 0.04]],
+            "mixture_weight": 0.4
+        });
+        let changed_model = PatternModelPayload::from_value(payload).unwrap();
+        let features = BTreeMap::from([
+            ("return_20d".to_string(), 0.25),
+            ("relative_strength_20d".to_string(), 1.20),
+        ]);
+
+        let base_score = similarity(&base_model, &features).unwrap();
+        let changed_score = similarity(&changed_model, &features).unwrap();
+
+        assert_ne!(base_score.similarity, changed_score.similarity);
+        assert_close(
+            changed_score.similarity,
+            0.4 * (-0.5_f64 * 0.062_5_f64).exp(),
+        );
     }
 
     #[test]

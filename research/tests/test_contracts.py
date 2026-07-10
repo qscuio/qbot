@@ -94,9 +94,131 @@ def test_pattern_model_payload_rejects_missing_required_feature_payload(
             scaler_scale=scaler_scale,
             centroid=centroid,
             distance_metric="euclidean",
+            cluster_parameters={},
             similarity_thresholds={"shadow_a": 0.9},
             necessary_conditions=[{"field": "trend", "operator": "gte", "value": 1.0}],
             risk_conditions=[{"field": "drawdown", "operator": "lte", "value": 0.1}],
+        )
+
+
+def _pattern_model_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "required_features": ["close_strength", "volume_ratio"],
+        "scaler_mean": {"close_strength": 1.5, "volume_ratio": 2.5},
+        "scaler_scale": {"close_strength": 0.4, "volume_ratio": 0.6},
+        "centroid": {"close_strength": 1.1, "volume_ratio": 3.1},
+        "distance_metric": "euclidean",
+        "cluster_parameters": {},
+        "similarity_thresholds": {"shadow_a": 0.9},
+        "necessary_conditions": [{"field": "trend", "operator": "gte", "value": 1.0}],
+        "risk_conditions": [{"field": "drawdown", "operator": "lte", "value": 0.1}],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_pattern_model_payload_accepts_empty_euclidean_cluster_parameters() -> None:
+    model = PatternModelPayload.model_validate(_pattern_model_payload())
+
+    assert model.cluster_parameters.model_dump(exclude_none=True) == {}
+
+
+def test_pattern_model_payload_rejects_missing_mahalanobis_covariance() -> None:
+    with pytest.raises(ValidationError, match="covariance"):
+        PatternModelPayload.model_validate(
+            _pattern_model_payload(distance_metric="mahalanobis", cluster_parameters={})
+        )
+
+
+@pytest.mark.parametrize(
+    "covariance",
+    [
+        [],
+        [[1.0, 0.0]],
+        [[1.0, 0.0], [0.0]],
+        [[1.0, float("nan")], [0.0, 1.0]],
+    ],
+)
+def test_pattern_model_payload_rejects_invalid_mahalanobis_covariance(
+    covariance: list[list[float]],
+) -> None:
+    with pytest.raises(ValidationError, match="covariance"):
+        PatternModelPayload.model_validate(
+            _pattern_model_payload(
+                distance_metric="mahalanobis",
+                cluster_parameters={"covariance": covariance},
+            )
+        )
+
+
+def test_pattern_model_payload_requires_gmm_cluster_parameters() -> None:
+    with pytest.raises(ValidationError, match="mixture_mean"):
+        PatternModelPayload.model_validate(
+            _pattern_model_payload(
+                distance_metric="gmm_probability",
+                cluster_parameters={
+                    "mixture_covariance": [[1.0, 0.0], [0.0, 1.0]],
+                    "mixture_weight": 0.7,
+                },
+            )
+        )
+    with pytest.raises(ValidationError, match="mixture_covariance"):
+        PatternModelPayload.model_validate(
+            _pattern_model_payload(
+                distance_metric="gmm_probability",
+                cluster_parameters={
+                    "mixture_mean": {"close_strength": 1.0, "volume_ratio": 2.0},
+                    "mixture_weight": 0.7,
+                },
+            )
+        )
+    with pytest.raises(ValidationError, match="mixture_weight"):
+        PatternModelPayload.model_validate(
+            _pattern_model_payload(
+                distance_metric="gmm_probability",
+                cluster_parameters={
+                    "mixture_mean": {"close_strength": 1.0, "volume_ratio": 2.0},
+                    "mixture_covariance": [[1.0, 0.0], [0.0, 1.0]],
+                },
+            )
+        )
+
+
+def test_pattern_model_payload_validates_gmm_cluster_parameters() -> None:
+    model = PatternModelPayload.model_validate(
+        _pattern_model_payload(
+            distance_metric="gmm_probability",
+            cluster_parameters={
+                "mixture_mean": {"close_strength": 1.0, "volume_ratio": 2.0},
+                "mixture_covariance": [[1.0, 0.2], [0.2, 1.5]],
+                "mixture_weight": 0.7,
+            },
+        )
+    )
+
+    assert model.cluster_parameters.mixture_weight == 0.7
+
+    with pytest.raises(ValidationError, match="mixture_mean"):
+        PatternModelPayload.model_validate(
+            _pattern_model_payload(
+                distance_metric="gmm_probability",
+                cluster_parameters={
+                    "mixture_mean": {"close_strength": 1.0},
+                    "mixture_covariance": [[1.0, 0.0], [0.0, 1.0]],
+                    "mixture_weight": 0.7,
+                },
+            )
+        )
+    with pytest.raises(ValidationError, match="mixture_weight"):
+        PatternModelPayload.model_validate(
+            _pattern_model_payload(
+                distance_metric="gmm_probability",
+                cluster_parameters={
+                    "mixture_mean": {"close_strength": 1.0, "volume_ratio": 2.0},
+                    "mixture_covariance": [[1.0, 0.0], [0.0, 1.0]],
+                    "mixture_weight": 0.0,
+                },
+            )
         )
 
 
@@ -128,6 +250,7 @@ def _analysis_pattern_version_payload(pattern_version_id: object) -> dict[str, o
             "scaler_scale": {"return_20d": 0.04},
             "centroid": {"return_20d": 0.18},
             "distance_metric": "euclidean",
+            "cluster_parameters": {},
             "similarity_thresholds": {"shadow_a": 0.88},
             "necessary_conditions": [
                 {"column": "return_20d", "operator": ">=", "value": 0.10},

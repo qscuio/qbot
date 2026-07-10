@@ -13,6 +13,7 @@
     "relative_strength_20d": 1.3
   },
   "distance_metric": "euclidean",
+  "cluster_parameters": {},
   "similarity_thresholds": {
     "shadow_a": 0.9,
     "shadow_b": 0.75
