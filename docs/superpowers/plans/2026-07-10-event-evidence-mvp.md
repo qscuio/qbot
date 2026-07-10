@@ -659,7 +659,7 @@ git commit -m "feat: build evidence-backed event claim graphs"
 - Adds manual submission and read endpoints.
 - Keeps event handlers outside the existing large route file.
 
-- [ ] **Step 1: Add endpoints**
+- [x] **Step 1: Add endpoints**
 
 ```text
 POST /api/analysis/events/manual
@@ -669,7 +669,7 @@ POST /api/analysis/events/:id/review
 GET  /api/analysis/events/daily-brief
 ```
 
-- [ ] **Step 2: Implement manual submission response**
+- [x] **Step 2: Implement manual submission response**
 
 ```json
 {
@@ -680,7 +680,7 @@ GET  /api/analysis/events/daily-brief
 }
 ```
 
-- [ ] **Step 3: Add Telegram commands**
+- [x] **Step 3: Add Telegram commands**
 
 ```text
 /event
@@ -692,7 +692,7 @@ GET  /api/analysis/events/daily-brief
 
 Only command parsing remains in `routes.rs`; event business logic stays in `EventIntelligence`.
 
-- [ ] **Step 4: Test auth and validation**
+- [x] **Step 4: Test auth and validation**
 
 Reject:
 
@@ -701,7 +701,7 @@ Reject:
 - unauthorized review action.
 - invalid evidence ID.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 cargo test api::event_routes -- --nocapture
@@ -778,10 +778,10 @@ git commit -m "feat: publish daily evidence-backed market facts"
 
 ## Phase Completion Checklist
 
-- [ ] Manual input works.
+- [x] Manual input works.
 - [x] One official source works through an adapter.
 - [x] Retention policy is enforced.
-- [ ] Evidence versions are immutable.
+- [x] Evidence versions are immutable.
 - [x] Exact and near duplicates are conservative and auditable.
 - [ ] Every published fact has evidence.
 - [x] Direct entity mapping does not guess ambiguous stocks.
