@@ -32,9 +32,19 @@ pub async fn load_scan_ranker_baseline(
     trade_date: NaiveDate,
 ) -> Result<Vec<BaselineCandidate>> {
     let rows: Vec<(String, String, String, String, String, serde_json::Value)> = sqlx::query_as(
-        r#"SELECT code, name, signal_id, signal_name, icon, metadata
+        r#"WITH latest_ranked_pool_run AS (
+               SELECT run_id
+               FROM daily_signal_scan_results
+               WHERE scan_date = $1
+                 AND signal_id IN ($2, $3, $4, $5, $6, $7)
+               GROUP BY run_id
+               ORDER BY MAX(scanned_at) DESC, run_id DESC
+               LIMIT 1
+           )
+           SELECT code, name, signal_id, signal_name, icon, metadata
            FROM daily_signal_scan_results
            WHERE scan_date = $1
+             AND run_id = (SELECT run_id FROM latest_ranked_pool_run)
              AND signal_id IN ($2, $3, $4, $5, $6, $7)
            ORDER BY signal_id ASC, code ASC"#,
     )
@@ -101,7 +111,7 @@ mod tests {
     use crate::services::scan_ranker::{ranked_pool_evidence, POOL_MID_A_ID, POOL_SHORT_A_ID};
     use crate::services::scanner::SignalHit;
     use crate::storage::postgres::{save_daily_signal_scan_results, DailySignalScanRow};
-    use chrono::NaiveDate;
+    use chrono::{NaiveDate, TimeZone, Utc};
     use serde_json::json;
     use sqlx::PgPool;
     use uuid::Uuid;
@@ -223,6 +233,132 @@ mod tests {
         assert_eq!(baseline[1].code, "000001.SZ");
         assert_eq!(baseline[1].base_score, 88.2);
         assert_eq!(baseline[1].horizon, "mid");
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn scan_ranker_adapter_loads_only_latest_archived_ranked_pool_run(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let scan_date = d("2026-03-09");
+        let older_run = Uuid::new_v4();
+        let newer_run = Uuid::new_v4();
+
+        let older_rows = vec![
+            DailySignalScanRow {
+                code: "000001.SZ".to_string(),
+                name: "平安银行".to_string(),
+                signal_id: POOL_MID_A_ID.to_string(),
+                signal_name: "中线A档".to_string(),
+                icon: "📈".to_string(),
+                metadata: ranked_hit(
+                    POOL_MID_A_ID,
+                    "000001.SZ",
+                    "平安银行",
+                    84.0,
+                    &["旧中线候选"],
+                )
+                .metadata,
+            },
+            DailySignalScanRow {
+                code: "300001.SZ".to_string(),
+                name: "特锐德".to_string(),
+                signal_id: POOL_SHORT_A_ID.to_string(),
+                signal_name: "短线A档".to_string(),
+                icon: "🔥".to_string(),
+                metadata: ranked_hit(
+                    POOL_SHORT_A_ID,
+                    "300001.SZ",
+                    "特锐德",
+                    89.5,
+                    &["旧短线候选"],
+                )
+                .metadata,
+            },
+            DailySignalScanRow {
+                code: "600111.SH".to_string(),
+                name: "北方稀土".to_string(),
+                signal_id: POOL_SHORT_A_ID.to_string(),
+                signal_name: "短线A档".to_string(),
+                icon: "🔥".to_string(),
+                metadata: ranked_hit(
+                    POOL_SHORT_A_ID,
+                    "600111.SH",
+                    "北方稀土",
+                    83.4,
+                    &["旧额外候选"],
+                )
+                .metadata,
+            },
+        ];
+        save_daily_signal_scan_results(&pool, scan_date, older_run, &older_rows)
+            .await
+            .unwrap();
+
+        let newer_rows = vec![
+            DailySignalScanRow {
+                code: "000001.SZ".to_string(),
+                name: "平安银行".to_string(),
+                signal_id: POOL_MID_A_ID.to_string(),
+                signal_name: "中线A档".to_string(),
+                icon: "📈".to_string(),
+                metadata: ranked_hit(
+                    POOL_MID_A_ID,
+                    "000001.SZ",
+                    "平安银行",
+                    88.8,
+                    &["新中线候选"],
+                )
+                .metadata,
+            },
+            DailySignalScanRow {
+                code: "600010.SH".to_string(),
+                name: "包钢股份".to_string(),
+                signal_id: POOL_SHORT_A_ID.to_string(),
+                signal_name: "短线A档".to_string(),
+                icon: "🔥".to_string(),
+                metadata: ranked_hit(
+                    POOL_SHORT_A_ID,
+                    "600010.SH",
+                    "包钢股份",
+                    93.1,
+                    &["新短线候选"],
+                )
+                .metadata,
+            },
+        ];
+        save_daily_signal_scan_results(&pool, scan_date, newer_run, &newer_rows)
+            .await
+            .unwrap();
+
+        sqlx::query("UPDATE daily_signal_scan_results SET scanned_at = $1 WHERE run_id = $2")
+            .bind(Utc.with_ymd_and_hms(2026, 3, 9, 9, 30, 0).unwrap())
+            .bind(older_run)
+            .execute(&pool)
+            .await?;
+        sqlx::query("UPDATE daily_signal_scan_results SET scanned_at = $1 WHERE run_id = $2")
+            .bind(Utc.with_ymd_and_hms(2026, 3, 9, 15, 45, 0).unwrap())
+            .bind(newer_run)
+            .execute(&pool)
+            .await?;
+
+        let baseline = load_scan_ranker_baseline(&pool, scan_date).await.unwrap();
+
+        assert_eq!(baseline.len(), 2);
+        assert_eq!(
+            baseline
+                .iter()
+                .map(|candidate| candidate.code.as_str())
+                .collect::<Vec<_>>(),
+            vec!["600010.SH", "000001.SZ"]
+        );
+        assert_eq!(baseline[0].base_score, 93.1);
+        assert_eq!(baseline[1].base_score, 88.8);
+        assert_eq!(baseline[0].reasons, vec!["新短线候选".to_string()]);
+        assert_eq!(baseline[1].reasons, vec!["新中线候选".to_string()]);
+        assert!(baseline
+            .iter()
+            .all(|candidate| { candidate.code != "300001.SZ" && candidate.code != "600111.SH" }));
         Ok(())
     }
 }
