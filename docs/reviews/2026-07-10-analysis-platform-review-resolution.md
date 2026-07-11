@@ -263,7 +263,7 @@ GDELT、两阶段事件聚类、`ImpactHypothesisGraph` 和异常收益验证进
 
 ## 10. 2026-07-11 发布状态
 
-- 当前发布状态：`BLOCKED`。DecisionSupport 保持只读，未获准作为生产交易输入。
+- 当前发布状态：`VERIFIED`。Gate 4 Task 10 的环境阻塞已解除；DecisionSupport 仍保持只读，未获准作为生产交易输入。
 - 已验证的线上约束：
   - `ENABLE_EVENT_SCORE_ADJUSTMENT=false`
   - `MAX_EVENT_SCORE_ADJUSTMENT=0`
@@ -271,9 +271,9 @@ GDELT、两阶段事件聚类、`ImpactHypothesisGraph` 和异常收益验证进
 - Gate 4 Task 10 验证结论：
   - `cargo fmt --all -- --check` 通过。
   - `git diff --check` 通过。
-  - `cargo test --all --locked` 在 shell 未提供 `DATABASE_URL` 时失败；补充默认 `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot` 后通过，说明 Rust 代码路径本身满足当前门槛。
-  - `cd research && python -m pytest -q`、`python -m ruff check .`、`python -m mypy qbot_research` 均因当前环境不存在 `python` 可执行文件而失败。
-  - 对 `deploy/docker-compose.yml` 提供的本地 PostgreSQL 执行 `SELECT COUNT(*) FROM signal_strategy_candidates WHERE signal_metadata ? 'decision_support_run_id';` 时，基础 `qbot` 数据库返回 `relation "signal_strategy_candidates" does not exist`，因此当前环境不能给出目标 `0` 的发布证明。
+  - `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot cargo test --all --locked` 通过，说明 Rust 数据库测试需要在 shell 环境中显式提供 `DATABASE_URL`。
+  - `cd research && . .venv/bin/activate && python -m pytest -q`、`python -m ruff check .`、`python -m mypy qbot_research` 均通过；本地 Python 验证使用仓库自带的 `research/.venv`。
+  - 对 `deploy/docker-compose.yml` 提供的本地 PostgreSQL 执行 `SELECT COUNT(*) FROM signal_strategy_candidates WHERE signal_metadata ? 'decision_support_run_id';` 返回 `0`，已验证 DecisionSupport 产物未写入自动交易候选表。
 
 ## 11. 实施计划
 

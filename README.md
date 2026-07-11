@@ -122,7 +122,7 @@ Copy `.env.example` to `.env` and fill in:
 
 ## Production Release Gates
 
-DecisionSupport is production-read-only. Keep event-score adjustments disabled:
+Gate 4 Task 10 verification passed on 2026-07-11. DecisionSupport remains production-read-only. Keep event-score adjustments disabled:
 
 ```text
 ENABLE_EVENT_SCORE_ADJUSTMENT=false
@@ -130,6 +130,12 @@ MAX_EVENT_SCORE_ADJUSTMENT=0
 ```
 
 DecisionSupport artifacts must not write into `signal_strategy_candidates` or any auto-trading path.
+The release-gate verification query against the Compose PostgreSQL service must return `0` for `signal_metadata ? 'decision_support_run_id'`.
+
+Required local verification environment:
+
+- Rust database-backed tests require `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot` in the shell environment.
+- Python verification commands run from the checked-out `research/.venv`; activate it first with `cd research && . .venv/bin/activate`, then use `python -m ...`.
 
 ## Local Testing
 
