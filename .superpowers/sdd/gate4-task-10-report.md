@@ -50,3 +50,7 @@ Executed through the repo's Docker Compose Postgres service:
 - Required production flags remain:
   - `ENABLE_EVENT_SCORE_ADJUSTMENT=false`
   - `MAX_EVENT_SCORE_ADJUSTMENT=0`
+
+## Follow-up doc fix
+
+- 2026-07-11: README environment and endpoint descriptions were aligned with the Gate 4 Task 9/10 release state. `/api/market/overview` is documented as a DecisionSupport compatibility adapter, and `ENABLE_AI_ANALYSIS` is documented as a legacy compatibility flag that no longer starts the free-form AI loop.

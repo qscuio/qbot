@@ -100,9 +100,9 @@ Copy `.env.example` to `.env` and fill in:
 | `STOCK_ALERT_CHANNEL` | No | Channel ID for signal burst alerts |
 | `DABAN_CHANNEL` | No | Channel ID for daban live/sentiment pushes |
 | `API_KEY` | No | Bearer token for REST API (leave empty = open) |
-| `AI_API_KEY` | No | API key used by AI narrative generation (`/api/market/overview` and AI report loop) |
-| `AI_BASE_URL` | No | Chat Completions base URL (default `https://api.openai.com/v1`) |
-| `AI_MODEL` | No | AI model name for narrative generation (default `gpt-4o-mini`) |
+| `AI_API_KEY` | No | Optional key for the LLM event extractor; the production market overview endpoint now serves DecisionSupport compatibility data and does not require an LLM call |
+| `AI_BASE_URL` | No | Chat Completions base URL for the LLM event extractor (default `https://api.openai.com/v1`) |
+| `AI_MODEL` | No | Model name for the LLM event extractor (default `gpt-4o-mini`) |
 | `DATA_PROXY` | No | HTTP/SOCKS5 proxy for Tushare/Sina (e.g. `socks5://127.0.0.1:1080`) |
 | `OFFICIAL_EVENT_FEED_URL` | No | Official market-event feed URL used by the hourly event ingestion job |
 | `OFFICIAL_EVENT_FEED_API_KEY` | No | Optional API key sent as `x-api-key` to the official event feed |
@@ -112,7 +112,7 @@ Copy `.env.example` to `.env` and fill in:
 | `REDIS_URL` | Yes | Redis URL (default: `redis://127.0.0.1:6379`) |
 | `API_PORT` | No | REST API port (default: `8080`) |
 | `ENABLE_DABAN_LIVE` | No | Enable intraday daban live loop (`true`/`false`, default `false`) |
-| `ENABLE_AI_ANALYSIS` | No | Enable scheduled AI market analysis push (`true`/`false`, default `false`) |
+| `ENABLE_AI_ANALYSIS` | No | Legacy compatibility flag; no longer starts the free-form AI analysis loop (`true`/`false`, default `false`) |
 | `ENABLE_CHIP_DIST` | No | Enable scheduled chip-distribution refresh (`true`/`false`, default `true`) |
 | `ENABLE_EVENT_SCORE_ADJUSTMENT` | No | Enable bounded event-score adjustments inside DecisionSupport (`true`/`false`, default `false`) |
 | `MAX_EVENT_SCORE_ADJUSTMENT` | No | Maximum absolute DecisionSupport event-score adjustment (default `0`, hard-capped at `5`) |
@@ -246,12 +246,12 @@ Push to `main` triggers `.github/workflows/deploy.yml`, which:
 | `DABAN_CHANNEL` | No | Telegram channel ID for daban notifications |
 | `ENABLE_SIGNAL_AUTO_TRADING` | No | Set to `true` to run the signal-based auto paper-trading loop |
 | `ENABLE_DABAN_LIVE` | No | Set to `true` to run intraday daban live loop |
-| `ENABLE_AI_ANALYSIS` | No | Set to `true` to run daily AI market overview push |
+| `ENABLE_AI_ANALYSIS` | No | Legacy compatibility flag only; no longer starts the daily AI market overview loop |
 | `ENABLE_CHIP_DIST` | No | Set to `true` to run daily chip distribution refresh |
 | `API_KEY` | No | REST API bearer token |
-| `AI_API_KEY` | No | Optional key for AI narrative analysis features |
-| `AI_BASE_URL` | No | Optional override for AI API base URL (default OpenAI v1) |
-| `AI_MODEL` | No | Optional override for AI narrative model |
+| `AI_API_KEY` | No | Optional key for the LLM event extractor; not used by the production market overview endpoint |
+| `AI_BASE_URL` | No | Optional override for the LLM event extractor API base URL (default OpenAI v1) |
+| `AI_MODEL` | No | Optional override for the LLM event extractor model |
 | `DATA_PROXY` | No | Optional HTTP/SOCKS proxy URL |
 
 ### VPS First-Run Setup
@@ -413,7 +413,7 @@ curl -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
 | GET | `/api/report/limitup` | Yes | Latest standalone limit-up report from DB |
 | GET | `/api/report/strong` | Yes | Latest standalone strong-stock report from DB |
 | GET | `/api/signal-auto/accounts` | Yes | Per-signal strategy account snapshots |
-| GET | `/api/market/overview` | Yes | Market overview with sector breadth, top stock trend, and report text |
+| GET | `/api/market/overview` | Yes | Market overview served from DecisionSupport compatibility data, including sector breadth, top stock trend, and report text |
 | GET | `/api/chart/data/{code}` | Yes | OHLCV chart data (`days`, `period=daily|weekly|monthly`) |
 | GET | `/api/chart/chips/{code}` | Yes | Chip distribution data (`date=YYYY-MM-DD` optional) |
 | GET | `/api/chart/search` | Yes | Search stocks (`q`, optional `limit`) |
