@@ -77,3 +77,5 @@ Gate 3 Task 6: complete (commits cce5739..4f735dc, review clean; verification: a
 Gate 3 Task 7: complete (commits aee0b23..7b4a02a, review clean; verification: analysis::events::event_statistics 3/3 passed, fmt check passed, diff check passed)
 
 Gate 3 Task 8: complete (commits e3bbee6..f1f5e6d, review clean; verification: reporting 5/5, scheduler 16/16, event_routes 16/16 passed with DATABASE_URL, fmt check passed, diff check passed)
+
+Gate 3 phase review: complete (commits ada917a..df8f73c, phase review clean after persisted read path, GDELT ingestion, scheduled clustering/observation, supplementary fact autopublish, and atomic cluster+mention persistence fixes; verification: analysis::events 122/122 passed, scheduler::tests 24/24 passed, repository transactional regression passed, fmt check passed, diff check passed)

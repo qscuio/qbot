@@ -192,9 +192,9 @@ Database integration tests require a valid `DATABASE_URL` or SQLx test database 
 - Consumes Gate 2 evidence and Gate 0 market snapshots.
 - Produces frozen hypotheses, event deltas, and market observations.
 
-- [ ] Execute every checkbox in the linked plan.
-- [ ] Confirm market alignment never mutates frozen hypotheses.
-- [ ] Confirm causal confidence remains separate from market alignment.
+- [x] Execute every checkbox in the linked plan.
+- [x] Confirm market alignment never mutates frozen hypotheses.
+- [x] Confirm causal confidence remains separate from market alignment.
 
 ### Task 5: Complete Gate 4
 
