@@ -93,3 +93,5 @@ Gate 4 Task 5: complete (commits 26197da..6c7aa85, review clean; verification: e
 Gate 4 Task 6: complete (commits eae4c87..0ee87b0, review clean; verification: decision_support::builder 10/10 passed with DATABASE_URL, fmt check passed, diff check passed)
 
 Gate 4 Task 7: complete (commits 534e8ba..05a28a1, review clean after atomic persistence and duplicate-path fixes; verification: api::decision_support_routes 6/6 passed with DATABASE_URL, storage::decision_support_repository 4/4 passed with DATABASE_URL, builder atomic rollback regression 1/1 passed with DATABASE_URL, fmt check passed, diff check passed)
+
+Gate 4 Task 8: complete (commits 87861c0..e18db95, review clean after latest-pattern-set scoping fix; verification: scheduler::tests 31/31 passed with DATABASE_URL, storage::pattern_repository 12/12 passed with DATABASE_URL, fmt check passed, diff check passed)

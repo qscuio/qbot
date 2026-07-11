@@ -504,19 +504,19 @@ git commit -m "feat: expose read-only decision support"
 - Builds after pattern and event jobs.
 - Failure does not affect existing reports.
 
-- [ ] **Step 1: Add job**
+- [x] **Step 1: Add job**
 
 ```rust
 pub async fn run_decision_support_job(state: Arc<AppState>);
 ```
 
-- [ ] **Step 2: Add schedule**
+- [x] **Step 2: Add schedule**
 
 ```rust
 const DECISION_SUPPORT_JOB_CRON: &str = "0 55 17 * * Mon,Tue,Wed,Thu,Fri";
 ```
 
-- [ ] **Step 3: Add degradation behavior**
+- [x] **Step 3: Add degradation behavior**
 
 If pattern results are missing:
 
@@ -533,7 +533,7 @@ If market snapshot is incomplete:
 - build a data-status report.
 - do not assign A.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ```bash
 cargo test scheduler::tests
