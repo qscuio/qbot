@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use serde::Deserialize;
+
 use crate::data::types::Candle;
 use crate::services::scanner::SignalHit;
 use crate::signals::base::sma;
@@ -19,6 +21,40 @@ pub const RANKED_POOL_IDS: [&str; 6] = [
     POOL_LONG_A_ID,
     POOL_LONG_B_ID,
 ];
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RankedPoolEvidence {
+    pub pool_id: String,
+    pub line_type: String,
+    pub tier: String,
+    pub trigger_id: String,
+    pub trigger_name: String,
+    pub score: f64,
+    pub reasons: Vec<String>,
+    pub risk_flags: Vec<String>,
+    pub factor_breakdown: Vec<(String, f64)>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RankedPoolEvidencePayload {
+    line_type: String,
+    tier: String,
+    trigger_id: String,
+    trigger_name: String,
+    score: f64,
+    #[serde(default)]
+    reasons: Vec<String>,
+    #[serde(default)]
+    risk_flags: Vec<String>,
+    #[serde(default)]
+    factor_breakdown: Vec<RankedPoolFactorPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RankedPoolFactorPayload {
+    name: String,
+    score: f64,
+}
 
 #[derive(Debug, Clone)]
 pub struct RankInput {
@@ -148,6 +184,30 @@ pub fn rank_scan_inputs(inputs: &[RankInput]) -> HashMap<String, Vec<SignalHit>>
     }
 
     buckets
+}
+
+pub fn ranked_pool_evidence(hit: &SignalHit) -> Option<RankedPoolEvidence> {
+    if !RANKED_POOL_IDS.contains(&hit.signal_id.as_str()) {
+        return None;
+    }
+
+    let payload: RankedPoolEvidencePayload = serde_json::from_value(hit.metadata.clone()).ok()?;
+
+    Some(RankedPoolEvidence {
+        pool_id: hit.signal_id.clone(),
+        line_type: payload.line_type,
+        tier: payload.tier,
+        trigger_id: payload.trigger_id,
+        trigger_name: payload.trigger_name,
+        score: payload.score,
+        reasons: payload.reasons,
+        risk_flags: payload.risk_flags,
+        factor_breakdown: payload
+            .factor_breakdown
+            .into_iter()
+            .map(|factor| (factor.name, factor.score))
+            .collect(),
+    })
 }
 
 impl RankedCandidate {
