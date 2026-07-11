@@ -524,6 +524,9 @@ mod tests {
             official_event_feed_api_key: Some("secret".to_string()),
             official_event_source_id: "official:market_event".to_string(),
             official_event_store_full_content: true,
+            enable_gdelt_events: false,
+            gdelt_event_query: String::new(),
+            gdelt_max_records: 250,
         }
     }
 

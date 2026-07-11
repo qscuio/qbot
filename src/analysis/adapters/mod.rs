@@ -4,6 +4,7 @@ use serde_json::Value;
 
 use crate::error::Result;
 
+pub mod gdelt;
 pub mod llm_event_extractor;
 pub mod official_event_source;
 

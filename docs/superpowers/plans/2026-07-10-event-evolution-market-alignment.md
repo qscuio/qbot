@@ -262,7 +262,7 @@ git commit -m "feat: cluster evolving market events"
 - Marks all rows as macro/geopolitical supplementary evidence.
 - Does not create company facts without another source.
 
-- [ ] **Step 1: Add configuration**
+- [x] **Step 1: Add configuration**
 
 ```text
 ENABLE_GDELT_EVENTS=false
@@ -270,7 +270,7 @@ GDELT_EVENT_QUERY=
 GDELT_MAX_RECORDS=250
 ```
 
-- [ ] **Step 2: Parse a fixture**
+- [x] **Step 2: Parse a fixture**
 
 Map:
 
@@ -286,7 +286,7 @@ organizations
 raw_payload
 ```
 
-- [ ] **Step 3: Enforce source role**
+- [x] **Step 3: Enforce source role**
 
 Set metadata:
 
@@ -297,11 +297,11 @@ Set metadata:
 }
 ```
 
-- [ ] **Step 4: Add cursor and idempotency tests**
+- [x] **Step 4: Add cursor and idempotency tests**
 
 Repeated fetches must not duplicate evidence.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 cargo test analysis::adapters::gdelt
@@ -611,7 +611,7 @@ git commit -m "feat: report evolving events and market alignment"
 
 ## Phase Completion Checklist
 
-- [ ] GDELT is supplementary and idempotent.
+- [x] GDELT is supplementary and idempotent.
 - [ ] EventMention and EventCluster are versioned.
 - [ ] Two-stage clustering respects manual locks.
 - [ ] EventDelta highlights new information.

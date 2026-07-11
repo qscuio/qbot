@@ -33,6 +33,11 @@ pub struct Config {
     pub official_event_source_id: String,
     pub official_event_store_full_content: bool,
 
+    // GDELT supplementary event source
+    pub enable_gdelt_events: bool,
+    pub gdelt_event_query: String,
+    pub gdelt_max_records: usize,
+
     // Feature flags
     pub enable_burst_monitor: bool,
     pub enable_daban_live: bool,
@@ -75,6 +80,14 @@ impl Config {
             official_event_store_full_content: std::env::var("OFFICIAL_EVENT_STORE_FULL_CONTENT")
                 .unwrap_or_else(|_| "false".to_string())
                 == "true",
+            enable_gdelt_events: std::env::var("ENABLE_GDELT_EVENTS")
+                .unwrap_or_else(|_| "false".to_string())
+                == "true",
+            gdelt_event_query: std::env::var("GDELT_EVENT_QUERY").unwrap_or_default(),
+            gdelt_max_records: std::env::var("GDELT_MAX_RECORDS")
+                .unwrap_or_else(|_| "250".to_string())
+                .parse()
+                .context("GDELT_MAX_RECORDS must be a positive integer")?,
             enable_burst_monitor: std::env::var("ENABLE_BURST_MONITOR")
                 .unwrap_or_else(|_| "true".to_string())
                 == "true",
@@ -159,6 +172,9 @@ mod tests {
             "OFFICIAL_EVENT_FEED_API_KEY",
             "OFFICIAL_EVENT_SOURCE_ID",
             "OFFICIAL_EVENT_STORE_FULL_CONTENT",
+            "ENABLE_GDELT_EVENTS",
+            "GDELT_EVENT_QUERY",
+            "GDELT_MAX_RECORDS",
         ]);
 
         // Only TUSHARE_TOKEN and TELEGRAM_BOT_TOKEN are required
@@ -171,6 +187,9 @@ mod tests {
         env.remove_var("OFFICIAL_EVENT_FEED_API_KEY");
         env.remove_var("OFFICIAL_EVENT_SOURCE_ID");
         env.remove_var("OFFICIAL_EVENT_STORE_FULL_CONTENT");
+        env.remove_var("ENABLE_GDELT_EVENTS");
+        env.remove_var("GDELT_EVENT_QUERY");
+        env.remove_var("GDELT_MAX_RECORDS");
 
         let cfg = Config::from_env().unwrap();
         assert_eq!(cfg.tushare_token, "test_token");
@@ -181,6 +200,9 @@ mod tests {
         assert_eq!(cfg.official_event_feed_api_key, None);
         assert_eq!(cfg.official_event_source_id, "official:market_event");
         assert!(!cfg.official_event_store_full_content);
+        assert!(!cfg.enable_gdelt_events);
+        assert!(cfg.gdelt_event_query.is_empty());
+        assert_eq!(cfg.gdelt_max_records, 250);
     }
 
     #[test]
@@ -203,5 +225,27 @@ mod tests {
             Some("https://example.test/feed")
         );
         assert_eq!(cfg.official_event_feed_api_key, None);
+    }
+
+    #[test]
+    fn test_config_reads_gdelt_settings() {
+        let env = ScopedEnvGuard::lock(&[
+            "TUSHARE_TOKEN",
+            "TELEGRAM_BOT_TOKEN",
+            "ENABLE_GDELT_EVENTS",
+            "GDELT_EVENT_QUERY",
+            "GDELT_MAX_RECORDS",
+        ]);
+        env.set_var("TUSHARE_TOKEN", "test_token");
+        env.set_var("TELEGRAM_BOT_TOKEN", "123:abc");
+        env.set_var("ENABLE_GDELT_EVENTS", "true");
+        env.set_var("GDELT_EVENT_QUERY", "red sea shipping");
+        env.set_var("GDELT_MAX_RECORDS", "25");
+
+        let cfg = Config::from_env().unwrap();
+
+        assert!(cfg.enable_gdelt_events);
+        assert_eq!(cfg.gdelt_event_query, "red sea shipping");
+        assert_eq!(cfg.gdelt_max_records, 25);
     }
 }
