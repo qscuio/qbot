@@ -92,6 +92,8 @@ async fn main() -> Result<()> {
         ("event_detail", "查看事件详情"),
         ("event_review", "复核发布事件"),
         ("market_facts", "查看市场事实简报"),
+        ("decision", "查看决策支持日报"),
+        ("decision_detail", "查看决策支持详情"),
         ("limitup", "涨停追踪概览"),
         ("strong", "近期强势股"),
         ("startup", "启动追踪"),

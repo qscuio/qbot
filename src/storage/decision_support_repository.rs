@@ -148,6 +148,61 @@ impl DecisionSupportRepository {
         Ok(row.map(|row| map_run_row(&row)))
     }
 
+    pub async fn find_run(&self, run_id: Uuid) -> Result<Option<DecisionSupportRunRow>> {
+        let row = sqlx::query(
+            r#"SELECT run_id,
+                      trade_date,
+                      support_version,
+                      market_snapshot_version,
+                      pattern_set_id,
+                      event_brief_version,
+                      event_score_enabled,
+                      event_score_limit::float8 AS event_score_limit,
+                      status,
+                      input_fingerprint,
+                      started_at,
+                      completed_at,
+                      error_message
+               FROM analysis_decision_support_runs
+               WHERE run_id = $1"#,
+        )
+        .bind(run_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|row| map_run_row(&row)))
+    }
+
+    pub async fn find_run_by_trade_date(
+        &self,
+        trade_date: NaiveDate,
+    ) -> Result<Option<DecisionSupportRunRow>> {
+        let row = sqlx::query(
+            r#"SELECT run_id,
+                      trade_date,
+                      support_version,
+                      market_snapshot_version,
+                      pattern_set_id,
+                      event_brief_version,
+                      event_score_enabled,
+                      event_score_limit::float8 AS event_score_limit,
+                      status,
+                      input_fingerprint,
+                      started_at,
+                      completed_at,
+                      error_message
+               FROM analysis_decision_support_runs
+               WHERE trade_date = $1
+               ORDER BY started_at DESC, run_id DESC
+               LIMIT 1"#,
+        )
+        .bind(trade_date)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|row| map_run_row(&row)))
+    }
+
     pub async fn list_candidates(&self, run_id: Uuid) -> Result<Vec<DecisionCandidateRow>> {
         let rows = sqlx::query(
             r#"SELECT run_id,
@@ -181,6 +236,29 @@ impl DecisionSupportRepository {
             .into_iter()
             .map(|row| map_candidate_row(&row))
             .collect())
+    }
+
+    pub async fn find_brief(&self, run_id: Uuid) -> Result<Option<DecisionBriefRow>> {
+        let row = sqlx::query(
+            r#"SELECT run_id,
+                      trade_date,
+                      content,
+                      structured_payload,
+                      created_at
+               FROM analysis_decision_daily_briefs
+               WHERE run_id = $1"#,
+        )
+        .bind(run_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|row| DecisionBriefRow {
+            run_id: row.get("run_id"),
+            trade_date: row.get("trade_date"),
+            content: row.get("content"),
+            structured_payload: row.get("structured_payload"),
+            created_at: row.get("created_at"),
+        }))
     }
 }
 

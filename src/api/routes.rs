@@ -384,6 +384,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .with_state(state.clone())
         .merge(crate::api::analysis_routes::analysis_router(state.clone()))
+        .merge(crate::api::decision_support_routes::decision_support_router(state.clone()))
         .merge(crate::api::event_routes::event_router(state.clone()))
         .merge(crate::api::pattern_routes::pattern_router(state.clone()))
 }
@@ -511,6 +512,8 @@ fn telegram_help_text() -> String {
         "/event_detail <code>&lt;事件ID&gt;</code>",
         "/event_review <code>&lt;事件ID&gt;</code>",
         "/market_facts",
+        "/decision",
+        "/decision_detail <code>&lt;code&gt;</code>",
         "",
         "<b>Limit-Up</b>",
         "/limitup        涨停追踪概览",
@@ -3209,6 +3212,18 @@ async fn handle_telegram_command(
         }
         "market_facts" => {
             crate::api::event_routes::handle_telegram_market_facts(state.clone(), chat_id).await?;
+        }
+        "decision" => {
+            crate::api::decision_support_routes::handle_telegram_decision(state.clone(), chat_id)
+                .await?;
+        }
+        "decision_detail" => {
+            crate::api::decision_support_routes::handle_telegram_decision_detail(
+                state.clone(),
+                chat_id,
+                &args,
+            )
+            .await?;
         }
         "watch" => {
             let code = args.split_whitespace().next().unwrap_or_default();

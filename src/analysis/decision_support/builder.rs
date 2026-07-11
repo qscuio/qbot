@@ -16,6 +16,7 @@ use crate::error::AppError;
 use crate::error::Result;
 use crate::storage::decision_support_repository::DecisionSupportRepository;
 use crate::storage::decision_support_repository::DecisionSupportRunRow;
+use crate::storage::decision_support_repository::{DecisionBriefRow, DecisionCandidateRow};
 use crate::storage::event_repository::DailyEventBriefRow;
 use crate::storage::event_repository::EventRepository;
 use crate::storage::market_repository::DataStatusSnapshot;
@@ -90,14 +91,18 @@ impl DecisionSupport {
         let candidates =
             apply_event_score_adjustments(candidates, &config, data_status.data_complete);
         let run_id = if config.persist_run {
-            self.persist_run(
-                trade_date,
-                &config,
-                &snapshot.input_fingerprint,
-                pattern_set.as_ref(),
-                event_brief_row.as_ref(),
-            )
-            .await?
+            let run_id = self
+                .persist_run(
+                    trade_date,
+                    &config,
+                    &snapshot.input_fingerprint,
+                    pattern_set.as_ref(),
+                    event_brief_row.as_ref(),
+                )
+                .await?;
+            self.persist_artifacts(run_id, trade_date, &candidates, event_summary.as_ref())
+                .await?;
+            run_id
         } else {
             Uuid::new_v4()
         };
@@ -155,6 +160,31 @@ impl DecisionSupport {
                 error_message: None,
             })
             .await
+    }
+
+    async fn persist_artifacts(
+        &self,
+        run_id: Uuid,
+        trade_date: NaiveDate,
+        candidates: &[DecisionCandidate],
+        event_summary: Option<&DailyEventBrief>,
+    ) -> Result<()> {
+        let created_at = Utc::now();
+        let candidate_rows = candidates
+            .iter()
+            .map(|candidate| decision_candidate_row(run_id, candidate, created_at))
+            .collect::<Result<Vec<_>>>()?;
+        self.decision_repo.save_candidates(&candidate_rows).await?;
+        self.decision_repo
+            .save_brief(&DecisionBriefRow {
+                run_id,
+                trade_date,
+                content: decision_brief_content(trade_date, candidates, event_summary),
+                structured_payload: decision_brief_payload(trade_date, candidates, event_summary),
+                created_at,
+            })
+            .await?;
+        Ok(())
     }
 }
 
@@ -334,6 +364,121 @@ fn capped_event_adjustment(raw_adjustment: f64, cap: f64, total_adjustment: f64)
     let max_increase = cap - total_adjustment;
     let max_decrease = -cap - total_adjustment;
     raw_adjustment.clamp(max_decrease, max_increase)
+}
+
+fn decision_candidate_row(
+    run_id: Uuid,
+    candidate: &DecisionCandidate,
+    created_at: chrono::DateTime<Utc>,
+) -> Result<DecisionCandidateRow> {
+    Ok(DecisionCandidateRow {
+        run_id,
+        code: candidate.code.clone(),
+        name: candidate.name.clone(),
+        horizon: candidate.horizon.clone(),
+        base_source: candidate.base_source.clone(),
+        base_score: candidate.base_score,
+        pattern_score: candidate.pattern_score,
+        event_adjustment: Some(candidate.event_adjustment),
+        risk_adjustment: Some(candidate.risk_adjustment),
+        final_score: candidate.final_score,
+        support_tier: candidate.support_tier.clone(),
+        facts: serde_json::to_value(&candidate.facts)?,
+        calculations: serde_json::to_value(&candidate.calculations)?,
+        inferences: serde_json::to_value(&candidate.inferences)?,
+        unknowns: serde_json::to_value(&candidate.unknowns)?,
+        risk_flags: serde_json::to_value(&candidate.risk_flags)?,
+        invalidations: serde_json::to_value(&candidate.invalidations)?,
+        source_refs: serde_json::to_value(candidate_source_refs(candidate))?,
+        created_at,
+    })
+}
+
+fn candidate_source_refs(candidate: &DecisionCandidate) -> Vec<String> {
+    let mut refs = Vec::new();
+    for statement in candidate
+        .facts
+        .iter()
+        .chain(candidate.calculations.iter())
+        .chain(candidate.inferences.iter())
+        .chain(candidate.unknowns.iter())
+    {
+        for source_ref in &statement.source_refs {
+            if !refs.iter().any(|existing| existing == source_ref) {
+                refs.push(source_ref.clone());
+            }
+        }
+    }
+    refs
+}
+
+fn decision_brief_content(
+    trade_date: NaiveDate,
+    candidates: &[DecisionCandidate],
+    event_summary: Option<&DailyEventBrief>,
+) -> String {
+    let top_candidates = candidates
+        .iter()
+        .take(3)
+        .map(|candidate| {
+            format!(
+                "{} {} {:.2}",
+                candidate.code, candidate.horizon, candidate.final_score
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let event_counts = event_summary
+        .map(|summary| {
+            format!(
+                "facts={} revisions={} unconfirmed={}",
+                summary.new_facts.len(),
+                summary.revisions.len(),
+                summary.unconfirmed.len()
+            )
+        })
+        .unwrap_or_else(|| "facts=0 revisions=0 unconfirmed=0".to_string());
+
+    if top_candidates.is_empty() {
+        format!(
+            "DecisionSupport {} persisted with 0 candidates; event summary {}",
+            trade_date, event_counts
+        )
+    } else {
+        format!(
+            "DecisionSupport {} persisted with {} candidates; top: {}; event summary {}",
+            trade_date,
+            candidates.len(),
+            top_candidates.join(", "),
+            event_counts
+        )
+    }
+}
+
+fn decision_brief_payload(
+    trade_date: NaiveDate,
+    candidates: &[DecisionCandidate],
+    event_summary: Option<&DailyEventBrief>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "tradeDate": trade_date,
+        "candidateCount": candidates.len(),
+        "topCandidates": candidates.iter().take(5).map(|candidate| serde_json::json!({
+            "code": candidate.code,
+            "name": candidate.name,
+            "horizon": candidate.horizon,
+            "supportTier": candidate.support_tier,
+            "finalScore": candidate.final_score,
+        })).collect::<Vec<_>>(),
+        "eventSummary": event_summary.map(|summary| serde_json::json!({
+            "newFactCount": summary.new_facts.len(),
+            "revisionCount": summary.revisions.len(),
+            "unconfirmedCount": summary.unconfirmed.len(),
+            "directEntityCount": summary.direct_entities.len(),
+            "sourceCount": summary.sources.len(),
+            "inputFingerprint": summary.input_fingerprint,
+        })),
+    })
 }
 
 #[cfg(test)]
