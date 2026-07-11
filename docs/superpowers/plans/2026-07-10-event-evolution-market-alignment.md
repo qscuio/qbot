@@ -428,7 +428,7 @@ Hypothesis output may name:
 
 It may not generate indirect stock codes.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 cargo test analysis::events::hypotheses
@@ -615,9 +615,9 @@ git commit -m "feat: report evolving events and market alignment"
 - [ ] EventMention and EventCluster are versioned.
 - [ ] Two-stage clustering respects manual locks.
 - [x] EventDelta highlights new information.
-- [ ] Hypotheses freeze before market observation.
+- [x] Hypotheses freeze before market observation.
 - [ ] Market alignment and causal confidence are separate.
 - [ ] Confounded windows are explicit.
 - [ ] Event-type baselines are point-in-time safe.
 - [ ] Event score remains zero.
-- [ ] No indirect beneficiary stock list is generated.
+- [x] No indirect beneficiary stock list is generated.
