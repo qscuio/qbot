@@ -79,6 +79,8 @@ impl DecisionSupport {
             &self.market_repo,
         )
         .await?;
+        let candidates =
+            apply_missing_pattern_status(candidates, trade_date, pattern_set.is_some());
         let data_status = data_status_from_snapshot(
             trade_date,
             &config.market_snapshot_version,
@@ -88,8 +90,10 @@ impl DecisionSupport {
             snapshot.data_complete,
             &snapshot.missing_inputs,
         );
-        let candidates =
-            apply_event_score_adjustments(candidates, &config, data_status.data_complete);
+        let candidates = apply_data_status_constraints(
+            apply_event_score_adjustments(candidates, &config, data_status.data_complete),
+            &data_status,
+        );
         let run_id = if config.persist_run {
             self.persist_run_with_artifacts(
                 trade_date,
@@ -99,6 +103,7 @@ impl DecisionSupport {
                 event_brief_row.as_ref(),
                 &candidates,
                 event_summary.as_ref(),
+                &data_status,
             )
             .await?
         } else {
@@ -132,6 +137,7 @@ impl DecisionSupport {
         event_brief_row: Option<&DailyEventBriefRow>,
         candidates: &[DecisionCandidate],
         event_summary: Option<&DailyEventBrief>,
+        data_status: &DataStatus,
     ) -> Result<Uuid> {
         let started_at = Utc::now();
         let run_id = Uuid::new_v4();
@@ -149,8 +155,13 @@ impl DecisionSupport {
         let brief = DecisionBriefRow {
             run_id,
             trade_date,
-            content: decision_brief_content(trade_date, candidates, event_summary),
-            structured_payload: decision_brief_payload(trade_date, candidates, event_summary),
+            content: decision_brief_content(trade_date, candidates, event_summary, data_status),
+            structured_payload: decision_brief_payload(
+                trade_date,
+                candidates,
+                event_summary,
+                data_status,
+            ),
             created_at: started_at,
         };
 
@@ -309,6 +320,63 @@ fn apply_event_score_adjustments(
     candidates
 }
 
+fn apply_missing_pattern_status(
+    mut candidates: Vec<DecisionCandidate>,
+    trade_date: NaiveDate,
+    has_published_pattern_set: bool,
+) -> Vec<DecisionCandidate> {
+    if !has_published_pattern_set
+        || candidates
+            .iter()
+            .all(|candidate| candidate.pattern_score.is_none())
+    {
+        let message = format!(
+            "pattern shadow results missing for {trade_date}; using scan-ranker baseline only"
+        );
+        for candidate in &mut candidates {
+            candidate
+                .unknowns
+                .push(SupportStatement::missing_status(message.clone()));
+        }
+    }
+
+    candidates
+}
+
+fn apply_data_status_constraints(
+    mut candidates: Vec<DecisionCandidate>,
+    data_status: &DataStatus,
+) -> Vec<DecisionCandidate> {
+    if data_status.data_complete {
+        return candidates;
+    }
+
+    let mut missing_summary = data_status.missing_inputs.clone();
+    missing_summary.sort();
+    let missing_summary = if missing_summary.is_empty() {
+        "market snapshot incomplete".to_string()
+    } else {
+        format!(
+            "market snapshot incomplete; missing inputs: {}",
+            missing_summary.join(", ")
+        )
+    };
+
+    for candidate in &mut candidates {
+        candidate
+            .unknowns
+            .push(SupportStatement::missing_status(missing_summary.clone()));
+        if candidate.support_tier == "A" {
+            candidate.support_tier = "watch".to_string();
+            candidate.unknowns.push(SupportStatement::missing_status(
+                "A-tier withheld until market snapshot inputs are complete",
+            ));
+        }
+    }
+
+    candidates
+}
+
 fn raw_event_adjustment(market_alignment: Option<f64>, causal_confidence: Option<f64>) -> f64 {
     market_alignment.unwrap_or(0.0) * causal_confidence.unwrap_or(0.0) * 10.0
 }
@@ -408,6 +476,7 @@ fn decision_brief_content(
     trade_date: NaiveDate,
     candidates: &[DecisionCandidate],
     event_summary: Option<&DailyEventBrief>,
+    data_status: &DataStatus,
 ) -> String {
     let top_candidates = candidates
         .iter()
@@ -430,19 +499,28 @@ fn decision_brief_content(
             )
         })
         .unwrap_or_else(|| "facts=0 revisions=0 unconfirmed=0".to_string());
+    let data_summary = if data_status.data_complete {
+        "data_status=complete".to_string()
+    } else {
+        format!(
+            "data_status=incomplete missing_inputs={}",
+            data_status.missing_inputs.len()
+        )
+    };
 
     if top_candidates.is_empty() {
         format!(
-            "DecisionSupport {} persisted with 0 candidates; event summary {}",
-            trade_date, event_counts
+            "DecisionSupport {} persisted with 0 candidates; event summary {}; {}",
+            trade_date, event_counts, data_summary
         )
     } else {
         format!(
-            "DecisionSupport {} persisted with {} candidates; top: {}; event summary {}",
+            "DecisionSupport {} persisted with {} candidates; top: {}; event summary {}; {}",
             trade_date,
             candidates.len(),
             top_candidates.join(", "),
-            event_counts
+            event_counts,
+            data_summary
         )
     }
 }
@@ -451,6 +529,7 @@ fn decision_brief_payload(
     trade_date: NaiveDate,
     candidates: &[DecisionCandidate],
     event_summary: Option<&DailyEventBrief>,
+    data_status: &DataStatus,
 ) -> serde_json::Value {
     serde_json::json!({
         "tradeDate": trade_date,
@@ -470,6 +549,15 @@ fn decision_brief_payload(
             "sourceCount": summary.sources.len(),
             "inputFingerprint": summary.input_fingerprint,
         })),
+        "dataStatus": {
+            "requestedTradeDate": data_status.requested_trade_date,
+            "latestTradeDate": data_status.latest_trade_date,
+            "snapshotVersion": data_status.snapshot_version,
+            "availableAt": data_status.available_at,
+            "dataComplete": data_status.data_complete,
+            "missingInputs": data_status.missing_inputs,
+            "inputFingerprint": data_status.input_fingerprint,
+        },
     })
 }
 

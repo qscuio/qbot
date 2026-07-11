@@ -10,6 +10,7 @@ use uuid::Uuid;
 use crate::analysis::adapters::gdelt::GdeltEventSource;
 use crate::analysis::adapters::official_event_source::OfficialEventSource;
 use crate::analysis::adapters::{EventSource, FetchedEvent};
+use crate::analysis::decision_support::{DecisionSupport, DecisionSupportConfig};
 use crate::analysis::events::claims::ClaimGraph;
 use crate::analysis::events::extraction::{EventExtractionV1, StockCodeDirectory};
 use crate::analysis::events::market_observation::{
@@ -57,6 +58,7 @@ const EVENT_INGESTION_JOB_CRON: &str = "0 5 9-17 * * Mon,Tue,Wed,Thu,Fri";
 const EVENT_FACT_BRIEF_JOB_CRON: &str = "0 50 17 * * Mon,Tue,Wed,Thu,Fri";
 const EVENT_CLUSTER_REFINEMENT_JOB_CRON: &str = "0 52 17 * * Mon,Tue,Wed,Thu,Fri";
 const EVENT_MARKET_OBSERVATION_JOB_CRON: &str = "0 54 17 * * Mon,Tue,Wed,Thu,Fri";
+const DECISION_SUPPORT_JOB_CRON: &str = "0 55 17 * * Mon,Tue,Wed,Thu,Fri";
 const DAILY_SIGNAL_ARCHIVE_JOB_CRON: &str = "0 5 20 * * Mon,Tue,Wed,Thu,Fri";
 const DAILY_REPORT_JOB_CRON: &str = "0 0 18 * * Mon,Tue,Wed,Thu,Fri";
 const WEEKLY_REPORT_JOB_CRON: &str = "0 0 20 * * Fri";
@@ -433,6 +435,52 @@ pub async fn run_event_market_observation_job(state: Arc<AppState>) {
             observation_count
         ),
         Err(error) => warn!("Event market observation failed: {}", error),
+    }
+}
+
+pub async fn run_decision_support_job(state: Arc<AppState>) {
+    let _guard = state.analysis_job_lock.lock().await;
+    let trade_date = match resolve_decision_support_trade_date(state.as_ref()).await {
+        Ok(trade_date) => trade_date,
+        Err(error) => {
+            warn!("DecisionSupport skipped: {}", error);
+            return;
+        }
+    };
+
+    let mut config = DecisionSupportConfig::from(&*state.config);
+    config.persist_run = true;
+
+    match DecisionSupport::new(state.db.clone())
+        .build_daily(trade_date, config)
+        .await
+    {
+        Ok(support) => info!(
+            "DecisionSupport persisted: trade_date={}, run_id={}, candidates={}",
+            trade_date,
+            support.run_id,
+            support.candidates.len()
+        ),
+        Err(error) => warn!("DecisionSupport failed for {}: {}", trade_date, error),
+    }
+}
+
+async fn resolve_decision_support_trade_date(state: &AppState) -> Result<chrono::NaiveDate> {
+    match postgres::latest_stock_trade_date(&state.db).await {
+        Ok(Some(trade_date)) => Ok(trade_date),
+        Ok(None) => {
+            let market_repo = MarketRepository::new(state.db.clone());
+            market_repo
+                .latest_market_snapshot(MARKET_SNAPSHOT_VERSION)
+                .await?
+                .map(|snapshot| snapshot.trade_date)
+                .ok_or_else(|| {
+                    crate::error::AppError::NotFound(
+                        "no market snapshot or trade date available".to_string(),
+                    )
+                })
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -1922,6 +1970,21 @@ pub async fn start_scheduler(
             .await?;
     }
 
+    // 17:55 weekdays
+    {
+        let s = state.clone();
+        sched
+            .add(Job::new_async_tz(
+                DECISION_SUPPORT_JOB_CRON,
+                beijing_tz(),
+                move |_, _| {
+                    let s = s.clone();
+                    Box::pin(async move { run_decision_support_job(s).await })
+                },
+            )?)
+            .await?;
+    }
+
     // 18:00 weekdays
     {
         let s = state.clone();
@@ -1976,7 +2039,7 @@ pub async fn start_scheduler(
     }
 
     sched.start().await?;
-    info!("Scheduler started with 13 jobs");
+    info!("Scheduler started with 14 jobs");
     Ok(sched)
 }
 
@@ -1992,6 +2055,7 @@ fn production_job_crons_in_registration_order() -> Vec<&'static str> {
         EVENT_FACT_BRIEF_JOB_CRON,
         EVENT_CLUSTER_REFINEMENT_JOB_CRON,
         EVENT_MARKET_OBSERVATION_JOB_CRON,
+        DECISION_SUPPORT_JOB_CRON,
         DAILY_REPORT_JOB_CRON,
         WEEKLY_REPORT_JOB_CRON,
         DAILY_SIGNAL_ARCHIVE_JOB_CRON,
@@ -2141,6 +2205,8 @@ fn round_metric(value: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::scan_ranker::POOL_SHORT_A_ID;
+    use crate::storage::decision_support_repository::DecisionSupportRepository;
     use async_trait::async_trait;
     use axum::{http::header, routing::get, Router};
     use chrono::{DateTime, Duration, NaiveDate, TimeZone};
@@ -2167,10 +2233,12 @@ mod tests {
     use crate::data::types::{Candle, IndexData, LimitUpStock, SectorData, StockInfo};
     use crate::error::Result;
     use crate::storage::event_repository::{
-        ClaimEvidenceRow, ClaimGraphRow, ClaimRow, DuplicateGroupMemberRow, DuplicateGroupRow,
-        EventClusterRow, EventHypothesisRow, EventRepository, ExtractionRow,
+        ClaimEvidenceRow, ClaimGraphRow, ClaimRow, DailyEventBriefRow, DuplicateGroupMemberRow,
+        DuplicateGroupRow, EventClusterRow, EventHypothesisRow, EventRepository, ExtractionRow,
     };
     use crate::storage::market_repository::MarketRepository;
+    use crate::storage::pattern_repository::{PatternRepository, ShadowCandidateRow};
+    use crate::storage::postgres::{save_daily_signal_scan_results, DailySignalScanRow};
 
     static EVENT_INGESTION_CURSOR_TEST_LOCK: tokio::sync::Mutex<()> =
         tokio::sync::Mutex::const_new(());
@@ -2211,6 +2279,11 @@ mod tests {
     }
 
     #[test]
+    fn decision_support_job_runs_after_event_observation_and_before_daily_report() {
+        assert_eq!(DECISION_SUPPORT_JOB_CRON, "0 55 17 * * Mon,Tue,Wed,Thu,Fri");
+    }
+
+    #[test]
     fn weekly_report_schedule_stays_on_friday_evening() {
         assert_eq!(WEEKLY_REPORT_JOB_CRON, "0 0 20 * * Fri");
         assert_eq!(POINT_IN_TIME_REFERENCE_JOB_CRON, "0 15 17 * * Fri");
@@ -2231,6 +2304,7 @@ mod tests {
                 "0 50 17 * * Mon,Tue,Wed,Thu,Fri",
                 "0 52 17 * * Mon,Tue,Wed,Thu,Fri",
                 "0 54 17 * * Mon,Tue,Wed,Thu,Fri",
+                "0 55 17 * * Mon,Tue,Wed,Thu,Fri",
                 "0 0 18 * * Mon,Tue,Wed,Thu,Fri",
                 "0 0 20 * * Fri",
                 "0 5 20 * * Mon,Tue,Wed,Thu,Fri",
@@ -3161,6 +3235,216 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn decision_support_job_persists_run_and_artifacts_when_inputs_exist(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let state = test_state(pool.clone()).await;
+        let trade_date = date(2026, 7, 10);
+
+        seed_stock_daily_bar(&pool, trade_date, "600001.SH").await?;
+        seed_decision_market_snapshot(&pool, trade_date, true, Vec::new()).await;
+        seed_ranked_pool_candidate(&pool, trade_date, "600001.SH", "Alpha Bank", 95.0).await;
+        seed_published_pattern_set(&pool).await?;
+        seed_shadow_candidate_for_latest_published_set(&pool, trade_date, "600001.SH").await?;
+        seed_daily_event_brief(&pool, trade_date, "event-fingerprint").await;
+
+        run_decision_support_job(state).await;
+
+        let repo = DecisionSupportRepository::new(pool.clone());
+        let run = repo
+            .find_run_by_trade_date(trade_date)
+            .await
+            .unwrap()
+            .expect("expected persisted decision support run");
+        assert_eq!(run.status, "completed");
+        assert!(run.pattern_set_id.is_some());
+        assert_eq!(
+            run.event_brief_version.as_deref(),
+            Some("daily_event_brief_v1")
+        );
+
+        let candidates = repo.list_candidates(run.run_id).await.unwrap();
+        assert!(!candidates.is_empty());
+        let brief = repo
+            .find_brief(run.run_id)
+            .await
+            .unwrap()
+            .expect("expected persisted brief");
+        assert_eq!(brief.trade_date, trade_date);
+        assert_eq!(brief.structured_payload["tradeDate"], json!(trade_date));
+        assert_eq!(
+            brief.structured_payload["candidateCount"],
+            json!(candidates.len())
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn decision_support_job_marks_missing_pattern_results_and_uses_scan_ranker_baseline(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let state = test_state(pool.clone()).await;
+        let trade_date = date(2026, 7, 10);
+
+        seed_stock_daily_bar(&pool, trade_date, "600001.SH").await?;
+        seed_decision_market_snapshot(&pool, trade_date, true, Vec::new()).await;
+        seed_ranked_pool_candidate(&pool, trade_date, "600001.SH", "Alpha Bank", 95.0).await;
+        seed_published_pattern_set(&pool).await?;
+
+        run_decision_support_job(state).await;
+
+        let repo = DecisionSupportRepository::new(pool.clone());
+        let run = repo
+            .find_run_by_trade_date(trade_date)
+            .await
+            .unwrap()
+            .expect("expected persisted decision support run");
+        let candidates = repo.list_candidates(run.run_id).await.unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].base_source, "scan_ranker");
+        assert!(candidates[0].unknowns.to_string().contains("pattern"));
+        assert!(candidates[0].unknowns.to_string().contains("missing"));
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn decision_support_job_handles_missing_event_brief_without_event_adjustments(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let state = test_state(pool.clone()).await;
+        let trade_date = date(2026, 7, 10);
+
+        seed_stock_daily_bar(&pool, trade_date, "600001.SH").await?;
+        seed_decision_market_snapshot(&pool, trade_date, true, Vec::new()).await;
+        seed_ranked_pool_candidate(&pool, trade_date, "600001.SH", "Alpha Bank", 95.0).await;
+
+        run_decision_support_job(state).await;
+
+        let repo = DecisionSupportRepository::new(pool.clone());
+        let run = repo
+            .find_run_by_trade_date(trade_date)
+            .await
+            .unwrap()
+            .expect("expected persisted decision support run");
+        assert_eq!(run.event_brief_version, None);
+
+        let candidates = repo.list_candidates(run.run_id).await.unwrap();
+        assert!(!candidates.is_empty());
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.event_adjustment == Some(0.0)));
+
+        let brief = repo
+            .find_brief(run.run_id)
+            .await
+            .unwrap()
+            .expect("expected persisted brief");
+        assert_eq!(brief.structured_payload["eventSummary"], Value::Null);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn decision_support_job_persists_data_status_and_withholds_a_tier_when_snapshot_is_incomplete(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let state = test_state(pool.clone()).await;
+        let trade_date = date(2026, 7, 10);
+        let missing_input = "security_status:600001.SH:2026-07-10".to_string();
+
+        seed_stock_daily_bar(&pool, trade_date, "600001.SH").await?;
+        seed_decision_market_snapshot(&pool, trade_date, false, vec![missing_input.clone()]).await;
+        seed_ranked_pool_candidate(&pool, trade_date, "600001.SH", "Alpha Bank", 95.0).await;
+
+        run_decision_support_job(state).await;
+
+        let repo = DecisionSupportRepository::new(pool.clone());
+        let run = repo
+            .find_run_by_trade_date(trade_date)
+            .await
+            .unwrap()
+            .expect("expected persisted decision support run");
+        let candidates = repo.list_candidates(run.run_id).await.unwrap();
+        assert!(!candidates.is_empty());
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.support_tier != "A"));
+
+        let brief = repo
+            .find_brief(run.run_id)
+            .await
+            .unwrap()
+            .expect("expected persisted brief");
+        assert_eq!(
+            brief.structured_payload["dataStatus"]["dataComplete"],
+            json!(false)
+        );
+        assert_eq!(
+            brief.structured_payload["dataStatus"]["missingInputs"],
+            json!([missing_input])
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn decision_support_job_returns_cleanly_on_failure_without_touching_trading_tables(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let state = test_state(pool.clone()).await;
+        let trade_date = date(2026, 7, 10);
+
+        seed_stock_daily_bar(&pool, trade_date, "600001.SH").await?;
+        seed_decision_market_snapshot(&pool, trade_date, true, Vec::new()).await;
+        seed_ranked_pool_candidate(&pool, trade_date, "600001.SH", "Alpha Bank", 95.0).await;
+
+        let repo = DecisionSupportRepository::new(pool.clone());
+        let existing_run_id = Uuid::new_v4();
+        repo.create_run(
+            &crate::storage::decision_support_repository::DecisionSupportRunRow {
+                run_id: existing_run_id,
+                trade_date,
+                support_version: crate::analysis::decision_support::DECISION_SUPPORT_VERSION
+                    .to_string(),
+                market_snapshot_version: MARKET_SNAPSHOT_VERSION.to_string(),
+                pattern_set_id: None,
+                event_brief_version: None,
+                event_score_enabled: false,
+                event_score_limit: 0.0,
+                status: "completed".to_string(),
+                input_fingerprint: "existing-run".to_string(),
+                started_at: dt(2026, 7, 10, 18),
+                completed_at: Some(dt(2026, 7, 10, 18)),
+                error_message: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let strategy_candidate_count_before =
+            count_rows(&pool, "signal_strategy_candidates").await?;
+        let _daily_report_guard = state.daily_report_job_lock.lock().await;
+
+        let run = timeout(
+            TokioDuration::from_secs(1),
+            run_decision_support_job(state.clone()),
+        )
+        .await;
+
+        assert!(run.is_ok(), "decision support job should return cleanly");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM analysis_decision_support_runs")
+                .fetch_one(&pool)
+                .await?,
+            1,
+            "failed decision support run should not persist a duplicate run"
+        );
+        assert_eq!(
+            count_rows(&pool, "signal_strategy_candidates").await?,
+            strategy_candidate_count_before
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn event_ingestion_job_processes_gdelt_sources_with_independent_cursor_handling(
         pool: PgPool,
     ) -> sqlx::Result<()> {
@@ -3873,6 +4157,144 @@ mod tests {
         .await?;
 
         Ok(())
+    }
+
+    async fn seed_decision_market_snapshot(
+        pool: &PgPool,
+        trade_date: NaiveDate,
+        data_complete: bool,
+        missing_inputs: Vec<String>,
+    ) {
+        MarketRepository::new(pool.clone())
+            .save_market_snapshot(&MarketSnapshot {
+                trade_date,
+                snapshot_version: MARKET_SNAPSHOT_VERSION.to_string(),
+                available_at: dt(2026, 7, 10, 18),
+                data_complete,
+                metrics: json!({"breadth": {"up_count": 1}}),
+                missing_inputs,
+                input_fingerprint: format!("decision-snapshot-{trade_date}"),
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn seed_ranked_pool_candidate(
+        pool: &PgPool,
+        trade_date: NaiveDate,
+        code: &str,
+        name: &str,
+        score: f64,
+    ) {
+        save_daily_signal_scan_results(
+            pool,
+            trade_date,
+            Uuid::new_v4(),
+            &[DailySignalScanRow {
+                code: code.to_string(),
+                name: name.to_string(),
+                signal_id: POOL_SHORT_A_ID.to_string(),
+                signal_name: "短线A档".to_string(),
+                icon: "🔥".to_string(),
+                metadata: json!({
+                    "line_type": "short",
+                    "tier": "A",
+                    "trigger_id": "breakout",
+                    "trigger_name": "突破信号",
+                    "score": score,
+                    "reasons": ["突破确认"],
+                    "risk_flags": ["量能不足"],
+                    "factor_breakdown": [
+                        {"name": "trend", "score": 18.5},
+                        {"name": "volume", "score": 11.2}
+                    ],
+                    "supporting_signals": ["breakout"],
+                    "matched_setups": [{"id": "breakout", "name": "突破信号"}]
+                }),
+            }],
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn seed_shadow_candidate_for_latest_published_set(
+        pool: &PgPool,
+        trade_date: NaiveDate,
+        code: &str,
+    ) -> sqlx::Result<()> {
+        let pattern_repo = PatternRepository::new(pool.clone());
+        let pattern_set = pattern_repo
+            .latest_published_set()
+            .await
+            .unwrap()
+            .expect("expected published pattern set");
+        let pattern_version_id: Uuid = sqlx::query_scalar(
+            r#"SELECT pattern_version_id
+               FROM analysis_pattern_set_members
+               WHERE pattern_set_id = $1
+               LIMIT 1"#,
+        )
+        .bind(pattern_set.pattern_set_id)
+        .fetch_one(pool)
+        .await?;
+
+        pattern_repo
+            .upsert_shadow_candidates(&[ShadowCandidateRow {
+                trade_date,
+                code: code.to_string(),
+                name: Some("Alpha Bank".to_string()),
+                horizon: "week".to_string(),
+                pattern_version_id,
+                pattern_set_id: pattern_set.pattern_set_id,
+                pattern_type: "trend".to_string(),
+                similarity_score: 0.91,
+                validated_lift: 1.25,
+                final_score: 2.2,
+                shadow_tier: "shadow_a".to_string(),
+                matched_features: json!({"raw": {"relative_strength_20d": 1.2}}),
+                risk_flags: json!({
+                    "has_triggered": false,
+                    "has_unevaluable": false,
+                    "triggered": [],
+                    "unevaluable": [],
+                    "risk_adjustment": 0.0
+                }),
+                supporting_signals: json!({
+                    "score_components": {
+                        "validated_pattern_strength": 0.8,
+                        "current_similarity": 0.4,
+                        "risk_adjustment": 0.0
+                    }
+                }),
+                invalidations: json!([]),
+                input_fingerprint: format!("shadow-{trade_date}-{code}"),
+                created_at: dt(2026, 7, 10, 18),
+            }])
+            .await
+            .unwrap();
+        Ok(())
+    }
+
+    async fn seed_daily_event_brief(pool: &PgPool, trade_date: NaiveDate, fingerprint: &str) {
+        EventRepository::new(pool.clone())
+            .save_daily_brief(&DailyEventBriefRow {
+                trade_date,
+                brief_version: "daily_event_brief_v1".to_string(),
+                content: "brief".to_string(),
+                structured_payload: json!({
+                    "tradeDate": trade_date,
+                    "newFacts": [],
+                    "revisions": [],
+                    "unconfirmed": [],
+                    "directEntities": [],
+                    "sources": [],
+                    "inputFingerprint": fingerprint
+                }),
+                input_fingerprint: fingerprint.to_string(),
+                generated_at: dt(2026, 7, 10, 18),
+            })
+            .await
+            .unwrap();
     }
 
     fn pattern_model_payload() -> Value {

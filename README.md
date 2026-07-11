@@ -145,9 +145,11 @@ curl -X POST http://localhost:8080/api/jobs/report/weekly  # generate + push wee
 curl -X POST http://localhost:8080/api/jobs/analysis/point-in-time/refresh           # refresh point-in-time trade-date inputs
 curl -X POST http://localhost:8080/api/jobs/analysis/point-in-time/reference-refresh # refresh point-in-time reference inputs
 curl -X POST http://localhost:8080/api/jobs/analysis/snapshot                        # build market snapshot
+curl -X POST http://localhost:8080/api/jobs/analysis/decision-support                # build + persist daily DecisionSupport artifacts
 
 # Read results
 curl http://localhost:8080/api/analysis/data-status
+curl http://localhost:8080/api/analysis/decision-support/latest
 curl http://localhost:8080/api/scan/latest
 curl http://localhost:8080/api/scan/prestart
 curl http://localhost:8080/api/scan/stats
@@ -184,6 +186,7 @@ Jobs are scheduled with fixed `UTC+08:00` in code (`Job::new_async_tz`).
 | 17:50 | Mon–Fri | Build and persist the daily evidence-backed market fact brief |
 | 17:52 | Mon–Fri | Run Gate 3 event-cluster refinement integration; current behavior is an explicit absence contract until persisted cluster outputs land |
 | 17:54 | Mon–Fri | Run Gate 3 market-observation integration; current behavior is an explicit absence contract until persisted hypotheses and observations land |
+| 17:55 | Mon–Fri | Build and persist the read-only daily DecisionSupport artifact set after pattern and event jobs; missing pattern/event inputs degrade in place, and incomplete market snapshots persist data-status output while withholding A-tier assignments |
 | 18:00 | Mon–Fri | Generate daily report, push to Telegram |
 | 20:00 | Friday | Generate weekly report, push to Telegram |
 | 20:05 | Mon–Fri | Run full signal scan and archive triggered hits to `daily_signal_scan_results` |
@@ -414,11 +417,15 @@ curl -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
 | POST | `/api/daban/sim/buy` | Yes | Open daban sim position (`code`, `price`, `shares`, optional `name`, `score`) |
 | POST | `/api/daban/sim/sell` | Yes | Close daban sim position (`position_id`, `price`, optional `reason`) |
 | GET | `/api/daban/sim/stats` | Yes | Daban simulator summary stats |
+| GET | `/api/analysis/decision-support/latest` | Yes | Latest persisted DecisionSupport run with brief and candidates |
+| GET | `/api/analysis/decision-support/{date}` | Yes | Persisted DecisionSupport run for one trade date (`YYYY-MM-DD`) |
+| GET | `/api/analysis/decision-support/{date}/{code}` | Yes | Persisted DecisionSupport detail rows for one code on one trade date |
 | POST | `/api/scan/trigger` | Yes | Trigger scan (background) |
 | POST | `/api/jobs/fetch` | Yes | Trigger data fetch job |
 | POST | `/api/jobs/scan` | Yes | Trigger signal scan job |
 | POST | `/api/jobs/scan/archive` | Yes | Trigger daily signal archive job |
 | POST | `/api/jobs/analysis/pattern-match` | Yes | Trigger shadow-only pattern matching job |
+| POST | `/api/jobs/analysis/decision-support` | Yes | Trigger the persisted daily DecisionSupport build |
 | POST | `/api/jobs/report/daily` | Yes | Trigger daily report + push |
 | POST | `/api/jobs/report/weekly` | Yes | Trigger weekly report + push |
 
