@@ -227,11 +227,18 @@ impl FrozenImpactHypothesis {
             ));
         }
 
+        let graph = build_impact_hypothesis_graph(claim_graph, canonical_ids, frozen_at)?;
+        if !strictly_preserves_prior_graph_payload(&self.graph, &graph) {
+            return Err(AppError::BadRequest(
+                "frozen hypotheses must preserve prior graph payload when evolving".to_string(),
+            ));
+        }
+
         Ok(Self {
             hypothesis_id: Uuid::new_v4(),
             hypothesis_version: self.hypothesis_version + 1,
             supersedes_hypothesis_id: Some(self.hypothesis_id),
-            graph: build_impact_hypothesis_graph(claim_graph, canonical_ids, frozen_at)?,
+            graph,
         })
     }
 }
@@ -455,8 +462,12 @@ fn infer_targets<'a>(
 }
 
 fn target_from_claim_node(node: &ClaimNode, edge: &ClaimEdge) -> Option<InferredTarget> {
+    if rejects_non_direct_target_label(&node.label) {
+        return None;
+    }
+
     let sanitized_label = sanitize_hypothesis_label(&node.label);
-    if is_non_direct_beneficiary_list_label(&sanitized_label) {
+    if rejects_non_direct_target_label(&sanitized_label) {
         return None;
     }
 
@@ -486,11 +497,14 @@ fn target_from_claim_node(node: &ClaimNode, edge: &ClaimEdge) -> Option<Inferred
 fn fallback_target(source_node: &ClaimNode, template: &TemplateSpec) -> (String, String) {
     match template.logic_rule_id {
         "company_order_v1" | "company_accident_v1" => {
-            let sanitized_label = sanitize_hypothesis_label(&source_node.label);
-            let label = if is_non_direct_beneficiary_list_label(&sanitized_label) {
+            let raw_subject = extract_company_subject(&source_node.label);
+            let sanitized_subject = sanitize_hypothesis_label(&raw_subject);
+            let label = if rejects_non_direct_target_label(&raw_subject)
+                || rejects_non_direct_target_label(&sanitized_subject)
+            {
                 template.fallback_target_label.to_string()
             } else {
-                extract_company_subject(&sanitized_label)
+                sanitized_subject
             };
 
             (label, template.fallback_target_type.to_string())
@@ -516,6 +530,60 @@ fn canonical_claim_ids(mut claim_ids: Vec<Uuid>) -> Result<Vec<Uuid>> {
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn strictly_preserves_prior_graph_payload(
+    prior: &ImpactHypothesisGraph,
+    candidate: &ImpactHypothesisGraph,
+) -> bool {
+    let prior_nodes = prior
+        .nodes
+        .iter()
+        .map(|node| (node.node_id.clone(), serde_json::to_string(node).unwrap()))
+        .collect::<BTreeMap<_, _>>();
+    let candidate_nodes = candidate
+        .nodes
+        .iter()
+        .map(|node| (node.node_id.clone(), serde_json::to_string(node).unwrap()))
+        .collect::<BTreeMap<_, _>>();
+
+    let nodes_preserved = prior_nodes
+        .iter()
+        .all(|(node_id, payload)| candidate_nodes.get(node_id) == Some(payload));
+
+    let prior_edges = payload_multiset(&prior.edges);
+    let candidate_edges = payload_multiset(&candidate.edges);
+    let edges_preserved = prior_edges.iter().all(|(payload, count)| {
+        candidate_edges
+            .get(payload)
+            .is_some_and(|candidate_count| candidate_count >= count)
+    });
+
+    let graph_grew = candidate_nodes.len() > prior_nodes.len()
+        || candidate_edges.len() > prior_edges.len()
+        || candidate_edges
+            .iter()
+            .any(|(payload, count)| candidate_count_exceeds(payload, *count, &prior_edges));
+
+    nodes_preserved && edges_preserved && graph_grew
+}
+
+fn payload_multiset<T: Serialize>(values: &[T]) -> BTreeMap<String, usize> {
+    let mut payloads = BTreeMap::new();
+    for value in values {
+        *payloads
+            .entry(serde_json::to_string(value).unwrap())
+            .or_insert(0) += 1;
+    }
+    payloads
+}
+
+fn candidate_count_exceeds(
+    payload: &str,
+    candidate_count: usize,
+    prior_counts: &BTreeMap<String, usize>,
+) -> bool {
+    candidate_count > prior_counts.get(payload).copied().unwrap_or_default()
 }
 
 fn sanitize_hypothesis_label(value: &str) -> String {
@@ -579,7 +647,7 @@ fn mentions_archetype(value: &str) -> bool {
 }
 
 fn is_direct_company_target(value: &str) -> bool {
-    !is_non_direct_beneficiary_list_label(value)
+    !rejects_non_direct_target_label(value)
 }
 
 fn is_non_direct_beneficiary_list_label(value: &str) -> bool {
@@ -588,6 +656,24 @@ fn is_non_direct_beneficiary_list_label(value: &str) -> bool {
         &lower,
         &["peer", "beneficiar", "indirect", "basket", "list"],
     )
+}
+
+fn rejects_non_direct_target_label(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("directly mentioned entity")
+        || is_non_direct_beneficiary_list_label(trimmed)
+        || is_stock_code_only_list_label(trimmed)
+}
+
+fn is_stock_code_only_list_label(value: &str) -> bool {
+    let tokens = value
+        .split_whitespace()
+        .map(|token| token.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '.'))
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+
+    !tokens.is_empty() && tokens.iter().all(|token| looks_like_stock_code(token))
 }
 
 fn looks_like_stock_code(token: &str) -> bool {
@@ -1193,6 +1279,325 @@ mod tests {
             error.to_string(),
             "frozen hypotheses require new facts to create a new version"
         );
+    }
+
+    #[test]
+    fn frozen_hypotheses_reject_mutated_prior_node_payload_when_evolving() {
+        let initial = FrozenImpactHypothesis::initial(
+            &ClaimGraph::new(
+                "claim_graph_v1",
+                vec![
+                    claim_node(
+                        "policy-1",
+                        "PolicyFact",
+                        "New energy vehicle subsidy expanded",
+                        vec![evidence_id(45)],
+                        0.92,
+                    ),
+                    claim_node(
+                        "company-1",
+                        "CompanyFact",
+                        "Acme Batteries",
+                        vec![evidence_id(46)],
+                        0.88,
+                    ),
+                ],
+                vec![claim_edge(
+                    "policy-1",
+                    "company-1",
+                    "applies_to",
+                    vec![evidence_id(47)],
+                    0.84,
+                )],
+            )
+            .unwrap(),
+            vec![Uuid::from_u128(7001)],
+            dt(2026, 7, 11, 20),
+        )
+        .unwrap();
+
+        let error = initial
+            .evolve(
+                &ClaimGraph::new(
+                    "claim_graph_v1",
+                    vec![
+                        claim_node(
+                            "policy-1",
+                            "PolicyFact",
+                            "New energy vehicle subsidy expanded",
+                            vec![evidence_id(45)],
+                            0.92,
+                        ),
+                        claim_node(
+                            "company-1",
+                            "CompanyFact",
+                            "Renamed Batteries",
+                            vec![evidence_id(46)],
+                            0.88,
+                        ),
+                        claim_node(
+                            "demand-1",
+                            "DemandFact",
+                            "Battery demand surges",
+                            vec![evidence_id(48)],
+                            0.86,
+                        ),
+                    ],
+                    vec![claim_edge(
+                        "policy-1",
+                        "company-1",
+                        "applies_to",
+                        vec![evidence_id(47)],
+                        0.84,
+                    )],
+                )
+                .unwrap(),
+                vec![Uuid::from_u128(7001), Uuid::from_u128(7002)],
+                dt(2026, 7, 11, 21),
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, AppError::BadRequest(_)));
+        assert_eq!(
+            error.to_string(),
+            "frozen hypotheses must preserve prior graph payload when evolving"
+        );
+    }
+
+    #[test]
+    fn frozen_hypotheses_reject_removed_prior_edge_payload_when_evolving() {
+        let initial = FrozenImpactHypothesis::initial(
+            &ClaimGraph::new(
+                "claim_graph_v1",
+                vec![
+                    claim_node(
+                        "policy-1",
+                        "PolicyFact",
+                        "New energy vehicle subsidy expanded",
+                        vec![evidence_id(49)],
+                        0.92,
+                    ),
+                    claim_node(
+                        "company-1",
+                        "CompanyFact",
+                        "Acme Batteries",
+                        vec![evidence_id(50)],
+                        0.88,
+                    ),
+                ],
+                vec![claim_edge(
+                    "policy-1",
+                    "company-1",
+                    "applies_to",
+                    vec![evidence_id(51)],
+                    0.84,
+                )],
+            )
+            .unwrap(),
+            vec![Uuid::from_u128(7101)],
+            dt(2026, 7, 11, 22),
+        )
+        .unwrap();
+
+        let error = initial
+            .evolve(
+                &ClaimGraph::new(
+                    "claim_graph_v1",
+                    vec![
+                        claim_node(
+                            "policy-1",
+                            "PolicyFact",
+                            "New energy vehicle subsidy expanded",
+                            vec![evidence_id(49)],
+                            0.92,
+                        ),
+                        claim_node(
+                            "company-1",
+                            "CompanyFact",
+                            "Acme Batteries",
+                            vec![evidence_id(50)],
+                            0.88,
+                        ),
+                        claim_node(
+                            "demand-1",
+                            "DemandFact",
+                            "Battery demand surges",
+                            vec![evidence_id(52)],
+                            0.86,
+                        ),
+                    ],
+                    Vec::new(),
+                )
+                .unwrap(),
+                vec![Uuid::from_u128(7101), Uuid::from_u128(7102)],
+                dt(2026, 7, 11, 23),
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, AppError::BadRequest(_)));
+        assert_eq!(
+            error.to_string(),
+            "frozen hypotheses must preserve prior graph payload when evolving"
+        );
+    }
+
+    #[test]
+    fn linked_non_company_stock_code_lists_fall_back_instead_of_emitting_placeholder_targets() {
+        for node_type in [
+            "DemandFact",
+            "SupplyFact",
+            "PriceFact",
+            "PolicyFact",
+            "RegulatoryFact",
+        ] {
+            let graph = build_impact_hypothesis_graph(
+                &ClaimGraph::new(
+                    "claim_graph_v1",
+                    vec![
+                        claim_node(
+                            "policy-1",
+                            "PolicyFact",
+                            "Battery subsidy widened",
+                            vec![evidence_id(53)],
+                            0.9,
+                        ),
+                        claim_node(
+                            "linked-1",
+                            node_type,
+                            "600519.SH 000001.SZ",
+                            vec![evidence_id(54)],
+                            0.82,
+                        ),
+                    ],
+                    vec![claim_edge(
+                        "policy-1",
+                        "linked-1",
+                        "affects",
+                        vec![evidence_id(55)],
+                        0.8,
+                    )],
+                )
+                .unwrap(),
+                vec![Uuid::from_u128(7201)],
+                dt(2026, 7, 12, 0),
+            )
+            .unwrap();
+
+            assert!(
+                graph
+                    .nodes
+                    .iter()
+                    .all(|node| node.label != "directly mentioned entity"),
+                "expected {node_type} stock-code list label to be rejected before sanitization"
+            );
+            assert!(
+                graph
+                    .nodes
+                    .iter()
+                    .any(|node| node.node_type == "IndustryImpact"
+                        && node.label == "subsidy-linked industry demand"),
+                "expected {node_type} stock-code list label to fall back to the template target"
+            );
+        }
+    }
+
+    #[test]
+    fn target_from_claim_node_rejects_stock_code_only_labels_across_non_company_paths() {
+        let edge = claim_edge(
+            "source-1",
+            "target-1",
+            "impacts",
+            vec![evidence_id(58)],
+            0.81,
+        );
+
+        for node_type in [
+            "DemandFact",
+            "SupplyFact",
+            "PriceFact",
+            "PolicyFact",
+            "RegulatoryFact",
+            "SourceLabel",
+        ] {
+            let target = target_from_claim_node(
+                &claim_node(
+                    "target-1",
+                    node_type,
+                    "600519.SH 000001.SZ",
+                    vec![evidence_id(59)],
+                    0.86,
+                ),
+                &edge,
+            );
+
+            assert!(
+                target.is_none(),
+                "expected {node_type} stock-code list label to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn company_template_fallback_does_not_emit_stock_code_list_source_subjects() {
+        let order_graph = build_impact_hypothesis_graph(
+            &ClaimGraph::new(
+                "claim_graph_v1",
+                vec![claim_node(
+                    "order-1",
+                    "CompanyFact",
+                    "600519.SH 000001.SZ wins major automation order",
+                    vec![evidence_id(56)],
+                    0.91,
+                )],
+                Vec::new(),
+            )
+            .unwrap(),
+            vec![Uuid::from_u128(7301)],
+            dt(2026, 7, 12, 1),
+        )
+        .unwrap();
+
+        assert!(order_graph
+            .nodes
+            .iter()
+            .all(|node| !(node.node_type == "RevenueImpact"
+                && (node.label == "directly mentioned entity"
+                    || node.label == "wins major automation order"))));
+        assert!(order_graph
+            .nodes
+            .iter()
+            .any(|node| node.node_type == "RevenueImpact"
+                && node.label == "direct order beneficiary"));
+
+        let accident_graph = build_impact_hypothesis_graph(
+            &ClaimGraph::new(
+                "claim_graph_v1",
+                vec![claim_node(
+                    "accident-1",
+                    "OperationalFact",
+                    "600519.SH 000001.SZ accident halts production",
+                    vec![evidence_id(60)],
+                    0.88,
+                )],
+                Vec::new(),
+            )
+            .unwrap(),
+            vec![Uuid::from_u128(7302)],
+            dt(2026, 7, 12, 2),
+        )
+        .unwrap();
+
+        assert!(accident_graph
+            .nodes
+            .iter()
+            .all(|node| !(node.node_type == "MarginImpact"
+                && (node.label == "directly mentioned entity"
+                    || node.label == "accident halts production"))));
+        assert!(accident_graph
+            .nodes
+            .iter()
+            .any(|node| node.node_type == "MarginImpact"
+                && node.label == "operationally exposed company margin"));
     }
 
     #[test]
