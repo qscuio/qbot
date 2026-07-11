@@ -120,7 +120,7 @@ impl IncrementalClusterer {
             .max_by(|left, right| compare_cluster_scores(&left.1, &right.1));
 
         if let Some((index, score)) = best_match {
-            if score.hard_conditions_met && score.score >= self.config.auto_join_threshold {
+            if score.score >= self.config.auto_join_threshold {
                 let cluster = &mut self.clusters[index];
                 cluster.mentions.push(ClusterMention {
                     origin_cluster_id: cluster.event_cluster_id,
@@ -134,7 +134,7 @@ impl IncrementalClusterer {
                 });
             }
 
-            if score.hard_conditions_met && score.score >= self.config.review_threshold {
+            if score.score >= self.config.review_threshold {
                 let cluster = &mut self.clusters[index];
                 cluster.review_required = true;
                 cluster.mentions.push(ClusterMention {
@@ -259,6 +259,7 @@ fn score_against_cluster(
         .mentions
         .iter()
         .map(|existing| score_mentions(mention, &existing.mention, config))
+        .filter(|score| score.hard_conditions_met)
         .max_by(compare_cluster_scores)
         .map(|mut score| {
             score.event_cluster_id = cluster.event_cluster_id;
@@ -1001,6 +1002,94 @@ mod tests {
         assert_eq!(clusterer.clusters().len(), 1);
         assert!(clusterer.clusters()[0].review_required);
         assert_eq!(clusterer.clusters()[0].mentions.len(), 2);
+    }
+
+    #[test]
+    fn higher_scoring_ineligible_candidate_does_not_mask_review_required_match() {
+        let config = IncrementalClusteringConfig::default();
+        let ineligible_cluster_id = Uuid::from_u128(1);
+        let eligible_cluster_id = Uuid::from_u128(2);
+        let mut clusterer = IncrementalClusterer {
+            config: config.clone(),
+            clusters: vec![
+                candidate_cluster(
+                    ineligible_cluster_id,
+                    None,
+                    vec![cluster_mention(
+                        ineligible_cluster_id,
+                        None,
+                        mention(
+                            "ACME memorandum update",
+                            Some(dt(2026, 7, 11, 5)),
+                            &["acme"],
+                            &["bulletin"],
+                            &["ningbo"],
+                            true,
+                            0.94,
+                        ),
+                    )],
+                    false,
+                ),
+                candidate_cluster(
+                    eligible_cluster_id,
+                    None,
+                    vec![cluster_mention(
+                        eligible_cluster_id,
+                        None,
+                        mention(
+                            "ACME signs logistics memorandum",
+                            Some(dt(2026, 7, 10, 8)),
+                            &["acme", "logisticsco"],
+                            &["sign", "memorandum"],
+                            &["ningbo"],
+                            true,
+                            0.93,
+                        ),
+                    )],
+                    false,
+                ),
+            ],
+        };
+
+        let outcome = clusterer.ingest_mention(
+            mention(
+                "ACME memorandum update",
+                Some(dt(2026, 7, 11, 6)),
+                &["acme"],
+                &["memorandum"],
+                &["ningbo"],
+                false,
+                0.62,
+            ),
+            None,
+        );
+
+        let decision = match outcome {
+            IncrementalAssignment::ReviewRequired(decision) => decision,
+            other => panic!("expected review-required for eligible cluster, got {other:?}"),
+        };
+
+        assert_eq!(decision.event_cluster_id, eligible_cluster_id);
+        assert!(decision.confidence >= config.review_threshold);
+        assert!(decision.confidence < config.auto_join_threshold);
+        assert_eq!(
+            clusterer
+                .clusters()
+                .iter()
+                .find(|cluster| cluster.event_cluster_id == ineligible_cluster_id)
+                .unwrap()
+                .mentions
+                .len(),
+            1
+        );
+        assert!(
+            clusterer
+                .clusters()
+                .iter()
+                .find(|cluster| cluster.event_cluster_id == eligible_cluster_id)
+                .unwrap()
+                .review_required
+        );
     }
 
     #[test]
