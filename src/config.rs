@@ -43,6 +43,8 @@ pub struct Config {
     pub enable_daban_live: bool,
     pub enable_ai_analysis: bool,
     pub enable_chip_dist: bool,
+    pub enable_event_score_adjustment: bool,
+    pub max_event_score_adjustment: f64,
     pub enable_signal_auto_trading: bool,
 }
 
@@ -100,6 +102,15 @@ impl Config {
             enable_chip_dist: std::env::var("ENABLE_CHIP_DIST")
                 .unwrap_or_else(|_| "true".to_string())
                 == "true",
+            enable_event_score_adjustment: std::env::var("ENABLE_EVENT_SCORE_ADJUSTMENT")
+                .unwrap_or_else(|_| "false".to_string())
+                == "true",
+            max_event_score_adjustment: clamped_env_f64(
+                "MAX_EVENT_SCORE_ADJUSTMENT",
+                0.0,
+                0.0,
+                5.0,
+            )?,
             enable_signal_auto_trading: std::env::var("ENABLE_SIGNAL_AUTO_TRADING")
                 .unwrap_or_else(|_| "false".to_string())
                 == "true",
@@ -111,6 +122,14 @@ fn optional_nonblank_env_var(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
         .filter(|value| !value.trim().is_empty())
+}
+
+fn clamped_env_f64(name: &str, default: f64, min: f64, max: f64) -> Result<f64> {
+    Ok(std::env::var(name)
+        .unwrap_or_else(|_| default.to_string())
+        .parse::<f64>()
+        .with_context(|| format!("{name} must be a number"))?
+        .clamp(min, max))
 }
 
 #[cfg(test)]
@@ -175,6 +194,8 @@ mod tests {
             "ENABLE_GDELT_EVENTS",
             "GDELT_EVENT_QUERY",
             "GDELT_MAX_RECORDS",
+            "ENABLE_EVENT_SCORE_ADJUSTMENT",
+            "MAX_EVENT_SCORE_ADJUSTMENT",
         ]);
 
         // Only TUSHARE_TOKEN and TELEGRAM_BOT_TOKEN are required
@@ -190,6 +211,8 @@ mod tests {
         env.remove_var("ENABLE_GDELT_EVENTS");
         env.remove_var("GDELT_EVENT_QUERY");
         env.remove_var("GDELT_MAX_RECORDS");
+        env.remove_var("ENABLE_EVENT_SCORE_ADJUSTMENT");
+        env.remove_var("MAX_EVENT_SCORE_ADJUSTMENT");
 
         let cfg = Config::from_env().unwrap();
         assert_eq!(cfg.tushare_token, "test_token");
@@ -203,6 +226,8 @@ mod tests {
         assert!(!cfg.enable_gdelt_events);
         assert!(cfg.gdelt_event_query.is_empty());
         assert_eq!(cfg.gdelt_max_records, 250);
+        assert!(!cfg.enable_event_score_adjustment);
+        assert_eq!(cfg.max_event_score_adjustment, 0.0);
     }
 
     #[test]
@@ -247,5 +272,24 @@ mod tests {
         assert!(cfg.enable_gdelt_events);
         assert_eq!(cfg.gdelt_event_query, "red sea shipping");
         assert_eq!(cfg.gdelt_max_records, 25);
+    }
+
+    #[test]
+    fn test_config_clamps_event_score_adjustment_limit() {
+        let env = ScopedEnvGuard::lock(&[
+            "TUSHARE_TOKEN",
+            "TELEGRAM_BOT_TOKEN",
+            "ENABLE_EVENT_SCORE_ADJUSTMENT",
+            "MAX_EVENT_SCORE_ADJUSTMENT",
+        ]);
+        env.set_var("TUSHARE_TOKEN", "test_token");
+        env.set_var("TELEGRAM_BOT_TOKEN", "123:abc");
+        env.set_var("ENABLE_EVENT_SCORE_ADJUSTMENT", "true");
+        env.set_var("MAX_EVENT_SCORE_ADJUSTMENT", "10");
+
+        let cfg = Config::from_env().unwrap();
+
+        assert!(cfg.enable_event_score_adjustment);
+        assert_eq!(cfg.max_event_score_adjustment, 5.0);
     }
 }

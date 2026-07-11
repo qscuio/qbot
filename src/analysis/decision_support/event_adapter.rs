@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::{DateTime, NaiveDate, Utc};
 
 use crate::analysis::decision_support::contracts::{
-    DecisionCandidate, SupportStatement, SupportStatementKind,
+    DecisionCandidate, EventScoreAdjustmentAudit, SupportStatement, SupportStatementKind,
 };
 use crate::analysis::events::claims::ClaimGraph;
 use crate::analysis::events::extraction::EventExtractionV1;
@@ -54,8 +54,26 @@ pub(crate) async fn apply_event_context(
                 continue;
             }
 
+            let direct_observation =
+                direct_company_observation(&context.observations, &candidate.code, trade_date);
+            let industry_observation = if direct_match {
+                None
+            } else {
+                reviewed_industry_observation(
+                    &context.observations,
+                    &matched_industries,
+                    trade_date,
+                )
+            };
+
             candidate.facts.extend(context.facts.clone());
             candidate.inferences.extend(context.inferences.clone());
+            candidate.event_score_audit.push(event_score_audit_entry(
+                &context.source,
+                direct_match,
+                direct_observation,
+                industry_observation,
+            ));
 
             if direct_match {
                 candidate.calculations.extend(
@@ -69,6 +87,11 @@ pub(crate) async fn apply_event_context(
                         .map(|observation| calculation_statement(&context.source, observation)),
                 );
             } else {
+                if let Some(observation) = industry_observation {
+                    candidate
+                        .calculations
+                        .push(calculation_statement(&context.source, observation));
+                }
                 candidate.unknowns.push(SupportStatement::missing_status(format!(
                     "Industry context matched {} via point-in-time sector membership [{}], but no direct stock mapping was persisted for {}.",
                     candidate.code,
@@ -300,6 +323,78 @@ fn calculation_statement(
     )
 }
 
+fn direct_company_observation<'a>(
+    observations: &'a [MarketObservationRow],
+    code: &str,
+    trade_date: NaiveDate,
+) -> Option<&'a MarketObservationRow> {
+    latest_observation(observations.iter().filter(|observation| {
+        observation.entity_type == "company"
+            && observation.entity_id == code
+            && observation.trade_date == trade_date
+    }))
+}
+
+fn reviewed_industry_observation<'a>(
+    observations: &'a [MarketObservationRow],
+    matched_industries: &[String],
+    trade_date: NaiveDate,
+) -> Option<&'a MarketObservationRow> {
+    latest_observation(observations.iter().filter(|observation| {
+        observation.entity_type == "industry"
+            && observation.trade_date == trade_date
+            && matched_industries.contains(&canonical_industry(&observation.entity_id))
+    }))
+}
+
+fn latest_observation<'a>(
+    observations: impl Iterator<Item = &'a MarketObservationRow>,
+) -> Option<&'a MarketObservationRow> {
+    observations.max_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.entity_id.cmp(&right.entity_id))
+    })
+}
+
+fn event_score_audit_entry(
+    source: &BriefSource,
+    direct_match: bool,
+    direct_observation: Option<&MarketObservationRow>,
+    industry_observation: Option<&MarketObservationRow>,
+) -> EventScoreAdjustmentAudit {
+    let (entity_relation, observation, reason) = if direct_match {
+        (
+            "direct_entity",
+            direct_observation,
+            "direct event entity matched candidate",
+        )
+    } else if industry_observation.is_some() {
+        (
+            "reviewed_industry",
+            industry_observation,
+            "reviewed industry relation matched candidate",
+        )
+    } else {
+        (
+            "industry_match",
+            None,
+            "industry relation matched without reviewed market observation",
+        )
+    };
+
+    EventScoreAdjustmentAudit {
+        event_id: source.evidence_id,
+        entity_relation: entity_relation.to_string(),
+        market_alignment: observation.and_then(|observation| observation.market_alignment_score),
+        causal_confidence: observation.map(|observation| observation.causal_confidence),
+        raw_adjustment: 0.0,
+        applied_adjustment: 0.0,
+        cap: 0.0,
+        reason: reason.to_string(),
+    }
+}
+
 async fn matched_candidate_industries(
     code: &str,
     trade_date: NaiveDate,
@@ -423,6 +518,7 @@ mod tests {
             unknowns: Vec::new(),
             risk_flags: Vec::new(),
             invalidations: Vec::new(),
+            event_score_audit: Vec::new(),
         }
     }
 

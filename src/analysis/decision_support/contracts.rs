@@ -112,6 +112,16 @@ pub struct DecisionSupportConfig {
     pub event_score_limit: f64,
 }
 
+impl From<&crate::config::Config> for DecisionSupportConfig {
+    fn from(config: &crate::config::Config) -> Self {
+        Self {
+            event_score_enabled: config.enable_event_score_adjustment,
+            event_score_limit: config.max_event_score_adjustment.clamp(0.0, 5.0),
+            ..Self::default()
+        }
+    }
+}
+
 impl Default for DecisionSupportConfig {
     fn default() -> Self {
         Self {
@@ -151,6 +161,19 @@ pub struct DataStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct EventScoreAdjustmentAudit {
+    pub event_id: Uuid,
+    pub entity_relation: String,
+    pub market_alignment: Option<f64>,
+    pub causal_confidence: Option<f64>,
+    pub raw_adjustment: f64,
+    pub applied_adjustment: f64,
+    pub cap: f64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct DecisionCandidate {
     pub code: String,
     pub name: String,
@@ -168,6 +191,8 @@ pub struct DecisionCandidate {
     pub unknowns: Vec<SupportStatement>,
     pub risk_flags: Vec<String>,
     pub invalidations: Vec<String>,
+    #[serde(default)]
+    pub event_score_audit: Vec<EventScoreAdjustmentAudit>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

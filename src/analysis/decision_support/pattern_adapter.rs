@@ -143,6 +143,7 @@ pub(crate) fn build_decision_candidates(
             unknowns,
             risk_flags,
             invalidations,
+            event_score_audit: Vec::new(),
         });
     }
 

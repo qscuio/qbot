@@ -5,8 +5,8 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::analysis::decision_support::contracts::{
-    DailyDecisionSupport, DataStatus, DecisionSupportConfig, MarketSummary, StatementBucket,
-    SupportStatement,
+    DailyDecisionSupport, DataStatus, DecisionCandidate, DecisionSupportConfig,
+    EventScoreAdjustmentAudit, MarketSummary, StatementBucket, SupportStatement,
 };
 use crate::analysis::decision_support::event_adapter::apply_event_context;
 use crate::analysis::decision_support::pattern_adapter::build_decision_candidates;
@@ -87,6 +87,8 @@ impl DecisionSupport {
             snapshot.data_complete,
             &snapshot.missing_inputs,
         );
+        let candidates =
+            apply_event_score_adjustments(candidates, &config, data_status.data_complete);
         let run_id = if config.persist_run {
             self.persist_run(
                 trade_date,
@@ -247,13 +249,100 @@ fn decision_support_input_fingerprint(
     format!("{:x}", hasher.finalize())
 }
 
+fn apply_event_score_adjustments(
+    mut candidates: Vec<DecisionCandidate>,
+    config: &DecisionSupportConfig,
+    data_complete: bool,
+) -> Vec<DecisionCandidate> {
+    let cap = config.event_score_limit.clamp(0.0, 5.0);
+
+    for candidate in &mut candidates {
+        let mut total_adjustment = 0.0;
+        for audit in &mut candidate.event_score_audit {
+            audit.raw_adjustment =
+                raw_event_adjustment(audit.market_alignment, audit.causal_confidence);
+            audit.applied_adjustment = 0.0;
+            audit.cap = if config.event_score_enabled { cap } else { 0.0 };
+            audit.reason = event_adjustment_reason(
+                audit,
+                config.event_score_enabled,
+                cap,
+                data_complete,
+                total_adjustment,
+            );
+            total_adjustment += audit.applied_adjustment;
+        }
+
+        candidate.event_adjustment = total_adjustment;
+        candidate.final_score = candidate.base_score + candidate.risk_adjustment + total_adjustment;
+    }
+
+    candidates.sort_by(|left, right| {
+        right
+            .final_score
+            .total_cmp(&left.final_score)
+            .then_with(|| left.code.cmp(&right.code))
+            .then_with(|| left.horizon.cmp(&right.horizon))
+    });
+    candidates
+}
+
+fn raw_event_adjustment(market_alignment: Option<f64>, causal_confidence: Option<f64>) -> f64 {
+    market_alignment.unwrap_or(0.0) * causal_confidence.unwrap_or(0.0) * 10.0
+}
+
+fn event_adjustment_reason(
+    audit: &mut EventScoreAdjustmentAudit,
+    event_score_enabled: bool,
+    cap: f64,
+    data_complete: bool,
+    total_adjustment: f64,
+) -> String {
+    if !matches!(
+        audit.entity_relation.as_str(),
+        "direct_entity" | "reviewed_industry"
+    ) {
+        return "event relation is not eligible for score adjustment".to_string();
+    }
+
+    if !event_score_enabled {
+        return "event score adjustment disabled by config".to_string();
+    }
+
+    if audit.market_alignment.is_none() || audit.causal_confidence.is_none() {
+        return "reviewed market alignment or causal confidence is missing".to_string();
+    }
+
+    if !data_complete && audit.raw_adjustment > 0.0 {
+        return "market data incomplete; positive event adjustment blocked".to_string();
+    }
+
+    let applied = capped_event_adjustment(audit.raw_adjustment, cap, total_adjustment);
+    audit.applied_adjustment = applied;
+    if applied == audit.raw_adjustment {
+        "eligible event adjustment applied".to_string()
+    } else {
+        format!("eligible event adjustment capped at {cap:.2}")
+    }
+}
+
+fn capped_event_adjustment(raw_adjustment: f64, cap: f64, total_adjustment: f64) -> f64 {
+    if cap <= 0.0 {
+        return 0.0;
+    }
+
+    let max_increase = cap - total_adjustment;
+    let max_decrease = -cap - total_adjustment;
+    raw_adjustment.clamp(max_decrease, max_increase)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::classify_statements;
+    use super::{apply_event_score_adjustments, classify_statements};
     use crate::analysis::decision_support::scan_ranker_adapter::BaselineCandidate;
     use crate::analysis::decision_support::{
         pattern_adapter::build_decision_candidates, DecisionSupport, DecisionSupportConfig,
-        SupportStatement,
+        EventScoreAdjustmentAudit, SupportStatement,
     };
     use crate::analysis::events::DailyEventBrief;
     use crate::storage::decision_support_repository::DecisionSupportRepository;
@@ -350,6 +439,51 @@ mod tests {
             },
             input_fingerprint: format!("fp-{code}-{horizon}-{shadow_tier}"),
             created_at: dt(2026, 7, 11, 18),
+        }
+    }
+
+    fn decision_candidate(
+        code: &str,
+        support_tier: &str,
+        base_score: f64,
+        risk_adjustment: f64,
+        event_score_audit: Vec<EventScoreAdjustmentAudit>,
+    ) -> crate::analysis::decision_support::DecisionCandidate {
+        crate::analysis::decision_support::DecisionCandidate {
+            code: code.to_string(),
+            name: format!("Name {code}"),
+            horizon: "short".to_string(),
+            base_source: "scan_ranker".to_string(),
+            base_score,
+            pattern_score: None,
+            event_adjustment: 0.0,
+            risk_adjustment,
+            final_score: base_score + risk_adjustment,
+            support_tier: support_tier.to_string(),
+            facts: Vec::new(),
+            calculations: Vec::new(),
+            inferences: Vec::new(),
+            unknowns: Vec::new(),
+            risk_flags: Vec::new(),
+            invalidations: Vec::new(),
+            event_score_audit,
+        }
+    }
+
+    fn audit_entry(
+        entity_relation: &str,
+        market_alignment: Option<f64>,
+        causal_confidence: Option<f64>,
+    ) -> EventScoreAdjustmentAudit {
+        EventScoreAdjustmentAudit {
+            event_id: Uuid::new_v4(),
+            entity_relation: entity_relation.to_string(),
+            market_alignment,
+            causal_confidence,
+            raw_adjustment: 0.0,
+            applied_adjustment: 0.0,
+            cap: 0.0,
+            reason: String::new(),
         }
     }
 
@@ -501,6 +635,209 @@ mod tests {
             .invalidations
             .iter()
             .any(|item| item.contains("insufficient_bar_history")));
+    }
+
+    #[test]
+    fn disabled_event_adjustment_keeps_score_zero_and_records_attempted_audit() {
+        let event_id = Uuid::new_v4();
+        let candidates = apply_event_score_adjustments(
+            vec![decision_candidate(
+                "600519.SH",
+                "watch",
+                82.0,
+                -1.5,
+                vec![EventScoreAdjustmentAudit {
+                    event_id,
+                    entity_relation: "direct_entity".to_string(),
+                    market_alignment: Some(1.0),
+                    causal_confidence: Some(1.0),
+                    raw_adjustment: 0.0,
+                    applied_adjustment: 0.0,
+                    cap: 0.0,
+                    reason: String::new(),
+                }],
+            )],
+            &DecisionSupportConfig {
+                event_score_enabled: false,
+                event_score_limit: 5.0,
+                ..DecisionSupportConfig::default()
+            },
+            true,
+        );
+
+        let candidate = &candidates[0];
+        let audit = &candidate.event_score_audit[0];
+        assert_eq!(candidate.event_adjustment, 0.0);
+        assert_eq!(candidate.final_score, 80.5);
+        assert_eq!(audit.event_id, event_id);
+        assert_eq!(audit.entity_relation, "direct_entity");
+        assert_eq!(audit.market_alignment, Some(1.0));
+        assert_eq!(audit.causal_confidence, Some(1.0));
+        assert_eq!(audit.raw_adjustment, 10.0);
+        assert_eq!(audit.applied_adjustment, 0.0);
+        assert_eq!(audit.cap, 0.0);
+        assert!(audit.reason.contains("disabled"));
+    }
+
+    #[test]
+    fn configured_event_adjustment_limit_is_hard_capped_at_five_points() {
+        let candidates = apply_event_score_adjustments(
+            vec![decision_candidate(
+                "600519.SH",
+                "watch",
+                82.0,
+                -1.5,
+                vec![audit_entry("direct_entity", Some(1.0), Some(1.0))],
+            )],
+            &DecisionSupportConfig {
+                event_score_enabled: true,
+                event_score_limit: 10.0,
+                ..DecisionSupportConfig::default()
+            },
+            true,
+        );
+
+        let candidate = &candidates[0];
+        let audit = &candidate.event_score_audit[0];
+        assert_eq!(candidate.event_adjustment, 5.0);
+        assert_eq!(candidate.final_score, 85.5);
+        assert_eq!(audit.raw_adjustment, 10.0);
+        assert_eq!(audit.applied_adjustment, 5.0);
+        assert_eq!(audit.cap, 5.0);
+    }
+
+    #[test]
+    fn reject_candidates_do_not_change_support_tier_because_of_events() {
+        let candidates = apply_event_score_adjustments(
+            vec![decision_candidate(
+                "600519.SH",
+                "reject",
+                82.0,
+                0.0,
+                vec![audit_entry("direct_entity", Some(1.0), Some(1.0))],
+            )],
+            &DecisionSupportConfig {
+                event_score_enabled: true,
+                event_score_limit: 5.0,
+                ..DecisionSupportConfig::default()
+            },
+            true,
+        );
+
+        let candidate = &candidates[0];
+        assert_eq!(candidate.support_tier, "reject");
+        assert_eq!(candidate.event_adjustment, 5.0);
+    }
+
+    #[test]
+    fn data_incomplete_candidates_cannot_receive_positive_event_adjustments() {
+        let candidates = apply_event_score_adjustments(
+            vec![decision_candidate(
+                "600519.SH",
+                "watch",
+                82.0,
+                -1.5,
+                vec![audit_entry("direct_entity", Some(0.8), Some(1.0))],
+            )],
+            &DecisionSupportConfig {
+                event_score_enabled: true,
+                event_score_limit: 5.0,
+                ..DecisionSupportConfig::default()
+            },
+            false,
+        );
+
+        let candidate = &candidates[0];
+        let audit = &candidate.event_score_audit[0];
+        assert_eq!(candidate.event_adjustment, 0.0);
+        assert_eq!(candidate.final_score, 80.5);
+        assert_eq!(audit.raw_adjustment, 8.0);
+        assert_eq!(audit.applied_adjustment, 0.0);
+        assert!(audit.reason.contains("data incomplete"));
+    }
+
+    #[test]
+    fn only_direct_entity_or_reviewed_industry_relations_are_adjustment_eligible() {
+        let candidates = apply_event_score_adjustments(
+            vec![
+                decision_candidate(
+                    "600519.SH",
+                    "watch",
+                    82.0,
+                    0.0,
+                    vec![audit_entry("industry_match", Some(0.9), Some(0.7))],
+                ),
+                decision_candidate(
+                    "000001.SZ",
+                    "watch",
+                    70.0,
+                    0.0,
+                    vec![audit_entry("reviewed_industry", Some(0.9), Some(0.7))],
+                ),
+            ],
+            &DecisionSupportConfig {
+                event_score_enabled: true,
+                event_score_limit: 5.0,
+                ..DecisionSupportConfig::default()
+            },
+            true,
+        );
+
+        let ineligible = &candidates
+            .iter()
+            .find(|candidate| candidate.code == "600519.SH")
+            .unwrap();
+        assert_eq!(ineligible.event_adjustment, 0.0);
+        assert_eq!(ineligible.event_score_audit[0].applied_adjustment, 0.0);
+        assert!(ineligible.event_score_audit[0]
+            .reason
+            .contains("not eligible"));
+
+        let reviewed = &candidates
+            .iter()
+            .find(|candidate| candidate.code == "000001.SZ")
+            .unwrap();
+        assert_eq!(reviewed.event_adjustment, 5.0);
+        assert_eq!(reviewed.event_score_audit[0].applied_adjustment, 5.0);
+    }
+
+    #[test]
+    fn attempted_adjustments_always_retain_full_audit_payload() {
+        let event_id = Uuid::new_v4();
+        let candidates = apply_event_score_adjustments(
+            vec![decision_candidate(
+                "600519.SH",
+                "watch",
+                82.0,
+                0.0,
+                vec![EventScoreAdjustmentAudit {
+                    event_id,
+                    entity_relation: "industry_match".to_string(),
+                    market_alignment: Some(-0.4),
+                    causal_confidence: Some(0.5),
+                    raw_adjustment: 0.0,
+                    applied_adjustment: 0.0,
+                    cap: 0.0,
+                    reason: String::new(),
+                }],
+            )],
+            &DecisionSupportConfig {
+                event_score_enabled: true,
+                event_score_limit: 5.0,
+                ..DecisionSupportConfig::default()
+            },
+            true,
+        );
+
+        let audit = &candidates[0].event_score_audit[0];
+        assert_eq!(audit.event_id, event_id);
+        assert_eq!(audit.entity_relation, "industry_match");
+        assert_eq!(audit.market_alignment, Some(-0.4));
+        assert_eq!(audit.causal_confidence, Some(0.5));
+        assert_eq!(audit.raw_adjustment, -2.0);
+        assert_eq!(audit.applied_adjustment, 0.0);
+        assert_eq!(audit.cap, 5.0);
+        assert!(!audit.reason.is_empty());
     }
 
     #[sqlx::test(migrations = "./migrations")]

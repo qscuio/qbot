@@ -611,6 +611,8 @@ mod tests {
                 enable_daban_live: false,
                 enable_ai_analysis: false,
                 enable_chip_dist: false,
+                enable_event_score_adjustment: false,
+                max_event_score_adjustment: 0.0,
                 enable_signal_auto_trading: false,
             }),
             db: pool,

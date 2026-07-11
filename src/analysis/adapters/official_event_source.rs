@@ -519,6 +519,8 @@ mod tests {
             enable_daban_live: false,
             enable_ai_analysis: false,
             enable_chip_dist: true,
+            enable_event_score_adjustment: false,
+            max_event_score_adjustment: 0.0,
             enable_signal_auto_trading: false,
             official_event_feed_url: Some("https://example.test/feed".to_string()),
             official_event_feed_api_key: Some("secret".to_string()),
