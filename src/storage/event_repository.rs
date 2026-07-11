@@ -109,6 +109,26 @@ pub struct EventClusterRow {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct EventMentionRow {
+    pub mention_id: Uuid,
+    pub evidence_id: Uuid,
+    pub event_cluster_id: Option<Uuid>,
+    pub cluster_version: Option<i32>,
+    pub mention_time: DateTime<Utc>,
+    pub adds_new_fact: bool,
+    pub source_independence: f64,
+    pub mention_payload: Value,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventMentionClusterLinkRow {
+    pub evidence_id: Uuid,
+    pub event_cluster_id: Uuid,
+    pub cluster_version: i32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct EventDeltaRow {
     pub event_cluster_id: Uuid,
     pub from_version: i32,
@@ -515,6 +535,29 @@ impl EventRepository {
         .await?;
 
         Ok(())
+    }
+
+    pub async fn save_event_mention(&self, row: &EventMentionRow) -> Result<Uuid> {
+        sqlx::query(
+            r#"INSERT INTO market_event_mentions
+               (mention_id, evidence_id, event_cluster_id, cluster_version, mention_time,
+                adds_new_fact, source_independence, mention_payload, created_at)
+               VALUES ($1, $2, $3, $4, $5,
+                       $6, $7, $8, $9)"#,
+        )
+        .bind(row.mention_id)
+        .bind(row.evidence_id)
+        .bind(row.event_cluster_id)
+        .bind(row.cluster_version)
+        .bind(row.mention_time)
+        .bind(row.adds_new_fact)
+        .bind(row.source_independence)
+        .bind(&row.mention_payload)
+        .bind(row.created_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(row.mention_id)
     }
 
     pub async fn save_event_delta(&self, row: &EventDeltaRow) -> Result<()> {
@@ -970,6 +1013,126 @@ impl EventRepository {
         .await?;
 
         Ok(row.map(claim_graph_from_row))
+    }
+
+    pub async fn list_latest_publishable_evidence(&self) -> Result<Vec<EventEvidenceRow>> {
+        let sql = evidence_select_sql(
+            r#"WHERE status = 'publishable'
+                 AND (source_id, source_item_id, version) IN (
+                     SELECT source_id, source_item_id, MAX(version) AS version
+                     FROM market_event_evidence
+                     GROUP BY source_id, source_item_id
+                 )
+               ORDER BY effective_trade_date ASC, available_at ASC, first_seen_at ASC,
+                        source_id ASC, source_item_id ASC, version ASC, evidence_id ASC"#,
+        );
+        let rows = sqlx::query(&sql).fetch_all(&self.pool).await?;
+
+        Ok(rows.into_iter().map(event_evidence_from_row).collect())
+    }
+
+    pub async fn list_latest_cluster_links_for_evidence_ids(
+        &self,
+        evidence_ids: &[Uuid],
+    ) -> Result<Vec<EventMentionClusterLinkRow>> {
+        if evidence_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let rows = sqlx::query(
+            r#"SELECT DISTINCT ON (evidence_id)
+                      evidence_id,
+                      event_cluster_id,
+                      cluster_version
+               FROM market_event_mentions
+               WHERE evidence_id = ANY($1)
+                 AND event_cluster_id IS NOT NULL
+                 AND cluster_version IS NOT NULL
+               ORDER BY evidence_id ASC, cluster_version DESC, created_at DESC, mention_id DESC"#,
+        )
+        .bind(evidence_ids)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| EventMentionClusterLinkRow {
+                evidence_id: row.get("evidence_id"),
+                event_cluster_id: row.get("event_cluster_id"),
+                cluster_version: row.get("cluster_version"),
+            })
+            .collect())
+    }
+
+    pub async fn list_duplicate_groups_for_evidence_ids(
+        &self,
+        evidence_ids: &[Uuid],
+    ) -> Result<Vec<DuplicateGroupRow>> {
+        if evidence_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let group_rows = sqlx::query(
+            r#"SELECT DISTINCT g.duplicate_group_id,
+                      g.relation_type,
+                      g.confidence::float8 AS confidence,
+                      g.locked_by_user,
+                      g.created_at
+               FROM market_event_duplicate_groups g
+               INNER JOIN market_event_duplicate_members m
+                       ON m.duplicate_group_id = g.duplicate_group_id
+               WHERE m.evidence_id = ANY($1)
+               ORDER BY g.created_at ASC, g.duplicate_group_id ASC"#,
+        )
+        .bind(evidence_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        if group_rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let group_ids = group_rows
+            .iter()
+            .map(|row| row.get::<Uuid, _>("duplicate_group_id"))
+            .collect::<Vec<_>>();
+        let member_rows = sqlx::query(
+            r#"SELECT duplicate_group_id, evidence_id, is_representative
+               FROM market_event_duplicate_members
+               WHERE duplicate_group_id = ANY($1)
+               ORDER BY duplicate_group_id ASC, is_representative DESC, evidence_id ASC"#,
+        )
+        .bind(&group_ids)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut members_by_group =
+            std::collections::BTreeMap::<Uuid, Vec<DuplicateGroupMemberRow>>::new();
+        for row in member_rows {
+            members_by_group
+                .entry(row.get("duplicate_group_id"))
+                .or_default()
+                .push(DuplicateGroupMemberRow {
+                    evidence_id: row.get("evidence_id"),
+                    is_representative: row.get("is_representative"),
+                });
+        }
+
+        Ok(group_rows
+            .into_iter()
+            .map(|row| {
+                let duplicate_group_id = row.get("duplicate_group_id");
+                DuplicateGroupRow {
+                    duplicate_group_id,
+                    relation_type: row.get("relation_type"),
+                    confidence: row.get("confidence"),
+                    locked_by_user: row.get("locked_by_user"),
+                    members: members_by_group
+                        .remove(&duplicate_group_id)
+                        .unwrap_or_default(),
+                    created_at: row.get("created_at"),
+                }
+            })
+            .collect())
     }
 
     pub async fn save_daily_brief(&self, brief: &DailyEventBriefRow) -> Result<()> {

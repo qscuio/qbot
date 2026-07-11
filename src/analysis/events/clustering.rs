@@ -101,6 +101,13 @@ impl IncrementalClusterer {
         }
     }
 
+    pub fn with_clusters(
+        config: IncrementalClusteringConfig,
+        clusters: Vec<CandidateCluster>,
+    ) -> Self {
+        Self { config, clusters }
+    }
+
     pub fn clusters(&self) -> &[CandidateCluster] {
         &self.clusters
     }

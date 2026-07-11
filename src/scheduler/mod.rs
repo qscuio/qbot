@@ -1,22 +1,28 @@
-use chrono::{Datelike, Duration, Utc};
+use chrono::{DateTime, Datelike, Duration, Utc};
 use redis::AsyncCommands;
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use tokio_cron_scheduler::{Job, JobScheduler};
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use crate::analysis::adapters::gdelt::GdeltEventSource;
 use crate::analysis::adapters::official_event_source::OfficialEventSource;
 use crate::analysis::adapters::{EventSource, FetchedEvent};
 use crate::analysis::events::claims::ClaimGraph;
-use crate::analysis::events::extraction::StockCodeDirectory;
+use crate::analysis::events::extraction::{EventExtractionV1, StockCodeDirectory};
 use crate::analysis::events::market_observation::{
-    observe_market_alignment, CausalConfidenceInputs, MarketSnapshotObservationInput,
-    ObservationEntity, ObservationWindow, ObservedReturn,
+    observe_market_alignment, CausalConfidenceInputs, EventImportance,
+    MarketSnapshotObservationInput, ObservationEntity, ObservationWindow, ObservedReturn,
+    WindowEvent,
 };
 use crate::analysis::events::{
-    compute_event_delta, render_daily_brief, AShareTradingDateResolver,
-    EventClusterVersionSnapshot, EventDelta, EventIntelligence, FrozenImpactHypothesis,
-    TradingDateResolver,
+    compute_event_delta, render_daily_brief, AShareTradingDateResolver, CandidateCluster,
+    ClaimEntityRole, ClusterMention, ClusterVersionRef, EndOfDayRefiner, EventClaimSnapshot,
+    EventClusterVersionSnapshot, EventDelta, EventIntelligence, EventMention,
+    FrozenImpactHypothesis, IncrementalClusterer, IncrementalClusteringConfig,
+    LockedClusterRelations, RefinedCluster, TradingDateResolver,
 };
 use crate::analysis::market_snapshot::{
     ingestion::PointInTimeIngestion, MarketSnapshotModule, PointInTimeContext,
@@ -33,7 +39,8 @@ use crate::services::{
 };
 use crate::state::AppState;
 use crate::storage::event_repository::{
-    DailyEventBriefRow, EventDeltaRow, EventEvidenceRow, EventHypothesisRow, EventRepository,
+    DailyEventBriefRow, DuplicateGroupRow, EventDeltaRow, EventEvidenceRow, EventHypothesisRow,
+    EventMentionClusterLinkRow, EventMentionRow, EventRepository, ExtractionRow,
     MarketObservationRow,
 };
 use crate::storage::market_repository::MarketRepository;
@@ -432,6 +439,7 @@ pub async fn run_event_market_observation_job(state: Arc<AppState>) {
 async fn persist_event_cluster_refinement_outputs(
     repo: &EventRepository,
 ) -> Result<(usize, usize)> {
+    let _persisted_cluster_versions = persist_scheduled_event_clusters(repo).await?;
     let latest_clusters = repo.list_latest_cluster_versions().await?;
     let mut persisted_deltas = 0usize;
     let mut persisted_hypotheses = 0usize;
@@ -563,11 +571,34 @@ async fn persist_event_market_observations(
     market_repo: &MarketRepository,
 ) -> Result<usize> {
     let hypotheses = repo.list_latest_hypotheses().await?;
+    let latest_publishable = repo.list_latest_publishable_evidence().await?;
+    let publishable_ids = latest_publishable
+        .iter()
+        .map(|row| row.evidence_id)
+        .collect::<Vec<_>>();
+    let extraction_by_evidence = repo
+        .list_latest_extractions_for_evidence_ids(&publishable_ids)
+        .await?
+        .into_iter()
+        .map(|row| (row.evidence_id, row))
+        .collect::<BTreeMap<_, _>>();
+    let cluster_links_by_evidence = repo
+        .list_latest_cluster_links_for_evidence_ids(&publishable_ids)
+        .await?
+        .into_iter()
+        .map(|row| (row.evidence_id, row))
+        .collect::<BTreeMap<_, _>>();
+    let latest_clusters_by_id = repo
+        .list_latest_cluster_versions()
+        .await?
+        .into_iter()
+        .map(|row| (row.event_cluster_id, row))
+        .collect::<BTreeMap<_, _>>();
     let mut persisted = 0usize;
 
     for hypothesis_row in hypotheses {
         let hypothesis: FrozenImpactHypothesis =
-            serde_json::from_value(hypothesis_row.graph_payload)?;
+            serde_json::from_value(hypothesis_row.graph_payload.clone())?;
         let trade_date = hypothesis
             .graph()
             .frozen_at
@@ -606,6 +637,16 @@ async fn persist_event_market_observations(
                 );
                 continue;
             };
+            let related_events = related_window_events_for_entity(
+                &latest_publishable,
+                &extraction_by_evidence,
+                &cluster_links_by_evidence,
+                &latest_clusters_by_id,
+                &hypothesis_row,
+                &entity,
+                &window,
+                &context,
+            )?;
 
             let observation = observe_market_alignment(&MarketSnapshotObservationInput {
                 context,
@@ -623,7 +664,7 @@ async fn persist_event_market_observations(
                     timing_quality: 0.0,
                     identification_quality: 0.0,
                 },
-                related_events: Vec::new(),
+                related_events,
                 observed_at: context.as_of,
             })?;
 
@@ -650,6 +691,658 @@ async fn persist_event_market_observations(
     }
 
     Ok(persisted)
+}
+
+#[derive(Debug, Clone)]
+struct PreparedEventMention {
+    mention: EventMention,
+    evidence: EventEvidenceRow,
+    extraction: Option<ExtractionRow>,
+    existing_cluster_link: Option<EventMentionClusterLinkRow>,
+    duplicate_group_id: Option<Uuid>,
+}
+
+async fn persist_scheduled_event_clusters(repo: &EventRepository) -> Result<usize> {
+    let evidence_rows = repo.list_latest_publishable_evidence().await?;
+    if evidence_rows.is_empty() {
+        return Ok(0);
+    }
+
+    let evidence_ids = evidence_rows
+        .iter()
+        .map(|row| row.evidence_id)
+        .collect::<Vec<_>>();
+    let extraction_by_evidence = repo
+        .list_latest_extractions_for_evidence_ids(&evidence_ids)
+        .await?
+        .into_iter()
+        .map(|row| (row.evidence_id, row))
+        .collect::<BTreeMap<_, _>>();
+    let cluster_links_by_evidence = repo
+        .list_latest_cluster_links_for_evidence_ids(&evidence_ids)
+        .await?
+        .into_iter()
+        .map(|row| (row.evidence_id, row))
+        .collect::<BTreeMap<_, _>>();
+    let duplicate_groups = repo
+        .list_duplicate_groups_for_evidence_ids(&evidence_ids)
+        .await?;
+    let duplicate_group_by_evidence = duplicate_group_membership_map(&duplicate_groups);
+
+    let mut prepared_mentions = Vec::new();
+    for evidence in evidence_rows {
+        let extraction = extraction_by_evidence.get(&evidence.evidence_id).cloned();
+        let Some(mention) = build_event_mention(&evidence, extraction.as_ref())? else {
+            continue;
+        };
+        prepared_mentions.push(PreparedEventMention {
+            mention,
+            evidence: evidence.clone(),
+            extraction,
+            existing_cluster_link: cluster_links_by_evidence
+                .get(&evidence.evidence_id)
+                .cloned(),
+            duplicate_group_id: duplicate_group_by_evidence
+                .get(&evidence.evidence_id)
+                .copied(),
+        });
+    }
+
+    if prepared_mentions.is_empty() {
+        return Ok(0);
+    }
+
+    let seeded_clusters = seeded_candidate_clusters(&prepared_mentions);
+    let config = IncrementalClusteringConfig::default();
+    let mut clusterer = IncrementalClusterer::with_clusters(config.clone(), seeded_clusters);
+    for prepared in prepared_mentions
+        .iter()
+        .filter(|item| item.existing_cluster_link.is_none())
+    {
+        clusterer.ingest_mention(prepared.mention.clone(), prepared.duplicate_group_id);
+    }
+
+    let locked_relations =
+        locked_cluster_relations_from_duplicate_groups(clusterer.clusters(), &duplicate_groups);
+    let refined_clusters =
+        EndOfDayRefiner::new(config).refine(clusterer.clusters(), &locked_relations);
+    let prepared_by_evidence = prepared_mentions
+        .into_iter()
+        .map(|prepared| (prepared.evidence.evidence_id, prepared))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut persisted = 0usize;
+    for cluster in refined_clusters {
+        let Some(row) = build_cluster_row(&cluster, &prepared_by_evidence)? else {
+            continue;
+        };
+        let should_persist = match repo.latest_cluster_version(row.event_cluster_id).await? {
+            Some(existing) => !cluster_rows_equivalent(&existing, &row),
+            None => true,
+        };
+        if !should_persist {
+            continue;
+        }
+
+        repo.save_event_cluster_version(&row).await?;
+        for cluster_mention in &cluster.mentions {
+            let Some(prepared) = prepared_by_evidence.get(&cluster_mention.mention.evidence_id)
+            else {
+                continue;
+            };
+            repo.save_event_mention(&EventMentionRow {
+                mention_id: Uuid::new_v4(),
+                evidence_id: prepared.evidence.evidence_id,
+                event_cluster_id: Some(row.event_cluster_id),
+                cluster_version: Some(row.cluster_version),
+                mention_time: cluster_mention
+                    .mention
+                    .event_time
+                    .unwrap_or(prepared.evidence.available_at),
+                adds_new_fact: cluster_mention.mention.adds_new_fact,
+                source_independence: cluster_mention.mention.source_independence,
+                mention_payload: mention_payload(
+                    &cluster_mention.mention,
+                    prepared.extraction.as_ref(),
+                )?,
+                created_at: row.created_at,
+            })
+            .await?;
+        }
+        persisted += 1;
+    }
+
+    Ok(persisted)
+}
+
+fn build_event_mention(
+    evidence: &EventEvidenceRow,
+    extraction: Option<&ExtractionRow>,
+) -> Result<Option<EventMention>> {
+    let Some(payload) = extraction
+        .map(|row| serde_json::from_value::<EventExtractionV1>(row.extracted_payload.clone()))
+        .transpose()?
+    else {
+        return Ok(None);
+    };
+
+    let entity_ids = mention_entity_ids(&payload);
+    let action_tokens = mention_action_tokens(&payload, evidence);
+    if entity_ids.is_empty() || action_tokens.is_empty() {
+        return Ok(None);
+    }
+
+    let location_tokens = payload
+        .entities
+        .iter()
+        .filter(|entity| entity.entity_type == "location")
+        .map(|entity| canonical_token(&entity.text))
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    let semantic_input = format!(
+        "{} {} {}",
+        evidence.title,
+        evidence.content.clone().unwrap_or_default(),
+        payload
+            .claims
+            .iter()
+            .map(|claim| claim.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+
+    Ok(Some(EventMention {
+        mention_id: Uuid::new_v4(),
+        evidence_id: evidence.evidence_id,
+        event_time: mention_time_from_payload(evidence, &payload),
+        entity_ids,
+        action_tokens,
+        location_tokens,
+        semantic_vector: semantic_vector(&semantic_input),
+        adds_new_fact: payload
+            .claims
+            .iter()
+            .any(|claim| claim.claim_type == crate::analysis::events::extraction::ClaimType::Fact),
+        source_independence: 1.0,
+    }))
+}
+
+fn mention_time_from_payload(
+    evidence: &EventEvidenceRow,
+    payload: &EventExtractionV1,
+) -> Option<DateTime<Utc>> {
+    evidence.occurred_at.or(evidence.published_at).or_else(|| {
+        payload
+            .dates
+            .first()
+            .and_then(|value| parse_extracted_date(&value.value))
+    })
+}
+
+fn parse_extracted_date(value: &str) -> Option<DateTime<Utc>> {
+    chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .ok()
+        .and_then(|date| date.and_hms_opt(0, 0, 0))
+        .map(|value| value.and_utc())
+}
+
+fn mention_entity_ids(payload: &EventExtractionV1) -> Vec<String> {
+    let mut entity_ids = payload
+        .entities
+        .iter()
+        .filter(|entity| entity.role == "subject")
+        .filter_map(|entity| {
+            entity
+                .stock_code
+                .clone()
+                .or_else(|| (!entity.text.trim().is_empty()).then(|| entity.text.clone()))
+        })
+        .map(|value| value.trim().to_string())
+        .collect::<Vec<_>>();
+    entity_ids.sort();
+    entity_ids.dedup();
+    entity_ids
+}
+
+fn mention_action_tokens(payload: &EventExtractionV1, evidence: &EventEvidenceRow) -> Vec<String> {
+    let mut tokens = Vec::new();
+    tokens.extend(tokenize_for_event_terms(&payload.event_type));
+    if let Some(subtype) = &payload.event_subtype {
+        tokens.extend(tokenize_for_event_terms(subtype));
+    }
+    for claim in &payload.claims {
+        tokens.extend(tokenize_for_event_terms(&claim.text));
+    }
+    tokens.extend(tokenize_for_event_terms(&evidence.title));
+    if let Some(content) = &evidence.content {
+        tokens.extend(tokenize_for_event_terms(content));
+    }
+    tokens.retain(|token| !is_stock_code_token(token));
+    tokens.sort();
+    tokens.dedup();
+    tokens
+}
+
+fn tokenize_for_event_terms(value: &str) -> Vec<String> {
+    value
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '.')
+        .map(canonical_token)
+        .filter(|token| token.len() > 2)
+        .collect()
+}
+
+fn canonical_token(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn is_stock_code_token(value: &str) -> bool {
+    value.len() == 9
+        && value.as_bytes().get(6) == Some(&b'.')
+        && value[..6].chars().all(|ch| ch.is_ascii_digit())
+        && matches!(&value[7..], "sh" | "sz")
+}
+
+fn semantic_vector(value: &str) -> Vec<f32> {
+    let mut buckets = [0.0_f32; 8];
+    for token in tokenize_for_event_terms(value) {
+        let bucket = token
+            .bytes()
+            .fold(0_usize, |acc, byte| acc.wrapping_add(byte as usize))
+            % buckets.len();
+        buckets[bucket] += 1.0;
+    }
+    let magnitude = buckets
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
+    if magnitude > 0.0 {
+        for bucket in &mut buckets {
+            *bucket /= magnitude;
+        }
+    }
+    buckets.to_vec()
+}
+
+fn duplicate_group_membership_map(groups: &[DuplicateGroupRow]) -> BTreeMap<Uuid, Uuid> {
+    let mut memberships = BTreeMap::new();
+    for group in groups {
+        for member in &group.members {
+            memberships.insert(member.evidence_id, group.duplicate_group_id);
+        }
+    }
+    memberships
+}
+
+fn seeded_candidate_clusters(prepared_mentions: &[PreparedEventMention]) -> Vec<CandidateCluster> {
+    let mut grouped = BTreeMap::<(Uuid, i32), Vec<&PreparedEventMention>>::new();
+    for prepared in prepared_mentions {
+        let Some(link) = &prepared.existing_cluster_link else {
+            continue;
+        };
+        grouped
+            .entry((link.event_cluster_id, link.cluster_version))
+            .or_default()
+            .push(prepared);
+    }
+
+    grouped
+        .into_iter()
+        .map(
+            |((event_cluster_id, cluster_version), members)| CandidateCluster {
+                event_cluster_id,
+                cluster_version: Some(cluster_version),
+                input_cluster_versions: vec![ClusterVersionRef {
+                    event_cluster_id,
+                    cluster_version: Some(cluster_version),
+                }],
+                mentions: members
+                    .into_iter()
+                    .map(|prepared| ClusterMention {
+                        origin_cluster_id: event_cluster_id,
+                        duplicate_group_id: prepared.duplicate_group_id,
+                        mention: prepared.mention.clone(),
+                    })
+                    .collect(),
+                review_required: false,
+            },
+        )
+        .collect()
+}
+
+fn locked_cluster_relations_from_duplicate_groups(
+    clusters: &[CandidateCluster],
+    groups: &[DuplicateGroupRow],
+) -> LockedClusterRelations {
+    let evidence_to_origin = clusters
+        .iter()
+        .flat_map(|cluster| {
+            cluster
+                .mentions
+                .iter()
+                .map(|mention| (mention.mention.evidence_id, mention.origin_cluster_id))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut relations = LockedClusterRelations::default();
+
+    for group in groups.iter().filter(|group| group.locked_by_user) {
+        let mut origin_ids = group
+            .members
+            .iter()
+            .filter_map(|member| evidence_to_origin.get(&member.evidence_id).copied())
+            .collect::<Vec<_>>();
+        origin_ids.sort();
+        origin_ids.dedup();
+        for left in 0..origin_ids.len() {
+            for right in (left + 1)..origin_ids.len() {
+                let pair = ordered_cluster_pair(origin_ids[left], origin_ids[right]);
+                match group.relation_type.as_str() {
+                    "exact" | "near" => {
+                        relations.merge_pairs.insert(pair);
+                    }
+                    "independent" => {
+                        relations.split_pairs.insert(pair);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    relations
+}
+
+fn ordered_cluster_pair(left: Uuid, right: Uuid) -> (Uuid, Uuid) {
+    if left <= right {
+        (left, right)
+    } else {
+        (right, left)
+    }
+}
+
+fn build_cluster_row(
+    cluster: &RefinedCluster,
+    prepared_by_evidence: &BTreeMap<Uuid, PreparedEventMention>,
+) -> Result<Option<crate::storage::event_repository::EventClusterRow>> {
+    let mut mentions = cluster
+        .mentions
+        .iter()
+        .filter_map(|mention| {
+            prepared_by_evidence
+                .get(&mention.mention.evidence_id)
+                .map(|prepared| (mention, prepared))
+        })
+        .collect::<Vec<_>>();
+    if mentions.is_empty() {
+        return Ok(None);
+    }
+
+    mentions.sort_by_key(|(_, prepared)| {
+        (
+            prepared.evidence.available_at,
+            prepared.evidence.first_seen_at,
+            prepared.evidence.evidence_id,
+        )
+    });
+    let representative = mentions
+        .iter()
+        .find(|(_, prepared)| prepared.evidence.evidence_id == cluster.representative_evidence_id)
+        .copied()
+        .unwrap_or(mentions[0]);
+    let representative_title = representative.1.evidence.title.clone();
+    let representative_entities = representative.1.extraction.as_ref().and_then(|row| {
+        serde_json::from_value::<EventExtractionV1>(row.extracted_payload.clone()).ok()
+    });
+    let event_type = representative_entities
+        .as_ref()
+        .map(|payload| payload.event_type.clone())
+        .unwrap_or_else(|| "issuer_disclosure".to_string());
+    let event_subtype = representative_entities
+        .as_ref()
+        .and_then(|payload| payload.event_subtype.clone());
+    let snapshot = EventClusterVersionSnapshot {
+        event_cluster_id: cluster.event_cluster_id,
+        cluster_version: cluster.cluster_version,
+        lifecycle_status: "active".to_string(),
+        claims: cluster_claim_snapshots(&mentions)?,
+        expectation: None,
+        uncertainties: cluster_uncertainties(&mentions)?,
+    };
+
+    let representative_ids = mentions
+        .iter()
+        .map(|(_, prepared)| prepared.evidence.evidence_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let first_seen_at = mentions
+        .iter()
+        .map(|(_, prepared)| prepared.evidence.first_seen_at)
+        .min()
+        .unwrap_or(representative.1.evidence.first_seen_at);
+    let last_seen_at = mentions
+        .iter()
+        .map(|(_, prepared)| prepared.evidence.available_at)
+        .max()
+        .unwrap_or(representative.1.evidence.available_at);
+    let created_at = last_seen_at;
+    let event_time = mentions
+        .iter()
+        .filter_map(|(mention, _)| mention.mention.event_time)
+        .min();
+
+    Ok(Some(crate::storage::event_repository::EventClusterRow {
+        event_cluster_id: cluster.event_cluster_id,
+        cluster_version: cluster.cluster_version,
+        canonical_title: representative_title,
+        event_time,
+        first_seen_at,
+        last_seen_at,
+        lifecycle_status: "active".to_string(),
+        primary_evidence_id: representative.1.evidence.evidence_id,
+        representative_ids,
+        source_entropy: cluster.source_entropy,
+        independent_sources: cluster.independent_sources as i32,
+        mention_count: cluster.mentions.len() as i32,
+        cluster_payload: json!({
+            "eventType": event_type,
+            "eventSubtype": event_subtype,
+            "deltaSnapshot": snapshot
+        }),
+        supersedes_version: cluster.supersedes_version,
+        created_at,
+    }))
+}
+
+fn cluster_claim_snapshots(
+    mentions: &[(&ClusterMention, &PreparedEventMention)],
+) -> Result<Vec<EventClaimSnapshot>> {
+    let mut snapshots = Vec::new();
+    for (_, prepared) in mentions {
+        let Some(extraction) = &prepared.extraction else {
+            continue;
+        };
+        let payload: EventExtractionV1 =
+            serde_json::from_value(extraction.extracted_payload.clone())?;
+        let entity_roles = payload
+            .entities
+            .iter()
+            .map(|entity| ClaimEntityRole {
+                entity_id: entity
+                    .stock_code
+                    .clone()
+                    .unwrap_or_else(|| entity.text.clone()),
+                role: entity.role.clone(),
+            })
+            .collect::<Vec<_>>();
+        let claim_date =
+            mention_time_from_payload(&prepared.evidence, &payload).map(|value| value.date_naive());
+        for claim in extraction
+            .claims
+            .iter()
+            .filter(|claim| claim.review_status == "published")
+        {
+            snapshots.push(EventClaimSnapshot {
+                claim_id: claim.claim_id,
+                canonical_claim_id: canonical_claim_id(&claim.claim_text),
+                status: Some(claim.review_status.clone()),
+                value: None,
+                entity_roles: entity_roles.clone(),
+                claim_date,
+            });
+        }
+    }
+    snapshots.sort_by_key(|snapshot| snapshot.claim_id);
+    Ok(snapshots)
+}
+
+fn cluster_uncertainties(
+    mentions: &[(&ClusterMention, &PreparedEventMention)],
+) -> Result<Vec<String>> {
+    let mut uncertainties = BTreeSet::new();
+    for (_, prepared) in mentions {
+        let Some(extraction) = &prepared.extraction else {
+            continue;
+        };
+        let payload: EventExtractionV1 =
+            serde_json::from_value(extraction.extracted_payload.clone())?;
+        for uncertainty in payload.uncertainties {
+            if !uncertainty.trim().is_empty() {
+                uncertainties.insert(uncertainty);
+            }
+        }
+    }
+    Ok(uncertainties.into_iter().collect())
+}
+
+fn canonical_claim_id(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn cluster_rows_equivalent(
+    existing: &crate::storage::event_repository::EventClusterRow,
+    next: &crate::storage::event_repository::EventClusterRow,
+) -> bool {
+    existing.canonical_title == next.canonical_title
+        && existing.event_time == next.event_time
+        && existing.lifecycle_status == next.lifecycle_status
+        && existing.primary_evidence_id == next.primary_evidence_id
+        && existing.representative_ids == next.representative_ids
+        && existing.source_entropy == next.source_entropy
+        && existing.independent_sources == next.independent_sources
+        && existing.mention_count == next.mention_count
+        && existing.cluster_payload == next.cluster_payload
+}
+
+fn mention_payload(mention: &EventMention, extraction: Option<&ExtractionRow>) -> Result<Value> {
+    let extraction_payload = extraction
+        .map(|row| row.extracted_payload.clone())
+        .unwrap_or_else(|| json!({}));
+    Ok(json!({
+        "entityIds": mention.entity_ids.clone(),
+        "actionTokens": mention.action_tokens.clone(),
+        "locationTokens": mention.location_tokens.clone(),
+        "semanticVector": mention.semantic_vector.clone(),
+        "extractedEvent": extraction_payload
+    }))
+}
+
+fn related_window_events_for_entity(
+    evidence_rows: &[EventEvidenceRow],
+    extraction_by_evidence: &BTreeMap<Uuid, ExtractionRow>,
+    cluster_links_by_evidence: &BTreeMap<Uuid, EventMentionClusterLinkRow>,
+    latest_clusters_by_id: &BTreeMap<Uuid, crate::storage::event_repository::EventClusterRow>,
+    hypothesis_row: &EventHypothesisRow,
+    entity: &ObservationEntity,
+    window: &ObservationWindow,
+    context: &PointInTimeContext,
+) -> Result<Vec<WindowEvent>> {
+    let current_primary_evidence = latest_clusters_by_id
+        .get(&hypothesis_row.event_cluster_id)
+        .map(|row| row.primary_evidence_id);
+    let hypothesis_trade_date = hypothesis_row
+        .frozen_at
+        .date_naive()
+        .succ_opt()
+        .unwrap_or_else(|| hypothesis_row.frozen_at.date_naive());
+    let mut related_events = Vec::new();
+
+    for evidence in evidence_rows {
+        if current_primary_evidence == Some(evidence.evidence_id) {
+            continue;
+        }
+        if evidence
+            .effective_trade_date
+            .succ_opt()
+            .unwrap_or(evidence.effective_trade_date)
+            != hypothesis_trade_date
+        {
+            continue;
+        }
+        if let Some(link) = cluster_links_by_evidence.get(&evidence.evidence_id) {
+            if link.event_cluster_id == hypothesis_row.event_cluster_id {
+                continue;
+            }
+        }
+        let Some(extraction) = extraction_by_evidence.get(&evidence.evidence_id) else {
+            continue;
+        };
+        let payload: EventExtractionV1 =
+            serde_json::from_value(extraction.extracted_payload.clone())?;
+        if !payload.entities.iter().any(|extracted| {
+            extracted.role == "subject"
+                && extracted
+                    .stock_code
+                    .as_deref()
+                    .map(|stock_code| stock_code == entity.entity_id)
+                    .unwrap_or(false)
+        }) {
+            continue;
+        }
+        let available_at = evidence.available_at;
+        if !context.can_use(available_at) {
+            continue;
+        }
+
+        related_events.push(WindowEvent {
+            entity_id: entity.entity_id.clone(),
+            window_label: window.label.clone(),
+            event_type: payload.event_type.clone(),
+            importance: confounder_event_importance(&payload, evidence),
+            available_at,
+        });
+    }
+
+    Ok(related_events)
+}
+
+fn confounder_event_importance(
+    payload: &EventExtractionV1,
+    evidence: &EventEvidenceRow,
+) -> EventImportance {
+    match payload.event_type.as_str() {
+        "earnings"
+        | "trading_suspension"
+        | "trading_resumption"
+        | "suspension"
+        | "resumption"
+        | "regulatory_penalty"
+        | "major_corporate_action" => EventImportance::Medium,
+        _ if payload
+            .event_subtype
+            .as_deref()
+            .map(|value| value.contains("major"))
+            .unwrap_or(false)
+            || evidence.title.to_ascii_lowercase().contains("major") =>
+        {
+            EventImportance::High
+        }
+        _ => EventImportance::Low,
+    }
 }
 
 struct LoadedMarketObservationInputs {
@@ -1490,8 +2183,8 @@ mod tests {
     use crate::data::types::{Candle, IndexData, LimitUpStock, SectorData, StockInfo};
     use crate::error::Result;
     use crate::storage::event_repository::{
-        ClaimEvidenceRow, ClaimGraphRow, ClaimRow, EventClusterRow, EventHypothesisRow,
-        EventRepository, ExtractionRow,
+        ClaimEvidenceRow, ClaimGraphRow, ClaimRow, DuplicateGroupMemberRow, DuplicateGroupRow,
+        EventClusterRow, EventHypothesisRow, EventRepository, ExtractionRow,
     };
     use crate::storage::market_repository::MarketRepository;
 
@@ -1993,6 +2686,254 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn event_cluster_refinement_job_builds_mentions_and_clusters_from_extracted_evidence(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let state = test_state(pool.clone()).await;
+        let repo = EventRepository::new(pool.clone());
+        let first = event_evidence(
+            "official:market_event",
+            "cluster-fresh-first",
+            1,
+            "publishable",
+            date(2026, 7, 10),
+        );
+        let second = event_evidence(
+            "official:market_event",
+            "cluster-fresh-second",
+            1,
+            "publishable",
+            date(2026, 7, 10),
+        );
+        repo.insert_evidence(&first).await.unwrap();
+        repo.insert_evidence(&second).await.unwrap();
+
+        repo.save_extraction(&extraction_row_with_event_payload(
+            first.evidence_id,
+            "issuer_disclosure",
+            None,
+            vec![published_claim(
+                first.evidence_id,
+                Uuid::from_u128(401),
+                "600519.SH wins major automation order in Shanghai",
+            )],
+            vec![
+                extracted_entity("Kweichow Moutai", "issuer", "subject", Some("600519.SH")),
+                extracted_entity("Shanghai", "location", "location", None),
+            ],
+            vec![],
+        ))
+        .await
+        .unwrap();
+        repo.save_extraction(&extraction_row_with_event_payload(
+            second.evidence_id,
+            "issuer_disclosure",
+            None,
+            vec![published_claim(
+                second.evidence_id,
+                Uuid::from_u128(402),
+                "600519.SH secures automation order update in Shanghai",
+            )],
+            vec![
+                extracted_entity("Kweichow Moutai", "issuer", "subject", Some("600519.SH")),
+                extracted_entity("Shanghai", "location", "location", None),
+            ],
+            vec![],
+        ))
+        .await
+        .unwrap();
+        repo.save_claim_graph(&claim_graph_row(
+            first.evidence_id,
+            1,
+            vec!["600519.SH wins major automation order in Shanghai"],
+        ))
+        .await
+        .unwrap();
+        repo.save_claim_graph(&claim_graph_row(
+            second.evidence_id,
+            1,
+            vec!["600519.SH secures automation order update in Shanghai"],
+        ))
+        .await
+        .unwrap();
+
+        run_event_cluster_refinement_job(state).await;
+
+        let mention_rows: Vec<(Uuid, Uuid, i32, bool, Value)> = sqlx::query_as(
+            r#"SELECT evidence_id,
+                      event_cluster_id,
+                      cluster_version,
+                      adds_new_fact,
+                      mention_payload
+               FROM market_event_mentions
+               ORDER BY evidence_id ASC"#,
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(mention_rows.len(), 2);
+        assert!(mention_rows.iter().all(|row| row.3));
+        assert_eq!(mention_rows[0].1, mention_rows[1].1);
+        assert_eq!(mention_rows[0].2, 1);
+        assert_eq!(mention_rows[1].2, 1);
+        assert_eq!(mention_rows[0].4["entityIds"], json!(["600519.SH"]));
+        assert_eq!(mention_rows[1].4["entityIds"], json!(["600519.SH"]));
+
+        let clusters: Vec<(Uuid, i32, i32, i32, Value)> = sqlx::query_as(
+            r#"SELECT event_cluster_id,
+                      cluster_version,
+                      mention_count,
+                      independent_sources,
+                      cluster_payload
+               FROM market_event_clusters
+               ORDER BY created_at ASC, event_cluster_id ASC"#,
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].1, 1);
+        assert_eq!(clusters[0].2, 2);
+        assert_eq!(clusters[0].3, 2);
+        assert_eq!(
+            clusters[0].4["deltaSnapshot"]["claims"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
+
+        let hypothesis_count: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*)
+               FROM market_event_hypotheses"#,
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(hypothesis_count, 1);
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn event_cluster_refinement_job_respects_locked_duplicate_merge_relations(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let state = test_state(pool.clone()).await;
+        let repo = EventRepository::new(pool.clone());
+        let left = event_evidence(
+            "official:market_event",
+            "cluster-locked-merge-left",
+            1,
+            "publishable",
+            date(2026, 7, 10),
+        );
+        let right = event_evidence(
+            "official:market_event",
+            "cluster-locked-merge-right",
+            1,
+            "publishable",
+            date(2026, 7, 10),
+        );
+        repo.insert_evidence(&left).await.unwrap();
+        repo.insert_evidence(&right).await.unwrap();
+
+        repo.save_extraction(&extraction_row_with_event_payload(
+            left.evidence_id,
+            "issuer_disclosure",
+            None,
+            vec![published_claim(
+                left.evidence_id,
+                Uuid::from_u128(451),
+                "600519.SH signs a port logistics agreement",
+            )],
+            vec![extracted_entity(
+                "Kweichow Moutai",
+                "issuer",
+                "subject",
+                Some("600519.SH"),
+            )],
+            vec![],
+        ))
+        .await
+        .unwrap();
+        repo.save_extraction(&extraction_row_with_event_payload(
+            right.evidence_id,
+            "issuer_disclosure",
+            None,
+            vec![published_claim(
+                right.evidence_id,
+                Uuid::from_u128(452),
+                "600519.SH opens a bonded warehouse center",
+            )],
+            vec![extracted_entity(
+                "Kweichow Moutai",
+                "issuer",
+                "subject",
+                Some("600519.SH"),
+            )],
+            vec![],
+        ))
+        .await
+        .unwrap();
+        repo.save_claim_graph(&claim_graph_row(
+            left.evidence_id,
+            1,
+            vec!["600519.SH signs a port logistics agreement"],
+        ))
+        .await
+        .unwrap();
+        repo.save_claim_graph(&claim_graph_row(
+            right.evidence_id,
+            1,
+            vec!["600519.SH opens a bonded warehouse center"],
+        ))
+        .await
+        .unwrap();
+
+        repo.save_duplicate_group(&DuplicateGroupRow {
+            duplicate_group_id: Uuid::new_v4(),
+            relation_type: "exact".to_string(),
+            confidence: 1.0,
+            locked_by_user: true,
+            members: vec![
+                DuplicateGroupMemberRow {
+                    evidence_id: left.evidence_id,
+                    is_representative: true,
+                },
+                DuplicateGroupMemberRow {
+                    evidence_id: right.evidence_id,
+                    is_representative: false,
+                },
+            ],
+            created_at: dt(2026, 7, 10, 12),
+        })
+        .await
+        .unwrap();
+
+        run_event_cluster_refinement_job(state).await;
+
+        let clusters: Vec<(Uuid, i32, i32)> = sqlx::query_as(
+            r#"SELECT event_cluster_id, cluster_version, mention_count
+               FROM market_event_clusters
+               ORDER BY created_at ASC, event_cluster_id ASC"#,
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(clusters.len(), 1, "{clusters:?}");
+        assert_eq!(clusters[0].1, 1);
+        assert_eq!(clusters[0].2, 2);
+
+        let mention_links: Vec<(Uuid, Uuid)> = sqlx::query_as(
+            r#"SELECT evidence_id, event_cluster_id
+               FROM market_event_mentions
+               ORDER BY evidence_id ASC"#,
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(mention_links.len(), 2);
+        assert_eq!(mention_links[0].1, mention_links[1].1);
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn event_market_observation_job_returns_cleanly_without_persisted_observations(
         pool: PgPool,
     ) -> sqlx::Result<()> {
@@ -2058,6 +2999,87 @@ mod tests {
         assert_eq!(stored.3["stock_return"], json!(0.05));
         assert_eq!(stored.3["market_return"], json!(0.02));
         assert_eq!(stored.3["industry_return"], json!(0.03));
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn event_market_observation_job_persists_confounded_rows_for_same_entity_events(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let state = test_state(pool.clone()).await;
+        let repo = EventRepository::new(pool.clone());
+        let evidence = event_evidence(
+            "official:market_event",
+            "notice-market-observation-confounded",
+            1,
+            "publishable",
+            date(2026, 7, 10),
+        );
+        let confounder = event_evidence(
+            "official:market_event",
+            "notice-market-observation-earnings",
+            1,
+            "publishable",
+            date(2026, 7, 10),
+        );
+        repo.insert_evidence(&evidence).await.unwrap();
+        repo.insert_evidence(&confounder).await.unwrap();
+
+        let cluster_id = Uuid::new_v4();
+        repo.save_event_cluster_version(&cluster_row_with_snapshot(
+            cluster_id,
+            1,
+            evidence.evidence_id,
+            vec![Uuid::from_u128(501)],
+        ))
+        .await
+        .unwrap();
+        let hypothesis = frozen_hypothesis_row(cluster_id, 1, 1, None, vec![Uuid::from_u128(501)]);
+        repo.save_frozen_hypothesis(&hypothesis).await.unwrap();
+        seed_event_market_inputs(&pool, date(2026, 7, 11), "600519.SH").await?;
+
+        repo.save_extraction(&extraction_row_with_event_payload(
+            confounder.evidence_id,
+            "earnings",
+            Some("guidance"),
+            vec![published_claim(
+                confounder.evidence_id,
+                Uuid::from_u128(502),
+                "600519.SH reports quarterly earnings guidance",
+            )],
+            vec![extracted_entity(
+                "Kweichow Moutai",
+                "issuer",
+                "subject",
+                Some("600519.SH"),
+            )],
+            vec![],
+        ))
+        .await
+        .unwrap();
+
+        run_event_market_observation_job(state).await;
+
+        let stored: (String, Value) = sqlx::query_as(
+            r#"SELECT observation_status, confounding_events
+               FROM market_event_market_observations
+               WHERE hypothesis_id = $1
+               LIMIT 1"#,
+        )
+        .bind(hypothesis.hypothesis_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(stored.0, "confounded");
+        assert_eq!(
+            stored.1,
+            json!([
+                {
+                    "kind": "earnings",
+                    "event_type": "earnings"
+                }
+            ])
+        );
 
         Ok(())
     }
@@ -2299,6 +3321,24 @@ mod tests {
     }
 
     fn extraction_row(evidence_id: Uuid, claims: Vec<ClaimRow>) -> ExtractionRow {
+        extraction_row_with_event_payload(
+            evidence_id,
+            "issuer_disclosure",
+            None,
+            claims,
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    fn extraction_row_with_event_payload(
+        evidence_id: Uuid,
+        event_type: &str,
+        event_subtype: Option<&str>,
+        claims: Vec<ClaimRow>,
+        entities: Vec<Value>,
+        uncertainties: Vec<&str>,
+    ) -> ExtractionRow {
         ExtractionRow {
             extraction_id: Uuid::new_v4(),
             evidence_id,
@@ -2306,13 +3346,43 @@ mod tests {
             prompt_version: Some("prompt-v1".to_string()),
             model_name: Some("test-model".to_string()),
             model_parameters: json!({"temperature": 0}),
-            extracted_payload: json!({"claims": claims.len()}),
+            extracted_payload: json!({
+                "event_type": event_type,
+                "event_subtype": event_subtype,
+                "claims": claims.iter().map(|claim| {
+                    json!({
+                        "claim_type": claim.claim_type,
+                        "text": claim.claim_text,
+                        "evidence_ids": claim.evidence.iter().map(|row| row.evidence_id).collect::<Vec<_>>(),
+                        "confidence": claim.confidence
+                    })
+                }).collect::<Vec<_>>(),
+                "entities": entities,
+                "amounts": [],
+                "dates": [],
+                "uncertainties": uncertainties,
+                "missing_information": []
+            }),
             validation_status: "valid".to_string(),
             validation_errors: json!([]),
             input_fingerprint: format!("fingerprint-{evidence_id}"),
             claims,
             created_at: dt(2026, 7, 10, 12),
         }
+    }
+
+    fn extracted_entity(
+        text: &str,
+        entity_type: &str,
+        role: &str,
+        stock_code: Option<&str>,
+    ) -> Value {
+        json!({
+            "text": text,
+            "entity_type": entity_type,
+            "role": role,
+            "stock_code": stock_code
+        })
     }
 
     fn published_claim(evidence_id: Uuid, claim_id: Uuid, claim_text: &str) -> ClaimRow {
