@@ -6,15 +6,24 @@ use tracing::{info, warn};
 
 use crate::analysis::adapters::official_event_source::OfficialEventSource;
 use crate::analysis::adapters::{EventSource, FetchedEvent};
+use crate::analysis::events::claims::ClaimGraph;
 use crate::analysis::events::extraction::StockCodeDirectory;
+use crate::analysis::events::market_observation::{
+    observe_market_alignment, CausalConfidenceInputs, MarketSnapshotObservationInput,
+    ObservationEntity, ObservationWindow,
+};
 use crate::analysis::events::{
-    render_daily_brief, AShareTradingDateResolver, EventIntelligence, TradingDateResolver,
+    compute_event_delta, render_daily_brief, AShareTradingDateResolver,
+    EventClusterVersionSnapshot, EventDelta, EventIntelligence, FrozenImpactHypothesis,
+    TradingDateResolver,
 };
 use crate::analysis::market_snapshot::{
-    ingestion::PointInTimeIngestion, MarketSnapshotModule, MARKET_SNAPSHOT_VERSION,
+    ingestion::PointInTimeIngestion, MarketSnapshotModule, PointInTimeContext,
+    MARKET_SNAPSHOT_VERSION,
 };
 use crate::analysis::patterns::matcher::PatternEngine;
 use crate::data::provider::DataProvider;
+use crate::error::Result;
 use crate::market_time::{beijing_today, beijing_tz};
 use crate::services::{
     limit_up::LimitUpService, market::MarketService, market_report::MarketReportService,
@@ -22,7 +31,10 @@ use crate::services::{
     stock_history::StockHistoryService,
 };
 use crate::state::AppState;
-use crate::storage::event_repository::{DailyEventBriefRow, EventEvidenceRow, EventRepository};
+use crate::storage::event_repository::{
+    DailyEventBriefRow, EventDeltaRow, EventEvidenceRow, EventHypothesisRow, EventRepository,
+    MarketObservationRow,
+};
 use crate::storage::market_repository::MarketRepository;
 use crate::storage::pattern_repository::PatternRepository;
 use crate::storage::postgres;
@@ -424,16 +436,303 @@ pub async fn run_event_fact_brief_job(state: Arc<AppState>) {
 
 pub async fn run_event_cluster_refinement_job(state: Arc<AppState>) {
     let _guard = state.analysis_job_lock.lock().await;
-    info!(
-        "Event cluster refinement skipped: no persisted event-cluster evolution output is available yet"
-    );
+    let repo = EventRepository::new(state.db.clone());
+    match persist_event_cluster_refinement_outputs(&repo).await {
+        Ok((delta_count, hypothesis_count)) => info!(
+            "Event cluster refinement persisted {} delta rows and {} frozen hypotheses",
+            delta_count, hypothesis_count
+        ),
+        Err(error) => warn!("Event cluster refinement failed: {}", error),
+    }
 }
 
 pub async fn run_event_market_observation_job(state: Arc<AppState>) {
     let _guard = state.analysis_job_lock.lock().await;
-    info!(
-        "Event market observation skipped: no persisted frozen hypotheses or market observations are available yet"
-    );
+    let repo = EventRepository::new(state.db.clone());
+    match persist_event_market_observations(&repo).await {
+        Ok(observation_count) => info!(
+            "Event market observation persisted {} repository-backed observation rows",
+            observation_count
+        ),
+        Err(error) => warn!("Event market observation failed: {}", error),
+    }
+}
+
+async fn persist_event_cluster_refinement_outputs(
+    repo: &EventRepository,
+) -> Result<(usize, usize)> {
+    let latest_clusters = repo.list_latest_cluster_versions().await?;
+    let mut persisted_deltas = 0usize;
+    let mut persisted_hypotheses = 0usize;
+
+    for latest_cluster in latest_clusters {
+        let cluster_versions = repo
+            .list_cluster_versions(latest_cluster.event_cluster_id)
+            .await?;
+        let mut prior_hypothesis: Option<FrozenImpactHypothesis> = None;
+
+        for cluster_version in cluster_versions {
+            if let Some(existing) = repo
+                .find_latest_hypothesis_for_cluster_version(
+                    cluster_version.event_cluster_id,
+                    cluster_version.cluster_version,
+                )
+                .await?
+            {
+                prior_hypothesis = Some(serde_json::from_value(existing.graph_payload)?);
+                continue;
+            }
+
+            if cluster_version.cluster_version > 1
+                && repo
+                    .find_event_delta(
+                        cluster_version.event_cluster_id,
+                        cluster_version.cluster_version - 1,
+                        cluster_version.cluster_version,
+                    )
+                    .await?
+                    .is_none()
+            {
+                let Some(previous_cluster) = repo
+                    .find_event_cluster_version(
+                        cluster_version.event_cluster_id,
+                        cluster_version.cluster_version - 1,
+                    )
+                    .await?
+                else {
+                    continue;
+                };
+                let Some(previous_snapshot) = cluster_snapshot_from_row(&previous_cluster)? else {
+                    continue;
+                };
+                let Some(current_snapshot) = cluster_snapshot_from_row(&cluster_version)? else {
+                    continue;
+                };
+                let delta = compute_event_delta(&previous_snapshot, &current_snapshot);
+                repo.save_event_delta(&EventDeltaRow {
+                    event_cluster_id: cluster_version.event_cluster_id,
+                    from_version: cluster_version.cluster_version - 1,
+                    to_version: cluster_version.cluster_version,
+                    delta_payload: serde_json::to_value(&delta)?,
+                    created_at: cluster_version.created_at,
+                })
+                .await?;
+                persisted_deltas += 1;
+            }
+
+            let Some(claim_graph) = repo
+                .find_latest_claim_graph_for_evidence(cluster_version.primary_evidence_id)
+                .await?
+                .map(|row| serde_json::from_value::<ClaimGraph>(row.graph_payload))
+                .transpose()?
+            else {
+                continue;
+            };
+            let extraction = repo
+                .list_latest_extractions_for_evidence_ids(&[cluster_version.primary_evidence_id])
+                .await?
+                .into_iter()
+                .find(|row| row.evidence_id == cluster_version.primary_evidence_id);
+            let Some(extraction) = extraction else {
+                continue;
+            };
+            let claim_ids = published_claim_ids(&extraction);
+            if claim_ids.is_empty() {
+                continue;
+            }
+
+            let next_hypothesis = if cluster_version.cluster_version == 1 {
+                FrozenImpactHypothesis::initial(
+                    &claim_graph,
+                    claim_ids,
+                    cluster_version.created_at,
+                )?
+            } else {
+                let Some(prior_hypothesis) = prior_hypothesis.clone() else {
+                    continue;
+                };
+                let Some(delta_row) = repo
+                    .find_event_delta(
+                        cluster_version.event_cluster_id,
+                        cluster_version.cluster_version - 1,
+                        cluster_version.cluster_version,
+                    )
+                    .await?
+                else {
+                    continue;
+                };
+                let delta: EventDelta = serde_json::from_value(delta_row.delta_payload)?;
+                prior_hypothesis.evolve(&claim_graph, &delta, cluster_version.created_at)?
+            };
+
+            repo.save_frozen_hypothesis(&EventHypothesisRow {
+                hypothesis_id: next_hypothesis.hypothesis_id(),
+                event_cluster_id: cluster_version.event_cluster_id,
+                cluster_version: cluster_version.cluster_version,
+                hypothesis_version: next_hypothesis.hypothesis_version(),
+                schema_version: next_hypothesis.graph().schema_version.clone(),
+                graph_payload: serde_json::to_value(&next_hypothesis)?,
+                frozen_at: next_hypothesis.graph().frozen_at,
+                based_on_claim_ids: next_hypothesis.graph().based_on_claim_ids.clone(),
+                review_status: "frozen".to_string(),
+                supersedes_id: next_hypothesis.supersedes_hypothesis_id(),
+                created_at: cluster_version.created_at,
+            })
+            .await?;
+            prior_hypothesis = Some(next_hypothesis);
+            persisted_hypotheses += 1;
+        }
+    }
+
+    Ok((persisted_deltas, persisted_hypotheses))
+}
+
+async fn persist_event_market_observations(repo: &EventRepository) -> Result<usize> {
+    let hypotheses = repo.list_latest_hypotheses().await?;
+    let mut persisted = 0usize;
+
+    for hypothesis_row in hypotheses {
+        let hypothesis: FrozenImpactHypothesis =
+            serde_json::from_value(hypothesis_row.graph_payload)?;
+        let trade_date = hypothesis
+            .graph()
+            .frozen_at
+            .date_naive()
+            .succ_opt()
+            .unwrap_or_else(|| hypothesis.graph().frozen_at.date_naive());
+        let window = ObservationWindow {
+            label: "t+1".to_string(),
+            expires_on: trade_date.succ_opt().unwrap_or(trade_date),
+        };
+        let context = PointInTimeContext {
+            trade_date,
+            as_of: trade_date.and_hms_opt(9, 30, 0).unwrap().and_utc(),
+        };
+        let existing = repo
+            .list_market_observations_for_hypothesis(hypothesis_row.hypothesis_id)
+            .await?;
+
+        for entity in direct_observation_entities(&hypothesis) {
+            if existing.iter().any(|row| {
+                row.entity_type == entity.entity_type
+                    && row.entity_id == entity.entity_id
+                    && row.trade_date == trade_date
+            }) {
+                continue;
+            }
+
+            let observation = observe_market_alignment(&MarketSnapshotObservationInput {
+                context,
+                hypothesis: hypothesis.clone(),
+                entity: entity.clone(),
+                window: window.clone(),
+                stock_return: None,
+                market_return: None,
+                industry_return: None,
+                snapshot_version: MARKET_SNAPSHOT_VERSION.to_string(),
+                benchmark_id: "unavailable".to_string(),
+                industry_benchmark_id: "unavailable".to_string(),
+                causal_inputs: CausalConfidenceInputs {
+                    evidence_strength: 0.0,
+                    timing_quality: 0.0,
+                    identification_quality: 0.0,
+                },
+                related_events: Vec::new(),
+                observed_at: context.as_of,
+            })?;
+
+            repo.save_market_observation(&MarketObservationRow {
+                hypothesis_id: observation.hypothesis_id,
+                entity_type: observation.entity_type,
+                entity_id: observation.entity_id,
+                trade_date: observation.trade_date,
+                observation_status: serde_json::to_value(observation.observation_status)?
+                    .as_str()
+                    .unwrap_or("not_observed")
+                    .to_string(),
+                market_alignment_score: observation.market_alignment_score,
+                causal_confidence: observation.causal_confidence,
+                abnormal_market_return: observation.abnormal_market_return,
+                abnormal_industry_return: observation.abnormal_industry_return,
+                market_metrics: serde_json::to_value(&observation.market_metrics)?,
+                confounding_events: serde_json::to_value(&observation.confounding_events)?,
+                created_at: observation.created_at,
+            })
+            .await?;
+            persisted += 1;
+        }
+    }
+
+    Ok(persisted)
+}
+
+fn cluster_snapshot_from_row(
+    row: &crate::storage::event_repository::EventClusterRow,
+) -> Result<Option<EventClusterVersionSnapshot>> {
+    match row.cluster_payload.get("deltaSnapshot") {
+        Some(snapshot) => Ok(Some(serde_json::from_value(snapshot.clone())?)),
+        None => {
+            if row.cluster_payload.get("claims").is_some() {
+                Ok(Some(serde_json::from_value(row.cluster_payload.clone())?))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+}
+
+fn published_claim_ids(
+    extraction: &crate::storage::event_repository::ExtractionRow,
+) -> Vec<uuid::Uuid> {
+    let mut claim_ids = extraction
+        .claims
+        .iter()
+        .filter(|claim| claim.review_status == "published")
+        .map(|claim| claim.claim_id)
+        .collect::<Vec<_>>();
+    claim_ids.sort_unstable();
+    claim_ids.dedup();
+    claim_ids
+}
+
+fn direct_observation_entities(hypothesis: &FrozenImpactHypothesis) -> Vec<ObservationEntity> {
+    let mut entities = Vec::new();
+
+    for node in &hypothesis.graph().nodes {
+        if !matches!(node.node_type.as_str(), "CompanyFact" | "RevenueImpact") {
+            continue;
+        }
+
+        let Some(entity_id) = extract_stock_code(&node.label) else {
+            continue;
+        };
+        if entities
+            .iter()
+            .any(|entity: &ObservationEntity| entity.entity_id == entity_id)
+        {
+            continue;
+        }
+        entities.push(ObservationEntity {
+            entity_type: "company".to_string(),
+            entity_id,
+        });
+    }
+
+    entities
+}
+
+fn extract_stock_code(label: &str) -> Option<String> {
+    label
+        .split(|ch: char| {
+            ch.is_whitespace() || matches!(ch, ',' | ';' | ':' | '(' | ')' | '[' | ']')
+        })
+        .find(|token| {
+            token.len() == 9
+                && token.as_bytes().get(6) == Some(&b'.')
+                && token[..6].chars().all(|ch| ch.is_ascii_digit())
+                && matches!(&token[7..], "SH" | "SZ")
+        })
+        .map(ToString::to_string)
 }
 
 /// Generate daily market report and push to Telegram (18:00 job).
@@ -939,6 +1238,9 @@ mod tests {
     use tokio::time::{timeout, Duration as TokioDuration};
     use uuid::Uuid;
 
+    use crate::analysis::events::{
+        ClaimEntityRole, EventClaimSnapshot, EventClusterVersionSnapshot,
+    };
     use crate::analysis::market_snapshot::{
         AdjustmentFactor, CorporateAction, DailyBasicSnapshot, IndexDailyBar, MarketSnapshot,
         SectorMembership, SecurityDailyStatus, SecurityMasterVersion, MARKET_SNAPSHOT_VERSION,
@@ -948,7 +1250,8 @@ mod tests {
     use crate::data::types::{Candle, IndexData, LimitUpStock, SectorData, StockInfo};
     use crate::error::Result;
     use crate::storage::event_repository::{
-        ClaimEvidenceRow, ClaimRow, EventRepository, ExtractionRow,
+        ClaimEvidenceRow, ClaimGraphRow, ClaimRow, EventClusterRow, EventHypothesisRow,
+        EventRepository, ExtractionRow,
     };
     use crate::storage::market_repository::MarketRepository;
 
@@ -1326,6 +1629,126 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn event_cluster_refinement_job_persists_missing_deltas_and_frozen_hypotheses(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let state = test_state(pool.clone()).await;
+        let repo = EventRepository::new(pool.clone());
+        let previous = event_evidence(
+            "official:market_event",
+            "notice-cluster-prev",
+            1,
+            "publishable",
+            date(2026, 7, 10),
+        );
+        let current = event_evidence(
+            "official:market_event",
+            "notice-cluster-current",
+            1,
+            "publishable",
+            date(2026, 7, 10),
+        );
+        repo.insert_evidence(&previous).await.unwrap();
+        repo.insert_evidence(&current).await.unwrap();
+
+        let prior_claim_id = Uuid::from_u128(101);
+        let repeated_claim_id = Uuid::from_u128(102);
+        let new_claim_id = Uuid::from_u128(202);
+        repo.save_extraction(&extraction_row(
+            previous.evidence_id,
+            vec![published_claim(
+                previous.evidence_id,
+                prior_claim_id,
+                "600519.SH wins major automation order",
+            )],
+        ))
+        .await
+        .unwrap();
+        repo.save_extraction(&extraction_row(
+            current.evidence_id,
+            vec![
+                published_claim(
+                    current.evidence_id,
+                    repeated_claim_id,
+                    "600519.SH wins major automation order",
+                ),
+                published_claim(
+                    current.evidence_id,
+                    new_claim_id,
+                    "600519.SH secures follow-on contract",
+                ),
+            ],
+        ))
+        .await
+        .unwrap();
+        repo.save_claim_graph(&claim_graph_row(
+            previous.evidence_id,
+            1,
+            vec!["600519.SH wins major automation order"],
+        ))
+        .await
+        .unwrap();
+        repo.save_claim_graph(&claim_graph_row(
+            current.evidence_id,
+            1,
+            vec![
+                "600519.SH wins major automation order",
+                "600519.SH secures follow-on contract",
+            ],
+        ))
+        .await
+        .unwrap();
+
+        let cluster_id = Uuid::new_v4();
+        repo.save_event_cluster_version(&cluster_row_with_snapshot(
+            cluster_id,
+            1,
+            previous.evidence_id,
+            vec![prior_claim_id],
+        ))
+        .await
+        .unwrap();
+        repo.save_event_cluster_version(&cluster_row_with_snapshot(
+            cluster_id,
+            2,
+            current.evidence_id,
+            vec![repeated_claim_id, new_claim_id],
+        ))
+        .await
+        .unwrap();
+
+        run_event_cluster_refinement_job(state).await;
+
+        let delta_count: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*)
+               FROM market_event_deltas
+               WHERE event_cluster_id = $1
+                 AND from_version = 1
+                 AND to_version = 2"#,
+        )
+        .bind(cluster_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(delta_count, 1);
+
+        let latest_hypothesis: (i32, i32, Option<Uuid>) = sqlx::query_as(
+            r#"SELECT cluster_version, hypothesis_version, supersedes_id
+               FROM market_event_hypotheses
+               WHERE event_cluster_id = $1
+               ORDER BY cluster_version DESC, hypothesis_version DESC
+               LIMIT 1"#,
+        )
+        .bind(cluster_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(latest_hypothesis.0, 2);
+        assert_eq!(latest_hypothesis.1, 2);
+        assert!(latest_hypothesis.2.is_some());
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn event_market_observation_job_returns_cleanly_without_persisted_observations(
         pool: PgPool,
     ) -> sqlx::Result<()> {
@@ -1338,6 +1761,51 @@ mod tests {
         .await;
 
         assert!(run.is_ok(), "market observation job should return cleanly");
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn event_market_observation_job_persists_not_observed_rows_when_market_inputs_are_unavailable(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let state = test_state(pool.clone()).await;
+        let repo = EventRepository::new(pool.clone());
+        let evidence = event_evidence(
+            "official:market_event",
+            "notice-market-observation",
+            1,
+            "publishable",
+            date(2026, 7, 10),
+        );
+        repo.insert_evidence(&evidence).await.unwrap();
+
+        let cluster_id = Uuid::new_v4();
+        repo.save_event_cluster_version(&cluster_row_with_snapshot(
+            cluster_id,
+            1,
+            evidence.evidence_id,
+            vec![Uuid::from_u128(301)],
+        ))
+        .await
+        .unwrap();
+        let hypothesis = frozen_hypothesis_row(cluster_id, 1, 1, None, vec![Uuid::from_u128(301)]);
+        repo.save_frozen_hypothesis(&hypothesis).await.unwrap();
+
+        run_event_market_observation_job(state).await;
+
+        let stored: (String, Option<f64>, Option<f64>) = sqlx::query_as(
+            r#"SELECT observation_status, market_alignment_score, abnormal_market_return
+               FROM market_event_market_observations
+               WHERE hypothesis_id = $1
+               LIMIT 1"#,
+        )
+        .bind(hypothesis.hypothesis_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(stored.0, "not_observed");
+        assert_eq!(stored.1, None);
+        assert_eq!(stored.2, None);
+
         Ok(())
     }
 
@@ -1400,6 +1868,169 @@ mod tests {
             supersedes_evidence_id: None,
             status: status.to_string(),
             created_at: dt(2026, 7, 10, 9),
+        }
+    }
+
+    fn extraction_row(evidence_id: Uuid, claims: Vec<ClaimRow>) -> ExtractionRow {
+        ExtractionRow {
+            extraction_id: Uuid::new_v4(),
+            evidence_id,
+            schema_version: "event-schema-v1".to_string(),
+            prompt_version: Some("prompt-v1".to_string()),
+            model_name: Some("test-model".to_string()),
+            model_parameters: json!({"temperature": 0}),
+            extracted_payload: json!({"claims": claims.len()}),
+            validation_status: "valid".to_string(),
+            validation_errors: json!([]),
+            input_fingerprint: format!("fingerprint-{evidence_id}"),
+            claims,
+            created_at: dt(2026, 7, 10, 12),
+        }
+    }
+
+    fn published_claim(evidence_id: Uuid, claim_id: Uuid, claim_text: &str) -> ClaimRow {
+        ClaimRow {
+            claim_id,
+            claim_type: "fact".to_string(),
+            claim_text: claim_text.to_string(),
+            confidence: 0.95,
+            review_status: "published".to_string(),
+            evidence: vec![ClaimEvidenceRow { evidence_id }],
+            created_at: dt(2026, 7, 10, 12),
+        }
+    }
+
+    fn claim_graph_row(evidence_id: Uuid, graph_version: i32, labels: Vec<&str>) -> ClaimGraphRow {
+        ClaimGraphRow {
+            claim_graph_id: Uuid::new_v4(),
+            evidence_id,
+            graph_version,
+            schema_version: "claim_graph_v1".to_string(),
+            graph_payload: json!({
+                "schema_version": "claim_graph_v1",
+                "nodes": labels.iter().enumerate().map(|(index, label)| {
+                    json!({
+                        "node_id": format!("order-{}", index + 1),
+                        "node_type": "CompanyFact",
+                        "label": label,
+                        "evidence_ids": [evidence_id],
+                        "confidence": 0.91
+                    })
+                }).collect::<Vec<_>>(),
+                "edges": []
+            }),
+            review_status: "published".to_string(),
+            created_at: dt(2026, 7, 10, 12),
+        }
+    }
+
+    fn cluster_row_with_snapshot(
+        event_cluster_id: Uuid,
+        cluster_version: i32,
+        primary_evidence_id: Uuid,
+        claim_ids: Vec<Uuid>,
+    ) -> EventClusterRow {
+        let claims = claim_ids
+            .into_iter()
+            .enumerate()
+            .map(|(index, claim_id)| EventClaimSnapshot {
+                claim_id,
+                canonical_claim_id: format!("claim-{}", index + 1),
+                status: Some("published".to_string()),
+                value: None,
+                entity_roles: vec![ClaimEntityRole {
+                    entity_id: "600519.SH".to_string(),
+                    role: "subject".to_string(),
+                }],
+                claim_date: Some(date(2026, 7, 10)),
+            })
+            .collect::<Vec<_>>();
+        let snapshot = EventClusterVersionSnapshot {
+            event_cluster_id,
+            cluster_version,
+            lifecycle_status: "active".to_string(),
+            claims,
+            expectation: None,
+            uncertainties: Vec::new(),
+        };
+
+        EventClusterRow {
+            event_cluster_id,
+            cluster_version,
+            canonical_title: format!("Cluster {event_cluster_id} v{cluster_version}"),
+            event_time: Some(dt(2026, 7, 10, 9)),
+            first_seen_at: dt(2026, 7, 10, 9),
+            last_seen_at: dt(2026, 7, 10, 10 + cluster_version as u32),
+            lifecycle_status: "active".to_string(),
+            primary_evidence_id,
+            representative_ids: vec![primary_evidence_id],
+            source_entropy: 0.42,
+            independent_sources: cluster_version,
+            mention_count: cluster_version,
+            cluster_payload: json!({
+                "deltaSnapshot": snapshot
+            }),
+            supersedes_version: (cluster_version > 1).then_some(cluster_version - 1),
+            created_at: dt(2026, 7, 10, 11 + cluster_version as u32),
+        }
+    }
+
+    fn frozen_hypothesis_row(
+        event_cluster_id: Uuid,
+        cluster_version: i32,
+        hypothesis_version: i32,
+        supersedes_id: Option<Uuid>,
+        based_on_claim_ids: Vec<Uuid>,
+    ) -> EventHypothesisRow {
+        let hypothesis_id = Uuid::new_v4();
+        EventHypothesisRow {
+            hypothesis_id,
+            event_cluster_id,
+            cluster_version,
+            hypothesis_version,
+            schema_version: "impact_hypothesis_graph_v1".to_string(),
+            graph_payload: json!({
+                "hypothesis_id": hypothesis_id,
+                "hypothesis_version": hypothesis_version,
+                "supersedes_hypothesis_id": supersedes_id,
+                "graph": {
+                    "schema_version": "impact_hypothesis_graph_v1",
+                    "nodes": [
+                        {
+                            "node_id": "company_order_v1:source:order-1",
+                            "node_type": "CompanyFact",
+                            "label": "600519.SH wins major automation order"
+                        },
+                        {
+                            "node_id": "company_order_v1:impact:600519-sh:0",
+                            "node_type": "RevenueImpact",
+                            "label": "600519.SH"
+                        }
+                    ],
+                    "edges": [
+                        {
+                            "from": "company_order_v1:source:order-1",
+                            "to": "company_order_v1:impact:600519-sh:0",
+                            "relation": "increases",
+                            "generation_method": "domain_rule",
+                            "logic_rule_id": "company_order_v1",
+                            "confidence": 0.91,
+                            "assumptions": ["Customer executes the awarded order."],
+                            "expected_horizon": "t+1",
+                            "observable_indicators": ["Order-related revenue expectations strengthen."],
+                            "counter_scenario": ["Order is canceled or materially delayed."],
+                            "invalidation_conditions": ["The order is publicly withdrawn."]
+                        }
+                    ],
+                    "based_on_claim_ids": based_on_claim_ids,
+                    "frozen_at": dt(2026, 7, 10, 16)
+                }
+            }),
+            frozen_at: dt(2026, 7, 10, 16),
+            based_on_claim_ids,
+            review_status: "frozen".to_string(),
+            supersedes_id,
+            created_at: dt(2026, 7, 10, 16),
         }
     }
 

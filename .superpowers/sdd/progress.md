@@ -66,6 +66,10 @@ Gate 2 Task 8: complete (commits 9990c3b..575eec0, review clean after external c
 Gate 2 Task 9: complete (commits dfb9fd3..1a1075e, review clean after cursor idempotency, fact-brief push, lock isolation, source-less non-fact handling, direct-entity role filtering, and revision-order fixes; verification: analysis::events 66/66 passed with DATABASE_URL, scheduler 14/14 passed with DATABASE_URL, full suite split 320/320 + config 1/1 passed before the phase checklist fix, fmt check passed, diff check passed; forbidden-feature scan only matched the beneficiary regression fixture)
 Gate 2 phase checklist gap: complete (commit a703326, review clean after enforcing fact-only ClaimGraph node types; verification: analysis::events::claims 4/4 passed with DATABASE_URL, full suite split 321/321 + config 1/1 passed, fmt check passed, diff check passed; forbidden-feature scan only matched the beneficiary regression fixture)
 
+Gate 3 Task 1: complete (commits ada917a..7ec4dd4, review clean; verification: storage::event_repository 24/24 passed with DATABASE_URL, fmt check passed, diff check passed)
+Gate 3 Task 2: complete (commits 7ec4dd4..a7fd512, review clean after locked-split and refinement-eligibility fixes; verification: analysis::events::clustering 18/18 passed with DATABASE_URL, fmt check passed, diff check passed)
+Gate 3 Task 3: complete (commits a7fd512..eee07e2, review clean after real GDELT ArtList parsing fix; verification: analysis::adapters::gdelt 5/5 passed with DATABASE_URL, fmt check passed, diff check passed)
+Gate 3 Task 4: complete (commits eee07e2..97d7773, review clean; verification: analysis::events::deltas 3/3 passed with DATABASE_URL, fmt check passed, diff check passed)
 Gate 3 Task 5: complete (commits 97d7773..27836dd, review clean after freeze payload, EventDelta evolution, and stock-list filtering fixes; verification: analysis::events::hypotheses 19/19 passed with DATABASE_URL, fmt check passed, diff check passed)
 
 Gate 3 Task 6: complete (commits cce5739..4f735dc, review clean; verification: analysis::events::market_observation 6/6 passed with DATABASE_URL, fmt check passed, diff check passed)

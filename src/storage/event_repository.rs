@@ -627,6 +627,341 @@ impl EventRepository {
         Ok(row.map(event_cluster_from_row))
     }
 
+    pub async fn find_event_cluster_version(
+        &self,
+        event_cluster_id: Uuid,
+        cluster_version: i32,
+    ) -> Result<Option<EventClusterRow>> {
+        let row = sqlx::query(
+            r#"SELECT event_cluster_id,
+                      cluster_version,
+                      canonical_title,
+                      event_time,
+                      first_seen_at,
+                      last_seen_at,
+                      lifecycle_status,
+                      primary_evidence_id,
+                      representative_ids,
+                      source_entropy::float8 AS source_entropy,
+                      independent_sources,
+                      mention_count,
+                      cluster_payload,
+                      supersedes_version,
+                      created_at
+               FROM market_event_clusters
+               WHERE event_cluster_id = $1
+                 AND cluster_version = $2
+               LIMIT 1"#,
+        )
+        .bind(event_cluster_id)
+        .bind(cluster_version)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(event_cluster_from_row))
+    }
+
+    pub async fn list_cluster_versions(
+        &self,
+        event_cluster_id: Uuid,
+    ) -> Result<Vec<EventClusterRow>> {
+        let rows = sqlx::query(
+            r#"SELECT event_cluster_id,
+                      cluster_version,
+                      canonical_title,
+                      event_time,
+                      first_seen_at,
+                      last_seen_at,
+                      lifecycle_status,
+                      primary_evidence_id,
+                      representative_ids,
+                      source_entropy::float8 AS source_entropy,
+                      independent_sources,
+                      mention_count,
+                      cluster_payload,
+                      supersedes_version,
+                      created_at
+               FROM market_event_clusters
+               WHERE event_cluster_id = $1
+               ORDER BY cluster_version ASC, created_at ASC"#,
+        )
+        .bind(event_cluster_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(event_cluster_from_row).collect())
+    }
+
+    pub async fn list_latest_cluster_versions(&self) -> Result<Vec<EventClusterRow>> {
+        let rows = sqlx::query(
+            r#"SELECT DISTINCT ON (event_cluster_id)
+                      event_cluster_id,
+                      cluster_version,
+                      canonical_title,
+                      event_time,
+                      first_seen_at,
+                      last_seen_at,
+                      lifecycle_status,
+                      primary_evidence_id,
+                      representative_ids,
+                      source_entropy::float8 AS source_entropy,
+                      independent_sources,
+                      mention_count,
+                      cluster_payload,
+                      supersedes_version,
+                      created_at
+               FROM market_event_clusters
+               ORDER BY event_cluster_id ASC, cluster_version DESC, created_at DESC"#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(event_cluster_from_row).collect())
+    }
+
+    pub async fn find_latest_cluster_for_evidence(
+        &self,
+        evidence_id: Uuid,
+    ) -> Result<Option<EventClusterRow>> {
+        let row = sqlx::query(
+            r#"SELECT event_cluster_id,
+                      cluster_version,
+                      canonical_title,
+                      event_time,
+                      first_seen_at,
+                      last_seen_at,
+                      lifecycle_status,
+                      primary_evidence_id,
+                      representative_ids,
+                      source_entropy::float8 AS source_entropy,
+                      independent_sources,
+                      mention_count,
+                      cluster_payload,
+                      supersedes_version,
+                      created_at
+               FROM market_event_clusters
+               WHERE primary_evidence_id = $1
+                  OR $1 = ANY(representative_ids)
+               ORDER BY cluster_version DESC, created_at DESC
+               LIMIT 1"#,
+        )
+        .bind(evidence_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(event_cluster_from_row))
+    }
+
+    pub async fn find_event_delta(
+        &self,
+        event_cluster_id: Uuid,
+        from_version: i32,
+        to_version: i32,
+    ) -> Result<Option<EventDeltaRow>> {
+        let row = sqlx::query(
+            r#"SELECT event_cluster_id,
+                      from_version,
+                      to_version,
+                      delta_payload,
+                      created_at
+               FROM market_event_deltas
+               WHERE event_cluster_id = $1
+                 AND from_version = $2
+                 AND to_version = $3
+               LIMIT 1"#,
+        )
+        .bind(event_cluster_id)
+        .bind(from_version)
+        .bind(to_version)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(event_delta_from_row))
+    }
+
+    pub async fn find_latest_delta_for_evidence(
+        &self,
+        evidence_id: Uuid,
+    ) -> Result<Option<EventDeltaRow>> {
+        let Some(cluster) = self.find_latest_cluster_for_evidence(evidence_id).await? else {
+            return Ok(None);
+        };
+        if cluster.cluster_version <= 1 {
+            return Ok(None);
+        }
+
+        self.find_event_delta(
+            cluster.event_cluster_id,
+            cluster.cluster_version - 1,
+            cluster.cluster_version,
+        )
+        .await
+    }
+
+    pub async fn find_latest_hypothesis_for_cluster_version(
+        &self,
+        event_cluster_id: Uuid,
+        cluster_version: i32,
+    ) -> Result<Option<EventHypothesisRow>> {
+        let row = sqlx::query(
+            r#"SELECT hypothesis_id,
+                      event_cluster_id,
+                      cluster_version,
+                      hypothesis_version,
+                      schema_version,
+                      graph_payload,
+                      frozen_at,
+                      based_on_claim_ids,
+                      review_status,
+                      supersedes_id,
+                      created_at
+               FROM market_event_hypotheses
+               WHERE event_cluster_id = $1
+                 AND cluster_version = $2
+               ORDER BY hypothesis_version DESC, created_at DESC
+               LIMIT 1"#,
+        )
+        .bind(event_cluster_id)
+        .bind(cluster_version)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(event_hypothesis_from_row))
+    }
+
+    pub async fn find_latest_hypothesis_for_cluster(
+        &self,
+        event_cluster_id: Uuid,
+    ) -> Result<Option<EventHypothesisRow>> {
+        let row = sqlx::query(
+            r#"SELECT hypothesis_id,
+                      event_cluster_id,
+                      cluster_version,
+                      hypothesis_version,
+                      schema_version,
+                      graph_payload,
+                      frozen_at,
+                      based_on_claim_ids,
+                      review_status,
+                      supersedes_id,
+                      created_at
+               FROM market_event_hypotheses
+               WHERE event_cluster_id = $1
+               ORDER BY cluster_version DESC, hypothesis_version DESC, created_at DESC
+               LIMIT 1"#,
+        )
+        .bind(event_cluster_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(event_hypothesis_from_row))
+    }
+
+    pub async fn list_latest_hypotheses(&self) -> Result<Vec<EventHypothesisRow>> {
+        let rows = sqlx::query(
+            r#"SELECT DISTINCT ON (event_cluster_id)
+                      hypothesis_id,
+                      event_cluster_id,
+                      cluster_version,
+                      hypothesis_version,
+                      schema_version,
+                      graph_payload,
+                      frozen_at,
+                      based_on_claim_ids,
+                      review_status,
+                      supersedes_id,
+                      created_at
+               FROM market_event_hypotheses
+               ORDER BY event_cluster_id ASC, cluster_version DESC, hypothesis_version DESC, created_at DESC"#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(event_hypothesis_from_row).collect())
+    }
+
+    pub async fn find_latest_hypothesis_for_evidence(
+        &self,
+        evidence_id: Uuid,
+    ) -> Result<Option<EventHypothesisRow>> {
+        let Some(cluster) = self.find_latest_cluster_for_evidence(evidence_id).await? else {
+            return Ok(None);
+        };
+
+        self.find_latest_hypothesis_for_cluster_version(
+            cluster.event_cluster_id,
+            cluster.cluster_version,
+        )
+        .await
+    }
+
+    pub async fn list_market_observations_for_hypothesis(
+        &self,
+        hypothesis_id: Uuid,
+    ) -> Result<Vec<MarketObservationRow>> {
+        let rows = sqlx::query(
+            r#"SELECT hypothesis_id,
+                      entity_type,
+                      entity_id,
+                      trade_date,
+                      observation_status,
+                      market_alignment_score::float8 AS market_alignment_score,
+                      causal_confidence::float8 AS causal_confidence,
+                      abnormal_market_return::float8 AS abnormal_market_return,
+                      abnormal_industry_return::float8 AS abnormal_industry_return,
+                      market_metrics,
+                      confounding_events,
+                      created_at
+               FROM market_event_market_observations
+               WHERE hypothesis_id = $1
+               ORDER BY trade_date ASC, entity_type ASC, entity_id ASC"#,
+        )
+        .bind(hypothesis_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(market_observation_from_row).collect())
+    }
+
+    pub async fn list_market_observations_for_evidence(
+        &self,
+        evidence_id: Uuid,
+    ) -> Result<Vec<MarketObservationRow>> {
+        let Some(hypothesis) = self
+            .find_latest_hypothesis_for_evidence(evidence_id)
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
+
+        self.list_market_observations_for_hypothesis(hypothesis.hypothesis_id)
+            .await
+    }
+
+    pub async fn find_latest_claim_graph_for_evidence(
+        &self,
+        evidence_id: Uuid,
+    ) -> Result<Option<ClaimGraphRow>> {
+        let row = sqlx::query(
+            r#"SELECT claim_graph_id,
+                      evidence_id,
+                      graph_version,
+                      schema_version,
+                      graph_payload,
+                      review_status,
+                      created_at
+               FROM market_event_claim_graphs
+               WHERE evidence_id = $1
+               ORDER BY graph_version DESC, created_at DESC
+               LIMIT 1"#,
+        )
+        .bind(evidence_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(claim_graph_from_row))
+    }
+
     pub async fn save_daily_brief(&self, brief: &DailyEventBriefRow) -> Result<()> {
         sqlx::query(
             r#"INSERT INTO market_event_daily_briefs
@@ -1001,6 +1336,61 @@ fn event_cluster_from_row(row: sqlx::postgres::PgRow) -> EventClusterRow {
         mention_count: row.get("mention_count"),
         cluster_payload: row.get("cluster_payload"),
         supersedes_version: row.get("supersedes_version"),
+        created_at: row.get("created_at"),
+    }
+}
+
+fn event_delta_from_row(row: sqlx::postgres::PgRow) -> EventDeltaRow {
+    EventDeltaRow {
+        event_cluster_id: row.get("event_cluster_id"),
+        from_version: row.get("from_version"),
+        to_version: row.get("to_version"),
+        delta_payload: row.get("delta_payload"),
+        created_at: row.get("created_at"),
+    }
+}
+
+fn event_hypothesis_from_row(row: sqlx::postgres::PgRow) -> EventHypothesisRow {
+    EventHypothesisRow {
+        hypothesis_id: row.get("hypothesis_id"),
+        event_cluster_id: row.get("event_cluster_id"),
+        cluster_version: row.get("cluster_version"),
+        hypothesis_version: row.get("hypothesis_version"),
+        schema_version: row.get("schema_version"),
+        graph_payload: row.get("graph_payload"),
+        frozen_at: row.get("frozen_at"),
+        based_on_claim_ids: row.get("based_on_claim_ids"),
+        review_status: row.get("review_status"),
+        supersedes_id: row.get("supersedes_id"),
+        created_at: row.get("created_at"),
+    }
+}
+
+fn market_observation_from_row(row: sqlx::postgres::PgRow) -> MarketObservationRow {
+    MarketObservationRow {
+        hypothesis_id: row.get("hypothesis_id"),
+        entity_type: row.get("entity_type"),
+        entity_id: row.get("entity_id"),
+        trade_date: row.get("trade_date"),
+        observation_status: row.get("observation_status"),
+        market_alignment_score: row.get("market_alignment_score"),
+        causal_confidence: row.get("causal_confidence"),
+        abnormal_market_return: row.get("abnormal_market_return"),
+        abnormal_industry_return: row.get("abnormal_industry_return"),
+        market_metrics: row.get("market_metrics"),
+        confounding_events: row.get("confounding_events"),
+        created_at: row.get("created_at"),
+    }
+}
+
+fn claim_graph_from_row(row: sqlx::postgres::PgRow) -> ClaimGraphRow {
+    ClaimGraphRow {
+        claim_graph_id: row.get("claim_graph_id"),
+        evidence_id: row.get("evidence_id"),
+        graph_version: row.get("graph_version"),
+        schema_version: row.get("schema_version"),
+        graph_payload: row.get("graph_payload"),
+        review_status: row.get("review_status"),
         created_at: row.get("created_at"),
     }
 }
@@ -2787,6 +3177,94 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, AppError::BadRequest(_)));
         assert!(error.to_string().contains("adjacent"));
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn persisted_gate3_outputs_are_readable_for_event_evidence(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = EventRepository::new(pool.clone());
+        let previous_evidence = evidence("gate3-reads-prev", 1, "publishable");
+        let current_evidence = evidence("gate3-reads-current", 1, "publishable");
+        save_evidence(&pool, &previous_evidence).await;
+        save_evidence(&pool, &current_evidence).await;
+
+        let cluster_id = Uuid::new_v4();
+        repo.save_event_cluster_version(&event_cluster(
+            cluster_id,
+            1,
+            previous_evidence.evidence_id,
+        ))
+        .await
+        .unwrap();
+        repo.save_event_cluster_version(&event_cluster(
+            cluster_id,
+            2,
+            current_evidence.evidence_id,
+        ))
+        .await
+        .unwrap();
+
+        let delta = event_delta(cluster_id, 1, 2);
+        repo.save_event_delta(&delta).await.unwrap();
+
+        let prior_hypothesis = frozen_hypothesis(cluster_id, 1, None);
+        repo.save_frozen_hypothesis(&prior_hypothesis)
+            .await
+            .unwrap();
+        let latest_hypothesis = EventHypothesisRow {
+            hypothesis_version: 2,
+            supersedes_id: Some(prior_hypothesis.hypothesis_id),
+            ..frozen_hypothesis(cluster_id, 2, Some(prior_hypothesis.hypothesis_id))
+        };
+        repo.save_frozen_hypothesis(&latest_hypothesis)
+            .await
+            .unwrap();
+
+        let observation = market_observation(latest_hypothesis.hypothesis_id, "market_aligned");
+        repo.save_market_observation(&observation).await.unwrap();
+
+        let stored_cluster = repo
+            .find_latest_cluster_for_evidence(current_evidence.evidence_id)
+            .await
+            .unwrap()
+            .expect("cluster linked to evidence");
+        assert_eq!(stored_cluster.event_cluster_id, cluster_id);
+        assert_eq!(stored_cluster.cluster_version, 2);
+
+        let stored_delta = repo
+            .find_latest_delta_for_evidence(current_evidence.evidence_id)
+            .await
+            .unwrap()
+            .expect("delta linked to evidence");
+        assert_eq!(stored_delta.event_cluster_id, cluster_id);
+        assert_eq!(stored_delta.from_version, 1);
+        assert_eq!(stored_delta.to_version, 2);
+
+        let stored_hypothesis = repo
+            .find_latest_hypothesis_for_evidence(current_evidence.evidence_id)
+            .await
+            .unwrap()
+            .expect("hypothesis linked to evidence");
+        assert_eq!(
+            stored_hypothesis.hypothesis_id,
+            latest_hypothesis.hypothesis_id
+        );
+        assert_eq!(stored_hypothesis.cluster_version, 2);
+        assert_eq!(stored_hypothesis.hypothesis_version, 2);
+
+        let stored_observations = repo
+            .list_market_observations_for_evidence(current_evidence.evidence_id)
+            .await
+            .unwrap();
+        assert_eq!(stored_observations.len(), 1);
+        assert_eq!(
+            stored_observations[0].hypothesis_id,
+            latest_hypothesis.hypothesis_id
+        );
+        assert_eq!(stored_observations[0].observation_status, "market_aligned");
 
         Ok(())
     }

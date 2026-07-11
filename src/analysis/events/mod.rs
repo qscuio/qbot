@@ -145,25 +145,56 @@ impl EventIntelligence {
     pub async fn get_event_evolution(&self, event_id: Uuid) -> Result<EventEvolutionView> {
         self.load_event_row(event_id).await?;
 
+        let Some(delta_row) = self
+            .deps
+            .repo
+            .find_latest_delta_for_evidence(event_id)
+            .await?
+        else {
+            return Ok(EventEvolutionView {
+                event_id,
+                event_score: GATE3_EVENT_SCORE,
+                has_persisted_evolution: false,
+                evolution: None,
+                message: GATE3_EVOLUTION_ABSENCE_MESSAGE.to_string(),
+            });
+        };
+
         Ok(EventEvolutionView {
             event_id,
             event_score: GATE3_EVENT_SCORE,
-            has_persisted_evolution: false,
-            evolution: None,
-            message: GATE3_EVOLUTION_ABSENCE_MESSAGE.to_string(),
+            has_persisted_evolution: true,
+            evolution: Some(serde_json::from_value(delta_row.delta_payload)?),
+            message: "Persisted Gate 3 event evolution loaded from repository.".to_string(),
         })
     }
 
     pub async fn get_event_hypothesis(&self, event_id: Uuid) -> Result<EventHypothesisView> {
         self.load_event_row(event_id).await?;
 
+        let Some(hypothesis_row) = self
+            .deps
+            .repo
+            .find_latest_hypothesis_for_evidence(event_id)
+            .await?
+        else {
+            return Ok(EventHypothesisView {
+                event_id,
+                event_score: GATE3_EVENT_SCORE,
+                has_frozen_hypothesis: false,
+                hypothesis_policy: GATE3_HYPOTHESIS_POLICY.to_string(),
+                hypothesis: None,
+                message: GATE3_HYPOTHESIS_ABSENCE_MESSAGE.to_string(),
+            });
+        };
+
         Ok(EventHypothesisView {
             event_id,
             event_score: GATE3_EVENT_SCORE,
-            has_frozen_hypothesis: false,
+            has_frozen_hypothesis: true,
             hypothesis_policy: GATE3_HYPOTHESIS_POLICY.to_string(),
-            hypothesis: None,
-            message: GATE3_HYPOTHESIS_ABSENCE_MESSAGE.to_string(),
+            hypothesis: Some(serde_json::from_value(hypothesis_row.graph_payload)?),
+            message: "Persisted frozen hypothesis loaded from repository.".to_string(),
         })
     }
 
@@ -173,13 +204,32 @@ impl EventIntelligence {
     ) -> Result<EventMarketObservationsView> {
         self.load_event_row(event_id).await?;
 
+        let observation_rows = self
+            .deps
+            .repo
+            .list_market_observations_for_evidence(event_id)
+            .await?;
+        if observation_rows.is_empty() {
+            return Ok(EventMarketObservationsView {
+                event_id,
+                event_score: GATE3_EVENT_SCORE,
+                has_market_observations: false,
+                market_causality: GATE3_MARKET_CAUSALITY_POLICY.to_string(),
+                observations: Vec::new(),
+                message: GATE3_MARKET_OBSERVATION_ABSENCE_MESSAGE.to_string(),
+            });
+        }
+
         Ok(EventMarketObservationsView {
             event_id,
             event_score: GATE3_EVENT_SCORE,
-            has_market_observations: false,
+            has_market_observations: true,
             market_causality: GATE3_MARKET_CAUSALITY_POLICY.to_string(),
-            observations: Vec::new(),
-            message: GATE3_MARKET_OBSERVATION_ABSENCE_MESSAGE.to_string(),
+            observations: observation_rows
+                .iter()
+                .map(market_observation_from_row)
+                .collect::<Result<Vec<_>>>()?,
+            message: "Persisted market observations loaded from repository.".to_string(),
         })
     }
 
@@ -535,6 +585,25 @@ fn event_detail_from_row(row: &EventEvidenceRow) -> EventDetail {
         source_readable: source_readable_from_content(row.content.as_deref()),
         manual_review_needed: None,
     }
+}
+
+fn market_observation_from_row(
+    row: &crate::storage::event_repository::MarketObservationRow,
+) -> Result<market_observation::MarketObservation> {
+    Ok(market_observation::MarketObservation {
+        hypothesis_id: row.hypothesis_id,
+        entity_type: row.entity_type.clone(),
+        entity_id: row.entity_id.clone(),
+        trade_date: row.trade_date,
+        observation_status: serde_json::from_value(json!(row.observation_status))?,
+        market_alignment_score: row.market_alignment_score,
+        causal_confidence: row.causal_confidence,
+        abnormal_market_return: row.abnormal_market_return,
+        abnormal_industry_return: row.abnormal_industry_return,
+        market_metrics: serde_json::from_value(row.market_metrics.clone())?,
+        confounding_events: serde_json::from_value(row.confounding_events.clone())?,
+        created_at: row.created_at,
+    })
 }
 
 pub(crate) fn render_daily_brief(brief: &DailyEventBrief) -> Result<String> {

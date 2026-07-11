@@ -554,7 +554,10 @@ mod tests {
     use crate::data::types::{Candle, IndexData, LimitUpStock, SectorData, StockInfo};
     use crate::error::Result;
     use crate::state::AppState;
-    use crate::storage::event_repository::{DailyEventBriefRow, EventEvidenceRow, EventRepository};
+    use crate::storage::event_repository::{
+        DailyEventBriefRow, EventClusterRow, EventDeltaRow, EventEvidenceRow, EventHypothesisRow,
+        EventRepository, MarketObservationRow,
+    };
     use crate::telegram::TelegramPusher;
 
     #[sqlx::test(migrations = "./migrations")]
@@ -1258,6 +1261,124 @@ mod tests {
         Ok(())
     }
 
+    #[sqlx::test(migrations = "./migrations")]
+    async fn event_logic_endpoints_surface_persisted_gate3_rows(pool: PgPool) -> sqlx::Result<()> {
+        let state = test_state(pool.clone()).await;
+        let repo = EventRepository::new(pool.clone());
+        let previous = evidence_row(
+            &Uuid::new_v4().to_string(),
+            1,
+            "publishable",
+            "Seeded previous event",
+            dt(2026, 7, 10, 7, 0, 0),
+        );
+        let current = evidence_row(
+            &Uuid::new_v4().to_string(),
+            1,
+            "publishable",
+            "Seeded current event",
+            dt(2026, 7, 10, 8, 0, 0),
+        );
+        repo.insert_evidence(&previous).await.unwrap();
+        repo.insert_evidence(&current).await.unwrap();
+
+        let cluster_id = Uuid::new_v4();
+        repo.save_event_cluster_version(&event_cluster_row(cluster_id, 1, previous.evidence_id))
+            .await
+            .unwrap();
+        repo.save_event_cluster_version(&event_cluster_row(cluster_id, 2, current.evidence_id))
+            .await
+            .unwrap();
+        repo.save_event_delta(&event_delta_row(cluster_id, 1, 2))
+            .await
+            .unwrap();
+
+        let hypothesis = frozen_hypothesis_row(cluster_id, 2, None);
+        repo.save_frozen_hypothesis(&hypothesis).await.unwrap();
+        repo.save_market_observation(&market_observation_row(hypothesis.hypothesis_id))
+            .await
+            .unwrap();
+
+        let mut router = event_router(state);
+
+        let evolution = router
+            .call(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!(
+                        "/api/analysis/events/{}/evolution",
+                        current.evidence_id
+                    ))
+                    .header(header::AUTHORIZATION, "Bearer test-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(evolution.status(), StatusCode::OK);
+        let evolution_payload = response_json(evolution).await;
+        assert_eq!(evolution_payload["eventScore"], 0.0);
+        assert_eq!(evolution_payload["hasPersistedEvolution"], true);
+        assert_eq!(
+            evolution_payload["evolution"]["new_claim_ids"],
+            json!([Uuid::from_u128(202)])
+        );
+
+        let hypothesis_response = router
+            .call(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!(
+                        "/api/analysis/events/{}/hypothesis",
+                        current.evidence_id
+                    ))
+                    .header(header::AUTHORIZATION, "Bearer test-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hypothesis_response.status(), StatusCode::OK);
+        let hypothesis_payload = response_json(hypothesis_response).await;
+        assert_eq!(hypothesis_payload["eventScore"], 0.0);
+        assert_eq!(hypothesis_payload["hasFrozenHypothesis"], true);
+        assert_eq!(hypothesis_payload["hypothesisPolicy"], "inference_only");
+        assert_eq!(
+            hypothesis_payload["hypothesis"]["graph"]["nodes"][0]["label"],
+            "600519.SH wins major automation order"
+        );
+
+        let observations_response = router
+            .call(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!(
+                        "/api/analysis/events/{}/market-observations",
+                        current.evidence_id
+                    ))
+                    .header(header::AUTHORIZATION, "Bearer test-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(observations_response.status(), StatusCode::OK);
+        let observations_payload = response_json(observations_response).await;
+        assert_eq!(observations_payload["eventScore"], 0.0);
+        assert_eq!(observations_payload["hasMarketObservations"], true);
+        assert_eq!(observations_payload["marketCausality"], "not_claimed");
+        assert_eq!(
+            observations_payload["observations"][0]["observation_status"],
+            "market_aligned"
+        );
+        assert_eq!(
+            observations_payload["observations"][0]["entity_id"],
+            "600519.SH"
+        );
+
+        Ok(())
+    }
+
     async fn response_json(response: axum::response::Response) -> Value {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -1305,6 +1426,137 @@ mod tests {
             supersedes_evidence_id: None,
             status: status.to_string(),
             created_at: available_at,
+        }
+    }
+
+    fn event_cluster_row(
+        event_cluster_id: Uuid,
+        cluster_version: i32,
+        primary_evidence_id: Uuid,
+    ) -> EventClusterRow {
+        EventClusterRow {
+            event_cluster_id,
+            cluster_version,
+            canonical_title: format!("Cluster {event_cluster_id} v{cluster_version}"),
+            event_time: Some(dt(2026, 7, 10, 8, 0, 0)),
+            first_seen_at: dt(2026, 7, 10, 8, 0, 0),
+            last_seen_at: dt(2026, 7, 10, 8, 30, 0),
+            lifecycle_status: "active".to_string(),
+            primary_evidence_id,
+            representative_ids: vec![primary_evidence_id],
+            source_entropy: 0.42,
+            independent_sources: cluster_version,
+            mention_count: cluster_version,
+            cluster_payload: json!({"clusterVersion": cluster_version}),
+            supersedes_version: (cluster_version > 1).then_some(cluster_version - 1),
+            created_at: dt(2026, 7, 10, 8, 30 + cluster_version as u32, 0),
+        }
+    }
+
+    fn event_delta_row(
+        event_cluster_id: Uuid,
+        from_version: i32,
+        to_version: i32,
+    ) -> EventDeltaRow {
+        EventDeltaRow {
+            event_cluster_id,
+            from_version,
+            to_version,
+            delta_payload: json!({
+                "new_claim_ids": [Uuid::from_u128(202)],
+                "repeated_claim_ids": [Uuid::from_u128(201)],
+                "revised_values": [],
+                "removed_claim_ids": [],
+                "status_changes": [],
+                "expectation_gap": null,
+                "new_uncertainties": ["pending customer acceptance"],
+                "resolved_uncertainties": []
+            }),
+            created_at: dt(2026, 7, 10, 9, 0, 0),
+        }
+    }
+
+    fn frozen_hypothesis_row(
+        event_cluster_id: Uuid,
+        cluster_version: i32,
+        supersedes_id: Option<Uuid>,
+    ) -> EventHypothesisRow {
+        let hypothesis_id = Uuid::new_v4();
+        let based_on_claim_ids = vec![Uuid::from_u128(201), Uuid::from_u128(202)];
+        EventHypothesisRow {
+            hypothesis_id,
+            event_cluster_id,
+            cluster_version,
+            hypothesis_version: 1,
+            schema_version: "impact_hypothesis_graph_v1".to_string(),
+            graph_payload: json!({
+                "hypothesis_id": hypothesis_id,
+                "hypothesis_version": 1,
+                "supersedes_hypothesis_id": supersedes_id,
+                "graph": {
+                    "schema_version": "impact_hypothesis_graph_v1",
+                    "nodes": [
+                        {
+                            "node_id": "company_order_v1:source:order-1",
+                            "node_type": "CompanyFact",
+                            "label": "600519.SH wins major automation order"
+                        },
+                        {
+                            "node_id": "company_order_v1:impact:600519-sh:0",
+                            "node_type": "RevenueImpact",
+                            "label": "600519.SH"
+                        }
+                    ],
+                    "edges": [
+                        {
+                            "from": "company_order_v1:source:order-1",
+                            "to": "company_order_v1:impact:600519-sh:0",
+                            "relation": "increases",
+                            "generation_method": "domain_rule",
+                            "logic_rule_id": "company_order_v1",
+                            "confidence": 0.91,
+                            "assumptions": ["Customer executes the awarded order."],
+                            "expected_horizon": "t+1",
+                            "observable_indicators": ["Order-related revenue expectations strengthen."],
+                            "counter_scenario": ["Order is canceled or materially delayed."],
+                            "invalidation_conditions": ["The order is publicly withdrawn."]
+                        }
+                    ],
+                    "based_on_claim_ids": based_on_claim_ids,
+                    "frozen_at": dt(2026, 7, 10, 9, 0, 0)
+                }
+            }),
+            frozen_at: dt(2026, 7, 10, 9, 0, 0),
+            based_on_claim_ids,
+            review_status: "frozen".to_string(),
+            supersedes_id,
+            created_at: dt(2026, 7, 10, 9, 0, 0),
+        }
+    }
+
+    fn market_observation_row(hypothesis_id: Uuid) -> MarketObservationRow {
+        MarketObservationRow {
+            hypothesis_id,
+            entity_type: "company".to_string(),
+            entity_id: "600519.SH".to_string(),
+            trade_date: date(2026, 7, 11),
+            observation_status: "market_aligned".to_string(),
+            market_alignment_score: Some(0.015),
+            causal_confidence: 0.72,
+            abnormal_market_return: Some(0.02),
+            abnormal_industry_return: Some(0.01),
+            market_metrics: json!({
+                "snapshot_version": "pit-market-snapshot-v1",
+                "window_label": "t+1",
+                "benchmark_id": "CSI300",
+                "industry_benchmark_id": "SW-FoodBeverage",
+                "stock_return": 0.05,
+                "market_return": 0.03,
+                "industry_return": 0.04,
+                "expected_direction": "positive"
+            }),
+            confounding_events: json!([]),
+            created_at: dt(2026, 7, 11, 9, 30, 0),
         }
     }
 
