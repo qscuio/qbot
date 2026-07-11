@@ -15,8 +15,17 @@ pub struct ImpactHypothesisGraph {
     pub schema_version: String,
     pub nodes: Vec<HypothesisNode>,
     pub edges: Vec<HypothesisEdge>,
+    #[serde(default)]
+    pub direct_observation_entities: Vec<HypothesisObservationEntity>,
     pub based_on_claim_ids: Vec<Uuid>,
     pub frozen_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HypothesisObservationEntity {
+    pub entity_type: String,
+    pub entity_id: String,
+    pub display_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +69,7 @@ pub fn build_impact_hypothesis_graph(
         .iter()
         .map(|node| (node.node_id.as_str(), node))
         .collect::<BTreeMap<_, _>>();
+    let direct_observation_entities = infer_direct_observation_entities(claim_graph, &node_index);
 
     let mut nodes_by_id = BTreeMap::<String, HypothesisNode>::new();
     let mut edges = Vec::new();
@@ -174,6 +184,7 @@ pub fn build_impact_hypothesis_graph(
         schema_version: IMPACT_HYPOTHESIS_SCHEMA_VERSION.to_string(),
         nodes: nodes_by_id.into_values().collect(),
         edges,
+        direct_observation_entities,
         based_on_claim_ids,
         frozen_at,
     })
@@ -451,6 +462,53 @@ fn infer_targets<'a>(
     targets
 }
 
+fn infer_direct_observation_entities<'a>(
+    claim_graph: &'a ClaimGraph,
+    node_index: &BTreeMap<&'a str, &'a ClaimNode>,
+) -> Vec<HypothesisObservationEntity> {
+    let mut entities_by_id = BTreeMap::<String, HypothesisObservationEntity>::new();
+
+    for source_node in &claim_graph.nodes {
+        let Some(template) = template_for_claim(source_node) else {
+            continue;
+        };
+
+        if matches!(
+            template.logic_rule_id,
+            "company_order_v1" | "company_accident_v1"
+        ) {
+            if let Some(entity) = direct_company_observation_entity(source_node) {
+                entities_by_id
+                    .entry(entity.entity_id.clone())
+                    .or_insert(entity);
+            }
+        }
+
+        for edge in claim_graph
+            .edges
+            .iter()
+            .filter(|edge| edge.from == source_node.node_id || edge.to == source_node.node_id)
+        {
+            let linked_id = if edge.from == source_node.node_id {
+                edge.to.as_str()
+            } else {
+                edge.from.as_str()
+            };
+            let Some(linked) = node_index.get(linked_id) else {
+                continue;
+            };
+            let Some(entity) = direct_company_observation_entity(linked) else {
+                continue;
+            };
+            entities_by_id
+                .entry(entity.entity_id.clone())
+                .or_insert(entity);
+        }
+    }
+
+    entities_by_id.into_values().collect()
+}
+
 fn target_from_claim_node(node: &ClaimNode, edge: &ClaimEdge) -> Option<InferredTarget> {
     if rejects_non_direct_target_label(&node.label) {
         return None;
@@ -504,6 +562,71 @@ fn fallback_target(source_node: &ClaimNode, template: &TemplateSpec) -> (String,
             template.fallback_target_type.to_string(),
         ),
     }
+}
+
+fn direct_company_observation_entity(node: &ClaimNode) -> Option<HypothesisObservationEntity> {
+    let sanitized_label = sanitize_hypothesis_label(&node.label);
+    if rejects_non_direct_target_label(&sanitized_label) {
+        return None;
+    }
+
+    let stock_codes = extract_stock_codes(&node.label);
+    if stock_codes.len() != 1 {
+        return None;
+    }
+
+    let direct_company_context = match node.node_type.as_str() {
+        "CompanyFact" => is_direct_company_target(&sanitized_label),
+        "OperationalFact" => template_for_claim(node)
+            .is_some_and(|template| template.logic_rule_id == "company_accident_v1"),
+        _ => false,
+    };
+    if !direct_company_context {
+        return None;
+    }
+
+    let display_name =
+        company_display_name(&sanitized_label).unwrap_or_else(|| stock_codes[0].clone());
+
+    Some(HypothesisObservationEntity {
+        entity_type: "company".to_string(),
+        entity_id: stock_codes[0].clone(),
+        display_name,
+    })
+}
+
+fn company_display_name(sanitized_label: &str) -> Option<String> {
+    let subject = extract_company_subject(sanitized_label).trim().to_string();
+    if subject.is_empty() || subject.eq_ignore_ascii_case("directly mentioned entity") {
+        return None;
+    }
+
+    let lower = subject.to_ascii_lowercase();
+    if contains_any(
+        &lower,
+        &[
+            "wins",
+            "win",
+            "secures",
+            "secured",
+            "receives",
+            "received",
+            "lands",
+            "order",
+            "orders",
+            "accident",
+            "explosion",
+            "fire",
+            "halt",
+            "halts",
+            "shutdown",
+            "incident",
+        ],
+    ) {
+        return None;
+    }
+
+    Some(subject)
 }
 
 fn canonical_claim_ids(mut claim_ids: Vec<Uuid>) -> Result<Vec<Uuid>> {
@@ -694,6 +817,20 @@ fn is_stock_code_only_list_label(value: &str) -> bool {
         .collect::<Vec<_>>();
 
     !tokens.is_empty() && tokens.iter().all(|token| looks_like_stock_code(token))
+}
+
+fn extract_stock_codes(value: &str) -> Vec<String> {
+    let mut stock_codes = value
+        .split(|ch: char| {
+            ch.is_whitespace() || matches!(ch, ',' | ';' | ':' | '(' | ')' | '[' | ']' | '/')
+        })
+        .map(|token| token.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '.'))
+        .filter(|token| looks_like_stock_code(token))
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    stock_codes.sort();
+    stock_codes.dedup();
+    stock_codes
 }
 
 fn looks_like_stock_code(token: &str) -> bool {
@@ -1818,6 +1955,42 @@ mod tests {
             .iter()
             .any(|node| node.node_type == "MarginImpact"
                 && node.label == "operationally exposed company margin"));
+    }
+
+    #[test]
+    fn structured_direct_observation_entities_survive_label_sanitization() {
+        let graph = build_impact_hypothesis_graph(
+            &ClaimGraph::new(
+                "claim_graph_v1",
+                vec![claim_node(
+                    "order-1",
+                    "CompanyFact",
+                    "Kweichow Moutai 600519.SH wins major automation order",
+                    vec![evidence_id(61)],
+                    0.91,
+                )],
+                Vec::new(),
+            )
+            .unwrap(),
+            vec![Uuid::from_u128(7401)],
+            dt(2026, 7, 12, 3),
+        )
+        .unwrap();
+
+        assert!(graph
+            .nodes
+            .iter()
+            .all(|node| !node.label.contains("600519.SH")));
+        assert_eq!(
+            serde_json::to_value(&graph).unwrap()["direct_observation_entities"],
+            serde_json::json!([
+                {
+                    "entity_type": "company",
+                    "entity_id": "600519.SH",
+                    "display_name": "Kweichow Moutai"
+                }
+            ])
+        );
     }
 
     #[test]

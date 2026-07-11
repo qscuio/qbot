@@ -1619,41 +1619,23 @@ fn published_claim_ids(
 fn direct_observation_entities(hypothesis: &FrozenImpactHypothesis) -> Vec<ObservationEntity> {
     let mut entities = Vec::new();
 
-    for node in &hypothesis.graph().nodes {
-        if !matches!(node.node_type.as_str(), "CompanyFact" | "RevenueImpact") {
+    for entity in &hypothesis.graph().direct_observation_entities {
+        if entity.entity_type != "company" {
             continue;
         }
-
-        let Some(entity_id) = extract_stock_code(&node.label) else {
-            continue;
-        };
         if entities
             .iter()
-            .any(|entity: &ObservationEntity| entity.entity_id == entity_id)
+            .any(|candidate: &ObservationEntity| candidate.entity_id == entity.entity_id)
         {
             continue;
         }
         entities.push(ObservationEntity {
-            entity_type: "company".to_string(),
-            entity_id,
+            entity_type: entity.entity_type.clone(),
+            entity_id: entity.entity_id.clone(),
         });
     }
 
     entities
-}
-
-fn extract_stock_code(label: &str) -> Option<String> {
-    label
-        .split(|ch: char| {
-            ch.is_whitespace() || matches!(ch, ',' | ';' | ':' | '(' | ')' | '[' | ']')
-        })
-        .find(|token| {
-            token.len() == 9
-                && token.as_bytes().get(6) == Some(&b'.')
-                && token[..6].chars().all(|ch| ch.is_ascii_digit())
-                && matches!(&token[7..], "SH" | "SZ")
-        })
-        .map(ToString::to_string)
 }
 
 /// Generate daily market report and push to Telegram (18:00 job).
@@ -2171,8 +2153,9 @@ mod tests {
     use tokio::time::{timeout, Duration as TokioDuration};
     use uuid::Uuid;
 
+    use crate::analysis::events::claims::{ClaimGraph, ClaimNode};
     use crate::analysis::events::{
-        ClaimEntityRole, EventClaimSnapshot, EventClusterVersionSnapshot,
+        ClaimEntityRole, EventClaimSnapshot, EventClusterVersionSnapshot, FrozenImpactHypothesis,
     };
     use crate::analysis::market_snapshot::{
         AdjustmentFactor, CorporateAction, DailyBasicSnapshot, IndexDailyBar, MarketSnapshot,
@@ -3004,6 +2987,55 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn event_market_observation_job_reads_structured_entities_from_generated_hypotheses(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let state = test_state(pool.clone()).await;
+        let repo = EventRepository::new(pool.clone());
+        let evidence = event_evidence(
+            "official:market_event",
+            "notice-market-observation-structured-entity",
+            1,
+            "publishable",
+            date(2026, 7, 10),
+        );
+        repo.insert_evidence(&evidence).await.unwrap();
+
+        let cluster_id = Uuid::new_v4();
+        repo.save_event_cluster_version(&cluster_row_with_snapshot(
+            cluster_id,
+            1,
+            evidence.evidence_id,
+            vec![Uuid::from_u128(701)],
+        ))
+        .await
+        .unwrap();
+        let hypothesis =
+            generated_sanitized_hypothesis_row(cluster_id, 1, 1, None, vec![Uuid::from_u128(701)]);
+        repo.save_frozen_hypothesis(&hypothesis).await.unwrap();
+        seed_event_market_inputs(&pool, date(2026, 7, 11), "600519.SH").await?;
+
+        run_event_market_observation_job(state).await;
+
+        let stored: (String, String, Option<f64>) = sqlx::query_as(
+            r#"SELECT entity_type,
+                      entity_id,
+                      market_alignment_score::float8
+               FROM market_event_market_observations
+               WHERE hypothesis_id = $1
+               LIMIT 1"#,
+        )
+        .bind(hypothesis.hypothesis_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(stored.0, "company");
+        assert_eq!(stored.1, "600519.SH");
+        assert_eq!(stored.2, Some(0.025));
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn event_market_observation_job_persists_confounded_rows_for_same_entity_events(
         pool: PgPool,
     ) -> sqlx::Result<()> {
@@ -3519,10 +3551,63 @@ mod tests {
                             "invalidation_conditions": ["The order is publicly withdrawn."]
                         }
                     ],
+                    "direct_observation_entities": [
+                        {
+                            "entity_type": "company",
+                            "entity_id": "600519.SH",
+                            "display_name": "Kweichow Moutai"
+                        }
+                    ],
                     "based_on_claim_ids": based_on_claim_ids,
                     "frozen_at": dt(2026, 7, 10, 16)
                 }
             }),
+            frozen_at: dt(2026, 7, 10, 16),
+            based_on_claim_ids,
+            review_status: "frozen".to_string(),
+            supersedes_id,
+            created_at: dt(2026, 7, 10, 16),
+        }
+    }
+
+    fn generated_sanitized_hypothesis_row(
+        event_cluster_id: Uuid,
+        cluster_version: i32,
+        hypothesis_version: i32,
+        supersedes_id: Option<Uuid>,
+        based_on_claim_ids: Vec<Uuid>,
+    ) -> EventHypothesisRow {
+        let generated = FrozenImpactHypothesis::initial(
+            &ClaimGraph::new(
+                "claim_graph_v1",
+                vec![ClaimNode {
+                    node_id: "order-1".to_string(),
+                    node_type: "CompanyFact".to_string(),
+                    label: "Kweichow Moutai 600519.SH wins major automation order".to_string(),
+                    evidence_ids: vec![Uuid::from_u128(9001)],
+                    confidence: 0.91,
+                }],
+                Vec::new(),
+            )
+            .unwrap(),
+            based_on_claim_ids.clone(),
+            dt(2026, 7, 10, 16),
+        )
+        .unwrap();
+
+        assert!(generated
+            .graph()
+            .nodes
+            .iter()
+            .all(|node| !node.label.contains("600519.SH")));
+
+        EventHypothesisRow {
+            hypothesis_id: generated.hypothesis_id(),
+            event_cluster_id,
+            cluster_version,
+            hypothesis_version,
+            schema_version: "impact_hypothesis_graph_v1".to_string(),
+            graph_payload: serde_json::to_value(&generated).unwrap(),
             frozen_at: dt(2026, 7, 10, 16),
             based_on_claim_ids,
             review_status: "frozen".to_string(),

@@ -494,12 +494,8 @@ impl EventIntelligence {
         };
         let input_fingerprint = input.input_fingerprint.clone();
         let output = self.deps.extractor.extract(input).await?;
-        let extraction = extraction_row_from_output(
-            evidence.evidence_id,
-            input_fingerprint,
-            extracted_at,
-            output,
-        )?;
+        let extraction =
+            extraction_row_from_output(evidence, input_fingerprint, extracted_at, output)?;
         self.deps.repo.save_extraction(&extraction).await?;
 
         let publish_at = Utc::now();
@@ -639,14 +635,17 @@ fn extraction_source_text(evidence: &EventEvidenceRow) -> String {
 }
 
 fn extraction_row_from_output(
-    evidence_id: Uuid,
+    evidence: &EventEvidenceRow,
     input_fingerprint: String,
     created_at: DateTime<Utc>,
     output: EventExtractionOutput,
 ) -> Result<ExtractionRow> {
+    let company_fact_autopublish_blocked =
+        supplementary_company_fact_autopublish_blocked(evidence, &output.extraction);
+
     Ok(ExtractionRow {
         extraction_id: Uuid::new_v4(),
-        evidence_id,
+        evidence_id: evidence.evidence_id,
         schema_version: output.metadata.schema_version,
         prompt_version: Some(output.metadata.prompt_version),
         model_name: Some(output.metadata.model_name),
@@ -664,7 +663,11 @@ fn extraction_row_from_output(
                 claim_type: extracted_claim_type_label(claim.claim_type).to_string(),
                 claim_text: claim.text,
                 confidence: claim.confidence,
-                review_status: extracted_claim_review_status(claim.claim_type).to_string(),
+                review_status: extracted_claim_review_status(
+                    claim.claim_type,
+                    company_fact_autopublish_blocked,
+                )
+                .to_string(),
                 evidence: claim
                     .evidence_ids
                     .into_iter()
@@ -688,8 +691,12 @@ fn extracted_claim_type_label(claim_type: ClaimType) -> &'static str {
     }
 }
 
-fn extracted_claim_review_status(claim_type: ClaimType) -> &'static str {
+fn extracted_claim_review_status(
+    claim_type: ClaimType,
+    company_fact_autopublish_blocked: bool,
+) -> &'static str {
     match claim_type {
+        ClaimType::Fact if company_fact_autopublish_blocked => "draft",
         ClaimType::Fact => "published",
         ClaimType::DirectQuote
         | ClaimType::ThirdPartyClaim
@@ -697,6 +704,29 @@ fn extracted_claim_review_status(claim_type: ClaimType) -> &'static str {
         | ClaimType::Rumor
         | ClaimType::Unknown => "draft",
     }
+}
+
+fn supplementary_company_fact_autopublish_blocked(
+    evidence: &EventEvidenceRow,
+    extraction: &EventExtractionV1,
+) -> bool {
+    supplementary_evidence_metadata(evidence) && extraction_has_direct_company_subject(extraction)
+}
+
+fn supplementary_evidence_metadata(evidence: &EventEvidenceRow) -> bool {
+    evidence.source_tier == "supplement"
+        || evidence.raw_payload["sourceRole"] == json!("macro_supplement")
+        || evidence.raw_payload["companyFactEligible"] == json!(false)
+}
+
+fn extraction_has_direct_company_subject(extraction: &EventExtractionV1) -> bool {
+    extraction.entities.iter().any(|entity| {
+        entity.role == "subject"
+            && matches!(
+                entity.entity_type.as_str(),
+                "organization" | "company" | "issuer"
+            )
+    })
 }
 
 fn latest_publishable_rows(rows: Vec<EventEvidenceRow>) -> Vec<EventEvidenceRow> {
@@ -900,7 +930,6 @@ fn ordered_claims_for_brief(extraction: &ExtractionRow) -> Vec<&ClaimRow> {
 struct BriefClaimOrderKey {
     claim_type: String,
     claim_text: String,
-    review_status: String,
     confidence_bits: u64,
     evidence_ids: Vec<Uuid>,
 }
@@ -910,7 +939,6 @@ impl BriefClaimOrderKey {
         Self {
             claim_type: claim.claim_type.clone(),
             claim_text: claim.claim_text.clone(),
-            review_status: claim.review_status.clone(),
             confidence_bits: claim.confidence.to_bits(),
             evidence_ids: normalized_claim_evidence_ids(
                 claim.evidence.iter().map(|evidence| evidence.evidence_id),
@@ -922,7 +950,6 @@ impl BriefClaimOrderKey {
         Self {
             claim_type: extracted_claim_type_label(claim.claim_type).to_string(),
             claim_text: claim.text.clone(),
-            review_status: extracted_claim_review_status(claim.claim_type).to_string(),
             confidence_bits: claim.confidence.to_bits(),
             evidence_ids: normalized_claim_evidence_ids(claim.evidence_ids.iter().copied()),
         }
@@ -1075,19 +1102,24 @@ impl EventExtractor for NoopEventExtractor {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, fs, path::PathBuf};
+    use std::{collections::BTreeMap, fs, path::PathBuf, sync::Arc};
 
+    use async_trait::async_trait;
     use chrono::Utc;
     use serde_json::json;
+    use sqlx::PgPool;
     use uuid::Uuid;
 
     use super::{
         build_brief_claim_records, build_brief_entity_records,
-        extraction::{ClaimType, EventExtractionV1, ExtractedClaim, ExtractedEntity},
-        previous_published_fact_ids, BriefEntityRecord, EventIntelligence,
+        extraction::{
+            ClaimType, EventExtractionMetadata, EventExtractionV1, ExtractedClaim, ExtractedEntity,
+        },
+        previous_published_fact_ids, BriefEntityRecord, EventExtractionInput,
+        EventExtractionOutput, EventExtractor, EventIntelligence, TradingDateResolver,
     };
     use crate::storage::event_repository::{
-        ClaimEvidenceRow, ClaimRow, EventEvidenceRow, ExtractionRow,
+        ClaimEvidenceRow, ClaimRow, EventEvidenceRow, EventRepository, ExtractionRow,
     };
 
     #[test]
@@ -1292,6 +1324,94 @@ mod tests {
         );
     }
 
+    #[sqlx::test(migrations = "./migrations")]
+    async fn supplementary_company_fact_extraction_stays_draft_and_out_of_daily_facts(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = EventRepository::new(pool.clone());
+        let trade_date = chrono::NaiveDate::from_ymd_opt(2026, 7, 10).unwrap();
+        let pending = pending_evidence_row(
+            "gdelt:market_event",
+            "gdelt-company-fact",
+            "supplement",
+            trade_date,
+            json!({
+                "sourceRole": "macro_supplement",
+                "companyFactEligible": false
+            }),
+        );
+        repo.insert_evidence(&pending).await.unwrap();
+
+        let intelligence = EventIntelligence::with_repository_resolver_and_extractor(
+            repo.clone(),
+            Arc::new(FixedTradeDateResolver(trade_date)),
+            Arc::new(StaticCompanyFactExtractor),
+        );
+        intelligence.process_pending(Utc::now()).await.unwrap();
+
+        let extraction = repo
+            .list_latest_extractions_for_evidence_ids(&[pending.evidence_id])
+            .await
+            .unwrap()
+            .pop()
+            .expect("expected saved extraction");
+        assert_eq!(extraction.claims.len(), 1);
+        assert_eq!(extraction.claims[0].review_status, "draft");
+
+        let brief = intelligence.build_daily_brief(trade_date).await.unwrap();
+        assert!(brief.new_facts.is_empty());
+        assert!(brief.revisions.is_empty());
+        assert_eq!(brief.unconfirmed.len(), 1);
+        assert_eq!(
+            brief.unconfirmed[0].summary,
+            "Kweichow Moutai won a major order."
+        );
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn official_company_fact_extraction_still_publishes_daily_facts(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = EventRepository::new(pool.clone());
+        let trade_date = chrono::NaiveDate::from_ymd_opt(2026, 7, 10).unwrap();
+        let pending = pending_evidence_row(
+            "official:market_event",
+            "official-company-fact",
+            "official",
+            trade_date,
+            json!({}),
+        );
+        repo.insert_evidence(&pending).await.unwrap();
+
+        let intelligence = EventIntelligence::with_repository_resolver_and_extractor(
+            repo.clone(),
+            Arc::new(FixedTradeDateResolver(trade_date)),
+            Arc::new(StaticCompanyFactExtractor),
+        );
+        intelligence.process_pending(Utc::now()).await.unwrap();
+
+        let extraction = repo
+            .list_latest_extractions_for_evidence_ids(&[pending.evidence_id])
+            .await
+            .unwrap()
+            .pop()
+            .expect("expected saved extraction");
+        assert_eq!(extraction.claims.len(), 1);
+        assert_eq!(extraction.claims[0].review_status, "published");
+
+        let brief = intelligence.build_daily_brief(trade_date).await.unwrap();
+        assert_eq!(brief.new_facts.len(), 1);
+        assert!(brief.unconfirmed.is_empty());
+        assert_eq!(
+            brief.new_facts[0].summary,
+            "Kweichow Moutai won a major order."
+        );
+
+        Ok(())
+    }
+
     fn extraction_row_with_entities(entities: Vec<ExtractedEntity>) -> ExtractionRow {
         let evidence_id = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
 
@@ -1406,5 +1526,91 @@ mod tests {
 
     fn module_source_path() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(file!())
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct FixedTradeDateResolver(chrono::NaiveDate);
+
+    impl TradingDateResolver for FixedTradeDateResolver {
+        fn effective_trade_date(
+            &self,
+            _available_at: chrono::DateTime<chrono::Utc>,
+        ) -> crate::error::Result<chrono::NaiveDate> {
+            Ok(self.0)
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct StaticCompanyFactExtractor;
+
+    #[async_trait]
+    impl EventExtractor for StaticCompanyFactExtractor {
+        async fn extract(
+            &self,
+            input: EventExtractionInput,
+        ) -> crate::error::Result<EventExtractionOutput> {
+            Ok(EventExtractionOutput {
+                extraction: EventExtractionV1 {
+                    event_type: "issuer_disclosure".to_string(),
+                    event_subtype: Some("order_win".to_string()),
+                    claims: vec![ExtractedClaim {
+                        claim_type: ClaimType::Fact,
+                        text: "Kweichow Moutai won a major order.".to_string(),
+                        evidence_ids: vec![input.evidence_id],
+                        confidence: 0.95,
+                    }],
+                    entities: vec![ExtractedEntity {
+                        text: "Kweichow Moutai".to_string(),
+                        entity_type: "issuer".to_string(),
+                        role: "subject".to_string(),
+                        stock_code: Some("600519.SH".to_string()),
+                    }],
+                    amounts: Vec::new(),
+                    dates: Vec::new(),
+                    uncertainties: Vec::new(),
+                    missing_information: Vec::new(),
+                },
+                metadata: EventExtractionMetadata {
+                    schema_version: "event_extraction_v1".to_string(),
+                    prompt_version: "prompt-v1".to_string(),
+                    model_name: "test-model".to_string(),
+                    model_parameters: json!({"temperature": 0}),
+                },
+            })
+        }
+    }
+
+    fn pending_evidence_row(
+        source_id: &str,
+        source_item_id: &str,
+        source_tier: &str,
+        trade_date: chrono::NaiveDate,
+        raw_payload: serde_json::Value,
+    ) -> EventEvidenceRow {
+        EventEvidenceRow {
+            evidence_id: Uuid::new_v4(),
+            source_id: source_id.to_string(),
+            source_item_id: source_item_id.to_string(),
+            source_url: Some(format!("https://example.test/{source_item_id}")),
+            source_tier: source_tier.to_string(),
+            source_terms_version: "terms-v1".to_string(),
+            occurred_at: None,
+            published_at: Some(Utc::now()),
+            first_seen_at: Utc::now(),
+            available_at: Utc::now(),
+            effective_trade_date: trade_date,
+            title: "Structured event".to_string(),
+            content: Some(
+                "Kweichow Moutai (600519.SH) disclosed a major order in an official filing."
+                    .to_string(),
+            ),
+            language: "en".to_string(),
+            content_hash: format!("hash-{source_id}-{source_item_id}"),
+            raw_payload,
+            version: 1,
+            supersedes_evidence_id: None,
+            status: "pending".to_string(),
+            created_at: Utc::now(),
+        }
     }
 }
