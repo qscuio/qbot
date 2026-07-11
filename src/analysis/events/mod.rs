@@ -28,6 +28,7 @@ pub mod contracts;
 mod dedup;
 pub mod deltas;
 pub(crate) mod entity_linking;
+pub mod event_statistics;
 mod evidence;
 pub(crate) mod extraction;
 pub mod hypotheses;
