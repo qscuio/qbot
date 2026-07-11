@@ -313,11 +313,20 @@ fn merge_fragmented_clusters(
     }
 
     let mut parents = (0..clusters.len()).collect::<Vec<_>>();
+    let mut component_origin_ids = clusters.iter().map(cluster_origin_ids).collect::<Vec<_>>();
 
     for left in 0..clusters.len() {
         for right in (left + 1)..clusters.len() {
-            if should_merge_clusters(&clusters[left], &clusters[right], locked_relations, config) {
-                union_indices(&mut parents, left, right);
+            if should_merge_clusters(&clusters[left], &clusters[right], locked_relations, config)
+                && !prospective_union_has_locked_split(
+                    &mut parents,
+                    &component_origin_ids,
+                    left,
+                    right,
+                    &locked_relations.split_pairs,
+                )
+            {
+                union_indices(&mut parents, &mut component_origin_ids, left, right);
             }
         }
     }
@@ -389,6 +398,7 @@ fn best_cross_cluster_score(
                 score_mentions(&left_mention.mention, &right_mention.mention, config)
             })
         })
+        .filter(|score| score.hard_conditions_met)
         .max_by(compare_cluster_scores)
 }
 
@@ -455,6 +465,7 @@ fn connected_components(
 
         let mut stack = vec![start];
         let mut component_indices = Vec::new();
+        let mut component_origin_ids = BTreeSet::from([cluster.mentions[start].origin_cluster_id]);
         visited[start] = true;
 
         while let Some(index) = stack.pop() {
@@ -468,8 +479,13 @@ fn connected_components(
                     &cluster.mentions[candidate],
                     locked_relations,
                     config,
+                ) && !adding_origin_creates_locked_split(
+                    &component_origin_ids,
+                    cluster.mentions[candidate].origin_cluster_id,
+                    &locked_relations.split_pairs,
                 ) {
                     visited[candidate] = true;
+                    component_origin_ids.insert(cluster.mentions[candidate].origin_cluster_id);
                     stack.push(candidate);
                 }
             }
@@ -623,7 +639,31 @@ fn find_index(parents: &mut [usize], index: usize) -> usize {
     parents[index]
 }
 
-fn union_indices(parents: &mut [usize], left: usize, right: usize) {
+fn prospective_union_has_locked_split(
+    parents: &mut [usize],
+    component_origin_ids: &[BTreeSet<Uuid>],
+    left: usize,
+    right: usize,
+    split_pairs: &BTreeSet<(Uuid, Uuid)>,
+) -> bool {
+    let left_root = find_index(parents, left);
+    let right_root = find_index(parents, right);
+
+    if left_root == right_root {
+        return false;
+    }
+
+    let mut combined_origin_ids = component_origin_ids[left_root].clone();
+    combined_origin_ids.extend(component_origin_ids[right_root].iter().copied());
+    contains_locked_split_pair(&combined_origin_ids, split_pairs)
+}
+
+fn union_indices(
+    parents: &mut [usize],
+    component_origin_ids: &mut [BTreeSet<Uuid>],
+    left: usize,
+    right: usize,
+) {
     let left_root = find_index(parents, left);
     let right_root = find_index(parents, right);
     if left_root != right_root {
@@ -633,7 +673,28 @@ fn union_indices(parents: &mut [usize], left: usize, right: usize) {
             (right_root, left_root)
         };
         parents[loser] = winner;
+        let loser_origin_ids = component_origin_ids[loser].clone();
+        component_origin_ids[winner].extend(loser_origin_ids);
     }
+}
+
+fn adding_origin_creates_locked_split(
+    component_origin_ids: &BTreeSet<Uuid>,
+    candidate_origin_id: Uuid,
+    split_pairs: &BTreeSet<(Uuid, Uuid)>,
+) -> bool {
+    component_origin_ids
+        .iter()
+        .any(|origin_id| split_pairs.contains(&ordered_pair(*origin_id, candidate_origin_id)))
+}
+
+fn contains_locked_split_pair(
+    origin_ids: &BTreeSet<Uuid>,
+    split_pairs: &BTreeSet<(Uuid, Uuid)>,
+) -> bool {
+    split_pairs
+        .iter()
+        .any(|(left, right)| origin_ids.contains(left) && origin_ids.contains(right))
 }
 
 fn independent_source_count(mentions: &[ClusterMention]) -> usize {
@@ -1311,6 +1372,255 @@ mod tests {
 
         assert_eq!(refined.len(), 1);
         assert_eq!(refined[0].mentions.len(), 2);
+    }
+
+    #[test]
+    fn end_of_day_refinement_blocks_transitive_bridge_merges_across_locked_splits() {
+        let cluster_a_id = Uuid::from_u128(101);
+        let cluster_b_id = Uuid::from_u128(102);
+        let cluster_c_id = Uuid::from_u128(103);
+        let clusters = vec![
+            candidate_cluster(
+                cluster_a_id,
+                Some(2),
+                vec![cluster_mention(
+                    cluster_a_id,
+                    None,
+                    mention(
+                        "ACME expands battery output",
+                        Some(dt(2026, 7, 10, 8)),
+                        &["acme"],
+                        &["expand", "battery"],
+                        &["suzhou"],
+                        true,
+                        0.94,
+                    ),
+                )],
+                false,
+            ),
+            candidate_cluster(
+                cluster_b_id,
+                Some(4),
+                vec![cluster_mention(
+                    cluster_b_id,
+                    None,
+                    mention(
+                        "ACME battery expansion update",
+                        Some(dt(2026, 7, 10, 9)),
+                        &["acme"],
+                        &["expand", "battery"],
+                        &["suzhou"],
+                        false,
+                        0.83,
+                    ),
+                )],
+                false,
+            ),
+            candidate_cluster(
+                cluster_c_id,
+                Some(6),
+                vec![cluster_mention(
+                    cluster_c_id,
+                    None,
+                    mention(
+                        "ACME expands battery capacity",
+                        Some(dt(2026, 7, 10, 10)),
+                        &["acme"],
+                        &["expand", "battery"],
+                        &["suzhou"],
+                        false,
+                        0.79,
+                    ),
+                )],
+                false,
+            ),
+        ];
+        let mut locked = LockedClusterRelations::default();
+        locked
+            .split_pairs
+            .insert(ordered_pair(cluster_a_id, cluster_c_id));
+
+        let refined =
+            EndOfDayRefiner::new(IncrementalClusteringConfig::default()).refine(&clusters, &locked);
+
+        assert_eq!(refined.len(), 2);
+        assert!(refined.iter().any(|cluster| {
+            cluster
+                .mentions
+                .iter()
+                .all(|mention| mention.origin_cluster_id != cluster_c_id)
+                && cluster
+                    .mentions
+                    .iter()
+                    .any(|mention| mention.origin_cluster_id == cluster_a_id)
+                && cluster
+                    .mentions
+                    .iter()
+                    .any(|mention| mention.origin_cluster_id == cluster_b_id)
+        }));
+        assert!(refined.iter().all(|cluster| {
+            let origin_ids = cluster
+                .mentions
+                .iter()
+                .map(|mention| mention.origin_cluster_id)
+                .collect::<std::collections::BTreeSet<_>>();
+            !(origin_ids.contains(&cluster_a_id) && origin_ids.contains(&cluster_c_id))
+        }));
+    }
+
+    #[test]
+    fn end_of_day_refinement_blocks_transitive_bridge_components_across_locked_splits() {
+        let cluster_a_id = Uuid::from_u128(201);
+        let cluster_b_id = Uuid::from_u128(202);
+        let cluster_c_id = Uuid::from_u128(203);
+        let clusters = vec![candidate_cluster(
+            cluster_a_id,
+            Some(5),
+            vec![
+                cluster_mention(
+                    cluster_a_id,
+                    None,
+                    mention(
+                        "ACME expands battery output",
+                        Some(dt(2026, 7, 10, 8)),
+                        &["acme"],
+                        &["expand", "battery"],
+                        &["suzhou"],
+                        true,
+                        0.94,
+                    ),
+                ),
+                cluster_mention(
+                    cluster_b_id,
+                    None,
+                    mention(
+                        "ACME battery expansion update",
+                        Some(dt(2026, 7, 10, 9)),
+                        &["acme"],
+                        &["expand", "battery"],
+                        &["suzhou"],
+                        false,
+                        0.83,
+                    ),
+                ),
+                cluster_mention(
+                    cluster_c_id,
+                    None,
+                    mention(
+                        "ACME expands battery capacity",
+                        Some(dt(2026, 7, 10, 10)),
+                        &["acme"],
+                        &["expand", "battery"],
+                        &["suzhou"],
+                        false,
+                        0.79,
+                    ),
+                ),
+            ],
+            false,
+        )];
+        let mut locked = LockedClusterRelations::default();
+        locked
+            .split_pairs
+            .insert(ordered_pair(cluster_a_id, cluster_c_id));
+
+        let refined =
+            EndOfDayRefiner::new(IncrementalClusteringConfig::default()).refine(&clusters, &locked);
+
+        assert_eq!(refined.len(), 2);
+        assert!(refined.iter().all(|cluster| {
+            let origin_ids = cluster
+                .mentions
+                .iter()
+                .map(|mention| mention.origin_cluster_id)
+                .collect::<std::collections::BTreeSet<_>>();
+            !(origin_ids.contains(&cluster_a_id) && origin_ids.contains(&cluster_c_id))
+        }));
+        assert!(refined.iter().any(|cluster| {
+            let origin_ids = cluster
+                .mentions
+                .iter()
+                .map(|mention| mention.origin_cluster_id)
+                .collect::<std::collections::BTreeSet<_>>();
+            origin_ids.contains(&cluster_a_id) && origin_ids.contains(&cluster_b_id)
+        }));
+    }
+
+    #[test]
+    fn refinement_filters_to_hard_condition_eligible_scores_before_ranking() {
+        let ineligible_cluster_id = Uuid::from_u128(301);
+        let eligible_cluster_id = Uuid::from_u128(302);
+        let config = IncrementalClusteringConfig {
+            auto_join_threshold: 0.5,
+            review_threshold: 0.4,
+            ..IncrementalClusteringConfig::default()
+        };
+        let clusters = vec![
+            candidate_cluster(
+                ineligible_cluster_id,
+                Some(1),
+                vec![cluster_mention(
+                    ineligible_cluster_id,
+                    None,
+                    mention(
+                        "ACME memorandum update",
+                        Some(dt(2026, 7, 11, 5)),
+                        &["acme"],
+                        &["memorandum"],
+                        &["ningbo"],
+                        true,
+                        0.94,
+                    ),
+                )],
+                false,
+            ),
+            candidate_cluster(
+                eligible_cluster_id,
+                Some(2),
+                vec![
+                    cluster_mention(
+                        eligible_cluster_id,
+                        None,
+                        mention(
+                            "ACME memorandum update",
+                            Some(dt(2026, 7, 11, 6)),
+                            &["acme"],
+                            &["bulletin"],
+                            &["ningbo"],
+                            false,
+                            0.62,
+                        ),
+                    ),
+                    cluster_mention(
+                        eligible_cluster_id,
+                        None,
+                        mention(
+                            "ACME signs logistics memorandum",
+                            Some(dt(2026, 7, 11, 2)),
+                            &["acme", "logisticsco"],
+                            &["sign", "memorandum"],
+                            &["ningbo"],
+                            true,
+                            0.93,
+                        ),
+                    ),
+                ],
+                false,
+            ),
+        ];
+
+        let refined =
+            EndOfDayRefiner::new(config).refine(&clusters, &LockedClusterRelations::default());
+
+        assert_eq!(refined.len(), 2);
+        assert!(refined.iter().any(|cluster| {
+            let origin_ids = cluster
+                .mentions
+                .iter()
+                .map(|mention| mention.origin_cluster_id)
+                .collect::<std::collections::BTreeSet<_>>();
+            origin_ids.contains(&ineligible_cluster_id) && origin_ids.contains(&eligible_cluster_id)
+        }));
     }
 
     #[test]
