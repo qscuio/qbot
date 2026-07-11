@@ -784,13 +784,13 @@ async fn persist_scheduled_event_clusters(repo: &EventRepository) -> Result<usiz
             continue;
         }
 
-        repo.save_event_cluster_version(&row).await?;
+        let mut mention_rows = Vec::with_capacity(cluster.mentions.len());
         for cluster_mention in &cluster.mentions {
             let Some(prepared) = prepared_by_evidence.get(&cluster_mention.mention.evidence_id)
             else {
                 continue;
             };
-            repo.save_event_mention(&EventMentionRow {
+            mention_rows.push(EventMentionRow {
                 mention_id: Uuid::new_v4(),
                 evidence_id: prepared.evidence.evidence_id,
                 event_cluster_id: Some(row.event_cluster_id),
@@ -806,9 +806,10 @@ async fn persist_scheduled_event_clusters(repo: &EventRepository) -> Result<usiz
                     prepared.extraction.as_ref(),
                 )?,
                 created_at: row.created_at,
-            })
-            .await?;
+            });
         }
+        repo.save_event_cluster_version_with_mentions(&row, &mention_rows)
+            .await?;
         persisted += 1;
     }
 
@@ -2775,6 +2776,7 @@ mod tests {
         assert_eq!(clusters.len(), 1);
         assert_eq!(clusters[0].1, 1);
         assert_eq!(clusters[0].2, 2);
+        assert_eq!(clusters[0].2 as usize, mention_rows.len());
         assert_eq!(clusters[0].3, 2);
         assert_eq!(
             clusters[0].4["deltaSnapshot"]["claims"]

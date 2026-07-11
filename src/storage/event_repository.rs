@@ -505,59 +505,25 @@ impl EventRepository {
     }
 
     pub async fn save_event_cluster_version(&self, row: &EventClusterRow) -> Result<()> {
-        sqlx::query(
-            r#"INSERT INTO market_event_clusters
-               (event_cluster_id, cluster_version, canonical_title, event_time,
-                first_seen_at, last_seen_at, lifecycle_status, primary_evidence_id,
-                representative_ids, source_entropy, independent_sources, mention_count,
-                cluster_payload, supersedes_version, created_at)
-               VALUES ($1, $2, $3, $4,
-                       $5, $6, $7, $8,
-                       $9, $10, $11, $12,
-                       $13, $14, $15)"#,
-        )
-        .bind(row.event_cluster_id)
-        .bind(row.cluster_version)
-        .bind(&row.canonical_title)
-        .bind(row.event_time)
-        .bind(row.first_seen_at)
-        .bind(row.last_seen_at)
-        .bind(&row.lifecycle_status)
-        .bind(row.primary_evidence_id)
-        .bind(&row.representative_ids)
-        .bind(row.source_entropy)
-        .bind(row.independent_sources)
-        .bind(row.mention_count)
-        .bind(&row.cluster_payload)
-        .bind(row.supersedes_version)
-        .bind(row.created_at)
-        .execute(&self.pool)
-        .await?;
+        save_event_cluster_version_in_txless(&self.pool, row).await
+    }
 
+    pub async fn save_event_cluster_version_with_mentions(
+        &self,
+        row: &EventClusterRow,
+        mentions: &[EventMentionRow],
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        save_event_cluster_version_in_tx(&mut tx, row).await?;
+        for mention in mentions {
+            save_event_mention_in_tx(&mut tx, mention).await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
     pub async fn save_event_mention(&self, row: &EventMentionRow) -> Result<Uuid> {
-        sqlx::query(
-            r#"INSERT INTO market_event_mentions
-               (mention_id, evidence_id, event_cluster_id, cluster_version, mention_time,
-                adds_new_fact, source_independence, mention_payload, created_at)
-               VALUES ($1, $2, $3, $4, $5,
-                       $6, $7, $8, $9)"#,
-        )
-        .bind(row.mention_id)
-        .bind(row.evidence_id)
-        .bind(row.event_cluster_id)
-        .bind(row.cluster_version)
-        .bind(row.mention_time)
-        .bind(row.adds_new_fact)
-        .bind(row.source_independence)
-        .bind(&row.mention_payload)
-        .bind(row.created_at)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(row.mention_id)
+        save_event_mention_in_txless(&self.pool, row).await
     }
 
     pub async fn save_event_delta(&self, row: &EventDeltaRow) -> Result<()> {
@@ -1689,6 +1655,124 @@ async fn save_revision_in_tx(
     Ok(())
 }
 
+async fn save_event_cluster_version_in_txless(pool: &PgPool, row: &EventClusterRow) -> Result<()> {
+    sqlx::query(
+        r#"INSERT INTO market_event_clusters
+           (event_cluster_id, cluster_version, canonical_title, event_time,
+            first_seen_at, last_seen_at, lifecycle_status, primary_evidence_id,
+            representative_ids, source_entropy, independent_sources, mention_count,
+            cluster_payload, supersedes_version, created_at)
+           VALUES ($1, $2, $3, $4,
+                   $5, $6, $7, $8,
+                   $9, $10, $11, $12,
+                   $13, $14, $15)"#,
+    )
+    .bind(row.event_cluster_id)
+    .bind(row.cluster_version)
+    .bind(&row.canonical_title)
+    .bind(row.event_time)
+    .bind(row.first_seen_at)
+    .bind(row.last_seen_at)
+    .bind(&row.lifecycle_status)
+    .bind(row.primary_evidence_id)
+    .bind(&row.representative_ids)
+    .bind(row.source_entropy)
+    .bind(row.independent_sources)
+    .bind(row.mention_count)
+    .bind(&row.cluster_payload)
+    .bind(row.supersedes_version)
+    .bind(row.created_at)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+async fn save_event_cluster_version_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    row: &EventClusterRow,
+) -> Result<()> {
+    sqlx::query(
+        r#"INSERT INTO market_event_clusters
+           (event_cluster_id, cluster_version, canonical_title, event_time,
+            first_seen_at, last_seen_at, lifecycle_status, primary_evidence_id,
+            representative_ids, source_entropy, independent_sources, mention_count,
+            cluster_payload, supersedes_version, created_at)
+           VALUES ($1, $2, $3, $4,
+                   $5, $6, $7, $8,
+                   $9, $10, $11, $12,
+                   $13, $14, $15)"#,
+    )
+    .bind(row.event_cluster_id)
+    .bind(row.cluster_version)
+    .bind(&row.canonical_title)
+    .bind(row.event_time)
+    .bind(row.first_seen_at)
+    .bind(row.last_seen_at)
+    .bind(&row.lifecycle_status)
+    .bind(row.primary_evidence_id)
+    .bind(&row.representative_ids)
+    .bind(row.source_entropy)
+    .bind(row.independent_sources)
+    .bind(row.mention_count)
+    .bind(&row.cluster_payload)
+    .bind(row.supersedes_version)
+    .bind(row.created_at)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
+}
+
+async fn save_event_mention_in_txless(pool: &PgPool, row: &EventMentionRow) -> Result<Uuid> {
+    sqlx::query(
+        r#"INSERT INTO market_event_mentions
+           (mention_id, evidence_id, event_cluster_id, cluster_version, mention_time,
+            adds_new_fact, source_independence, mention_payload, created_at)
+           VALUES ($1, $2, $3, $4, $5,
+                   $6, $7, $8, $9)"#,
+    )
+    .bind(row.mention_id)
+    .bind(row.evidence_id)
+    .bind(row.event_cluster_id)
+    .bind(row.cluster_version)
+    .bind(row.mention_time)
+    .bind(row.adds_new_fact)
+    .bind(row.source_independence)
+    .bind(&row.mention_payload)
+    .bind(row.created_at)
+    .execute(pool)
+    .await?;
+
+    Ok(row.mention_id)
+}
+
+async fn save_event_mention_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    row: &EventMentionRow,
+) -> Result<Uuid> {
+    sqlx::query(
+        r#"INSERT INTO market_event_mentions
+           (mention_id, evidence_id, event_cluster_id, cluster_version, mention_time,
+            adds_new_fact, source_independence, mention_payload, created_at)
+           VALUES ($1, $2, $3, $4, $5,
+                   $6, $7, $8, $9)"#,
+    )
+    .bind(row.mention_id)
+    .bind(row.evidence_id)
+    .bind(row.event_cluster_id)
+    .bind(row.cluster_version)
+    .bind(row.mention_time)
+    .bind(row.adds_new_fact)
+    .bind(row.source_independence)
+    .bind(&row.mention_payload)
+    .bind(row.created_at)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(row.mention_id)
+}
+
 async fn find_manual_duplicate_candidates_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     row: &EventEvidenceRow,
@@ -2178,8 +2262,8 @@ mod tests {
     use super::{
         ClaimEvidenceRow, ClaimGraphRow, ClaimRow, DailyEventBriefRow, DuplicateGroupMemberRow,
         DuplicateGroupRow, EventClusterRow, EventDeltaRow, EventEvidenceRow, EventHypothesisRow,
-        EventRepository, EventRevisionRow, ExtractionRow, ManualEvidenceInsertEffect,
-        MarketObservationRow,
+        EventMentionRow, EventRepository, EventRevisionRow, ExtractionRow,
+        ManualEvidenceInsertEffect, MarketObservationRow,
     };
     use crate::error::{AppError, Result};
     use chrono::{DateTime, NaiveDate, TimeZone, Utc};
@@ -2331,6 +2415,29 @@ mod tests {
             }),
             confounding_events: json!([]),
             created_at: dt(2026, 7, 10, 17),
+        }
+    }
+
+    fn event_mention(
+        mention_id: Uuid,
+        evidence_id: Uuid,
+        event_cluster_id: Uuid,
+        cluster_version: i32,
+    ) -> EventMentionRow {
+        EventMentionRow {
+            mention_id,
+            evidence_id,
+            event_cluster_id: Some(event_cluster_id),
+            cluster_version: Some(cluster_version),
+            mention_time: dt(2026, 7, 10, 12),
+            adds_new_fact: true,
+            source_independence: 0.91,
+            mention_payload: json!({
+                "evidenceId": evidence_id,
+                "eventClusterId": event_cluster_id,
+                "clusterVersion": cluster_version
+            }),
+            created_at: dt(2026, 7, 10, 12),
         }
     }
 
@@ -3288,6 +3395,65 @@ mod tests {
         .fetch_all(&pool)
         .await?;
         assert_eq!(stored_versions, vec![1, 2]);
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn saving_cluster_version_with_mentions_rolls_back_when_any_mention_fails(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = EventRepository::new(pool.clone());
+        let primary = evidence("cluster-batch-primary", 1, "publishable");
+        let secondary = evidence("cluster-batch-secondary", 1, "publishable");
+        save_evidence(&pool, &primary).await;
+        save_evidence(&pool, &secondary).await;
+
+        let cluster_id = Uuid::new_v4();
+        let cluster = EventClusterRow {
+            mention_count: 2,
+            independent_sources: 2,
+            representative_ids: vec![primary.evidence_id, secondary.evidence_id],
+            ..event_cluster(cluster_id, 1, primary.evidence_id)
+        };
+        let duplicate_mention_id = Uuid::new_v4();
+        let mention_rows = vec![
+            event_mention(duplicate_mention_id, primary.evidence_id, cluster_id, 1),
+            event_mention(duplicate_mention_id, secondary.evidence_id, cluster_id, 1),
+        ];
+
+        let error = repo
+            .save_event_cluster_version_with_mentions(&cluster, &mention_rows)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("duplicate key")
+                || error.to_string().contains("unique constraint")
+        );
+
+        let stored_cluster_count: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*)
+               FROM market_event_clusters
+               WHERE event_cluster_id = $1
+                 AND cluster_version = $2"#,
+        )
+        .bind(cluster_id)
+        .bind(1_i32)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(stored_cluster_count, 0);
+
+        let stored_mentions: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*)
+               FROM market_event_mentions
+               WHERE event_cluster_id = $1
+                 AND cluster_version = $2"#,
+        )
+        .bind(cluster_id)
+        .bind(1_i32)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(stored_mentions, 0);
 
         Ok(())
     }
