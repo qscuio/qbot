@@ -165,7 +165,7 @@ async fn load_factual_top_stock(
         return Ok(None);
     };
 
-    let bars = postgres::get_stock_history(pool, &code, 220).await?;
+    let bars = postgres::get_stock_history_as_of(pool, &code, trade_date, 220).await?;
     let trend = TrendAnalyzer::analyze(&code, &bars);
 
     Ok(Some(FactualTopStock {

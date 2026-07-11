@@ -617,6 +617,41 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn market_overview_bounds_top_stock_trend_history_to_requested_trade_date(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let llm_calls = Arc::new(AtomicUsize::new(0));
+        let (llm_base_url, llm_handle) = spawn_failing_llm_server(llm_calls.clone()).await;
+
+        let trade_date = date(2026, 7, 11);
+        seed_market_snapshot(&pool, trade_date).await?;
+        seed_persisted_decision_artifact(&pool, trade_date).await?;
+        seed_sector_rows(&pool, trade_date).await?;
+        seed_top_stock_with_future_history(&pool, trade_date).await?;
+
+        let state = test_state(pool, Some("test-ai-key"), &llm_base_url).await;
+
+        let overview = AiAnalysisService::new(state)
+            .market_overview(Some(trade_date))
+            .await
+            .expect("market overview should not leak future bars into top stock trend");
+
+        llm_handle.abort();
+
+        let payload = serde_json::to_value(&overview).expect("serialize market overview");
+        assert_eq!(payload["topStock"]["code"], "300750.SZ");
+        assert_eq!(payload["topStock"]["trend"]["price"], 70.0);
+        let trend_score = payload["topStock"]["trend"]["score"]
+            .as_f64()
+            .expect("top stock trend score");
+        assert!(trend_score >= 70.0);
+        assert!(payload.get("compatibility").is_none());
+        assert_eq!(llm_calls.load(Ordering::SeqCst), 0);
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn market_overview_preserves_top_stock_when_metadata_is_missing(
         pool: PgPool,
     ) -> sqlx::Result<()> {
@@ -1046,6 +1081,90 @@ mod tests {
         )
         .await
         .unwrap();
+        Ok(())
+    }
+
+    async fn seed_top_stock_with_future_history(
+        pool: &PgPool,
+        trade_date: NaiveDate,
+    ) -> sqlx::Result<()> {
+        postgres::upsert_stock_info(
+            pool,
+            &[
+                StockInfo {
+                    code: "300750.SZ".to_string(),
+                    name: "Momentum Tech".to_string(),
+                    market: "SZ".to_string(),
+                    industry: Some("Battery".to_string()),
+                },
+                StockInfo {
+                    code: "600000.SH".to_string(),
+                    name: "Alpha Bank".to_string(),
+                    market: "SH".to_string(),
+                    industry: Some("Banking".to_string()),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+        let mut bars = Vec::new();
+        for offset in 0..61 {
+            let day = trade_date - chrono::Days::new((60 - offset) as u64);
+            let top_close = 10.0 + offset as f64;
+            let candidate_close = 20.0 + (offset as f64 * 0.2);
+
+            bars.push((
+                "300750.SZ".to_string(),
+                Candle {
+                    trade_date: day,
+                    open: top_close - 1.0,
+                    high: top_close + 1.0,
+                    low: top_close - 1.5,
+                    close: if offset == 60 { 70.0 } else { top_close },
+                    volume: 1_000_000,
+                    amount: 5_000_000.0,
+                    turnover: Some(2.0),
+                    pe: Some(20.0),
+                    pb: Some(3.0),
+                },
+            ));
+            bars.push((
+                "600000.SH".to_string(),
+                Candle {
+                    trade_date: day,
+                    open: candidate_close - 0.3,
+                    high: candidate_close + 0.3,
+                    low: candidate_close - 0.6,
+                    close: candidate_close,
+                    volume: 800_000,
+                    amount: 3_500_000.0,
+                    turnover: Some(1.0),
+                    pe: Some(8.0),
+                    pb: Some(0.8),
+                },
+            ));
+        }
+        for (day_offset, close) in [(1_u64, 5.0), (2, 4.0), (3, 3.0)] {
+            let day = trade_date + chrono::Days::new(day_offset);
+            bars.push((
+                "300750.SZ".to_string(),
+                Candle {
+                    trade_date: day,
+                    open: close + 1.0,
+                    high: close + 1.5,
+                    low: close - 0.5,
+                    close,
+                    volume: 1_500_000,
+                    amount: 2_000_000.0,
+                    turnover: Some(4.0),
+                    pe: Some(18.0),
+                    pb: Some(2.5),
+                },
+            ));
+        }
+
+        postgres::upsert_daily_bars(pool, &bars).await.unwrap();
         Ok(())
     }
 

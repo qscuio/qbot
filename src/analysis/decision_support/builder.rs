@@ -19,7 +19,6 @@ use crate::storage::decision_support_repository::DecisionSupportRunRow;
 use crate::storage::decision_support_repository::{DecisionBriefRow, DecisionCandidateRow};
 use crate::storage::event_repository::DailyEventBriefRow;
 use crate::storage::event_repository::EventRepository;
-use crate::storage::market_repository::DataStatusSnapshot;
 use crate::storage::market_repository::MarketRepository;
 use crate::storage::pattern_repository::PatternRepository;
 use crate::storage::pattern_repository::PatternSetRow;
@@ -59,10 +58,6 @@ impl DecisionSupport {
                     trade_date, config.market_snapshot_version
                 ))
             })?;
-        let latest_status = self
-            .market_repo
-            .latest_market_snapshot(&config.market_snapshot_version)
-            .await?;
         let scan_candidates = load_scan_ranker_baseline(&self.pool, trade_date).await?;
         let pattern_set = self.pattern_repo.latest_published_set().await?;
         let pattern_candidates = match pattern_set.as_ref() {
@@ -90,8 +85,7 @@ impl DecisionSupport {
             apply_missing_pattern_status(candidates, trade_date, pattern_set.is_some());
         let data_status = data_status_from_snapshot(
             trade_date,
-            &config.market_snapshot_version,
-            latest_status.as_ref(),
+            &snapshot.snapshot_version,
             &snapshot.input_fingerprint,
             snapshot.available_at,
             snapshot.data_complete,
@@ -230,32 +224,19 @@ fn parse_event_summary(row: &DailyEventBriefRow) -> Result<DailyEventBrief> {
 fn data_status_from_snapshot(
     requested_trade_date: NaiveDate,
     snapshot_version: &str,
-    latest_status: Option<&DataStatusSnapshot>,
-    fallback_input_fingerprint: &str,
-    fallback_available_at: chrono::DateTime<Utc>,
-    fallback_data_complete: bool,
-    fallback_missing_inputs: &[String],
+    input_fingerprint: &str,
+    available_at: chrono::DateTime<Utc>,
+    data_complete: bool,
+    missing_inputs: &[String],
 ) -> DataStatus {
-    if let Some(latest_status) = latest_status {
-        DataStatus {
-            requested_trade_date,
-            latest_trade_date: Some(latest_status.trade_date),
-            snapshot_version: latest_status.snapshot_version.clone(),
-            available_at: Some(latest_status.available_at),
-            data_complete: latest_status.data_complete,
-            missing_inputs: latest_status.missing_inputs.clone(),
-            input_fingerprint: Some(latest_status.input_fingerprint.clone()),
-        }
-    } else {
-        DataStatus {
-            requested_trade_date,
-            latest_trade_date: Some(requested_trade_date),
-            snapshot_version: snapshot_version.to_string(),
-            available_at: Some(fallback_available_at),
-            data_complete: fallback_data_complete,
-            missing_inputs: fallback_missing_inputs.to_vec(),
-            input_fingerprint: Some(fallback_input_fingerprint.to_string()),
-        }
+    DataStatus {
+        requested_trade_date,
+        latest_trade_date: Some(requested_trade_date),
+        snapshot_version: snapshot_version.to_string(),
+        available_at: Some(available_at),
+        data_complete,
+        missing_inputs: missing_inputs.to_vec(),
+        input_fingerprint: Some(input_fingerprint.to_string()),
     }
 }
 
@@ -1192,6 +1173,79 @@ mod tests {
             None,
             "default build_daily should remain read-only until run persistence is specified"
         );
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn build_daily_uses_requested_snapshot_for_data_status_and_a_tier_withholding(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let market_repo = MarketRepository::new(pool.clone());
+        let trade_date = date(2026, 7, 11);
+
+        market_repo
+            .save_market_snapshot(&crate::analysis::market_snapshot::MarketSnapshot {
+                trade_date,
+                snapshot_version: crate::analysis::market_snapshot::MARKET_SNAPSHOT_VERSION
+                    .to_string(),
+                available_at: dt(2026, 7, 11, 18),
+                data_complete: false,
+                metrics: json!({"breadth": {"up_count": 123}}),
+                missing_inputs: vec!["security_status:600000:2026-07-11".to_string()],
+                input_fingerprint: "requested-fingerprint".to_string(),
+            })
+            .await
+            .unwrap();
+        market_repo
+            .save_market_snapshot(&crate::analysis::market_snapshot::MarketSnapshot {
+                trade_date: date(2026, 7, 12),
+                snapshot_version: crate::analysis::market_snapshot::MARKET_SNAPSHOT_VERSION
+                    .to_string(),
+                available_at: dt(2026, 7, 12, 18),
+                data_complete: true,
+                metrics: json!({"breadth": {"up_count": 456}}),
+                missing_inputs: Vec::new(),
+                input_fingerprint: "later-fingerprint".to_string(),
+            })
+            .await
+            .unwrap();
+        seed_ranked_pool_candidate(&pool, trade_date, "600000.SH", "Alpha Bank", 95.0, "short")
+            .await;
+
+        let support = DecisionSupport::new(pool)
+            .build_daily(trade_date, DecisionSupportConfig::default())
+            .await
+            .unwrap();
+
+        assert_eq!(support.data_status.requested_trade_date, trade_date);
+        assert_eq!(support.data_status.latest_trade_date, Some(trade_date));
+        assert!(!support.data_status.data_complete);
+        assert_eq!(
+            support.data_status.missing_inputs,
+            vec!["security_status:600000:2026-07-11".to_string()]
+        );
+        assert_eq!(
+            support.data_status.input_fingerprint.as_deref(),
+            Some("requested-fingerprint")
+        );
+
+        let candidate = support
+            .candidates
+            .iter()
+            .find(|candidate| candidate.code == "600000.SH")
+            .expect("expected ranked candidate");
+        assert_eq!(candidate.support_tier, "watch");
+        assert!(candidate.unknowns.iter().any(|statement| {
+            statement
+                .statement
+                .contains("A-tier withheld until market snapshot inputs are complete")
+        }));
+        assert!(candidate.unknowns.iter().any(|statement| {
+            statement
+                .statement
+                .contains("security_status:600000:2026-07-11")
+        }));
 
         Ok(())
     }

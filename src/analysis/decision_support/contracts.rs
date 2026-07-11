@@ -130,8 +130,62 @@ impl Default for DecisionSupportConfig {
                 .to_string(),
             persist_run: false,
             event_score_enabled: false,
-            event_score_limit: 5.0,
+            event_score_limit: 0.0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DecisionSupportConfig;
+    use crate::config::Config;
+
+    #[test]
+    fn decision_support_config_default_disables_event_score_adjustment_budget() {
+        let config = DecisionSupportConfig::default();
+
+        assert!(!config.event_score_enabled);
+        assert_eq!(config.event_score_limit, 0.0);
+    }
+
+    #[test]
+    fn decision_support_config_from_env_config_clamps_event_score_limit() {
+        let config = Config {
+            tushare_token: "test".to_string(),
+            database_url: "postgresql://qbot:qbot@127.0.0.1/qbot".to_string(),
+            redis_url: "redis://127.0.0.1:6379".to_string(),
+            telegram_bot_token: "test".to_string(),
+            telegram_webhook_secret: None,
+            webhook_url: None,
+            stock_alert_channel: None,
+            report_channel: None,
+            daban_channel: None,
+            api_port: 8080,
+            api_key: None,
+            ai_api_key: None,
+            ai_base_url: "http://localhost".to_string(),
+            ai_model: "gpt-4o-mini".to_string(),
+            data_proxy: None,
+            official_event_feed_url: None,
+            official_event_feed_api_key: None,
+            official_event_source_id: "official:market_event".to_string(),
+            official_event_store_full_content: false,
+            enable_gdelt_events: false,
+            gdelt_event_query: String::new(),
+            gdelt_max_records: 250,
+            enable_burst_monitor: false,
+            enable_daban_live: false,
+            enable_ai_analysis: false,
+            enable_chip_dist: false,
+            enable_event_score_adjustment: true,
+            max_event_score_adjustment: 8.0,
+            enable_signal_auto_trading: false,
+        };
+
+        let support_config = DecisionSupportConfig::from(&config);
+
+        assert!(support_config.event_score_enabled);
+        assert_eq!(support_config.event_score_limit, 5.0);
     }
 }
 

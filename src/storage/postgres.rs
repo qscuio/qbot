@@ -101,7 +101,49 @@ pub async fn upsert_daily_bars_in_tx(
 
 /// Fetch OHLCV history for a stock (sorted ascending)
 pub async fn get_stock_history(pool: &PgPool, code: &str, days: usize) -> Result<Vec<Candle>> {
-    let rows: Vec<(
+    get_stock_history_query(
+        sqlx::query_as(
+            r#"SELECT trade_date, open::float8, high::float8, low::float8, close::float8,
+                      volume, amount::float8, turnover::float8, pe::float8, pb::float8
+               FROM stock_daily_bars
+               WHERE code = $1
+               ORDER BY trade_date DESC
+               LIMIT $2"#,
+        )
+        .bind(code)
+        .bind(days as i64)
+        .fetch_all(pool)
+        .await?,
+    )
+}
+
+/// Fetch OHLCV history for a stock up to and including an as-of trade date (sorted ascending)
+pub async fn get_stock_history_as_of(
+    pool: &PgPool,
+    code: &str,
+    as_of_trade_date: NaiveDate,
+    days: usize,
+) -> Result<Vec<Candle>> {
+    get_stock_history_query(
+        sqlx::query_as(
+            r#"SELECT trade_date, open::float8, high::float8, low::float8, close::float8,
+                      volume, amount::float8, turnover::float8, pe::float8, pb::float8
+               FROM stock_daily_bars
+               WHERE code = $1
+                 AND trade_date <= $2
+               ORDER BY trade_date DESC
+               LIMIT $3"#,
+        )
+        .bind(code)
+        .bind(as_of_trade_date)
+        .bind(days as i64)
+        .fetch_all(pool)
+        .await?,
+    )
+}
+
+fn get_stock_history_query(
+    rows: Vec<(
         NaiveDate,
         Option<f64>,
         Option<f64>,
@@ -112,19 +154,8 @@ pub async fn get_stock_history(pool: &PgPool, code: &str, days: usize) -> Result
         Option<f64>,
         Option<f64>,
         Option<f64>,
-    )> = sqlx::query_as(
-        r#"SELECT trade_date, open::float8, high::float8, low::float8, close::float8,
-                      volume, amount::float8, turnover::float8, pe::float8, pb::float8
-               FROM stock_daily_bars
-               WHERE code = $1
-               ORDER BY trade_date DESC
-               LIMIT $2"#,
-    )
-    .bind(code)
-    .bind(days as i64)
-    .fetch_all(pool)
-    .await?;
-
+    )>,
+) -> Result<Vec<Candle>> {
     let mut bars: Vec<Candle> = rows
         .into_iter()
         .map(
