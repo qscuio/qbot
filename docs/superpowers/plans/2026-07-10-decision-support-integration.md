@@ -445,7 +445,7 @@ This task may merge with event score disabled. Do not enable in production as pa
 - Adds daily and candidate detail endpoints.
 - Adds read-only Telegram commands.
 
-- [ ] **Step 1: Add endpoints**
+- [x] **Step 1: Add endpoints**
 
 ```text
 GET  /api/analysis/decision-support/latest
@@ -454,14 +454,14 @@ GET  /api/analysis/decision-support/:date/:code
 POST /api/jobs/analysis/decision-support
 ```
 
-- [ ] **Step 2: Add Telegram commands**
+- [x] **Step 2: Add Telegram commands**
 
 ```text
 /decision
 /decision_detail <code>
 ```
 
-- [ ] **Step 3: Ensure response labels**
+- [x] **Step 3: Ensure response labels**
 
 Every statement includes:
 
@@ -472,7 +472,7 @@ inference
 unknown
 ```
 
-- [ ] **Step 4: Add auth and safety tests**
+- [x] **Step 4: Add auth and safety tests**
 
 No endpoint may create or update:
 
@@ -483,7 +483,7 @@ trading_sim_positions
 daban_sim_positions
 ```
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 cargo test api::decision_support_routes -- --nocapture

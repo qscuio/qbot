@@ -91,3 +91,5 @@ Gate 4 Task 4: complete (commits 058601f..e0b2169, review clean; verification: a
 Gate 4 Task 5: complete (commits 26197da..6c7aa85, review clean; verification: event_adapter 4/4 passed with DATABASE_URL, fmt check passed, diff check passed)
 
 Gate 4 Task 6: complete (commits eae4c87..0ee87b0, review clean; verification: decision_support::builder 10/10 passed with DATABASE_URL, fmt check passed, diff check passed)
+
+Gate 4 Task 7: complete (commits 534e8ba..05a28a1, review clean after atomic persistence and duplicate-path fixes; verification: api::decision_support_routes 6/6 passed with DATABASE_URL, storage::decision_support_repository 4/4 passed with DATABASE_URL, builder atomic rollback regression 1/1 passed with DATABASE_URL, fmt check passed, diff check passed)
