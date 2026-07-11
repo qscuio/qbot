@@ -26,6 +26,7 @@ pub(crate) mod claims;
 pub mod clustering;
 pub mod contracts;
 mod dedup;
+pub mod deltas;
 pub(crate) mod entity_linking;
 mod evidence;
 pub(crate) mod extraction;
@@ -42,6 +43,10 @@ pub use contracts::{
     BriefUnconfirmed, DailyEventBrief, EventDetail, EventEvidence, EventListItem,
     EventProcessingSummary, EventReviewResult, ExistingEventEvidenceRelation, ManualEventInput,
     ManualEventSubmissionOutcome, PersistedDailyEventBrief, TradingDateResolver,
+};
+pub use deltas::{
+    compute_event_delta, ClaimEntityRole, EventClaimSnapshot, EventClusterVersionSnapshot,
+    EventDelta, ExpectationGap, ExpectationSnapshot, NormalizedValue, RevisedValue, StatusChange,
 };
 pub use mentions::{ClusterMention, EventMention};
 

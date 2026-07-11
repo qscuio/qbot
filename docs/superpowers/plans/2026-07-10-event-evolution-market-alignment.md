@@ -321,7 +321,7 @@ git commit -m "feat: add GDELT macro event adapter"
 - Produces deterministic deltas between cluster versions.
 - Does not use market prices.
 
-- [ ] **Step 1: Define delta payload**
+- [x] **Step 1: Define delta payload**
 
 ```rust
 pub struct EventDelta {
@@ -336,7 +336,7 @@ pub struct EventDelta {
 }
 ```
 
-- [ ] **Step 2: Test numeric revisions**
+- [x] **Step 2: Test numeric revisions**
 
 Example:
 
@@ -347,11 +347,11 @@ new order amount: 0.8 billion
 
 Must produce a revised value, not a second unrelated claim.
 
-- [ ] **Step 3: Implement deterministic comparison**
+- [x] **Step 3: Implement deterministic comparison**
 
 Use canonical claim IDs, normalized units, entity roles, and dates.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ```bash
 cargo test analysis::events::deltas
@@ -614,7 +614,7 @@ git commit -m "feat: report evolving events and market alignment"
 - [x] GDELT is supplementary and idempotent.
 - [ ] EventMention and EventCluster are versioned.
 - [ ] Two-stage clustering respects manual locks.
-- [ ] EventDelta highlights new information.
+- [x] EventDelta highlights new information.
 - [ ] Hypotheses freeze before market observation.
 - [ ] Market alignment and causal confidence are separate.
 - [ ] Confounded windows are explicit.
