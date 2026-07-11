@@ -114,9 +114,22 @@ Copy `.env.example` to `.env` and fill in:
 | `ENABLE_DABAN_LIVE` | No | Enable intraday daban live loop (`true`/`false`, default `false`) |
 | `ENABLE_AI_ANALYSIS` | No | Enable scheduled AI market analysis push (`true`/`false`, default `false`) |
 | `ENABLE_CHIP_DIST` | No | Enable scheduled chip-distribution refresh (`true`/`false`, default `true`) |
+| `ENABLE_EVENT_SCORE_ADJUSTMENT` | No | Enable bounded event-score adjustments inside DecisionSupport (`true`/`false`, default `false`) |
+| `MAX_EVENT_SCORE_ADJUSTMENT` | No | Maximum absolute DecisionSupport event-score adjustment (default `0`, hard-capped at `5`) |
 | `ENABLE_SIGNAL_AUTO_TRADING` | No | Enable signal-based auto paper trading loop with Telegram action pushes (`true`/`false`, default `false`) |
 
 ---
+
+## Production Release Gates
+
+DecisionSupport is production-read-only. Keep event-score adjustments disabled:
+
+```text
+ENABLE_EVENT_SCORE_ADJUSTMENT=false
+MAX_EVENT_SCORE_ADJUSTMENT=0
+```
+
+DecisionSupport artifacts must not write into `signal_strategy_candidates` or any auto-trading path.
 
 ## Local Testing
 

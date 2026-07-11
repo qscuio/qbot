@@ -261,7 +261,21 @@ GDELT、两阶段事件聚类、`ImpactHypothesisGraph` 和异常收益验证进
 - 保守自动合并精确率目标不低于 90%
 - 人工锁定关系不会被自动任务覆盖
 
-## 10. 实施计划
+## 10. 2026-07-11 发布状态
+
+- 当前发布状态：`BLOCKED`。DecisionSupport 保持只读，未获准作为生产交易输入。
+- 已验证的线上约束：
+  - `ENABLE_EVENT_SCORE_ADJUSTMENT=false`
+  - `MAX_EVENT_SCORE_ADJUSTMENT=0`
+  - 事件上下文当前只保留解释用途，不得绕过 `DecisionSupport` 的只读边界或接入自动交易。
+- Gate 4 Task 10 验证结论：
+  - `cargo fmt --all -- --check` 通过。
+  - `git diff --check` 通过。
+  - `cargo test --all --locked` 在 shell 未提供 `DATABASE_URL` 时失败；补充默认 `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot` 后通过，说明 Rust 代码路径本身满足当前门槛。
+  - `cd research && python -m pytest -q`、`python -m ruff check .`、`python -m mypy qbot_research` 均因当前环境不存在 `python` 可执行文件而失败。
+  - 对 `deploy/docker-compose.yml` 提供的本地 PostgreSQL 执行 `SELECT COUNT(*) FROM signal_strategy_candidates WHERE signal_metadata ? 'decision_support_run_id';` 时，基础 `qbot` 数据库返回 `relation "signal_strategy_candidates" does not exist`，因此当前环境不能给出目标 `0` 的发布证明。
+
+## 11. 实施计划
 
 - [总体实施路线图](../superpowers/plans/2026-07-10-analysis-platform-roadmap.md)
 - [Phase 0：Point-in-time 数据底座](../superpowers/plans/2026-07-10-point-in-time-data-foundation.md)
@@ -270,7 +284,7 @@ GDELT、两阶段事件聚类、`ImpactHypothesisGraph` 和异常收益验证进
 - [Phase 3：事件演化和市场观察](../superpowers/plans/2026-07-10-event-evolution-market-alignment.md)
 - [Phase 4：DecisionSupport 有限融合](../superpowers/plans/2026-07-10-decision-support-integration.md)
 
-## 11. 非目标
+## 12. 非目标
 
 当前不做：
 
