@@ -129,7 +129,7 @@ git commit -m "feat: add decision-support persistence"
 - Produces `DecisionSupport::build_daily`.
 - Reads but does not mutate scanner, pattern, event, or trading data.
 
-- [ ] **Step 1: Define contracts**
+- [x] **Step 1: Define contracts**
 
 ```rust
 pub struct DecisionSupport {
@@ -168,7 +168,7 @@ pub struct DecisionCandidate {
 }
 ```
 
-- [ ] **Step 2: Add classification tests**
+- [x] **Step 2: Add classification tests**
 
 A source-backed event fact must appear in `facts`.
 
@@ -178,7 +178,7 @@ An impact hypothesis must appear in `inferences`.
 
 Missing status data must appear in `unknowns`.
 
-- [ ] **Step 3: Implement builder interface**
+- [x] **Step 3: Implement builder interface**
 
 ```rust
 impl DecisionSupport {
@@ -190,7 +190,7 @@ impl DecisionSupport {
 }
 ```
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ```bash
 cargo test analysis::decision_support

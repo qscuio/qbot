@@ -81,3 +81,5 @@ Gate 3 Task 8: complete (commits e3bbee6..f1f5e6d, review clean; verification: r
 Gate 3 phase review: complete (commits ada917a..df8f73c, phase review clean after persisted read path, GDELT ingestion, scheduled clustering/observation, supplementary fact autopublish, and atomic cluster+mention persistence fixes; verification: analysis::events 122/122 passed, scheduler::tests 24/24 passed, repository transactional regression passed, fmt check passed, diff check passed)
 
 Gate 4 Task 1: complete (commits c91fc59..a4814eb, review clean after candidate insert deduplication; verification: storage::decision_support_repository 3/3 passed with DATABASE_URL, fmt check passed, diff check passed)
+
+Gate 4 Task 2: complete (commits 31380b3..c4c09ac, review clean after decision_support re-export warning fix; verification: analysis::decision_support 2/2 passed with DATABASE_URL, fmt check passed, diff check passed)
