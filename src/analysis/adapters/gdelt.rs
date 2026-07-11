@@ -3,6 +3,7 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use reqwest::{Client, Url};
 use serde::Deserialize;
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 use crate::analysis::adapters::{ContentRetentionPolicy, EventSource, FetchBatch, FetchedEvent};
 use crate::config::Config;
@@ -147,17 +148,18 @@ fn parse_article(raw_article: Value) -> Result<FetchedEvent> {
         .as_object()
         .cloned()
         .ok_or_else(|| AppError::DataProvider("GDELT article must be a JSON object".to_string()))?;
-    let source_item_id = required_string_with_aliases(&raw_payload, &["source_item_id", "url"])?;
+    let source_url = required_string_with_aliases(&raw_payload, &["source_url", "url"])?;
+    let source_item_id = optional_string_with_aliases(&raw_payload, &["source_item_id"])
+        .unwrap_or_else(|| source_item_id_from_url(&source_url));
     let published_at = parse_published_at(required_string_with_aliases(
         &raw_payload,
         &["published_at", "seendate", "date"],
     )?)?;
     let title = required_string_with_aliases(&raw_payload, &["title"])?;
-    let source_url = required_string_with_aliases(&raw_payload, &["source_url", "url"])?;
-    let language = required_string_with_aliases(&raw_payload, &["language", "lang"])?;
-    let themes = required_array(&raw_payload, "themes")?;
-    let locations = required_array(&raw_payload, "locations")?;
-    let organizations = required_array(&raw_payload, "organizations")?;
+    let language = optional_string_with_aliases(&raw_payload, &["language", "lang"]);
+    let themes = optional_array_or_empty(&raw_payload, "themes")?;
+    let locations = optional_array_or_empty(&raw_payload, "locations")?;
+    let organizations = optional_array_or_empty(&raw_payload, "organizations")?;
     let description = optional_string_with_aliases(&raw_payload, &["description", "desc"]);
 
     raw_payload.insert(
@@ -170,7 +172,9 @@ fn parse_article(raw_article: Value) -> Result<FetchedEvent> {
     );
     raw_payload.insert("title".to_string(), Value::String(title.clone()));
     raw_payload.insert("source_url".to_string(), Value::String(source_url.clone()));
-    raw_payload.insert("language".to_string(), Value::String(language));
+    if let Some(language) = language {
+        raw_payload.insert("language".to_string(), Value::String(language));
+    }
     raw_payload.insert("themes".to_string(), themes);
     raw_payload.insert("locations".to_string(), locations);
     raw_payload.insert("organizations".to_string(), organizations);
@@ -247,14 +251,20 @@ fn optional_string_with_aliases(payload: &Map<String, Value>, fields: &[&str]) -
     })
 }
 
-fn required_array(payload: &Map<String, Value>, field: &str) -> Result<Value> {
-    payload
-        .get(field)
-        .filter(|value| value.is_array())
-        .cloned()
-        .ok_or_else(|| {
-            AppError::DataProvider(format!("GDELT article missing array field `{field}`"))
-        })
+fn optional_array_or_empty(payload: &Map<String, Value>, field: &str) -> Result<Value> {
+    match payload.get(field) {
+        Some(value) if value.is_array() => Ok(value.clone()),
+        Some(_) => Err(AppError::DataProvider(format!(
+            "GDELT article field `{field}` must be an array when present"
+        ))),
+        None => Ok(Value::Array(Vec::new())),
+    }
+}
+
+fn source_item_id_from_url(source_url: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(source_url.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 fn parse_published_at(value: String) -> Result<DateTime<Utc>> {
@@ -304,6 +314,79 @@ mod tests {
 
     use super::*;
     use crate::analysis::adapters::{ContentRetentionPolicy, EventSource, FetchedEvent};
+
+    #[test]
+    fn parses_real_artlist_fixture_derives_ids_and_defaults_missing_enrichments() {
+        let source = GdeltEventSource::new("red sea shipping", 250).unwrap();
+        let fixture = include_str!("../../../tests/fixtures/gdelt_doc_artlist_real_shape.json");
+
+        let batch = source
+            .parse_response_body(
+                fixture,
+                Utc.with_ymd_and_hms(2026, 7, 10, 9, 0, 0).unwrap(),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            batch.next_cursor.as_deref(),
+            Some(
+                "2026-07-10T08:45:00+00:00|35d4ee9122a063c4dadc1d3470dae354be627436fae4c8b518d9a07dfd973aea"
+            )
+        );
+        assert_eq!(batch.items.len(), 2);
+        assert_eq!(
+            batch.items[0],
+            FetchedEvent {
+                source_item_id: "6a007dabace71ba342877915f290b557f7822697e6926947dc721cff14b6d388"
+                    .to_string(),
+                published_at: Utc.with_ymd_and_hms(2026, 7, 10, 8, 15, 0).unwrap(),
+                title: "Shipping reroutes after Red Sea attacks raise freight concerns".to_string(),
+                content: None,
+                source_url: "https://example.test/articles/red-sea-shipping".to_string(),
+                raw_payload: json!({
+                    "url": "https://example.test/articles/red-sea-shipping",
+                    "title": "Shipping reroutes after Red Sea attacks raise freight concerns",
+                    "seendate": "20260710081500",
+                    "language": "English",
+                    "domain": "example.test",
+                    "sourcecountry": "US",
+                    "source_item_id": "6a007dabace71ba342877915f290b557f7822697e6926947dc721cff14b6d388",
+                    "published_at": "2026-07-10T08:15:00+00:00",
+                    "source_url": "https://example.test/articles/red-sea-shipping",
+                    "themes": [],
+                    "locations": [],
+                    "organizations": [],
+                    "sourceRole": "macro_supplement",
+                    "companyFactEligible": false
+                }),
+            }
+        );
+        assert_eq!(
+            batch.items[1]
+                .raw_payload
+                .get("themes")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            batch.items[1]
+                .raw_payload
+                .get("locations")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            batch.items[1]
+                .raw_payload
+                .get("organizations")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+    }
 
     #[test]
     fn parses_fixture_and_maps_supplementary_metadata() {
