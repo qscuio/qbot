@@ -234,13 +234,15 @@ fn decision_support_input_fingerprint(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::analysis::decision_support::SupportStatement;
+    use super::classify_statements;
+    use crate::analysis::decision_support::{
+        DecisionSupport, DecisionSupportConfig, SupportStatement,
+    };
     use crate::analysis::events::DailyEventBrief;
     use crate::storage::decision_support_repository::DecisionSupportRepository;
     use crate::storage::event_repository::{DailyEventBriefRow, EventRepository};
     use crate::storage::market_repository::MarketRepository;
-    use chrono::{TimeZone, Utc};
+    use chrono::{NaiveDate, TimeZone, Utc};
     use serde_json::json;
     use sqlx::PgPool;
 
