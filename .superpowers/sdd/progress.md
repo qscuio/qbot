@@ -85,3 +85,5 @@ Gate 4 Task 1: complete (commits c91fc59..a4814eb, review clean after candidate 
 Gate 4 Task 2: complete (commits 31380b3..c4c09ac, review clean after decision_support re-export warning fix; verification: analysis::decision_support 2/2 passed with DATABASE_URL, fmt check passed, diff check passed)
 
 Gate 4 Task 3: complete (commits 3aa038c..fe351b2, review clean after latest-run archive filtering fix; verification: scan_ranker_adapter 3/3 passed with DATABASE_URL, fmt check passed, diff check passed)
+
+Gate 4 Task 4: complete (commits 058601f..e0b2169, review clean; verification: analysis::decision_support::builder 4/4 passed with DATABASE_URL, fmt check passed, diff check passed)

@@ -274,7 +274,7 @@ git commit -m "feat: adapt scan-ranker output for decision support"
 - Joins candidates by `(code, horizon)`.
 - Preserves source-specific scores.
 
-- [ ] **Step 1: Define merge rules**
+- [x] **Step 1: Define merge rules**
 
 ```text
 scan-ranker only      -> base_source=scan_ranker
@@ -284,7 +284,7 @@ both                  -> base_source=combined
 
 Do not average unrelated raw score scales.
 
-- [ ] **Step 2: Normalize evidence, not raw scores**
+- [x] **Step 2: Normalize evidence, not raw scores**
 
 Use configured rank percentiles:
 
@@ -300,7 +300,7 @@ base_score = max(scan_ranker_percentile, pattern_percentile)
 pattern_score = pattern_percentile or null
 ```
 
-- [ ] **Step 3: Add conflict tests**
+- [x] **Step 3: Add conflict tests**
 
 If scan-ranker says A and pattern says Reject:
 
@@ -308,7 +308,7 @@ If scan-ranker says A and pattern says Reject:
 - add a disagreement risk flag.
 - retain both explanations.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ```bash
 cargo test analysis::decision_support::builder
