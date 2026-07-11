@@ -185,7 +185,7 @@ git commit -m "feat: add event evolution schema"
 - Produces end-of-day refined cluster versions.
 - Preserves evidence and duplicate groups.
 
-- [ ] **Step 1: Define clustering contracts**
+- [x] **Step 1: Define clustering contracts**
 
 ```rust
 pub struct EventMention {
@@ -207,7 +207,7 @@ pub struct ClusterDecision {
 }
 ```
 
-- [ ] **Step 2: Test incremental clustering**
+- [x] **Step 2: Test incremental clustering**
 
 Cases:
 
@@ -216,7 +216,7 @@ Cases:
 - low confidence becomes review required.
 - duplicate-group members do not count as independent sources.
 
-- [ ] **Step 3: Implement low-cost incremental scoring**
+- [x] **Step 3: Implement low-cost incremental scoring**
 
 ```text
 time proximity
@@ -228,7 +228,7 @@ semantic similarity
 
 Automatic join requires all hard conditions plus configured score threshold.
 
-- [ ] **Step 4: Implement end-of-day refinement**
+- [x] **Step 4: Implement end-of-day refinement**
 
 Refinement can:
 
@@ -238,7 +238,7 @@ Refinement can:
 - calculate source entropy.
 - respect user-locked merge/split relations.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 cargo test analysis::events::clustering -- --nocapture
