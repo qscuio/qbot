@@ -31,6 +31,7 @@ pub(crate) mod entity_linking;
 mod evidence;
 pub(crate) mod extraction;
 pub mod hypotheses;
+pub mod market_observation;
 pub mod mentions;
 mod reporting;
 mod time;
