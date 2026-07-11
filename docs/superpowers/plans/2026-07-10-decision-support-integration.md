@@ -329,7 +329,7 @@ git commit -m "feat: combine baseline and shadow pattern evidence"
 - Adds direct event facts and industry context.
 - Returns `event_adjustment = 0.0`.
 
-- [ ] **Step 1: Implement direct-context selection**
+- [x] **Step 1: Implement direct-context selection**
 
 Include events when:
 
@@ -338,21 +338,21 @@ Include events when:
 
 Do not include fuzzy beneficiary lists.
 
-- [ ] **Step 2: Test zero contribution**
+- [x] **Step 2: Test zero contribution**
 
 ```rust
 assert_eq!(candidate.event_adjustment, 0.0);
 assert_eq!(candidate.final_score, candidate.base_score + candidate.risk_adjustment);
 ```
 
-- [ ] **Step 3: Separate statements**
+- [x] **Step 3: Separate statements**
 
 - ClaimGraph content -> facts.
 - Market observation -> calculations.
 - ImpactHypothesisGraph -> inferences.
 - Missing direct mapping -> unknowns.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ```bash
 cargo test event_adapter
