@@ -30,7 +30,7 @@
 **Interfaces:**
 - Produces mentions, clusters, deltas, hypotheses, observations, and type-statistics tables.
 
-- [ ] **Step 1: Create the migration**
+- [x] **Step 1: Create the migration**
 
 ```sql
 CREATE TABLE market_event_mentions (
@@ -143,7 +143,7 @@ CREATE TABLE market_event_type_statistics (
 );
 ```
 
-- [ ] **Step 2: Add repository tests**
+- [x] **Step 2: Add repository tests**
 
 Verify:
 
@@ -153,7 +153,7 @@ Verify:
 - market observations cannot exist without a hypothesis.
 - observation status accepts only configured values at the application layer.
 
-- [ ] **Step 3: Implement repository methods**
+- [x] **Step 3: Implement repository methods**
 
 ```rust
 pub async fn save_event_cluster_version(&self, row: &EventClusterRow) -> Result<()>;
@@ -163,7 +163,7 @@ pub async fn save_market_observation(&self, row: &MarketObservationRow) -> Resul
 pub async fn latest_cluster_version(&self, id: Uuid) -> Result<Option<EventClusterRow>>;
 ```
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ```bash
 cargo test storage::event_repository -- --nocapture
@@ -185,7 +185,7 @@ git commit -m "feat: add event evolution schema"
 - Produces end-of-day refined cluster versions.
 - Preserves evidence and duplicate groups.
 
-- [ ] **Step 1: Define clustering contracts**
+- [x] **Step 1: Define clustering contracts**
 
 ```rust
 pub struct EventMention {
@@ -207,7 +207,7 @@ pub struct ClusterDecision {
 }
 ```
 
-- [ ] **Step 2: Test incremental clustering**
+- [x] **Step 2: Test incremental clustering**
 
 Cases:
 
@@ -216,7 +216,7 @@ Cases:
 - low confidence becomes review required.
 - duplicate-group members do not count as independent sources.
 
-- [ ] **Step 3: Implement low-cost incremental scoring**
+- [x] **Step 3: Implement low-cost incremental scoring**
 
 ```text
 time proximity
@@ -228,7 +228,7 @@ semantic similarity
 
 Automatic join requires all hard conditions plus configured score threshold.
 
-- [ ] **Step 4: Implement end-of-day refinement**
+- [x] **Step 4: Implement end-of-day refinement**
 
 Refinement can:
 
@@ -238,7 +238,7 @@ Refinement can:
 - calculate source entropy.
 - respect user-locked merge/split relations.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 cargo test analysis::events::clustering -- --nocapture
@@ -262,7 +262,7 @@ git commit -m "feat: cluster evolving market events"
 - Marks all rows as macro/geopolitical supplementary evidence.
 - Does not create company facts without another source.
 
-- [ ] **Step 1: Add configuration**
+- [x] **Step 1: Add configuration**
 
 ```text
 ENABLE_GDELT_EVENTS=false
@@ -270,7 +270,7 @@ GDELT_EVENT_QUERY=
 GDELT_MAX_RECORDS=250
 ```
 
-- [ ] **Step 2: Parse a fixture**
+- [x] **Step 2: Parse a fixture**
 
 Map:
 
@@ -286,7 +286,7 @@ organizations
 raw_payload
 ```
 
-- [ ] **Step 3: Enforce source role**
+- [x] **Step 3: Enforce source role**
 
 Set metadata:
 
@@ -297,11 +297,11 @@ Set metadata:
 }
 ```
 
-- [ ] **Step 4: Add cursor and idempotency tests**
+- [x] **Step 4: Add cursor and idempotency tests**
 
 Repeated fetches must not duplicate evidence.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 cargo test analysis::adapters::gdelt
@@ -321,7 +321,7 @@ git commit -m "feat: add GDELT macro event adapter"
 - Produces deterministic deltas between cluster versions.
 - Does not use market prices.
 
-- [ ] **Step 1: Define delta payload**
+- [x] **Step 1: Define delta payload**
 
 ```rust
 pub struct EventDelta {
@@ -336,7 +336,7 @@ pub struct EventDelta {
 }
 ```
 
-- [ ] **Step 2: Test numeric revisions**
+- [x] **Step 2: Test numeric revisions**
 
 Example:
 
@@ -347,11 +347,11 @@ new order amount: 0.8 billion
 
 Must produce a revised value, not a second unrelated claim.
 
-- [ ] **Step 3: Implement deterministic comparison**
+- [x] **Step 3: Implement deterministic comparison**
 
 Use canonical claim IDs, normalized units, entity roles, and dates.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ```bash
 cargo test analysis::events::deltas
@@ -371,7 +371,7 @@ git commit -m "feat: track event information deltas"
 - Produces a hypothesis graph from ClaimGraph and deterministic templates.
 - Freezes before market observation.
 
-- [ ] **Step 1: Define graph contracts**
+- [x] **Step 1: Define graph contracts**
 
 ```rust
 pub struct ImpactHypothesisGraph {
@@ -397,7 +397,7 @@ pub struct HypothesisEdge {
 }
 ```
 
-- [ ] **Step 2: Add deterministic templates**
+- [x] **Step 2: Add deterministic templates**
 
 Required templates:
 
@@ -410,7 +410,7 @@ company_order_v1
 company_accident_v1
 ```
 
-- [ ] **Step 3: Enforce freeze**
+- [x] **Step 3: Enforce freeze**
 
 After `frozen_at`:
 
@@ -418,7 +418,7 @@ After `frozen_at`:
 - market observation can only append separate rows.
 - new facts create a new hypothesis version.
 
-- [ ] **Step 4: Limit stock scope**
+- [x] **Step 4: Limit stock scope**
 
 Hypothesis output may name:
 
@@ -428,7 +428,7 @@ Hypothesis output may name:
 
 It may not generate indirect stock codes.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 cargo test analysis::events::hypotheses
@@ -449,7 +449,7 @@ git commit -m "feat: freeze evidence-based impact hypotheses"
 - Consumes frozen hypotheses and point-in-time market snapshots.
 - Never mutates hypotheses.
 
-- [ ] **Step 1: Define statuses**
+- [x] **Step 1: Define statuses**
 
 ```rust
 pub enum MarketObservationStatus {
@@ -462,7 +462,7 @@ pub enum MarketObservationStatus {
 }
 ```
 
-- [ ] **Step 2: Test abnormal return**
+- [x] **Step 2: Test abnormal return**
 
 ```text
 stock return 5%
@@ -472,7 +472,7 @@ market abnormal = 3%
 industry abnormal = 2%
 ```
 
-- [ ] **Step 3: Add confounder rules**
+- [x] **Step 3: Add confounder rules**
 
 Mark `Confounded` when the same entity/window contains:
 
@@ -482,13 +482,13 @@ Mark `Confounded` when the same entity/window contains:
 - major corporate action.
 - another high-importance event.
 
-- [ ] **Step 4: Keep causal confidence separate**
+- [x] **Step 4: Keep causal confidence separate**
 
 `market_alignment_score` can change by observed prices.
 
 `causal_confidence` is derived from evidence, timing, confounders, and identification quality; it must not increase solely because returns align.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 cargo test analysis::events::market_observation
@@ -508,7 +508,7 @@ git commit -m "feat: observe event market alignment without causal claims"
 - Produces versioned historical statistics.
 - Uses only events available before the statistics cutoff.
 
-- [ ] **Step 1: Define aggregation key**
+- [x] **Step 1: Define aggregation key**
 
 ```text
 event_type
@@ -519,11 +519,11 @@ data_cutoff
 logic_version
 ```
 
-- [ ] **Step 2: Test point-in-time cutoff**
+- [x] **Step 2: Test point-in-time cutoff**
 
 An event first seen after cutoff must not enter the baseline.
 
-- [ ] **Step 3: Calculate metrics**
+- [x] **Step 3: Calculate metrics**
 
 ```text
 sample_count
@@ -535,7 +535,7 @@ time_to_peak
 failure_rate
 ```
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ```bash
 cargo test analysis::events::event_statistics
@@ -560,14 +560,14 @@ git commit -m "feat: add historical event-impact baselines"
 - Adds evolution detail and market-logic brief.
 - Keeps event score zero.
 
-- [ ] **Step 1: Add jobs**
+- [x] **Step 1: Add jobs**
 
 ```rust
 pub async fn run_event_cluster_refinement_job(state: Arc<AppState>);
 pub async fn run_event_market_observation_job(state: Arc<AppState>);
 ```
 
-- [ ] **Step 2: Add report sections**
+- [x] **Step 2: Add report sections**
 
 ```text
 今日事件增量
@@ -579,7 +579,7 @@ pub async fn run_event_market_observation_job(state: Arc<AppState>);
 同类历史基线
 ```
 
-- [ ] **Step 3: Add endpoints**
+- [x] **Step 3: Add endpoints**
 
 ```text
 GET /api/analysis/events/:id/evolution
@@ -588,7 +588,7 @@ GET /api/analysis/events/:id/market-observations
 GET /api/analysis/events/market-logic-brief
 ```
 
-- [ ] **Step 4: Add safety tests**
+- [x] **Step 4: Add safety tests**
 
 Assert:
 
@@ -597,7 +597,7 @@ Assert:
 - report does not claim market causality.
 - indirect stock-code lists are absent.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 cargo fmt --all -- --check
@@ -611,13 +611,13 @@ git commit -m "feat: report evolving events and market alignment"
 
 ## Phase Completion Checklist
 
-- [ ] GDELT is supplementary and idempotent.
-- [ ] EventMention and EventCluster are versioned.
-- [ ] Two-stage clustering respects manual locks.
-- [ ] EventDelta highlights new information.
-- [ ] Hypotheses freeze before market observation.
-- [ ] Market alignment and causal confidence are separate.
-- [ ] Confounded windows are explicit.
-- [ ] Event-type baselines are point-in-time safe.
-- [ ] Event score remains zero.
-- [ ] No indirect beneficiary stock list is generated.
+- [x] GDELT is supplementary and idempotent.
+- [x] EventMention and EventCluster are versioned.
+- [x] Two-stage clustering respects manual locks.
+- [x] EventDelta highlights new information.
+- [x] Hypotheses freeze before market observation.
+- [x] Market alignment and causal confidence are separate.
+- [x] Confounded windows are explicit.
+- [x] Event-type baselines are point-in-time safe.
+- [x] Event score remains zero.
+- [x] No indirect beneficiary stock list is generated.

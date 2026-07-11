@@ -1,3 +1,4 @@
+mod analysis;
 mod api;
 mod config;
 mod data;
@@ -48,10 +49,13 @@ async fn main() -> Result<()> {
     signals::registry::SignalRegistry::init();
 
     // Data providers (tushare primary, eastmoney + tencent secondary, db fallback) and Telegram pusher
-    let tushare_provider: Arc<dyn DataProvider> = Arc::new(data::tushare::TushareClient::new(
+    let tushare_client = Arc::new(data::tushare::TushareClient::new(
         config.tushare_token.clone(),
         config.data_proxy.as_deref(),
     ));
+    let tushare_provider: Arc<dyn DataProvider> = tushare_client.clone();
+    let point_in_time_provider: Arc<dyn data::point_in_time_provider::PointInTimeDataProvider> =
+        tushare_client.clone();
     let eastmoney_provider: Arc<dyn DataProvider> = Arc::new(
         data::eastmoney::EastmoneyProvider::new(config.data_proxy.as_deref()),
     );
@@ -83,6 +87,13 @@ async fn main() -> Result<()> {
         ("autosim_report", "自动交易日报"),
         ("sim", "普通模拟交易"),
         ("daban", "打板评分"),
+        ("event", "提交市场事件"),
+        ("events", "查看最新事件"),
+        ("event_detail", "查看事件详情"),
+        ("event_review", "复核发布事件"),
+        ("market_facts", "查看市场事实简报"),
+        ("decision", "查看决策支持日报"),
+        ("decision_detail", "查看决策支持详情"),
         ("limitup", "涨停追踪概览"),
         ("strong", "近期强势股"),
         ("startup", "启动追踪"),
@@ -113,12 +124,59 @@ async fn main() -> Result<()> {
         db,
         redis,
         provider: provider.clone(),
+        point_in_time_provider,
         pusher: pusher.clone(),
         fetch_job_lock: Arc::new(Mutex::new(())),
+        analysis_job_lock: Arc::new(Mutex::new(())),
         scan_job_lock: Arc::new(Mutex::new(())),
         daily_report_job_lock: Arc::new(Mutex::new(())),
         weekly_report_job_lock: Arc::new(Mutex::new(())),
     });
+
+    {
+        let probe_provider = state.point_in_time_provider.clone();
+        let repo = storage::market_repository::MarketRepository::new(state.db.clone());
+        tokio::spawn(async move {
+            let capability_probe = probe_provider.probe_capabilities().await;
+            if let Err(e) = repo
+                .persist_point_in_time_capability_probe(&capability_probe)
+                .await
+            {
+                warn!("Failed to persist point-in-time capability probe: {}", e);
+            }
+            match &capability_probe {
+                Ok(capabilities) => {
+                    let missing: Vec<&str> = [
+                        (
+                            "security_master_history",
+                            capabilities.security_master_history,
+                        ),
+                        ("corporate_actions", capabilities.corporate_actions),
+                        ("adjustment_factors", capabilities.adjustment_factors),
+                        ("daily_basic", capabilities.daily_basic),
+                        ("daily_security_status", capabilities.daily_security_status),
+                        ("historical_index_bars", capabilities.historical_index_bars),
+                        (
+                            "historical_sector_membership",
+                            capabilities.historical_sector_membership,
+                        ),
+                    ]
+                    .into_iter()
+                    .filter_map(|(name, supported)| (!supported).then_some(name))
+                    .collect();
+                    if missing.is_empty() {
+                        info!("Point-in-time data capability probe completed");
+                    } else {
+                        warn!(
+                            "Point-in-time data prerequisites missing: {}",
+                            missing.join(", ")
+                        );
+                    }
+                }
+                Err(e) => warn!("Point-in-time data capability probe failed: {}", e),
+            }
+        });
+    }
 
     if let Some(base_url) = state.config.webhook_url.as_deref() {
         let endpoint = format!("{}/telegram/webhook", base_url.trim_end_matches('/'));
@@ -177,14 +235,8 @@ async fn main() -> Result<()> {
         info!("Chip distribution loop started");
     }
 
-    if state.config.enable_ai_analysis && state.config.report_channel.is_some() {
-        let ai = services::ai_analysis::AiAnalysisService::new(state.clone());
-        let channel = state.config.report_channel.clone().unwrap_or_default();
-        let pusher_clone = pusher.clone();
-        tokio::spawn(async move {
-            ai.run_daily_loop(pusher_clone, channel).await;
-        });
-        info!("AI analysis loop started");
+    if state.config.enable_ai_analysis {
+        info!("ENABLE_AI_ANALYSIS no longer starts a free-form loop; DecisionSupport scheduler owns daily analysis generation");
     }
 
     // Check if first-run backfill needed
@@ -209,6 +261,9 @@ async fn main() -> Result<()> {
     if std::env::args().any(|a| a == "--run-now") {
         info!("--run-now: firing all jobs sequentially");
         scheduler::run_fetch_job(state.clone(), provider.clone()).await;
+        scheduler::run_point_in_time_reference_refresh_job(state.clone()).await;
+        scheduler::run_point_in_time_trade_date_refresh_job(state.clone()).await;
+        scheduler::run_market_snapshot_job(state.clone()).await;
         scheduler::run_scan_job(state.clone()).await;
         scheduler::run_daily_report_job(state.clone(), provider.clone(), pusher.clone()).await;
         scheduler::run_weekly_report_job(state.clone(), provider.clone(), pusher.clone()).await;

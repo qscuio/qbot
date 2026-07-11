@@ -1,6 +1,6 @@
 # qbot
 
-A-share stock analysis bot. Fetches daily market data from Tushare, runs 24 signal detectors, generates reports, archives daily signal snapshots, and pushes reports to a Telegram channel on a cron schedule.
+A-share stock analysis bot. Fetches daily market data from Tushare, runs 24 signal detectors, ingests official market-event evidence, publishes a daily fact brief, exposes Gate 3 event-evolution and market-observation read models with explicit non-causal absence contracts, archives daily signal snapshots, and pushes reports to a Telegram channel on a cron schedule.
 
 ---
 
@@ -53,7 +53,7 @@ A-share stock analysis bot. Fetches daily market data from Tushare, runs 24 sign
 | Path | Purpose |
 |------|---------|
 | `src/main.rs` | Boot sequence, `--run-now` flag |
-| `src/scheduler/mod.rs` | 5 cron jobs + reusable job functions |
+| `src/scheduler/mod.rs` | 11 cron jobs + reusable job functions |
 | `src/api/routes.rs` | REST API routes incl. job trigger endpoints |
 | `src/signals/` | All 24 signal detectors |
 | `src/services/` | Business logic (scanner, reports, limit-up, etc.) |
@@ -100,19 +100,42 @@ Copy `.env.example` to `.env` and fill in:
 | `STOCK_ALERT_CHANNEL` | No | Channel ID for signal burst alerts |
 | `DABAN_CHANNEL` | No | Channel ID for daban live/sentiment pushes |
 | `API_KEY` | No | Bearer token for REST API (leave empty = open) |
-| `AI_API_KEY` | No | API key used by AI narrative generation (`/api/market/overview` and AI report loop) |
-| `AI_BASE_URL` | No | Chat Completions base URL (default `https://api.openai.com/v1`) |
-| `AI_MODEL` | No | AI model name for narrative generation (default `gpt-4o-mini`) |
+| `AI_API_KEY` | No | Optional key for the LLM event extractor; the production market overview endpoint now serves DecisionSupport compatibility data and does not require an LLM call |
+| `AI_BASE_URL` | No | Chat Completions base URL for the LLM event extractor (default `https://api.openai.com/v1`) |
+| `AI_MODEL` | No | Model name for the LLM event extractor (default `gpt-4o-mini`) |
 | `DATA_PROXY` | No | HTTP/SOCKS5 proxy for Tushare/Sina (e.g. `socks5://127.0.0.1:1080`) |
+| `OFFICIAL_EVENT_FEED_URL` | No | Official market-event feed URL used by the hourly event ingestion job |
+| `OFFICIAL_EVENT_FEED_API_KEY` | No | Optional API key sent as `x-api-key` to the official event feed |
+| `OFFICIAL_EVENT_SOURCE_ID` | No | Official event source adapter id (default `official:market_event`) |
+| `OFFICIAL_EVENT_STORE_FULL_CONTENT` | No | Persist full official feed content instead of summary-only retention (`true`/`false`, default `false`) |
 | `DATABASE_URL` | Yes | PostgreSQL URL (default: `postgresql://qbot:qbot@127.0.0.1/qbot`) |
 | `REDIS_URL` | Yes | Redis URL (default: `redis://127.0.0.1:6379`) |
 | `API_PORT` | No | REST API port (default: `8080`) |
 | `ENABLE_DABAN_LIVE` | No | Enable intraday daban live loop (`true`/`false`, default `false`) |
-| `ENABLE_AI_ANALYSIS` | No | Enable scheduled AI market analysis push (`true`/`false`, default `false`) |
+| `ENABLE_AI_ANALYSIS` | No | Legacy compatibility flag; no longer starts the free-form AI analysis loop (`true`/`false`, default `false`) |
 | `ENABLE_CHIP_DIST` | No | Enable scheduled chip-distribution refresh (`true`/`false`, default `true`) |
+| `ENABLE_EVENT_SCORE_ADJUSTMENT` | No | Enable bounded event-score adjustments inside DecisionSupport (`true`/`false`, default `false`) |
+| `MAX_EVENT_SCORE_ADJUSTMENT` | No | Maximum absolute DecisionSupport event-score adjustment (default `0`, hard-capped at `5`) |
 | `ENABLE_SIGNAL_AUTO_TRADING` | No | Enable signal-based auto paper trading loop with Telegram action pushes (`true`/`false`, default `false`) |
 
 ---
+
+## Production Release Gates
+
+Gate 4 Task 10 verification passed on 2026-07-11. DecisionSupport remains production-read-only. Keep event-score adjustments disabled:
+
+```text
+ENABLE_EVENT_SCORE_ADJUSTMENT=false
+MAX_EVENT_SCORE_ADJUSTMENT=0
+```
+
+DecisionSupport artifacts must not write into `signal_strategy_candidates` or any auto-trading path.
+The release-gate verification query against the Compose PostgreSQL service must return `0` for `signal_metadata ? 'decision_support_run_id'`.
+
+Required local verification environment:
+
+- Rust database-backed tests require `DATABASE_URL=postgresql://qbot:qbot@127.0.0.1:5432/qbot` in the shell environment.
+- Python verification commands run from the checked-out `research/.venv`; activate it first with `cd research && . .venv/bin/activate`, then use `python -m ...`.
 
 ## Local Testing
 
@@ -138,8 +161,14 @@ curl -X POST http://localhost:8080/api/jobs/scan           # run 24 signal detec
 curl -X POST http://localhost:8080/api/jobs/scan/archive   # archive daily signal snapshot
 curl -X POST http://localhost:8080/api/jobs/report/daily   # generate + push daily report
 curl -X POST http://localhost:8080/api/jobs/report/weekly  # generate + push weekly report
+curl -X POST http://localhost:8080/api/jobs/analysis/point-in-time/refresh           # refresh point-in-time trade-date inputs
+curl -X POST http://localhost:8080/api/jobs/analysis/point-in-time/reference-refresh # refresh point-in-time reference inputs
+curl -X POST http://localhost:8080/api/jobs/analysis/snapshot                        # build market snapshot
+curl -X POST http://localhost:8080/api/jobs/analysis/decision-support                # build + persist daily DecisionSupport artifacts
 
 # Read results
+curl http://localhost:8080/api/analysis/data-status
+curl http://localhost:8080/api/analysis/decision-support/latest
 curl http://localhost:8080/api/scan/latest
 curl http://localhost:8080/api/scan/prestart
 curl http://localhost:8080/api/scan/stats
@@ -148,6 +177,14 @@ curl http://localhost:8080/api/report/daily
 ```
 
 If `API_KEY` is set, add `-H "Authorization: Bearer <key>"` to protected endpoints.
+
+## Point-in-Time Analysis Data
+
+Existing current-state rows are not point-in-time history until they are copied through an explicit estimated backfill. Estimated rows are tracked separately so sensitivity work can exclude them.
+
+Pattern research is blocked until security master, daily basics, corporate actions, adjustment factors, status, indices, and sector membership are complete.
+
+`GET /api/analysis/data-status` reports capability failures, completeness, and estimated-row counts without guessing missing inputs. `missingInputs` comes from persisted market snapshots, not from API-side inference.
 
 ---
 
@@ -159,7 +196,16 @@ Jobs are scheduled with fixed `UTC+08:00` in code (`Job::new_async_tz`).
 | Time (Beijing) | Days | Job |
 |----------------|------|-----|
 | 17:00 | Mon–Fri | Fetch OHLCV, limit-up stocks, sector data |
+| 17:10 | Mon–Fri | Refresh point-in-time trade-date inputs |
+| 17:15 | Friday | Refresh point-in-time reference inputs |
+| 17:20 | Mon–Fri | Build point-in-time market snapshot |
 | 17:30 | Mon–Fri | Run full signal scan, cache to Redis |
+| 17:40 | Mon–Fri | Match latest published patterns against the latest complete market snapshot and persist shadow candidates |
+| Hourly at `:05` from 09:00 to 17:00 | Mon–Fri | Ingest official market-event feed with Redis-backed provider cursor state, run structured extraction, and publish eligible evidence |
+| 17:50 | Mon–Fri | Build and persist the daily evidence-backed market fact brief |
+| 17:52 | Mon–Fri | Run Gate 3 event-cluster refinement integration; current behavior is an explicit absence contract until persisted cluster outputs land |
+| 17:54 | Mon–Fri | Run Gate 3 market-observation integration; current behavior is an explicit absence contract until persisted hypotheses and observations land |
+| 17:55 | Mon–Fri | Build and persist the read-only daily DecisionSupport artifact set after pattern and event jobs; missing pattern/event inputs degrade in place, and incomplete market snapshots persist data-status output while withholding A-tier assignments |
 | 18:00 | Mon–Fri | Generate daily report, push to Telegram |
 | 20:00 | Friday | Generate weekly report, push to Telegram |
 | 20:05 | Mon–Fri | Run full signal scan and archive triggered hits to `daily_signal_scan_results` |
@@ -200,12 +246,12 @@ Push to `main` triggers `.github/workflows/deploy.yml`, which:
 | `DABAN_CHANNEL` | No | Telegram channel ID for daban notifications |
 | `ENABLE_SIGNAL_AUTO_TRADING` | No | Set to `true` to run the signal-based auto paper-trading loop |
 | `ENABLE_DABAN_LIVE` | No | Set to `true` to run intraday daban live loop |
-| `ENABLE_AI_ANALYSIS` | No | Set to `true` to run daily AI market overview push |
+| `ENABLE_AI_ANALYSIS` | No | Legacy compatibility flag only; no longer starts the daily AI market overview loop |
 | `ENABLE_CHIP_DIST` | No | Set to `true` to run daily chip distribution refresh |
 | `API_KEY` | No | REST API bearer token |
-| `AI_API_KEY` | No | Optional key for AI narrative analysis features |
-| `AI_BASE_URL` | No | Optional override for AI API base URL (default OpenAI v1) |
-| `AI_MODEL` | No | Optional override for AI narrative model |
+| `AI_API_KEY` | No | Optional key for the LLM event extractor; not used by the production market overview endpoint |
+| `AI_BASE_URL` | No | Optional override for the LLM event extractor API base URL (default OpenAI v1) |
+| `AI_MODEL` | No | Optional override for the LLM event extractor model |
 | `DATA_PROXY` | No | Optional HTTP/SOCKS proxy URL |
 
 ### VPS First-Run Setup
@@ -356,12 +402,18 @@ curl -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
 | GET | `/api/scan/prestart` | Yes | Pre-start candidate pool with A-tier `3/5` resonance and B-tier `core + auxiliary` setup from `ma_bullish/volume_price/slow_bull/small_bullish/triple_bullish` |
 | GET | `/api/scan/stats` | Yes | Forward-return stats by signal (`days`, optional `signal_id`, optional `limit`) |
 | GET | `/api/scan/daily-stats` | Yes | Forward-return stats from daily archived signal snapshots (`days`, optional `signal_id`, optional `limit`) |
+| GET | `/api/analysis/patterns/shadow` | Yes | Persisted pattern shadow candidates from `analysis_shadow_candidates` (`date=YYYY-MM-DD`, optional `limit`) |
+| GET | `/api/analysis/patterns/shadow/{code}` | Yes | Persisted pattern shadow candidates for one stock code (`date=YYYY-MM-DD`, optional `limit`) |
+| GET | `/api/analysis/events/{id}/evolution` | Yes | Event evolution contract; returns explicit absence when no persisted Gate 3 delta exists and keeps `eventScore=0.0` |
+| GET | `/api/analysis/events/{id}/hypothesis` | Yes | Frozen-hypothesis contract; labels hypotheses as inference-only and returns explicit absence when nothing is persisted |
+| GET | `/api/analysis/events/{id}/market-observations` | Yes | Market-observation contract; makes no market-causality claim and returns explicit absence when nothing is persisted |
+| GET | `/api/analysis/events/market-logic-brief` | Yes | Gate 3 logic guardrails: zero event score, inference-only hypotheses, non-causal market observations, no indirect stock-code lists |
 | GET | `/api/report/daily` | Yes | Latest daily report from DB |
 | GET | `/api/report/signal_auto` | Yes | Latest signal auto-trading daily report from DB |
 | GET | `/api/report/limitup` | Yes | Latest standalone limit-up report from DB |
 | GET | `/api/report/strong` | Yes | Latest standalone strong-stock report from DB |
 | GET | `/api/signal-auto/accounts` | Yes | Per-signal strategy account snapshots |
-| GET | `/api/market/overview` | Yes | Market overview with sector breadth, top stock trend, and report text |
+| GET | `/api/market/overview` | Yes | Market overview served from DecisionSupport compatibility data, including sector breadth, top stock trend, and report text |
 | GET | `/api/chart/data/{code}` | Yes | OHLCV chart data (`days`, `period=daily|weekly|monthly`) |
 | GET | `/api/chart/chips/{code}` | Yes | Chip distribution data (`date=YYYY-MM-DD` optional) |
 | GET | `/api/chart/search` | Yes | Search stocks (`q`, optional `limit`) |
@@ -384,10 +436,15 @@ curl -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
 | POST | `/api/daban/sim/buy` | Yes | Open daban sim position (`code`, `price`, `shares`, optional `name`, `score`) |
 | POST | `/api/daban/sim/sell` | Yes | Close daban sim position (`position_id`, `price`, optional `reason`) |
 | GET | `/api/daban/sim/stats` | Yes | Daban simulator summary stats |
+| GET | `/api/analysis/decision-support/latest` | Yes | Latest persisted DecisionSupport run with brief and candidates |
+| GET | `/api/analysis/decision-support/{date}` | Yes | Persisted DecisionSupport run for one trade date (`YYYY-MM-DD`) |
+| GET | `/api/analysis/decision-support/{date}/{code}` | Yes | Persisted DecisionSupport detail rows for one code on one trade date |
 | POST | `/api/scan/trigger` | Yes | Trigger scan (background) |
 | POST | `/api/jobs/fetch` | Yes | Trigger data fetch job |
 | POST | `/api/jobs/scan` | Yes | Trigger signal scan job |
 | POST | `/api/jobs/scan/archive` | Yes | Trigger daily signal archive job |
+| POST | `/api/jobs/analysis/pattern-match` | Yes | Trigger shadow-only pattern matching job |
+| POST | `/api/jobs/analysis/decision-support` | Yes | Trigger the persisted daily DecisionSupport build |
 | POST | `/api/jobs/report/daily` | Yes | Trigger daily report + push |
 | POST | `/api/jobs/report/weekly` | Yes | Trigger weekly report + push |
 
@@ -409,6 +466,7 @@ curl -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
 | `user_watchlist` | Watchlist stocks |
 | `trading_sim_positions` / `daban_sim_positions` / `sim_capital` | Trading simulation records |
 | `signal_strategy_accounts` / `signal_strategy_candidates` / `signal_strategy_positions` / `signal_strategy_events` | Auto paper-trading accounts, candidates, trades, and event logs. Includes pre-start signal accounts plus synthetic `auto_daban` and `auto_strong` accounts. Pre-start signals only buy `A`-tier setups and log `B`-tier setups as watch-only observations |
+| `analysis_shadow_candidates` | Shadow-only strong-stock pattern matches from manually published pattern sets. These rows are reporting-only and are not auto-trading candidates |
 | `startup_watchlist` | One-limit-up-in-30-days startup tracking |
 | `reports` | Generated daily/weekly/limitup/strong report content |
 

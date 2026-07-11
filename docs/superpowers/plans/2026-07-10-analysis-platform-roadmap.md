@@ -153,9 +153,9 @@ Database integration tests require a valid `DATABASE_URL` or SQLx test database 
 - Produces the point-in-time data contracts required by all later phases.
 - Later tasks must not start until `/api/analysis/data-status` reports all critical prerequisites available.
 
-- [ ] Execute every checkbox in the linked plan.
-- [ ] Run the Rust verification commands above.
-- [ ] Confirm no pattern, event, or decision-support candidate table is populated.
+- [x] Execute every checkbox in the linked plan.
+- [x] Run the Rust verification commands above.
+- [x] Confirm no pattern, event, or decision-support candidate table is populated.
 
 ### Task 2: Complete Gate 1
 
@@ -166,9 +166,9 @@ Database integration tests require a valid `DATABASE_URL` or SQLx test database 
 - Consumes Gate 0 datasets.
 - Produces manually published pattern versions and shadow candidates only.
 
-- [ ] Execute every checkbox in the linked plan.
-- [ ] Run Rust and Python verification.
-- [ ] Confirm `signal_strategy_candidates` contains no shadow-model writes.
+- [x] Execute every checkbox in the linked plan.
+- [x] Run Rust and Python verification.
+- [x] Confirm `signal_strategy_candidates` contains no shadow-model writes.
 
 ### Task 3: Complete Gate 2
 
@@ -179,9 +179,9 @@ Database integration tests require a valid `DATABASE_URL` or SQLx test database 
 - Consumes Gate 0 time and security contracts.
 - Produces evidence-backed facts and ClaimGraph; event score remains zero.
 
-- [ ] Execute every checkbox in the linked plan.
-- [ ] Confirm every published fact has evidence.
-- [ ] Confirm no indirect beneficiary stock list is produced.
+- [x] Execute every checkbox in the linked plan.
+- [x] Confirm every published fact has evidence.
+- [x] Confirm no indirect beneficiary stock list is produced.
 
 ### Task 4: Complete Gate 3
 
@@ -192,9 +192,9 @@ Database integration tests require a valid `DATABASE_URL` or SQLx test database 
 - Consumes Gate 2 evidence and Gate 0 market snapshots.
 - Produces frozen hypotheses, event deltas, and market observations.
 
-- [ ] Execute every checkbox in the linked plan.
-- [ ] Confirm market alignment never mutates frozen hypotheses.
-- [ ] Confirm causal confidence remains separate from market alignment.
+- [x] Execute every checkbox in the linked plan.
+- [x] Confirm market alignment never mutates frozen hypotheses.
+- [x] Confirm causal confidence remains separate from market alignment.
 
 ### Task 5: Complete Gate 4
 
@@ -205,6 +205,6 @@ Database integration tests require a valid `DATABASE_URL` or SQLx test database 
 - Consumes scan-ranker, shadow patterns, event intelligence, and market snapshots.
 - Produces read-only decision-support artifacts.
 
-- [ ] Execute every checkbox in the linked plan.
-- [ ] Confirm event adjustment defaults to zero and is hard-capped at five.
-- [ ] Confirm no new analysis output reaches trading tables.
+- [x] Execute every checkbox in the linked plan.
+- [x] Confirm event adjustment defaults to zero and is hard-capped at five.
+- [x] Confirm no new analysis output reaches trading tables.

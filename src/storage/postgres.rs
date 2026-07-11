@@ -1,5 +1,5 @@
 use chrono::NaiveDate;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::data::types::{Candle, LimitUpStock, SectorData, StockInfo};
@@ -59,6 +59,15 @@ pub async fn upsert_daily_bars(pool: &PgPool, bars: &[(String, Candle)]) -> Resu
     }
 
     let mut tx = pool.begin().await?;
+    let count = upsert_daily_bars_in_tx(&mut tx, bars).await?;
+    tx.commit().await?;
+    Ok(count)
+}
+
+pub async fn upsert_daily_bars_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    bars: &[(String, Candle)],
+) -> Result<usize> {
     let mut count = 0usize;
 
     for (code, bar) in bars {
@@ -68,7 +77,8 @@ pub async fn upsert_daily_bars(pool: &PgPool, bars: &[(String, Candle)]) -> Resu
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
                ON CONFLICT (code, trade_date) DO UPDATE SET
                open=EXCLUDED.open, high=EXCLUDED.high, low=EXCLUDED.low,
-               close=EXCLUDED.close, volume=EXCLUDED.volume, amount=EXCLUDED.amount"#,
+               close=EXCLUDED.close, volume=EXCLUDED.volume, amount=EXCLUDED.amount,
+               turnover=EXCLUDED.turnover, pe=EXCLUDED.pe, pb=EXCLUDED.pb"#,
         )
         .bind(code)
         .bind(bar.trade_date)
@@ -81,18 +91,59 @@ pub async fn upsert_daily_bars(pool: &PgPool, bars: &[(String, Candle)]) -> Resu
         .bind(bar.turnover)
         .bind(bar.pe)
         .bind(bar.pb)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
         count += 1;
     }
 
-    tx.commit().await?;
     Ok(count)
 }
 
 /// Fetch OHLCV history for a stock (sorted ascending)
 pub async fn get_stock_history(pool: &PgPool, code: &str, days: usize) -> Result<Vec<Candle>> {
-    let rows: Vec<(
+    get_stock_history_query(
+        sqlx::query_as(
+            r#"SELECT trade_date, open::float8, high::float8, low::float8, close::float8,
+                      volume, amount::float8, turnover::float8, pe::float8, pb::float8
+               FROM stock_daily_bars
+               WHERE code = $1
+               ORDER BY trade_date DESC
+               LIMIT $2"#,
+        )
+        .bind(code)
+        .bind(days as i64)
+        .fetch_all(pool)
+        .await?,
+    )
+}
+
+/// Fetch OHLCV history for a stock up to and including an as-of trade date (sorted ascending)
+pub async fn get_stock_history_as_of(
+    pool: &PgPool,
+    code: &str,
+    as_of_trade_date: NaiveDate,
+    days: usize,
+) -> Result<Vec<Candle>> {
+    get_stock_history_query(
+        sqlx::query_as(
+            r#"SELECT trade_date, open::float8, high::float8, low::float8, close::float8,
+                      volume, amount::float8, turnover::float8, pe::float8, pb::float8
+               FROM stock_daily_bars
+               WHERE code = $1
+                 AND trade_date <= $2
+               ORDER BY trade_date DESC
+               LIMIT $3"#,
+        )
+        .bind(code)
+        .bind(as_of_trade_date)
+        .bind(days as i64)
+        .fetch_all(pool)
+        .await?,
+    )
+}
+
+fn get_stock_history_query(
+    rows: Vec<(
         NaiveDate,
         Option<f64>,
         Option<f64>,
@@ -103,19 +154,8 @@ pub async fn get_stock_history(pool: &PgPool, code: &str, days: usize) -> Result
         Option<f64>,
         Option<f64>,
         Option<f64>,
-    )> = sqlx::query_as(
-        r#"SELECT trade_date, open::float8, high::float8, low::float8, close::float8,
-                      volume, amount::float8, turnover::float8, pe::float8, pb::float8
-               FROM stock_daily_bars
-               WHERE code = $1
-               ORDER BY trade_date DESC
-               LIMIT $2"#,
-    )
-    .bind(code)
-    .bind(days as i64)
-    .fetch_all(pool)
-    .await?;
-
+    )>,
+) -> Result<Vec<Candle>> {
     let mut bars: Vec<Candle> = rows
         .into_iter()
         .map(
@@ -452,6 +492,16 @@ pub async fn list_daily_signal_outcome_samples(
 /// Save limit-up stocks
 pub async fn save_limit_up_stocks(pool: &PgPool, stocks: &[LimitUpStock]) -> Result<()> {
     let mut tx = pool.begin().await?;
+    save_limit_up_stocks_in_tx(&mut tx, stocks).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn save_limit_up_stocks_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    stocks: &[LimitUpStock],
+) -> Result<usize> {
+    let mut count = 0usize;
     for s in stocks {
         sqlx::query(
             r#"INSERT INTO limit_up_stocks
@@ -470,11 +520,11 @@ pub async fn save_limit_up_stocks(pool: &PgPool, stocks: &[LimitUpStock]) -> Res
         .bind(s.close)
         .bind(s.pct_chg)
         .bind(s.strth)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
+        count += 1;
     }
-    tx.commit().await?;
-    Ok(())
+    Ok(count)
 }
 
 pub async fn latest_limit_up_trade_date(pool: &PgPool) -> Result<Option<NaiveDate>> {
@@ -657,6 +707,16 @@ pub async fn list_limit_up_stocks_by_date(
 /// Save sector data
 pub async fn save_sector_data(pool: &PgPool, sectors: &[SectorData]) -> Result<()> {
     let mut tx = pool.begin().await?;
+    save_sector_data_in_tx(&mut tx, sectors).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn save_sector_data_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    sectors: &[SectorData],
+) -> Result<usize> {
+    let mut count = 0usize;
     for s in sectors {
         sqlx::query(
             r#"INSERT INTO sector_daily (code, name, sector_type, change_pct, amount, trade_date)
@@ -670,11 +730,11 @@ pub async fn save_sector_data(pool: &PgPool, sectors: &[SectorData]) -> Result<(
         .bind(s.change_pct)
         .bind(s.amount)
         .bind(s.trade_date)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
+        count += 1;
     }
-    tx.commit().await?;
-    Ok(())
+    Ok(count)
 }
 
 /// Get latest report by type
@@ -840,10 +900,210 @@ pub async fn list_watchlist_stocks(pool: &PgPool, user_id: i64) -> Result<Vec<(S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::NaiveDate;
+    use crate::storage::market_repository::MarketRepository;
+    use chrono::{NaiveDate, TimeZone, Utc};
 
     fn d(value: &str) -> NaiveDate {
         NaiveDate::parse_from_str(value, "%Y-%m-%d").unwrap()
+    }
+
+    fn dt(year: i32, month: u32, day: u32, hour: u32) -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(year, month, day, hour, 0, 0)
+            .single()
+            .unwrap()
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn daily_bar_upsert_updates_fundamentals(pool: PgPool) -> sqlx::Result<()> {
+        let initial = Candle {
+            trade_date: d("2026-07-10"),
+            open: 10.0,
+            high: 11.0,
+            low: 9.5,
+            close: 10.5,
+            volume: 1_000,
+            amount: 10_500.0,
+            turnover: Some(1.1),
+            pe: Some(12.2),
+            pb: Some(1.3),
+        };
+        let revised = Candle {
+            open: 10.2,
+            high: 11.2,
+            low: 9.7,
+            close: 10.8,
+            volume: 1_100,
+            amount: 11_880.0,
+            turnover: Some(2.2),
+            pe: Some(13.3),
+            pb: Some(1.4),
+            ..initial.clone()
+        };
+
+        upsert_daily_bars(&pool, &[("600000.SH".to_string(), initial)])
+            .await
+            .unwrap();
+        upsert_daily_bars(&pool, &[("600000.SH".to_string(), revised)])
+            .await
+            .unwrap();
+
+        let row: (f64, f64, f64, f64) = sqlx::query_as(
+            r#"SELECT close::float8, turnover::float8, pe::float8, pb::float8
+               FROM stock_daily_bars
+               WHERE code = '600000.SH' AND trade_date = '2026-07-10'"#,
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(row, (10.8, 2.2, 13.3, 1.4));
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn daily_bar_current_state_rolls_back_when_version_append_fails(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let bar = Candle {
+            trade_date: d("2026-07-10"),
+            open: 10.0,
+            high: 11.0,
+            low: 9.5,
+            close: 10.5,
+            volume: 1_000,
+            amount: 10_500.0,
+            turnover: Some(1.1),
+            pe: Some(12.2),
+            pb: Some(1.3),
+        };
+        let bars = [("600000.SH".to_string(), bar)];
+        let mut tx = pool.begin().await?;
+
+        upsert_daily_bars_in_tx(&mut tx, &bars).await.unwrap();
+        let append_result = MarketRepository::append_daily_bar_versions_in_tx(
+            &mut tx,
+            &bars,
+            dt(2026, 7, 10, 8),
+            "observed",
+            "source-name-that-is-too-long-for-the-version-source-column",
+        )
+        .await;
+
+        assert!(append_result.is_err());
+        drop(tx);
+
+        let current_rows: (i64,) = sqlx::query_as(
+            r#"SELECT COUNT(*) FROM stock_daily_bars
+               WHERE code = '600000.SH' AND trade_date = '2026-07-10'"#,
+        )
+        .fetch_one(&pool)
+        .await?;
+        let version_rows: (i64,) = sqlx::query_as(
+            r#"SELECT COUNT(*) FROM stock_daily_bar_versions
+               WHERE code = '600000.SH' AND trade_date = '2026-07-10'"#,
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(current_rows.0, 0);
+        assert_eq!(version_rows.0, 0);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn sector_current_state_rolls_back_when_version_append_fails(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let sector = SectorData {
+            code: "BK0477".to_string(),
+            name: "Semiconductors".to_string(),
+            sector_type: "industry".to_string(),
+            change_pct: 2.34,
+            amount: 123_456_789.0,
+            trade_date: d("2026-07-10"),
+        };
+        let sectors = [sector];
+        let mut tx = pool.begin().await?;
+
+        save_sector_data_in_tx(&mut tx, &sectors).await.unwrap();
+        let append_result = MarketRepository::append_sector_versions_in_tx(
+            &mut tx,
+            &sectors,
+            dt(2026, 7, 10, 8),
+            "observed",
+            "source-name-that-is-too-long-for-the-version-source-column",
+        )
+        .await;
+
+        assert!(append_result.is_err());
+        drop(tx);
+
+        let current_rows: (i64,) = sqlx::query_as(
+            r#"SELECT COUNT(*) FROM sector_daily
+               WHERE code = 'BK0477' AND trade_date = '2026-07-10'"#,
+        )
+        .fetch_one(&pool)
+        .await?;
+        let version_rows: (i64,) = sqlx::query_as(
+            r#"SELECT COUNT(*) FROM sector_daily_versions
+               WHERE code = 'BK0477' AND trade_date = '2026-07-10'"#,
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(current_rows.0, 0);
+        assert_eq!(version_rows.0, 0);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn limit_up_current_state_rolls_back_when_version_append_fails(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let stock = LimitUpStock {
+            code: "600000.SH".to_string(),
+            name: "Alpha".to_string(),
+            trade_date: d("2026-07-10"),
+            close: 10.5,
+            pct_chg: 10.01,
+            fd_amount: 987_654_321.0,
+            first_time: Some("09:35".to_string()),
+            last_time: Some("14:55".to_string()),
+            open_times: 2,
+            strth: 88.8,
+            limit: "U".to_string(),
+        };
+        let stocks = [stock];
+        let mut tx = pool.begin().await?;
+
+        save_limit_up_stocks_in_tx(&mut tx, &stocks).await.unwrap();
+        let append_result = MarketRepository::append_limit_up_versions_in_tx(
+            &mut tx,
+            &stocks,
+            dt(2026, 7, 10, 8),
+            "observed",
+            "source-name-that-is-too-long-for-the-version-source-column",
+        )
+        .await;
+
+        assert!(append_result.is_err());
+        drop(tx);
+
+        let current_rows: (i64,) = sqlx::query_as(
+            r#"SELECT COUNT(*) FROM limit_up_stocks
+               WHERE code = '600000.SH' AND trade_date = '2026-07-10'"#,
+        )
+        .fetch_one(&pool)
+        .await?;
+        let version_rows: (i64,) = sqlx::query_as(
+            r#"SELECT COUNT(*) FROM limit_up_stock_versions
+               WHERE code = '600000.SH' AND trade_date = '2026-07-10'"#,
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(current_rows.0, 0);
+        assert_eq!(version_rows.0, 0);
+        Ok(())
     }
 
     async fn seed_limit_up(

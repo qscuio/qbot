@@ -40,14 +40,14 @@ use crate::storage::redis_cache::RedisCache;
 
 type ApiResult = std::result::Result<Json<Value>, (StatusCode, Json<Value>)>;
 
-fn api_error(msg: &str) -> (StatusCode, Json<Value>) {
+pub(crate) fn api_error(msg: &str) -> (StatusCode, Json<Value>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({"error": msg})),
     )
 }
 
-fn check_auth(headers: &HeaderMap, api_key: Option<&str>) -> bool {
+pub(crate) fn check_auth(headers: &HeaderMap, api_key: Option<&str>) -> bool {
     match api_key {
         None => true,
         Some(key) => headers
@@ -382,7 +382,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/miniapp/chart",
             ServeDir::new("web/miniapp/chart").append_index_html_on_directories(true),
         )
-        .with_state(state)
+        .with_state(state.clone())
+        .merge(crate::api::analysis_routes::analysis_router(state.clone()))
+        .merge(crate::api::decision_support_routes::decision_support_router(state.clone()))
+        .merge(crate::api::event_routes::event_router(state.clone()))
+        .merge(crate::api::pattern_routes::pattern_router(state.clone()))
 }
 
 fn parse_optional_date(
@@ -501,6 +505,15 @@ fn telegram_help_text() -> String {
         "/daban sim      打板模拟交易",
         "/daban portfolio 打板持仓",
         "/daban stats    打板统计",
+        "",
+        "<b>Events</b>",
+        "/event <code>&lt;文本或链接&gt;</code>",
+        "/events",
+        "/event_detail <code>&lt;事件ID&gt;</code>",
+        "/event_review <code>&lt;事件ID&gt;</code>",
+        "/market_facts",
+        "/decision",
+        "/decision_detail <code>&lt;code&gt;</code>",
         "",
         "<b>Limit-Up</b>",
         "/limitup        涨停追踪概览",
@@ -3172,6 +3185,46 @@ async fn handle_telegram_command(
         "start" | "help" => {
             send_help_with_menu(&state, chat_id).await?;
         }
+        "event" => {
+            crate::api::event_routes::handle_telegram_submit_event(
+                state.clone(),
+                chat_id,
+                user_id,
+                &args,
+            )
+            .await?;
+        }
+        "events" => {
+            crate::api::event_routes::handle_telegram_list_events(state.clone(), chat_id).await?;
+        }
+        "event_detail" => {
+            crate::api::event_routes::handle_telegram_event_detail(state.clone(), chat_id, &args)
+                .await?;
+        }
+        "event_review" => {
+            crate::api::event_routes::handle_telegram_review_event(
+                state.clone(),
+                chat_id,
+                user_id,
+                &args,
+            )
+            .await?;
+        }
+        "market_facts" => {
+            crate::api::event_routes::handle_telegram_market_facts(state.clone(), chat_id).await?;
+        }
+        "decision" => {
+            crate::api::decision_support_routes::handle_telegram_decision(state.clone(), chat_id)
+                .await?;
+        }
+        "decision_detail" => {
+            crate::api::decision_support_routes::handle_telegram_decision_detail(
+                state.clone(),
+                chat_id,
+                &args,
+            )
+            .await?;
+        }
         "watch" => {
             let code = args.split_whitespace().next().unwrap_or_default();
             if code.is_empty() {
@@ -3731,7 +3784,7 @@ async fn handle_telegram_command(
             tg_send(
                 &state,
                 chat_id,
-                "🤖 正在生成今日 A 股复盘报告，请稍候（约 10-30 秒）...",
+                "🤖 正在读取今日 DecisionSupport 兼容复盘，请稍候（约 10-30 秒）...",
             )
             .await?;
             let report = AiAnalysisService::new(state.clone())

@@ -1,0 +1,46 @@
+{
+  "required_features": ["return_20d", "relative_strength_20d"],
+  "scaler_mean": {
+    "return_20d": 0.1,
+    "relative_strength_20d": 1.0
+  },
+  "scaler_scale": {
+    "return_20d": 0.05,
+    "relative_strength_20d": 0.1
+  },
+  "centroid": {
+    "return_20d": 0.2,
+    "relative_strength_20d": 1.3
+  },
+  "distance_metric": "euclidean",
+  "cluster_parameters": {},
+  "validation_lift": 2.0,
+  "validation_coverage": 0.27,
+  "baseline_comparison": {
+    "best_required_baseline_return": 0.01,
+    "cost_adjusted_return_delta": 0.022
+  },
+  "similarity_thresholds": {
+    "shadow_a": 0.9,
+    "shadow_b": 0.75
+  },
+  "necessary_conditions": [
+    {
+      "column": "return_20d",
+      "operator": ">=",
+      "value": 0.1
+    },
+    {
+      "column": "relative_strength_20d",
+      "operator": ">=",
+      "value": 1.05
+    }
+  ],
+  "risk_conditions": [
+    {
+      "column": "return_20d",
+      "operator": "<",
+      "value": 0.0
+    }
+  ]
+}

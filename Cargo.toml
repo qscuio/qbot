@@ -27,7 +27,7 @@ dotenvy = "0.15"
 uuid = { version = "=1.11.0", features = ["v4", "serde"] }
 async-trait = "0.1"
 tempfile = "=3.10.1"
+sha2 = "0.10"
 
 [dev-dependencies]
 tokio-test = "0.4"
-

@@ -1,0 +1,26 @@
+{
+  "articles": [
+    {
+      "source_item_id": "gdelt-article-001",
+      "published_at": "2026-07-10T08:15:00Z",
+      "title": "Shipping reroutes after Red Sea attacks raise freight concerns",
+      "source_url": "https://example.test/articles/red-sea-shipping",
+      "language": "en",
+      "themes": ["MARITIME_SECURITY", "SUPPLY_CHAIN"],
+      "locations": ["Red Sea", "Suez Canal"],
+      "organizations": ["Maersk", "Hapag-Lloyd"],
+      "description": "Major carriers diverted vessels after renewed attacks in the Red Sea."
+    },
+    {
+      "source_item_id": "gdelt-article-002",
+      "published_at": "2026-07-10T08:45:00Z",
+      "title": "Insurers reprice war-risk cover for Middle East cargo lanes",
+      "source_url": "https://example.test/articles/war-risk-cover",
+      "language": "en",
+      "themes": ["INSURANCE", "SUPPLY_CHAIN"],
+      "locations": ["Red Sea"],
+      "organizations": ["Lloyd's of London"],
+      "description": "Marine insurers increased war-risk premiums for cargo transits."
+    }
+  ]
+}

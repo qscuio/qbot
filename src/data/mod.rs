@@ -1,6 +1,7 @@
 pub mod db;
 pub mod eastmoney;
 pub mod fallback;
+pub mod point_in_time_provider;
 pub mod provider;
 pub mod sina;
 pub mod tencent;

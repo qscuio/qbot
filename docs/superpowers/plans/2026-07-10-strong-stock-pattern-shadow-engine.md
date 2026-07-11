@@ -34,7 +34,7 @@
 - Produces training-run, dataset, model-version, model-set, and shadow-candidate tables.
 - Later Python and Rust tasks use these tables as the contract.
 
-- [ ] **Step 1: Create the migration**
+- [x] **Step 1: Create the migration**
 
 ```sql
 CREATE TABLE analysis_dataset_manifests (
@@ -138,7 +138,7 @@ CREATE INDEX idx_shadow_candidates_date
     ON analysis_shadow_candidates(trade_date DESC, horizon, shadow_tier, final_score DESC);
 ```
 
-- [ ] **Step 2: Add SQLx tests**
+- [x] **Step 2: Add SQLx tests**
 
 Test:
 
@@ -147,7 +147,7 @@ Test:
 - a pattern set cannot contain duplicate members or duplicate member order.
 - duplicate shadow candidate upserts deterministically.
 
-- [ ] **Step 3: Implement `PatternRepository`**
+- [x] **Step 3: Implement `PatternRepository`**
 
 Public methods:
 
@@ -158,7 +158,7 @@ pub async fn latest_published_set(&self) -> Result<Option<PatternSetRow>>;
 pub async fn list_shadow_candidates(&self, trade_date: NaiveDate) -> Result<Vec<ShadowCandidateRow>>;
 ```
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ```bash
 cargo test storage::pattern_repository -- --nocapture
@@ -183,7 +183,7 @@ git commit -m "feat: add pattern research and shadow schema"
 - Python is independently deployable.
 - No Rust subprocess integration.
 
-- [ ] **Step 1: Define dependencies**
+- [x] **Step 1: Define dependencies**
 
 ```toml
 [project]
@@ -222,7 +222,7 @@ line-length = 100
 strict = true
 ```
 
-- [ ] **Step 2: Define Pydantic contracts**
+- [x] **Step 2: Define Pydantic contracts**
 
 ```python
 from datetime import date, datetime
@@ -271,11 +271,11 @@ class ValidationPayload(BaseModel):
     baseline_comparison: dict[str, float]
 ```
 
-- [ ] **Step 3: Add validation tests**
+- [x] **Step 3: Add validation tests**
 
 Assert invalid horizons, negative row counts, and missing model features fail.
 
-- [ ] **Step 4: Add independent service files**
+- [x] **Step 4: Add independent service files**
 
 `qbot-research.service` must run:
 
@@ -285,7 +285,7 @@ ExecStart=/opt/qbot/research/.venv/bin/qbot-research train-all --config /etc/qbo
 
 `qbot-research.timer` runs weekly and must not depend on `qbot.service` beyond network/database availability.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 cd research
@@ -311,7 +311,7 @@ git commit -m "feat: scaffold independent research worker"
 - Reads only records whose `available_at <= cutoff`.
 - Writes Parquet and manifest.
 
-- [ ] **Step 1: Write fixture-based tests**
+- [x] **Step 1: Write fixture-based tests**
 
 Use DuckDB temporary tables to assert:
 
@@ -320,7 +320,7 @@ Use DuckDB temporary tables to assert:
 - a delisted stock remains in historical data.
 - rows missing critical adjustment/status data are excluded and counted.
 
-- [ ] **Step 2: Implement dataset query**
+- [x] **Step 2: Implement dataset query**
 
 Build a Polars frame with one row per `(trade_date, code)` and explicit columns for:
 
@@ -335,7 +335,7 @@ market breadth
 available_at_cutoff
 ```
 
-- [ ] **Step 3: Write partitioned Parquet**
+- [x] **Step 3: Write partitioned Parquet**
 
 Partition by:
 
@@ -347,11 +347,11 @@ year
 
 Compute SHA-256 for every file and save `manifest.json`.
 
-- [ ] **Step 4: Register the manifest in PostgreSQL**
+- [x] **Step 4: Register the manifest in PostgreSQL**
 
 Insert into `analysis_dataset_manifests` only after all files and checksums are complete.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 cd research
@@ -375,11 +375,11 @@ git commit -m "feat: export point-in-time research datasets"
 - Produces `label_samples(frame, horizon)`.
 - Produces `match_controls(samples, candidates, config)`.
 
-- [ ] **Step 1: Test label timing**
+- [x] **Step 1: Test label timing**
 
 Assert feature date `t` never reads a future value except the label columns.
 
-- [ ] **Step 2: Implement labels**
+- [x] **Step 2: Implement labels**
 
 Output:
 
@@ -394,7 +394,7 @@ strength_score
 is_positive
 ```
 
-- [ ] **Step 3: Test matched controls**
+- [x] **Step 3: Test matched controls**
 
 Given a positive sample, select controls using:
 
@@ -410,7 +410,7 @@ tradable state
 
 Assert the positive sample cannot match itself.
 
-- [ ] **Step 4: Add failure-control types**
+- [x] **Step 4: Add failure-control types**
 
 Label controls as:
 
@@ -420,7 +420,7 @@ failed_breakout
 negative_excess
 ```
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 cd research
@@ -441,7 +441,7 @@ git commit -m "feat: add strong-stock labels and matched controls"
 - Produces `discover_archetypes(train_frame, pattern_type, config)`.
 - Outputs serializable candidate archetypes.
 
-- [ ] **Step 1: Define deterministic pattern-family gates**
+- [x] **Step 1: Define deterministic pattern-family gates**
 
 Implement three pure masks:
 
@@ -451,11 +451,11 @@ def vcp_breakout_family(frame: pl.DataFrame) -> pl.Expr: ...
 def oversold_reversal_family(frame: pl.DataFrame) -> pl.Expr: ...
 ```
 
-- [ ] **Step 2: Test unclassified behavior**
+- [x] **Step 2: Test unclassified behavior**
 
 Samples not satisfying any family remain unclassified; do not force assignment.
 
-- [ ] **Step 3: Implement K-Means and GMM comparison**
+- [x] **Step 3: Implement K-Means and GMM comparison**
 
 Use only training-window data. Save:
 
@@ -465,11 +465,11 @@ Use only training-window data. Save:
 - random seed.
 - high-contribution features.
 
-- [ ] **Step 4: Reject unstable or tiny clusters**
+- [x] **Step 4: Reject unstable or tiny clusters**
 
 Candidate archetypes below configured sample size are not exported.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 cd research
@@ -493,14 +493,14 @@ git commit -m "feat: discover interpretable strong-stock archetypes"
 - Produces `validate_archetype`.
 - Produces baseline metrics with the same result schema.
 
-- [ ] **Step 1: Test purge and embargo**
+- [x] **Step 1: Test purge and embargo**
 
 For a 20-day horizon, assert:
 
 - no train label window overlaps validation start.
 - embargo contains at least 20 trading days after validation.
 
-- [ ] **Step 2: Implement split generator**
+- [x] **Step 2: Implement split generator**
 
 ```python
 def purged_walk_forward_splits(
@@ -513,7 +513,7 @@ def purged_walk_forward_splits(
     ...
 ```
 
-- [ ] **Step 3: Implement baselines**
+- [x] **Step 3: Implement baselines**
 
 Required:
 
@@ -524,7 +524,7 @@ volatility_contraction_breakout
 scan_ranker_a
 ```
 
-- [ ] **Step 4: Implement validation metrics**
+- [x] **Step 4: Implement validation metrics**
 
 Calculate:
 
@@ -545,7 +545,7 @@ top_stock_contribution
 top_period_contribution
 ```
 
-- [ ] **Step 5: Enforce release gate**
+- [x] **Step 5: Enforce release gate**
 
 A candidate can become `validated` only if:
 
@@ -556,7 +556,7 @@ and top_stock_contribution <= config.max_single_stock_contribution
 and top_period_contribution <= config.max_single_period_contribution
 ```
 
-- [ ] **Step 6: Verify and commit**
+- [x] **Step 6: Verify and commit**
 
 ```bash
 cd research
@@ -578,7 +578,7 @@ git commit -m "feat: validate patterns with purged walk-forward"
 - Produces immutable `analysis_pattern_versions` rows.
 - Never writes `published`.
 
-- [ ] **Step 1: Test export contract**
+- [x] **Step 1: Test export contract**
 
 Assert exported payload validates with Pydantic and status is only:
 
@@ -587,7 +587,7 @@ draft
 validated
 ```
 
-- [ ] **Step 2: Implement CLI commands**
+- [x] **Step 2: Implement CLI commands**
 
 ```text
 qbot-research build-dataset --horizon week --as-of YYYY-MM-DD
@@ -595,11 +595,11 @@ qbot-research train --horizon week --dataset-version ...
 qbot-research train-all --as-of YYYY-MM-DD
 ```
 
-- [ ] **Step 3: Save examples**
+- [x] **Step 3: Save examples**
 
 Write typical positive and failed examples to `analysis_pattern_examples`.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ```bash
 cd research
@@ -628,11 +628,11 @@ git commit -m "feat: export validated pattern versions"
 - Consumes published model payloads.
 - Writes shadow candidates only.
 
-- [ ] **Step 1: Define Rust model contract**
+- [x] **Step 1: Define Rust model contract**
 
 Mirror Python fields exactly with `serde(deny_unknown_fields)`.
 
-- [ ] **Step 2: Add golden fixture test**
+- [x] **Step 2: Add golden fixture test**
 
 Place a JSON fixture under:
 
@@ -647,7 +647,7 @@ Assert:
 - missing feature rejects.
 - fixed feature vector produces fixed similarity.
 
-- [ ] **Step 3: Implement matching**
+- [x] **Step 3: Implement matching**
 
 ```rust
 pub struct PatternEngine {
@@ -666,7 +666,7 @@ impl PatternEngine {
 
 No event inputs.
 
-- [ ] **Step 4: Implement tiers**
+- [x] **Step 4: Implement tiers**
 
 ```text
 shadow_a
@@ -677,11 +677,11 @@ reject
 
 A model validation Lift is part of the score; similarity alone cannot create `shadow_a`.
 
-- [ ] **Step 5: Persist output**
+- [x] **Step 5: Persist output**
 
 Use `analysis_shadow_candidates`, never `signal_strategy_candidates`.
 
-- [ ] **Step 6: Verify and commit**
+- [x] **Step 6: Verify and commit**
 
 ```bash
 cargo test analysis::patterns -- --nocapture
@@ -706,7 +706,7 @@ git commit -m "feat: match published patterns in shadow mode"
 - Adds shadow read endpoints.
 - Adds a 17:40 job after market snapshot and scan.
 
-- [ ] **Step 1: Add endpoints**
+- [x] **Step 1: Add endpoints**
 
 ```text
 GET  /api/analysis/patterns/shadow
@@ -714,7 +714,7 @@ GET  /api/analysis/patterns/shadow/:code
 POST /api/jobs/analysis/pattern-match
 ```
 
-- [ ] **Step 2: Add scheduler function**
+- [x] **Step 2: Add scheduler function**
 
 ```rust
 pub async fn run_pattern_shadow_job(state: Arc<AppState>) {
@@ -724,13 +724,13 @@ pub async fn run_pattern_shadow_job(state: Arc<AppState>) {
 }
 ```
 
-- [ ] **Step 3: Add cron**
+- [x] **Step 3: Add cron**
 
 ```rust
 const PATTERN_SHADOW_JOB_CRON: &str = "0 40 17 * * Mon,Tue,Wed,Thu,Fri";
 ```
 
-- [ ] **Step 4: Add safety tests**
+- [x] **Step 4: Add safety tests**
 
 Assert:
 
@@ -739,7 +739,7 @@ Assert:
 - missing published model skips safely.
 - incomplete snapshot skips safely.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 cargo fmt --all -- --check
@@ -754,13 +754,13 @@ git commit -m "feat: report strong-stock shadow candidates"
 
 ## Phase Completion Checklist
 
-- [ ] Week and month datasets are point-in-time safe.
-- [ ] Controls are matched and persisted.
-- [ ] Purge and embargo tests pass.
-- [ ] All four baselines run.
-- [ ] Pattern validation reports Lift and effective sample size.
-- [ ] Python exports only draft/validated models.
-- [ ] Publishing remains manual.
-- [ ] Rust loads only published models.
-- [ ] Shadow candidates never reach auto trading.
-- [ ] Existing `scan_ranker` remains unchanged and comparable.
+- [x] Week and month datasets are point-in-time safe.
+- [x] Controls are matched and persisted.
+- [x] Purge and embargo tests pass.
+- [x] All four baselines run.
+- [x] Pattern validation reports Lift and effective sample size.
+- [x] Python exports only draft/validated models.
+- [x] Publishing remains manual.
+- [x] Rust loads only published models.
+- [x] Shadow candidates never reach auto trading.
+- [x] Existing `scan_ranker` remains unchanged and comparable.

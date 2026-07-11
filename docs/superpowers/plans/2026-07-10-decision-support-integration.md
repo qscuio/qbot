@@ -32,7 +32,7 @@
 **Interfaces:**
 - Produces immutable daily artifacts and candidate details.
 
-- [ ] **Step 1: Create migration**
+- [x] **Step 1: Create migration**
 
 ```sql
 CREATE TABLE analysis_decision_support_runs (
@@ -87,7 +87,7 @@ CREATE INDEX idx_decision_candidates_rank
     ON analysis_decision_candidates(run_id, support_tier, final_score DESC);
 ```
 
-- [ ] **Step 2: Add repository tests**
+- [x] **Step 2: Add repository tests**
 
 Verify:
 
@@ -96,7 +96,7 @@ Verify:
 - candidate facts/calculations/inferences/unknowns remain separate.
 - repeated build upserts by deterministic run ID or rejects duplicate version.
 
-- [ ] **Step 3: Implement repository**
+- [x] **Step 3: Implement repository**
 
 ```rust
 pub async fn create_run(&self, row: &DecisionSupportRunRow) -> Result<Uuid>;
@@ -106,7 +106,7 @@ pub async fn latest_run(&self) -> Result<Option<DecisionSupportRunRow>>;
 pub async fn list_candidates(&self, run_id: Uuid) -> Result<Vec<DecisionCandidateRow>>;
 ```
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ```bash
 cargo test storage::decision_support_repository -- --nocapture
@@ -129,7 +129,7 @@ git commit -m "feat: add decision-support persistence"
 - Produces `DecisionSupport::build_daily`.
 - Reads but does not mutate scanner, pattern, event, or trading data.
 
-- [ ] **Step 1: Define contracts**
+- [x] **Step 1: Define contracts**
 
 ```rust
 pub struct DecisionSupport {
@@ -168,7 +168,7 @@ pub struct DecisionCandidate {
 }
 ```
 
-- [ ] **Step 2: Add classification tests**
+- [x] **Step 2: Add classification tests**
 
 A source-backed event fact must appear in `facts`.
 
@@ -178,7 +178,7 @@ An impact hypothesis must appear in `inferences`.
 
 Missing status data must appear in `unknowns`.
 
-- [ ] **Step 3: Implement builder interface**
+- [x] **Step 3: Implement builder interface**
 
 ```rust
 impl DecisionSupport {
@@ -190,7 +190,7 @@ impl DecisionSupport {
 }
 ```
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ```bash
 cargo test analysis::decision_support
@@ -212,7 +212,7 @@ git commit -m "feat: add read-only decision-support module"
 - Converts them to a stable baseline contract.
 - Does not duplicate scan-ranker scoring logic.
 
-- [ ] **Step 1: Expose a stable metadata parser**
+- [x] **Step 1: Expose a stable metadata parser**
 
 Add a public read-only type:
 
@@ -238,7 +238,7 @@ pub fn ranked_pool_evidence(hit: &SignalHit) -> Option<RankedPoolEvidence>;
 
 Do not expose internal `Metrics` or classifier functions.
 
-- [ ] **Step 2: Implement adapter**
+- [x] **Step 2: Implement adapter**
 
 ```rust
 pub async fn load_scan_ranker_baseline(
@@ -249,11 +249,11 @@ pub async fn load_scan_ranker_baseline(
 
 Read `daily_signal_scan_results` for pool IDs only.
 
-- [ ] **Step 3: Test no rescoring**
+- [x] **Step 3: Test no rescoring**
 
 A metadata fixture must produce the same score and reasons without recalculating from candles.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ```bash
 cargo test scan_ranker_adapter
@@ -274,7 +274,7 @@ git commit -m "feat: adapt scan-ranker output for decision support"
 - Joins candidates by `(code, horizon)`.
 - Preserves source-specific scores.
 
-- [ ] **Step 1: Define merge rules**
+- [x] **Step 1: Define merge rules**
 
 ```text
 scan-ranker only      -> base_source=scan_ranker
@@ -284,7 +284,7 @@ both                  -> base_source=combined
 
 Do not average unrelated raw score scales.
 
-- [ ] **Step 2: Normalize evidence, not raw scores**
+- [x] **Step 2: Normalize evidence, not raw scores**
 
 Use configured rank percentiles:
 
@@ -300,7 +300,7 @@ base_score = max(scan_ranker_percentile, pattern_percentile)
 pattern_score = pattern_percentile or null
 ```
 
-- [ ] **Step 3: Add conflict tests**
+- [x] **Step 3: Add conflict tests**
 
 If scan-ranker says A and pattern says Reject:
 
@@ -308,7 +308,7 @@ If scan-ranker says A and pattern says Reject:
 - add a disagreement risk flag.
 - retain both explanations.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ```bash
 cargo test analysis::decision_support::builder
@@ -329,7 +329,7 @@ git commit -m "feat: combine baseline and shadow pattern evidence"
 - Adds direct event facts and industry context.
 - Returns `event_adjustment = 0.0`.
 
-- [ ] **Step 1: Implement direct-context selection**
+- [x] **Step 1: Implement direct-context selection**
 
 Include events when:
 
@@ -338,21 +338,21 @@ Include events when:
 
 Do not include fuzzy beneficiary lists.
 
-- [ ] **Step 2: Test zero contribution**
+- [x] **Step 2: Test zero contribution**
 
 ```rust
 assert_eq!(candidate.event_adjustment, 0.0);
 assert_eq!(candidate.final_score, candidate.base_score + candidate.risk_adjustment);
 ```
 
-- [ ] **Step 3: Separate statements**
+- [x] **Step 3: Separate statements**
 
 - ClaimGraph content -> facts.
 - Market observation -> calculations.
 - ImpactHypothesisGraph -> inferences.
 - Missing direct mapping -> unknowns.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ```bash
 cargo test event_adapter
@@ -375,7 +375,7 @@ git commit -m "feat: add zero-weight event context"
 - Adds a disabled-by-default configuration.
 - Maximum absolute adjustment is hard-capped at `5`.
 
-- [ ] **Step 1: Add config**
+- [x] **Step 1: Add config**
 
 ```rust
 pub enable_event_score_adjustment: bool,
@@ -395,7 +395,7 @@ Parsing must clamp:
 value.clamp(0.0, 5.0)
 ```
 
-- [ ] **Step 2: Add gate tests**
+- [x] **Step 2: Add gate tests**
 
 Assert:
 
@@ -405,7 +405,7 @@ Assert:
 - data-incomplete candidate cannot receive positive adjustment.
 - only direct entity or reviewed industry relation is eligible.
 
-- [ ] **Step 3: Implement audit payload**
+- [x] **Step 3: Implement audit payload**
 
 Every adjustment records:
 
@@ -420,7 +420,7 @@ cap
 reason
 ```
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ```bash
 cargo test decision_support::builder
@@ -445,7 +445,7 @@ This task may merge with event score disabled. Do not enable in production as pa
 - Adds daily and candidate detail endpoints.
 - Adds read-only Telegram commands.
 
-- [ ] **Step 1: Add endpoints**
+- [x] **Step 1: Add endpoints**
 
 ```text
 GET  /api/analysis/decision-support/latest
@@ -454,14 +454,14 @@ GET  /api/analysis/decision-support/:date/:code
 POST /api/jobs/analysis/decision-support
 ```
 
-- [ ] **Step 2: Add Telegram commands**
+- [x] **Step 2: Add Telegram commands**
 
 ```text
 /decision
 /decision_detail <code>
 ```
 
-- [ ] **Step 3: Ensure response labels**
+- [x] **Step 3: Ensure response labels**
 
 Every statement includes:
 
@@ -472,7 +472,7 @@ inference
 unknown
 ```
 
-- [ ] **Step 4: Add auth and safety tests**
+- [x] **Step 4: Add auth and safety tests**
 
 No endpoint may create or update:
 
@@ -483,7 +483,7 @@ trading_sim_positions
 daban_sim_positions
 ```
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 cargo test api::decision_support_routes -- --nocapture
@@ -504,19 +504,19 @@ git commit -m "feat: expose read-only decision support"
 - Builds after pattern and event jobs.
 - Failure does not affect existing reports.
 
-- [ ] **Step 1: Add job**
+- [x] **Step 1: Add job**
 
 ```rust
 pub async fn run_decision_support_job(state: Arc<AppState>);
 ```
 
-- [ ] **Step 2: Add schedule**
+- [x] **Step 2: Add schedule**
 
 ```rust
 const DECISION_SUPPORT_JOB_CRON: &str = "0 55 17 * * Mon,Tue,Wed,Thu,Fri";
 ```
 
-- [ ] **Step 3: Add degradation behavior**
+- [x] **Step 3: Add degradation behavior**
 
 If pattern results are missing:
 
@@ -533,7 +533,7 @@ If market snapshot is incomplete:
 - build a data-status report.
 - do not assign A.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ```bash
 cargo test scheduler::tests
@@ -555,7 +555,7 @@ git commit -m "feat: schedule daily decision-support build"
 - Existing `/api/market/overview` continues working.
 - Old free-form AI prompt is no longer the source of market facts.
 
-- [ ] **Step 1: Add compatibility adapter**
+- [x] **Step 1: Add compatibility adapter**
 
 Replace internal market narrative generation with:
 
@@ -573,19 +573,19 @@ pub async fn market_overview(
 }
 ```
 
-- [ ] **Step 2: Remove scheduled free-form loop**
+- [x] **Step 2: Remove scheduled free-form loop**
 
 Do not run a separate 15:30 AI loop. Daily DecisionSupport is generated by scheduler.
 
-- [ ] **Step 3: Preserve one compatibility cycle**
+- [x] **Step 3: Preserve one compatibility cycle**
 
 Keep response field names where practical. Mark `aiNarrative` deprecated and populate it from the structured brief rendering.
 
-- [ ] **Step 4: Test no direct LLM call**
+- [x] **Step 4: Test no direct LLM call**
 
 A compatibility test uses a fake LLM endpoint that would fail if called; `market_overview` must still pass from stored structured data.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 cargo test services::ai_analysis -- --nocapture
@@ -604,7 +604,7 @@ git commit -m "refactor: route market overview through decision support"
 **Interfaces:**
 - Documents actual release status and disabled features.
 
-- [ ] **Step 1: Run full Rust verification**
+- [x] **Step 1: Run full Rust verification**
 
 ```bash
 cargo fmt --all -- --check
@@ -612,7 +612,7 @@ cargo test --all --locked
 git diff --check
 ```
 
-- [ ] **Step 2: Run Python verification**
+- [x] **Step 2: Run Python verification**
 
 ```bash
 cd research
@@ -621,7 +621,7 @@ python -m ruff check .
 python -m mypy qbot_research
 ```
 
-- [ ] **Step 3: Run database assertions**
+- [x] **Step 3: Run database assertions**
 
 Execute SQL proving no DecisionSupport run inserted into trading tables:
 
@@ -632,7 +632,7 @@ WHERE signal_metadata ? 'decision_support_run_id';
 
 Expected: `0`.
 
-- [ ] **Step 4: Document production flags**
+- [x] **Step 4: Document production flags**
 
 README must show:
 
@@ -641,7 +641,7 @@ ENABLE_EVENT_SCORE_ADJUSTMENT=false
 MAX_EVENT_SCORE_ADJUSTMENT=0
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add README.md docs/reviews/2026-07-10-analysis-platform-review-resolution.md
@@ -652,12 +652,12 @@ git commit -m "docs: record decision-support release gates"
 
 ## Phase Completion Checklist
 
-- [ ] DecisionSupport is read-only.
-- [ ] Facts, calculations, inferences, and unknowns are separate.
-- [ ] `scan_ranker` remains the baseline.
-- [ ] Shadow patterns are not silently promoted to production.
-- [ ] Event context begins at zero weight.
-- [ ] Optional event adjustment is capped at 5.
-- [ ] Reject cannot become A because of events.
-- [ ] Existing market overview is a compatibility adapter.
-- [ ] No new analysis output enters auto trading.
+- [x] DecisionSupport is read-only.
+- [x] Facts, calculations, inferences, and unknowns are separate.
+- [x] `scan_ranker` remains the baseline.
+- [x] Shadow patterns are not silently promoted to production.
+- [x] Event context begins at zero weight.
+- [x] Optional event adjustment is capped at 5.
+- [x] Reject cannot become A because of events.
+- [x] Existing market overview is a compatibility adapter.
+- [x] No new analysis output enters auto trading.

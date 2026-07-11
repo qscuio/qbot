@@ -31,7 +31,7 @@
 - Produces tables used by all later tasks.
 - Does not change existing repository function signatures.
 
-- [ ] **Step 1: Create the migration**
+- [x] **Step 1: Create the migration**
 
 ```sql
 CREATE TABLE IF NOT EXISTS stock_daily_bar_versions (
@@ -262,7 +262,7 @@ CREATE INDEX IF NOT EXISTS idx_market_snapshot_date
     ON market_daily_snapshots(trade_date DESC, snapshot_version);
 ```
 
-- [ ] **Step 2: Add a migration smoke test**
+- [x] **Step 2: Add a migration smoke test**
 
 Append to the future `src/storage/market_repository.rs` test module:
 
@@ -298,7 +298,7 @@ async fn point_in_time_tables_exist(pool: PgPool) -> sqlx::Result<()> {
 }
 ```
 
-- [ ] **Step 3: Run the migration test**
+- [x] **Step 3: Run the migration test**
 
 Run:
 
@@ -308,7 +308,7 @@ cargo test point_in_time_tables_exist -- --nocapture
 
 Expected: PASS when SQLx can create the test database.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add migrations/013_point_in_time_market_data.sql src/storage/market_repository.rs
@@ -330,7 +330,7 @@ git commit -m "feat: add point-in-time market data schema"
 - Produces shared Rust types for repository, provider, and snapshot tasks.
 - No database calls in contract files.
 
-- [ ] **Step 1: Write contract unit tests**
+- [x] **Step 1: Write contract unit tests**
 
 Create `src/analysis/market_snapshot/contracts.rs` with tests first:
 
@@ -353,7 +353,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Verify the test fails**
+- [x] **Step 2: Verify the test fails**
 
 Run:
 
@@ -363,7 +363,7 @@ cargo test point_in_time_context_rejects_data_available_after_cutoff
 
 Expected: FAIL because the module and types do not exist.
 
-- [ ] **Step 3: Implement the contracts**
+- [x] **Step 3: Implement the contracts**
 
 ```rust
 use chrono::{DateTime, NaiveDate, Utc};
@@ -524,7 +524,7 @@ Add to `src/main.rs`:
 mod analysis;
 ```
 
-- [ ] **Step 4: Run unit tests**
+- [x] **Step 4: Run unit tests**
 
 Run:
 
@@ -534,7 +534,7 @@ cargo test point_in_time_context_rejects_data_available_after_cutoff
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/analysis src/main.rs
@@ -555,7 +555,7 @@ git commit -m "feat: add point-in-time analysis contracts"
 - Produces point-in-time reads and upserts.
 - Consumes contracts from Task 2.
 
-- [ ] **Step 1: Write a failing point-in-time query test**
+- [x] **Step 1: Write a failing point-in-time query test**
 
 ```rust
 #[sqlx::test(migrations = "./migrations")]
@@ -587,7 +587,7 @@ async fn latest_adjustment_factor_respects_as_of(pool: PgPool) -> sqlx::Result<(
 }
 ```
 
-- [ ] **Step 2: Verify the test fails**
+- [x] **Step 2: Verify the test fails**
 
 Run:
 
@@ -597,7 +597,7 @@ cargo test latest_adjustment_factor_respects_as_of
 
 Expected: FAIL because `MarketRepository` does not exist.
 
-- [ ] **Step 3: Implement the repository skeleton**
+- [x] **Step 3: Implement the repository skeleton**
 
 ```rust
 use chrono::{DateTime, NaiveDate, Utc};
@@ -680,7 +680,7 @@ Add:
 pub mod market_repository;
 ```
 
-- [ ] **Step 4: Add remaining repository methods**
+- [x] **Step 4: Add remaining repository methods**
 
 Implement:
 
@@ -704,7 +704,7 @@ pub async fn market_snapshot(&self, trade_date: NaiveDate, version: &str) -> Res
 
 Version tables are append-only by `(entity, trade_date, available_at)`. Use `ON CONFLICT ... DO NOTHING`; never update an earlier observation. The legacy current-state tables continue to use their existing upsert behavior.
 
-- [ ] **Step 5: Run repository tests**
+- [x] **Step 5: Run repository tests**
 
 Run:
 
@@ -714,7 +714,7 @@ cargo test storage::market_repository -- --nocapture
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/storage/market_repository.rs src/storage/mod.rs
@@ -739,7 +739,7 @@ git commit -m "feat: add point-in-time market repository"
 - Existing fallback providers remain unchanged.
 - Missing critical capabilities block Phase 1 instead of triggering inferred history.
 
-- [ ] **Step 1: Add the capability and provider contracts**
+- [x] **Step 1: Add the capability and provider contracts**
 
 ```rust
 use async_trait::async_trait;
@@ -814,7 +814,7 @@ Export from `src/data/mod.rs`:
 pub mod point_in_time_provider;
 ```
 
-- [ ] **Step 2: Add bounded capability probes and parser tests**
+- [x] **Step 2: Add bounded capability probes and parser tests**
 
 The probe performs small sample requests and records unsupported or unauthorized capabilities without substituting current-state data.
 
@@ -833,7 +833,7 @@ assert!(!capabilities.historical_sector_membership);
 assert!(capabilities.details["historical_sector_membership"].contains("unauthorized"));
 ```
 
-- [ ] **Step 3: Implement verified Tushare methods**
+- [x] **Step 3: Implement verified Tushare methods**
 
 Use private Tushare calls for capabilities confirmed by the probe. Map `available_at` to the actual QBot fetch time:
 
@@ -845,7 +845,7 @@ Live fetches use `AvailabilityQuality::Observed`. Historical backfills whose tru
 
 If security master history, corporate actions, daily basics, historical membership, or daily status is unsupported, return an explicit `AppError::DataProvider` from that method. Never derive historical membership from current `stock_info.industry`, never infer historical ST state from the current security name, and never approximate market cap from price alone.
 
-- [ ] **Step 4: Wire the dedicated provider into state**
+- [x] **Step 4: Wire the dedicated provider into state**
 
 Add to `AppState`:
 
@@ -869,11 +869,11 @@ let point_in_time_provider:
 
 Pass `point_in_time_provider` into `AppState`.
 
-- [ ] **Step 5: Persist and expose capability status**
+- [x] **Step 5: Persist and expose capability status**
 
 Store the latest probe result in `analysis_data_runs.details` with `run_type='point_in_time_capability_probe'`. Add it to `/api/analysis/data-status` so Phase 1 can show exactly which prerequisite is missing.
 
-- [ ] **Step 6: Run tests**
+- [x] **Step 6: Run tests**
 
 Run:
 
@@ -884,7 +884,7 @@ cargo test config::tests::test_config_defaults
 
 Expected: PASS, including explicit unsupported-capability behavior.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/data src/state.rs src/main.rs
@@ -909,7 +909,7 @@ git commit -m "feat: probe point-in-time data capabilities"
 - New live observations use observed timestamps.
 - Historical backfills append estimated observations without overwriting them later.
 
-- [ ] **Step 1: Write failing current-view and version-history tests**
+- [x] **Step 1: Write failing current-view and version-history tests**
 
 Add SQLx tests proving that:
 
@@ -917,7 +917,7 @@ Add SQLx tests proving that:
 - two observations for the same `(code, trade_date)` with different `available_at` values both remain in `stock_daily_bar_versions`;
 - a repeated observation with the same `(code, trade_date, available_at)` is idempotent.
 
-- [ ] **Step 2: Verify failure**
+- [x] **Step 2: Verify failure**
 
 Run:
 
@@ -927,7 +927,7 @@ cargo test daily_bar_upsert_updates_fundamentals append_daily_bar_versions_is_po
 
 Expected: FAIL because the current legacy `ON CONFLICT` clause omits fundamental fields and the append-only version function does not exist.
 
-- [ ] **Step 3: Extend the upsert signature**
+- [x] **Step 3: Extend the upsert signature**
 
 Keep the existing legacy signature and current-state table behavior:
 
@@ -952,7 +952,7 @@ pub async fn append_daily_bar_versions(
 
 The legacy table remains the current operational view. Research and replay read only `stock_daily_bar_versions`.
 
-- [ ] **Step 4: Update call sites**
+- [x] **Step 4: Update call sites**
 
 Daily live ingestion:
 
@@ -984,7 +984,7 @@ MarketRepository::new(self.state.db.clone())
 
 Add `MarketRepository::append_sector_versions` and `MarketRepository::append_limit_up_versions` with the same append-only rule. Existing sector and limit-up tables remain current operational views.
 
-- [ ] **Step 5: Run tests**
+- [x] **Step 5: Run tests**
 
 Run:
 
@@ -995,7 +995,7 @@ cargo test --all --locked
 
 Expected: all non-environment-dependent tests PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/storage/postgres.rs src/storage/market_repository.rs src/services/stock_history.rs src/services/sector.rs src/services/limit_up.rs
@@ -1017,7 +1017,7 @@ git commit -m "feat: persist market data availability metadata"
 - Consumes the capability-checked provider and append-only repository methods.
 - Records partial and failed runs in `analysis_data_runs`.
 
-- [ ] **Step 1: Write fake-provider tests**
+- [x] **Step 1: Write fake-provider tests**
 
 Create a fake `PointInTimeDataProvider` and assert:
 
@@ -1027,7 +1027,7 @@ Create a fake `PointInTimeDataProvider` and assert:
 - a failure in corporate actions does not erase successfully fetched daily basics;
 - the run status becomes `partial` when a non-critical category fails.
 
-- [ ] **Step 2: Define the ingestion interface**
+- [x] **Step 2: Define the ingestion interface**
 
 ```rust
 #[derive(Clone)]
@@ -1062,7 +1062,7 @@ impl PointInTimeIngestion {
 }
 ```
 
-- [ ] **Step 3: Implement reference-data refresh**
+- [x] **Step 3: Implement reference-data refresh**
 
 `refresh_reference_data` fetches and appends:
 
@@ -1074,7 +1074,7 @@ stock_sector_membership
 
 It must compare source records and avoid appending a new version when the normalized payload is unchanged.
 
-- [ ] **Step 4: Implement trade-date refresh**
+- [x] **Step 4: Implement trade-date refresh**
 
 `refresh_trade_date` fetches and appends:
 
@@ -1087,7 +1087,7 @@ stock_adjustment_factors
 
 It also verifies that daily bar, sector, and limit-up version writes from Task 5 exist for the date.
 
-- [ ] **Step 5: Implement historical backfill semantics**
+- [x] **Step 5: Implement historical backfill semantics**
 
 Historical backfill records:
 
@@ -1108,7 +1108,7 @@ Conservative estimation rules:
 
 Dataset construction may include estimated records but must report estimated-row counts and support a sensitivity run that excludes them. It must never use `ingested_at` as the historical decision cutoff.
 
-- [ ] **Step 6: Add scheduler job functions without enabling a new cron**
+- [x] **Step 6: Add scheduler job functions without enabling a new cron**
 
 ```rust
 pub async fn run_point_in_time_reference_refresh_job(state: Arc<AppState>);
@@ -1117,7 +1117,7 @@ pub async fn run_point_in_time_trade_date_refresh_job(state: Arc<AppState>);
 
 Call both from `--run-now` after the legacy fetch job. Production schedules are added in Task 9 after completeness reporting exists.
 
-- [ ] **Step 7: Run tests and commit**
+- [x] **Step 7: Run tests and commit**
 
 ```bash
 cargo test analysis::market_snapshot::ingestion -- --nocapture
@@ -1138,7 +1138,7 @@ git commit -m "feat: refresh point-in-time supporting data"
 - Produces `adjust_candles`.
 - Consumes raw `Candle` values and dated adjustment factors.
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 ```rust
 #[test]
@@ -1171,7 +1171,7 @@ fn rejects_missing_factor_for_a_bar() {
 }
 ```
 
-- [ ] **Step 2: Verify failure**
+- [x] **Step 2: Verify failure**
 
 Run:
 
@@ -1181,7 +1181,7 @@ cargo test adjustment::tests -- --nocapture
 
 Expected: FAIL.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```rust
 pub fn adjust_candles(
@@ -1220,7 +1220,7 @@ pub fn adjust_candles(
 }
 ```
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run:
 
@@ -1230,7 +1230,7 @@ cargo test adjustment::tests
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/analysis/market_snapshot
@@ -1252,7 +1252,7 @@ git commit -m "feat: add adjusted-price calculation"
 - Persists one versioned snapshot per trade date.
 - Does not alter existing market report output yet.
 
-- [ ] **Step 1: Write a failing pure metrics test**
+- [x] **Step 1: Write a failing pure metrics test**
 
 Create a fixture with four securities and assert:
 
@@ -1265,7 +1265,7 @@ assert_eq!(metrics.new_high_20_count, 1);
 assert_eq!(metrics.new_low_20_count, 1);
 ```
 
-- [ ] **Step 2: Implement pure calculation types**
+- [x] **Step 2: Implement pure calculation types**
 
 ```rust
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1284,7 +1284,7 @@ pub struct MarketBreadthMetrics {
 
 Implement `calculate_market_breadth`.
 
-- [ ] **Step 3: Implement the deep module**
+- [x] **Step 3: Implement the deep module**
 
 ```rust
 #[derive(Clone)]
@@ -1318,7 +1318,7 @@ The builder must:
 7. Calculate `input_fingerprint` from sorted source IDs and timestamps.
 8. Persist `snapshot_version = "market-v1"`.
 
-- [ ] **Step 4: Add a scheduler job function without enabling a new cron yet**
+- [x] **Step 4: Add a scheduler job function without enabling a new cron yet**
 
 ```rust
 pub async fn run_market_snapshot_job(state: Arc<AppState>) {
@@ -1335,7 +1335,7 @@ pub async fn run_market_snapshot_job(state: Arc<AppState>) {
 
 Call it from `--run-now` after `run_fetch_job` and before `run_scan_job`. Do not add the production cron until Task 9 adds completeness behavior.
 
-- [ ] **Step 5: Run tests**
+- [x] **Step 5: Run tests**
 
 Run:
 
@@ -1346,7 +1346,7 @@ cargo test scheduler::tests -- --nocapture
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/analysis/market_snapshot src/scheduler/mod.rs src/main.rs
@@ -1374,7 +1374,7 @@ git commit -m "feat: build daily market snapshots"
 - Adds explicit refresh and snapshot job endpoints.
 - Schedules point-in-time refresh before the market snapshot.
 
-- [ ] **Step 1: Add router tests**
+- [x] **Step 1: Add router tests**
 
 Test that `analysis_router` contains:
 
@@ -1387,7 +1387,7 @@ POST /api/jobs/analysis/snapshot
 
 Use an Axum `Router` smoke test or a direct handler unit test with a SQLx database.
 
-- [ ] **Step 2: Implement handlers**
+- [x] **Step 2: Implement handlers**
 
 Response:
 
@@ -1404,7 +1404,7 @@ Response:
 
 The handlers call `run_point_in_time_trade_date_refresh_job`, `run_point_in_time_reference_refresh_job`, and `run_market_snapshot_job` respectively.
 
-- [ ] **Step 3: Mount the sub-router**
+- [x] **Step 3: Mount the sub-router**
 
 ```rust
 // src/api/mod.rs
@@ -1420,7 +1420,7 @@ In `build_router`:
 .merge(crate::api::analysis_routes::analysis_router(state.clone()))
 ```
 
-- [ ] **Step 4: Add the production cron**
+- [x] **Step 4: Add the production cron**
 
 Add:
 
@@ -1429,6 +1429,8 @@ const POINT_IN_TIME_TRADE_DATE_JOB_CRON: &str = "0 10 17 * * Mon,Tue,Wed,Thu,Fri
 const MARKET_SNAPSHOT_JOB_CRON: &str = "0 20 17 * * Mon,Tue,Wed,Thu,Fri";
 const POINT_IN_TIME_REFERENCE_JOB_CRON: &str = "0 30 20 * * Fri";
 ```
+
+Final review resolution: the reference refresh runs at `0 15 17 * * Fri` so the phase completion requirement that weekly refresh runs before snapshot generation is satisfied.
 
 Add to `AppState`:
 
@@ -1440,7 +1442,7 @@ Initialize it in `main.rs`. Register daily trade-date refresh after the legacy f
 
 Update scheduler tests to assert the exact schedules and order.
 
-- [ ] **Step 5: Document environment and endpoints**
+- [x] **Step 5: Document environment and endpoints**
 
 README must state:
 
@@ -1448,7 +1450,7 @@ README must state:
 - Pattern research is blocked until security master, daily basics, corporate actions, adjustment factors, status, indices, and sector membership are complete.
 - The new endpoint reports capability failures, completeness, and estimated-row counts without guessing missing inputs.
 
-- [ ] **Step 6: Verify**
+- [x] **Step 6: Verify**
 
 Run:
 
@@ -1460,7 +1462,7 @@ git diff --check
 
 Expected: formatting and non-environment-dependent tests PASS; SQLx failures must be reported if `DATABASE_URL` is unavailable.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/api src/scheduler/mod.rs src/state.rs src/main.rs README.md
@@ -1471,17 +1473,17 @@ git commit -m "feat: expose point-in-time data status"
 
 ## Phase Completion Checklist
 
-- [ ] Migration `013` applies cleanly.
-- [ ] Historical unknown availability is not silently fabricated.
-- [ ] Daily ingestion records observed availability.
-- [ ] Security master history retains delisted names and dates.
-- [ ] Daily market-cap and valuation data are queryable by explicit `as_of`.
-- [ ] Corporate actions, adjustment factors, and status data are queryable by explicit `as_of`.
-- [ ] Historical sector membership has effective dates.
-- [ ] Index history is persisted.
-- [ ] Capability probe reports unsupported provider features.
-- [ ] Daily and weekly refresh jobs are scheduled before snapshot generation.
-- [ ] Market snapshot reports missing critical inputs.
-- [ ] Existing scanner output is unchanged.
-- [ ] No pattern or event candidate table exists yet.
-- [ ] Workspace is clean after verification.
+- [x] Migration `013` applies cleanly.
+- [x] Historical unknown availability is not silently fabricated.
+- [x] Daily ingestion records observed availability.
+- [x] Security master history retains delisted names and dates.
+- [x] Daily market-cap and valuation data are queryable by explicit `as_of`.
+- [x] Corporate actions, adjustment factors, and status data are queryable by explicit `as_of`.
+- [x] Historical sector membership has effective dates.
+- [x] Index history is persisted.
+- [x] Capability probe reports unsupported provider features.
+- [x] Daily and weekly refresh jobs are scheduled before snapshot generation.
+- [x] Market snapshot reports missing critical inputs.
+- [x] Existing scanner output is unchanged.
+- [x] No pattern or event candidate table exists yet.
+- [x] Workspace is clean after verification.

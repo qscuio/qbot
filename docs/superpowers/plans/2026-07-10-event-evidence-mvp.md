@@ -33,7 +33,7 @@
 **Interfaces:**
 - Produces immutable evidence, duplicate groups, extraction, claims, entities, ClaimGraph, revision, and brief tables.
 
-- [ ] **Step 1: Create the migration**
+- [x] **Step 1: Create the migration**
 
 ```sql
 CREATE TABLE market_event_evidence (
@@ -159,7 +159,7 @@ CREATE INDEX idx_event_entities_canonical
     ON market_event_entities(canonical_type, canonical_id, review_status);
 ```
 
-- [ ] **Step 2: Add SQLx tests**
+- [x] **Step 2: Add SQLx tests**
 
 Verify:
 
@@ -168,7 +168,7 @@ Verify:
 - user-locked duplicate groups remain locked after upsert.
 - daily brief upserts by trade date.
 
-- [ ] **Step 3: Implement `EventRepository`**
+- [x] **Step 3: Implement `EventRepository`**
 
 Public methods:
 
@@ -183,7 +183,7 @@ pub async fn save_daily_brief(&self, brief: &DailyEventBriefRow) -> Result<()>;
 pub async fn list_publishable_evidence(&self, trade_date: NaiveDate) -> Result<Vec<EventEvidenceRow>>;
 ```
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ```bash
 cargo test storage::event_repository -- --nocapture
@@ -205,7 +205,7 @@ git commit -m "feat: add event evidence MVP schema"
 - Produces the public `EventIntelligence` types.
 - Keeps internal dedup/extraction details private.
 
-- [ ] **Step 1: Define contracts**
+- [x] **Step 1: Define contracts**
 
 ```rust
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -251,7 +251,7 @@ pub trait TradingDateResolver: Send + Sync {
 }
 ```
 
-- [ ] **Step 2: Test time classification**
+- [x] **Step 2: Test time classification**
 
 Tests must cover:
 
@@ -259,7 +259,7 @@ Tests must cover:
 - 15:30 maps to the next trading date.
 - Saturday maps to Monday or the next open date.
 
-- [ ] **Step 3: Add public module interface**
+- [x] **Step 3: Add public module interface**
 
 ```rust
 pub struct EventIntelligence {
@@ -286,7 +286,7 @@ impl EventIntelligence {
 }
 ```
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ```bash
 cargo test analysis::events::contracts
@@ -308,7 +308,7 @@ git commit -m "feat: add event intelligence contracts"
 - Produces normalized immutable evidence from manual input.
 - Uses trading calendar to calculate effective trade date.
 
-- [ ] **Step 1: Write normalization tests**
+- [x] **Step 1: Write normalization tests**
 
 Assert:
 
@@ -317,7 +317,7 @@ Assert:
 - content hash is stable.
 - repeated submission returns the existing evidence relation instead of creating silent duplicates.
 
-- [ ] **Step 2: Implement evidence normalization**
+- [x] **Step 2: Implement evidence normalization**
 
 ```rust
 fn normalize_text(value: &str) -> String {
@@ -338,7 +338,7 @@ fn content_hash(title: &str, content: Option<&str>) -> String {
 
 Add `sha2 = "0.10"` to `Cargo.toml`.
 
-- [ ] **Step 3: Implement immutable insertion**
+- [x] **Step 3: Implement immutable insertion**
 
 Manual source ID:
 
@@ -349,7 +349,7 @@ manual:rest
 
 Source item ID is a UUID generated at ingestion; repeated content is linked through duplicate handling rather than reusing the ID.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ```bash
 cargo test analysis::events::evidence
@@ -369,7 +369,7 @@ git commit -m "feat: ingest manual market-event evidence"
 - Produces `DuplicateDecision`.
 - Does not implement EventCluster.
 
-- [ ] **Step 1: Define decisions**
+- [x] **Step 1: Define decisions**
 
 ```rust
 pub enum DuplicateDecision {
@@ -380,7 +380,7 @@ pub enum DuplicateDecision {
 }
 ```
 
-- [ ] **Step 2: Test exact duplicate rules**
+- [x] **Step 2: Test exact duplicate rules**
 
 Exact when:
 
@@ -388,17 +388,17 @@ Exact when:
 - canonical URL match.
 - content hash match.
 
-- [ ] **Step 3: Implement conservative near duplicate**
+- [x] **Step 3: Implement conservative near duplicate**
 
 Use title token Jaccard plus normalized content prefix similarity. Automatic near-duplicate requires a configured threshold at least `0.92`; otherwise return `ReviewRequired`.
 
 Do not use an LLM for duplicate decisions in Phase 2.
 
-- [ ] **Step 4: Test locked relations**
+- [x] **Step 4: Test locked relations**
 
 A user-locked `Independent` or duplicate relation cannot be overwritten by reprocessing.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 cargo test analysis::events::dedup
@@ -423,7 +423,7 @@ git commit -m "feat: deduplicate event evidence conservatively"
 - The selected source configuration is environment-driven.
 - Content retention policy is explicit.
 
-- [ ] **Step 1: Define `EventSource`**
+- [x] **Step 1: Define `EventSource`**
 
 ```rust
 #[async_trait::async_trait]
@@ -438,7 +438,7 @@ pub trait EventSource: Send + Sync {
 }
 ```
 
-- [ ] **Step 2: Add configuration**
+- [x] **Step 2: Add configuration**
 
 ```rust
 pub official_event_feed_url: Option<String>,
@@ -456,7 +456,7 @@ OFFICIAL_EVENT_SOURCE_ID
 OFFICIAL_EVENT_STORE_FULL_CONTENT
 ```
 
-- [ ] **Step 3: Implement adapter parsing**
+- [x] **Step 3: Implement adapter parsing**
 
 The adapter must map:
 
@@ -471,11 +471,11 @@ raw_payload
 
 When full content retention is disabled, discard full content before persistence.
 
-- [ ] **Step 4: Add fixture tests**
+- [x] **Step 4: Add fixture tests**
 
 No live network calls in tests. Parse a local JSON fixture and assert retention behavior.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 cargo test analysis::adapters::official_event_source
@@ -498,7 +498,7 @@ git commit -m "feat: add official market-event source adapter"
 - Outputs candidate claims only.
 - Invalid Schema never reaches the published layer.
 
-- [ ] **Step 1: Define strict Rust Schema**
+- [x] **Step 1: Define strict Rust Schema**
 
 Use `#[serde(deny_unknown_fields)]`:
 
@@ -533,7 +533,7 @@ rumor
 unknown
 ```
 
-- [ ] **Step 2: Add Schema tests**
+- [x] **Step 2: Add Schema tests**
 
 Assert:
 
@@ -542,7 +542,7 @@ Assert:
 - unknown JSON fields fail.
 - a fixture round-trips.
 
-- [ ] **Step 3: Implement the LLM adapter**
+- [x] **Step 3: Implement the LLM adapter**
 
 Reuse OpenAI-compatible HTTP settings but use a dedicated system prompt and temperature `0`.
 
@@ -554,7 +554,7 @@ The adapter must:
 4. Return a validation error after the second failure.
 5. Save prompt version and model parameters.
 
-- [ ] **Step 4: Add deterministic validation**
+- [x] **Step 4: Add deterministic validation**
 
 Validate:
 
@@ -563,7 +563,7 @@ Validate:
 - direct stock codes map to known `stock_info`.
 - rumor/opinion claims cannot be promoted to facts.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 cargo test analysis::events::extraction -- --nocapture
@@ -586,7 +586,7 @@ git commit -m "feat: extract evidence-backed market-event claims"
 - Produces ClaimGraph with evidence-backed nodes and edges.
 - No industry-chain beneficiary expansion.
 
-- [ ] **Step 1: Test direct entity linking**
+- [x] **Step 1: Test direct entity linking**
 
 Fixture cases:
 
@@ -596,7 +596,7 @@ Fixture cases:
 - ambiguous short name returns review required.
 - unknown organization remains unmapped.
 
-- [ ] **Step 2: Implement link priority**
+- [x] **Step 2: Implement link priority**
 
 ```text
 explicit security code
@@ -606,7 +606,7 @@ exact official industry name
 otherwise unresolved
 ```
 
-- [ ] **Step 3: Define ClaimGraph payload**
+- [x] **Step 3: Define ClaimGraph payload**
 
 ```rust
 pub struct ClaimGraph {
@@ -632,11 +632,11 @@ pub struct ClaimEdge {
 }
 ```
 
-- [ ] **Step 4: Enforce evidence**
+- [x] **Step 4: Enforce evidence**
 
 Graph construction returns an error if any node or edge has no evidence IDs.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 cargo test analysis::events::entity_linking analysis::events::claims
@@ -659,7 +659,7 @@ git commit -m "feat: build evidence-backed event claim graphs"
 - Adds manual submission and read endpoints.
 - Keeps event handlers outside the existing large route file.
 
-- [ ] **Step 1: Add endpoints**
+- [x] **Step 1: Add endpoints**
 
 ```text
 POST /api/analysis/events/manual
@@ -669,7 +669,7 @@ POST /api/analysis/events/:id/review
 GET  /api/analysis/events/daily-brief
 ```
 
-- [ ] **Step 2: Implement manual submission response**
+- [x] **Step 2: Implement manual submission response**
 
 ```json
 {
@@ -680,7 +680,7 @@ GET  /api/analysis/events/daily-brief
 }
 ```
 
-- [ ] **Step 3: Add Telegram commands**
+- [x] **Step 3: Add Telegram commands**
 
 ```text
 /event
@@ -692,7 +692,7 @@ GET  /api/analysis/events/daily-brief
 
 Only command parsing remains in `routes.rs`; event business logic stays in `EventIntelligence`.
 
-- [ ] **Step 4: Test auth and validation**
+- [x] **Step 4: Test auth and validation**
 
 Reject:
 
@@ -701,7 +701,7 @@ Reject:
 - unauthorized review action.
 - invalid evidence ID.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 cargo test api::event_routes -- --nocapture
@@ -726,7 +726,7 @@ git commit -m "feat: expose market-event evidence workflows"
 - Pushes facts only.
 - Event score remains zero.
 
-- [ ] **Step 1: Write report golden tests**
+- [x] **Step 1: Write report golden tests**
 
 Output sections:
 
@@ -740,11 +740,11 @@ Output sections:
 
 Assert every fact includes at least one source reference.
 
-- [ ] **Step 2: Implement report builder**
+- [x] **Step 2: Implement report builder**
 
 Do not ask an LLM to compose the fact brief. Render from structured claims and sources. LLM use is limited to extraction.
 
-- [ ] **Step 3: Add jobs**
+- [x] **Step 3: Add jobs**
 
 ```rust
 pub async fn run_event_ingestion_job(state: Arc<AppState>);
@@ -760,11 +760,11 @@ fact brief: 17:50 trading days
 
 The hourly job must use provider cursor state and be idempotent.
 
-- [ ] **Step 4: Add failure isolation**
+- [x] **Step 4: Add failure isolation**
 
 A failed event source or extraction must not fail the existing daily market report.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 cargo fmt --all -- --check
@@ -778,14 +778,14 @@ git commit -m "feat: publish daily evidence-backed market facts"
 
 ## Phase Completion Checklist
 
-- [ ] Manual input works.
-- [ ] One official source works through an adapter.
-- [ ] Retention policy is enforced.
-- [ ] Evidence versions are immutable.
-- [ ] Exact and near duplicates are conservative and auditable.
-- [ ] Every published fact has evidence.
-- [ ] Direct entity mapping does not guess ambiguous stocks.
-- [ ] ClaimGraph contains facts only.
-- [ ] No GDELT or complex clustering exists yet.
-- [ ] No event score reaches candidate ranking.
-- [ ] No non-direct beneficiary stock list is generated.
+- [x] Manual input works.
+- [x] One official source works through an adapter.
+- [x] Retention policy is enforced.
+- [x] Evidence versions are immutable.
+- [x] Exact and near duplicates are conservative and auditable.
+- [x] Every published fact has evidence.
+- [x] Direct entity mapping does not guess ambiguous stocks.
+- [x] ClaimGraph contains facts only.
+- [x] No GDELT or complex clustering exists yet.
+- [x] No event score reaches candidate ranking.
+- [x] No non-direct beneficiary stock list is generated.
