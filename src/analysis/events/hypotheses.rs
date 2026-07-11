@@ -42,10 +42,10 @@ pub struct HypothesisEdge {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FrozenImpactHypothesis {
-    pub hypothesis_id: Uuid,
-    pub hypothesis_version: i32,
-    pub supersedes_hypothesis_id: Option<Uuid>,
-    pub graph: ImpactHypothesisGraph,
+    hypothesis_id: Uuid,
+    hypothesis_version: i32,
+    supersedes_hypothesis_id: Option<Uuid>,
+    graph: ImpactHypothesisGraph,
 }
 
 pub fn build_impact_hypothesis_graph(
@@ -179,6 +179,22 @@ pub fn build_impact_hypothesis_graph(
 }
 
 impl FrozenImpactHypothesis {
+    pub fn hypothesis_id(&self) -> Uuid {
+        self.hypothesis_id
+    }
+
+    pub fn hypothesis_version(&self) -> i32 {
+        self.hypothesis_version
+    }
+
+    pub fn supersedes_hypothesis_id(&self) -> Option<Uuid> {
+        self.supersedes_hypothesis_id
+    }
+
+    pub fn graph(&self) -> &ImpactHypothesisGraph {
+        &self.graph
+    }
+
     pub fn initial(
         claim_graph: &ClaimGraph,
         based_on_claim_ids: Vec<Uuid>,
@@ -199,7 +215,13 @@ impl FrozenImpactHypothesis {
         frozen_at: DateTime<Utc>,
     ) -> Result<Self> {
         let canonical_ids = canonical_claim_ids(based_on_claim_ids)?;
-        if canonical_ids == self.graph.based_on_claim_ids {
+        let prior_ids = &self.graph.based_on_claim_ids;
+        let prior_preserved = prior_ids
+            .iter()
+            .all(|claim_id| canonical_ids.binary_search(claim_id).is_ok());
+        let has_new_fact = canonical_ids.len() > prior_ids.len();
+
+        if !prior_preserved || !has_new_fact {
             return Err(AppError::BadRequest(
                 "frozen hypotheses require new facts to create a new version".to_string(),
             ));
@@ -409,7 +431,9 @@ fn infer_targets<'a>(
         let Some(linked) = node_index.get(linked_id) else {
             continue;
         };
-        let target = target_from_claim_node(linked, edge);
+        let Some(target) = target_from_claim_node(linked, edge) else {
+            continue;
+        };
         if seen.insert((target.node_type.clone(), target.label.clone())) {
             targets.push(target);
         }
@@ -430,28 +454,29 @@ fn infer_targets<'a>(
     targets
 }
 
-fn target_from_claim_node(node: &ClaimNode, edge: &ClaimEdge) -> InferredTarget {
+fn target_from_claim_node(node: &ClaimNode, edge: &ClaimEdge) -> Option<InferredTarget> {
     let sanitized_label = sanitize_hypothesis_label(&node.label);
     let (node_type, label) = match node.node_type.as_str() {
-        "CompanyFact" => (
+        _ if mentions_archetype(&sanitized_label) => {
+            ("StockArchetypeImpact".to_string(), sanitized_label.clone())
+        }
+        "CompanyFact" if is_direct_company_target(&sanitized_label) => (
             "RevenueImpact".to_string(),
             extract_company_subject(&sanitized_label),
         ),
+        "CompanyFact" => return None,
         "SupplyFact" | "DemandFact" | "PriceFact" => {
             ("IndustryImpact".to_string(), sanitized_label.clone())
         }
         "RegulatoryFact" | "PolicyFact" => ("IndustryImpact".to_string(), sanitized_label.clone()),
-        _ if mentions_archetype(&sanitized_label) => {
-            ("StockArchetypeImpact".to_string(), sanitized_label.clone())
-        }
         _ => ("IndustryImpact".to_string(), sanitized_label.clone()),
     };
 
-    InferredTarget {
+    Some(InferredTarget {
         node_type,
         label,
         confidence: node.confidence.min(edge.confidence),
-    }
+    })
 }
 
 fn fallback_target(source_node: &ClaimNode, template: &TemplateSpec) -> (String, String) {
@@ -541,6 +566,11 @@ fn mentions_archetype(value: &str) -> bool {
             "contractor",
         ],
     )
+}
+
+fn is_direct_company_target(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    !contains_any(&lower, &["peer", "beneficiary", "indirect", "basket"])
 }
 
 fn looks_like_stock_code(token: &str) -> bool {
@@ -769,6 +799,81 @@ mod tests {
     }
 
     #[test]
+    fn hypothesis_scope_omits_indirect_company_targets() {
+        let graph = build_impact_hypothesis_graph(
+            &ClaimGraph::new(
+                "claim_graph_v1",
+                vec![
+                    claim_node(
+                        "order-1",
+                        "CompanyFact",
+                        "Acme Robotics wins major automation order",
+                        vec![evidence_id(24)],
+                        0.91,
+                    ),
+                    claim_node(
+                        "peer-1",
+                        "CompanyFact",
+                        "Peer beneficiary basket 600519.SH 000001.SZ",
+                        vec![evidence_id(25)],
+                        0.75,
+                    ),
+                    claim_node(
+                        "industry-1",
+                        "DemandFact",
+                        "Industrial automation demand",
+                        vec![evidence_id(26)],
+                        0.78,
+                    ),
+                    claim_node(
+                        "upstream-1",
+                        "SupplyFact",
+                        "Upstream servo suppliers",
+                        vec![evidence_id(27)],
+                        0.74,
+                    ),
+                ],
+                vec![
+                    claim_edge("order-1", "peer-1", "impacts", vec![evidence_id(28)], 0.7),
+                    claim_edge(
+                        "order-1",
+                        "industry-1",
+                        "impacts",
+                        vec![evidence_id(29)],
+                        0.77,
+                    ),
+                    claim_edge(
+                        "order-1",
+                        "upstream-1",
+                        "impacts",
+                        vec![evidence_id(30)],
+                        0.72,
+                    ),
+                ],
+            )
+            .unwrap(),
+            vec![Uuid::from_u128(2002)],
+            dt(2026, 7, 11, 11),
+        )
+        .unwrap();
+
+        assert!(graph
+            .nodes
+            .iter()
+            .all(|node| node.label != "Peer beneficiary basket"));
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|node| node.node_type == "IndustryImpact"
+                && node.label == "Industrial automation demand"));
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|node| node.node_type == "StockArchetypeImpact"
+                && node.label == "Upstream servo suppliers"));
+    }
+
+    #[test]
     fn frozen_hypotheses_require_new_version_when_new_facts_arrive() {
         let initial = FrozenImpactHypothesis::initial(
             &ClaimGraph::new(
@@ -816,15 +921,15 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(initial.hypothesis_version, 1);
-        assert_eq!(evolved.hypothesis_version, 2);
-        assert_eq!(evolved.graph.based_on_claim_ids.len(), 2);
+        assert_eq!(initial.hypothesis_version(), 1);
+        assert_eq!(evolved.hypothesis_version(), 2);
+        assert_eq!(evolved.graph().based_on_claim_ids.len(), 2);
         assert_eq!(
-            evolved.supersedes_hypothesis_id,
-            Some(initial.hypothesis_id)
+            evolved.supersedes_hypothesis_id(),
+            Some(initial.hypothesis_id())
         );
         assert_eq!(
-            initial.graph.based_on_claim_ids,
+            initial.graph().based_on_claim_ids,
             vec![Uuid::from_u128(3001)]
         );
     }
@@ -873,6 +978,133 @@ mod tests {
             error.to_string(),
             "frozen hypotheses require new facts to create a new version"
         );
+    }
+
+    #[test]
+    fn frozen_hypotheses_reject_subset_claim_ids_when_evolving() {
+        let initial = FrozenImpactHypothesis::initial(
+            &ClaimGraph::new(
+                "claim_graph_v1",
+                vec![claim_node(
+                    "order-1",
+                    "CompanyFact",
+                    "Acme Robotics wins major automation order",
+                    vec![evidence_id(42)],
+                    0.91,
+                )],
+                Vec::new(),
+            )
+            .unwrap(),
+            vec![Uuid::from_u128(5001), Uuid::from_u128(5002)],
+            dt(2026, 7, 11, 16),
+        )
+        .unwrap();
+
+        let error = initial
+            .evolve(
+                &ClaimGraph::new(
+                    "claim_graph_v1",
+                    vec![claim_node(
+                        "order-1",
+                        "CompanyFact",
+                        "Acme Robotics wins major automation order",
+                        vec![evidence_id(42)],
+                        0.91,
+                    )],
+                    Vec::new(),
+                )
+                .unwrap(),
+                vec![Uuid::from_u128(5001)],
+                dt(2026, 7, 11, 17),
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, AppError::BadRequest(_)));
+        assert_eq!(
+            error.to_string(),
+            "frozen hypotheses require new facts to create a new version"
+        );
+    }
+
+    #[test]
+    fn frozen_hypotheses_reject_replacement_claim_ids_when_evolving() {
+        let initial = FrozenImpactHypothesis::initial(
+            &ClaimGraph::new(
+                "claim_graph_v1",
+                vec![claim_node(
+                    "order-1",
+                    "CompanyFact",
+                    "Acme Robotics wins major automation order",
+                    vec![evidence_id(43)],
+                    0.91,
+                )],
+                Vec::new(),
+            )
+            .unwrap(),
+            vec![Uuid::from_u128(6001), Uuid::from_u128(6002)],
+            dt(2026, 7, 11, 18),
+        )
+        .unwrap();
+
+        let error = initial
+            .evolve(
+                &ClaimGraph::new(
+                    "claim_graph_v1",
+                    vec![
+                        claim_node(
+                            "order-1",
+                            "CompanyFact",
+                            "Acme Robotics wins major automation order",
+                            vec![evidence_id(43)],
+                            0.91,
+                        ),
+                        claim_node(
+                            "order-2",
+                            "CompanyFact",
+                            "Replacement order fact",
+                            vec![evidence_id(44)],
+                            0.85,
+                        ),
+                    ],
+                    Vec::new(),
+                )
+                .unwrap(),
+                vec![Uuid::from_u128(6001), Uuid::from_u128(6003)],
+                dt(2026, 7, 11, 19),
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, AppError::BadRequest(_)));
+        assert_eq!(
+            error.to_string(),
+            "frozen hypotheses require new facts to create a new version"
+        );
+    }
+
+    #[test]
+    fn frozen_hypothesis_wrapper_fields_are_private() {
+        let source =
+            std::fs::read_to_string(format!("{}/{}", env!("CARGO_MANIFEST_DIR"), file!())).unwrap();
+
+        let struct_body = source
+            .split("pub struct FrozenImpactHypothesis {")
+            .nth(1)
+            .and_then(|tail| tail.split("}").next())
+            .unwrap();
+
+        assert!(!struct_body.contains("pub hypothesis_id:"));
+        assert!(!struct_body.contains("pub hypothesis_version:"));
+        assert!(!struct_body.contains("pub supersedes_hypothesis_id:"));
+        assert!(!struct_body.contains("pub graph:"));
+
+        let _hypothesis_id: fn(&FrozenImpactHypothesis) -> Uuid =
+            FrozenImpactHypothesis::hypothesis_id;
+        let _hypothesis_version: fn(&FrozenImpactHypothesis) -> i32 =
+            FrozenImpactHypothesis::hypothesis_version;
+        let _supersedes: fn(&FrozenImpactHypothesis) -> Option<Uuid> =
+            FrozenImpactHypothesis::supersedes_hypothesis_id;
+        let _graph: fn(&FrozenImpactHypothesis) -> &ImpactHypothesisGraph =
+            FrozenImpactHypothesis::graph;
     }
 
     fn claim_node(
