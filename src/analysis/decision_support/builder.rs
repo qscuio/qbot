@@ -8,6 +8,7 @@ use crate::analysis::decision_support::contracts::{
     DailyDecisionSupport, DataStatus, DecisionSupportConfig, MarketSummary, StatementBucket,
     SupportStatement,
 };
+use crate::analysis::decision_support::event_adapter::apply_event_context;
 use crate::analysis::decision_support::pattern_adapter::build_decision_candidates;
 use crate::analysis::decision_support::scan_ranker_adapter::load_scan_ranker_baseline;
 use crate::analysis::events::DailyEventBrief;
@@ -69,7 +70,14 @@ impl DecisionSupport {
             .as_ref()
             .map(parse_event_summary)
             .transpose()?;
-        let candidates = build_decision_candidates(scan_candidates, pattern_candidates);
+        let candidates = apply_event_context(
+            trade_date,
+            build_decision_candidates(scan_candidates, pattern_candidates),
+            event_summary.as_ref(),
+            &self.event_repo,
+            &self.market_repo,
+        )
+        .await?;
         let data_status = data_status_from_snapshot(
             trade_date,
             &config.market_snapshot_version,
