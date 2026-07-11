@@ -188,130 +188,39 @@ async fn insert_candidate(
     tx: &mut Transaction<'_, Postgres>,
     row: &DecisionCandidateRow,
 ) -> Result<usize> {
-    let rows_affected = match (row.event_adjustment, row.risk_adjustment) {
-        (Some(event_adjustment), Some(risk_adjustment)) => sqlx::query(
-            r#"INSERT INTO analysis_decision_candidates
-                   (run_id, code, name, horizon, base_source, base_score, pattern_score,
-                    event_adjustment, risk_adjustment, final_score, support_tier, facts,
-                    calculations, inferences, unknowns, risk_flags, invalidations,
-                    source_refs, created_at)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7,
-                           $8, $9, $10, $11, $12,
-                           $13, $14, $15, $16, $17,
-                           $18, $19)"#,
-        )
-        .bind(row.run_id)
-        .bind(&row.code)
-        .bind(&row.name)
-        .bind(&row.horizon)
-        .bind(&row.base_source)
-        .bind(row.base_score)
-        .bind(row.pattern_score)
-        .bind(event_adjustment)
-        .bind(risk_adjustment)
-        .bind(row.final_score)
-        .bind(&row.support_tier)
-        .bind(&row.facts)
-        .bind(&row.calculations)
-        .bind(&row.inferences)
-        .bind(&row.unknowns)
-        .bind(&row.risk_flags)
-        .bind(&row.invalidations)
-        .bind(&row.source_refs)
-        .bind(row.created_at)
-        .execute(&mut **tx)
-        .await?
-        .rows_affected(),
-        (Some(event_adjustment), None) => sqlx::query(
-            r#"INSERT INTO analysis_decision_candidates
-                   (run_id, code, name, horizon, base_source, base_score, pattern_score,
-                    event_adjustment, final_score, support_tier, facts, calculations,
-                    inferences, unknowns, risk_flags, invalidations, source_refs, created_at)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7,
-                           $8, $9, $10, $11, $12,
-                           $13, $14, $15, $16, $17, $18)"#,
-        )
-        .bind(row.run_id)
-        .bind(&row.code)
-        .bind(&row.name)
-        .bind(&row.horizon)
-        .bind(&row.base_source)
-        .bind(row.base_score)
-        .bind(row.pattern_score)
-        .bind(event_adjustment)
-        .bind(row.final_score)
-        .bind(&row.support_tier)
-        .bind(&row.facts)
-        .bind(&row.calculations)
-        .bind(&row.inferences)
-        .bind(&row.unknowns)
-        .bind(&row.risk_flags)
-        .bind(&row.invalidations)
-        .bind(&row.source_refs)
-        .bind(row.created_at)
-        .execute(&mut **tx)
-        .await?
-        .rows_affected(),
-        (None, Some(risk_adjustment)) => sqlx::query(
-            r#"INSERT INTO analysis_decision_candidates
-                   (run_id, code, name, horizon, base_source, base_score, pattern_score,
-                    risk_adjustment, final_score, support_tier, facts, calculations,
-                    inferences, unknowns, risk_flags, invalidations, source_refs, created_at)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7,
-                           $8, $9, $10, $11, $12,
-                           $13, $14, $15, $16, $17, $18)"#,
-        )
-        .bind(row.run_id)
-        .bind(&row.code)
-        .bind(&row.name)
-        .bind(&row.horizon)
-        .bind(&row.base_source)
-        .bind(row.base_score)
-        .bind(row.pattern_score)
-        .bind(risk_adjustment)
-        .bind(row.final_score)
-        .bind(&row.support_tier)
-        .bind(&row.facts)
-        .bind(&row.calculations)
-        .bind(&row.inferences)
-        .bind(&row.unknowns)
-        .bind(&row.risk_flags)
-        .bind(&row.invalidations)
-        .bind(&row.source_refs)
-        .bind(row.created_at)
-        .execute(&mut **tx)
-        .await?
-        .rows_affected(),
-        (None, None) => sqlx::query(
-            r#"INSERT INTO analysis_decision_candidates
-                   (run_id, code, name, horizon, base_source, base_score, pattern_score,
-                    final_score, support_tier, facts, calculations, inferences, unknowns,
-                    risk_flags, invalidations, source_refs, created_at)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7,
-                           $8, $9, $10, $11, $12, $13,
-                           $14, $15, $16, $17)"#,
-        )
-        .bind(row.run_id)
-        .bind(&row.code)
-        .bind(&row.name)
-        .bind(&row.horizon)
-        .bind(&row.base_source)
-        .bind(row.base_score)
-        .bind(row.pattern_score)
-        .bind(row.final_score)
-        .bind(&row.support_tier)
-        .bind(&row.facts)
-        .bind(&row.calculations)
-        .bind(&row.inferences)
-        .bind(&row.unknowns)
-        .bind(&row.risk_flags)
-        .bind(&row.invalidations)
-        .bind(&row.source_refs)
-        .bind(row.created_at)
-        .execute(&mut **tx)
-        .await?
-        .rows_affected(),
-    };
+    let rows_affected = sqlx::query(
+        r#"INSERT INTO analysis_decision_candidates
+               (run_id, code, name, horizon, base_source, base_score, pattern_score,
+                event_adjustment, risk_adjustment, final_score, support_tier, facts,
+                calculations, inferences, unknowns, risk_flags, invalidations,
+                source_refs, created_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7,
+                       $8, $9, $10, $11, $12,
+                       $13, $14, $15, $16, $17,
+                       $18, $19)"#,
+    )
+    .bind(row.run_id)
+    .bind(&row.code)
+    .bind(&row.name)
+    .bind(&row.horizon)
+    .bind(&row.base_source)
+    .bind(row.base_score)
+    .bind(row.pattern_score)
+    .bind(row.event_adjustment.unwrap_or(0.0))
+    .bind(row.risk_adjustment.unwrap_or(0.0))
+    .bind(row.final_score)
+    .bind(&row.support_tier)
+    .bind(&row.facts)
+    .bind(&row.calculations)
+    .bind(&row.inferences)
+    .bind(&row.unknowns)
+    .bind(&row.risk_flags)
+    .bind(&row.invalidations)
+    .bind(&row.source_refs)
+    .bind(row.created_at)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
 
     Ok(rows_affected as usize)
 }
@@ -458,7 +367,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn save_candidates_preserves_reason_buckets_and_uses_zero_event_default(
+    async fn save_candidates_preserves_reason_buckets_and_uses_zero_adjustment_defaults(
         pool: PgPool,
     ) -> sqlx::Result<()> {
         let repo = DecisionSupportRepository::new(pool.clone());
@@ -470,9 +379,10 @@ mod tests {
         );
         repo.create_run(&run).await.unwrap();
 
-        repo.save_candidates(&[candidate_row(run.run_id)])
-            .await
-            .unwrap();
+        let mut candidate = candidate_row(run.run_id);
+        candidate.risk_adjustment = None;
+
+        repo.save_candidates(&[candidate]).await.unwrap();
 
         let rows = repo.list_candidates(run.run_id).await.unwrap();
         assert_eq!(rows.len(), 1);
@@ -481,6 +391,7 @@ mod tests {
         assert_eq!(rows[0].inferences, json!(["inference-1"]));
         assert_eq!(rows[0].unknowns, json!(["unknown-1"]));
         assert_eq!(rows[0].event_adjustment, Some(0.0));
+        assert_eq!(rows[0].risk_adjustment, Some(0.0));
 
         Ok(())
     }
