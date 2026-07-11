@@ -71,3 +71,5 @@ Gate 3 Task 5: complete (commits 97d7773..27836dd, review clean after freeze pay
 Gate 3 Task 6: complete (commits cce5739..4f735dc, review clean; verification: analysis::events::market_observation 6/6 passed with DATABASE_URL, fmt check passed, diff check passed)
 
 Gate 3 Task 7: complete (commits aee0b23..7b4a02a, review clean; verification: analysis::events::event_statistics 3/3 passed, fmt check passed, diff check passed)
+
+Gate 3 Task 8: complete (commits e3bbee6..f1f5e6d, review clean; verification: reporting 5/5, scheduler 16/16, event_routes 16/16 passed with DATABASE_URL, fmt check passed, diff check passed)

@@ -560,14 +560,14 @@ git commit -m "feat: add historical event-impact baselines"
 - Adds evolution detail and market-logic brief.
 - Keeps event score zero.
 
-- [ ] **Step 1: Add jobs**
+- [x] **Step 1: Add jobs**
 
 ```rust
 pub async fn run_event_cluster_refinement_job(state: Arc<AppState>);
 pub async fn run_event_market_observation_job(state: Arc<AppState>);
 ```
 
-- [ ] **Step 2: Add report sections**
+- [x] **Step 2: Add report sections**
 
 ```text
 今日事件增量
@@ -579,7 +579,7 @@ pub async fn run_event_market_observation_job(state: Arc<AppState>);
 同类历史基线
 ```
 
-- [ ] **Step 3: Add endpoints**
+- [x] **Step 3: Add endpoints**
 
 ```text
 GET /api/analysis/events/:id/evolution
@@ -588,7 +588,7 @@ GET /api/analysis/events/:id/market-observations
 GET /api/analysis/events/market-logic-brief
 ```
 
-- [ ] **Step 4: Add safety tests**
+- [x] **Step 4: Add safety tests**
 
 Assert:
 
@@ -597,7 +597,7 @@ Assert:
 - report does not claim market causality.
 - indirect stock-code lists are absent.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 cargo fmt --all -- --check
@@ -612,12 +612,12 @@ git commit -m "feat: report evolving events and market alignment"
 ## Phase Completion Checklist
 
 - [x] GDELT is supplementary and idempotent.
-- [ ] EventMention and EventCluster are versioned.
-- [ ] Two-stage clustering respects manual locks.
+- [x] EventMention and EventCluster are versioned.
+- [x] Two-stage clustering respects manual locks.
 - [x] EventDelta highlights new information.
 - [x] Hypotheses freeze before market observation.
 - [x] Market alignment and causal confidence are separate.
 - [x] Confounded windows are explicit.
 - [x] Event-type baselines are point-in-time safe.
-- [ ] Event score remains zero.
+- [x] Event score remains zero.
 - [x] No indirect beneficiary stock list is generated.
