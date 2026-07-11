@@ -708,25 +708,15 @@ fn extracted_claim_review_status(
 
 fn supplementary_company_fact_autopublish_blocked(
     evidence: &EventEvidenceRow,
-    extraction: &EventExtractionV1,
+    _extraction: &EventExtractionV1,
 ) -> bool {
-    supplementary_evidence_metadata(evidence) && extraction_has_direct_company_subject(extraction)
+    supplementary_evidence_metadata(evidence)
 }
 
 fn supplementary_evidence_metadata(evidence: &EventEvidenceRow) -> bool {
     evidence.source_tier == "supplement"
         || evidence.raw_payload["sourceRole"] == json!("macro_supplement")
         || evidence.raw_payload["companyFactEligible"] == json!(false)
-}
-
-fn extraction_has_direct_company_subject(extraction: &EventExtractionV1) -> bool {
-    extraction.entities.iter().any(|entity| {
-        entity.role == "subject"
-            && matches!(
-                entity.entity_type.as_str(),
-                "organization" | "company" | "issuer"
-            )
-    })
 }
 
 fn latest_publishable_rows(rows: Vec<EventEvidenceRow>) -> Vec<EventEvidenceRow> {
@@ -1371,6 +1361,98 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn supplementary_company_fact_extraction_without_entities_stays_draft_and_out_of_daily_facts(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = EventRepository::new(pool.clone());
+        let trade_date = chrono::NaiveDate::from_ymd_opt(2026, 7, 10).unwrap();
+        let pending = pending_evidence_row(
+            "gdelt:market_event",
+            "gdelt-company-fact-no-entities",
+            "supplement",
+            trade_date,
+            json!({
+                "sourceRole": "macro_supplement",
+                "companyFactEligible": false
+            }),
+        );
+        repo.insert_evidence(&pending).await.unwrap();
+
+        let intelligence = EventIntelligence::with_repository_resolver_and_extractor(
+            repo.clone(),
+            Arc::new(FixedTradeDateResolver(trade_date)),
+            Arc::new(StaticCompanyFactWithoutEntitiesExtractor),
+        );
+        intelligence.process_pending(Utc::now()).await.unwrap();
+
+        let extraction = repo
+            .list_latest_extractions_for_evidence_ids(&[pending.evidence_id])
+            .await
+            .unwrap()
+            .pop()
+            .expect("expected saved extraction");
+        assert_eq!(extraction.claims.len(), 1);
+        assert_eq!(extraction.claims[0].review_status, "draft");
+
+        let brief = intelligence.build_daily_brief(trade_date).await.unwrap();
+        assert!(brief.new_facts.is_empty());
+        assert!(brief.revisions.is_empty());
+        assert_eq!(brief.unconfirmed.len(), 1);
+        assert_eq!(
+            brief.unconfirmed[0].summary,
+            "Kweichow Moutai won a major order."
+        );
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn supplementary_company_fact_extraction_with_misrolled_entities_stays_draft_and_out_of_daily_facts(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = EventRepository::new(pool.clone());
+        let trade_date = chrono::NaiveDate::from_ymd_opt(2026, 7, 10).unwrap();
+        let pending = pending_evidence_row(
+            "gdelt:market_event",
+            "gdelt-company-fact-misrolled-entities",
+            "supplement",
+            trade_date,
+            json!({
+                "sourceRole": "macro_supplement",
+                "companyFactEligible": false
+            }),
+        );
+        repo.insert_evidence(&pending).await.unwrap();
+
+        let intelligence = EventIntelligence::with_repository_resolver_and_extractor(
+            repo.clone(),
+            Arc::new(FixedTradeDateResolver(trade_date)),
+            Arc::new(StaticCompanyFactMisrolledEntitiesExtractor),
+        );
+        intelligence.process_pending(Utc::now()).await.unwrap();
+
+        let extraction = repo
+            .list_latest_extractions_for_evidence_ids(&[pending.evidence_id])
+            .await
+            .unwrap()
+            .pop()
+            .expect("expected saved extraction");
+        assert_eq!(extraction.claims.len(), 1);
+        assert_eq!(extraction.claims[0].review_status, "draft");
+
+        let brief = intelligence.build_daily_brief(trade_date).await.unwrap();
+        assert!(brief.new_facts.is_empty());
+        assert!(brief.revisions.is_empty());
+        assert_eq!(brief.unconfirmed.len(), 1);
+        assert_eq!(
+            brief.unconfirmed[0].summary,
+            "Kweichow Moutai won a major order."
+        );
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn official_company_fact_extraction_still_publishes_daily_facts(
         pool: PgPool,
     ) -> sqlx::Result<()> {
@@ -1563,6 +1645,81 @@ mod tests {
                         text: "Kweichow Moutai".to_string(),
                         entity_type: "issuer".to_string(),
                         role: "subject".to_string(),
+                        stock_code: Some("600519.SH".to_string()),
+                    }],
+                    amounts: Vec::new(),
+                    dates: Vec::new(),
+                    uncertainties: Vec::new(),
+                    missing_information: Vec::new(),
+                },
+                metadata: EventExtractionMetadata {
+                    schema_version: "event_extraction_v1".to_string(),
+                    prompt_version: "prompt-v1".to_string(),
+                    model_name: "test-model".to_string(),
+                    model_parameters: json!({"temperature": 0}),
+                },
+            })
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct StaticCompanyFactWithoutEntitiesExtractor;
+
+    #[async_trait]
+    impl EventExtractor for StaticCompanyFactWithoutEntitiesExtractor {
+        async fn extract(
+            &self,
+            input: EventExtractionInput,
+        ) -> crate::error::Result<EventExtractionOutput> {
+            Ok(EventExtractionOutput {
+                extraction: EventExtractionV1 {
+                    event_type: "issuer_disclosure".to_string(),
+                    event_subtype: Some("order_win".to_string()),
+                    claims: vec![ExtractedClaim {
+                        claim_type: ClaimType::Fact,
+                        text: "Kweichow Moutai won a major order.".to_string(),
+                        evidence_ids: vec![input.evidence_id],
+                        confidence: 0.95,
+                    }],
+                    entities: Vec::new(),
+                    amounts: Vec::new(),
+                    dates: Vec::new(),
+                    uncertainties: Vec::new(),
+                    missing_information: Vec::new(),
+                },
+                metadata: EventExtractionMetadata {
+                    schema_version: "event_extraction_v1".to_string(),
+                    prompt_version: "prompt-v1".to_string(),
+                    model_name: "test-model".to_string(),
+                    model_parameters: json!({"temperature": 0}),
+                },
+            })
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct StaticCompanyFactMisrolledEntitiesExtractor;
+
+    #[async_trait]
+    impl EventExtractor for StaticCompanyFactMisrolledEntitiesExtractor {
+        async fn extract(
+            &self,
+            input: EventExtractionInput,
+        ) -> crate::error::Result<EventExtractionOutput> {
+            Ok(EventExtractionOutput {
+                extraction: EventExtractionV1 {
+                    event_type: "issuer_disclosure".to_string(),
+                    event_subtype: Some("order_win".to_string()),
+                    claims: vec![ExtractedClaim {
+                        claim_type: ClaimType::Fact,
+                        text: "Kweichow Moutai won a major order.".to_string(),
+                        evidence_ids: vec![input.evidence_id],
+                        confidence: 0.95,
+                    }],
+                    entities: vec![ExtractedEntity {
+                        text: "Kweichow Moutai".to_string(),
+                        entity_type: "issuer".to_string(),
+                        role: "mentioned".to_string(),
                         stock_code: Some("600519.SH".to_string()),
                     }],
                     amounts: Vec::new(),
