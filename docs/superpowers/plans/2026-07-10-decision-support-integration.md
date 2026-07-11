@@ -375,7 +375,7 @@ git commit -m "feat: add zero-weight event context"
 - Adds a disabled-by-default configuration.
 - Maximum absolute adjustment is hard-capped at `5`.
 
-- [ ] **Step 1: Add config**
+- [x] **Step 1: Add config**
 
 ```rust
 pub enable_event_score_adjustment: bool,
@@ -395,7 +395,7 @@ Parsing must clamp:
 value.clamp(0.0, 5.0)
 ```
 
-- [ ] **Step 2: Add gate tests**
+- [x] **Step 2: Add gate tests**
 
 Assert:
 
@@ -405,7 +405,7 @@ Assert:
 - data-incomplete candidate cannot receive positive adjustment.
 - only direct entity or reviewed industry relation is eligible.
 
-- [ ] **Step 3: Implement audit payload**
+- [x] **Step 3: Implement audit payload**
 
 Every adjustment records:
 
@@ -420,7 +420,7 @@ cap
 reason
 ```
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ```bash
 cargo test decision_support::builder
