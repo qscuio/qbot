@@ -456,6 +456,10 @@ fn infer_targets<'a>(
 
 fn target_from_claim_node(node: &ClaimNode, edge: &ClaimEdge) -> Option<InferredTarget> {
     let sanitized_label = sanitize_hypothesis_label(&node.label);
+    if is_non_direct_beneficiary_list_label(&sanitized_label) {
+        return None;
+    }
+
     let (node_type, label) = match node.node_type.as_str() {
         _ if mentions_archetype(&sanitized_label) => {
             ("StockArchetypeImpact".to_string(), sanitized_label.clone())
@@ -481,10 +485,16 @@ fn target_from_claim_node(node: &ClaimNode, edge: &ClaimEdge) -> Option<Inferred
 
 fn fallback_target(source_node: &ClaimNode, template: &TemplateSpec) -> (String, String) {
     match template.logic_rule_id {
-        "company_order_v1" | "company_accident_v1" => (
-            extract_company_subject(&sanitize_hypothesis_label(&source_node.label)),
-            template.fallback_target_type.to_string(),
-        ),
+        "company_order_v1" | "company_accident_v1" => {
+            let sanitized_label = sanitize_hypothesis_label(&source_node.label);
+            let label = if is_non_direct_beneficiary_list_label(&sanitized_label) {
+                template.fallback_target_label.to_string()
+            } else {
+                extract_company_subject(&sanitized_label)
+            };
+
+            (label, template.fallback_target_type.to_string())
+        }
         _ => (
             template.fallback_target_label.to_string(),
             template.fallback_target_type.to_string(),
@@ -569,8 +579,15 @@ fn mentions_archetype(value: &str) -> bool {
 }
 
 fn is_direct_company_target(value: &str) -> bool {
+    !is_non_direct_beneficiary_list_label(value)
+}
+
+fn is_non_direct_beneficiary_list_label(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
-    !contains_any(&lower, &["peer", "beneficiary", "indirect", "basket"])
+    contains_any(
+        &lower,
+        &["peer", "beneficiar", "indirect", "basket", "list"],
+    )
 }
 
 fn looks_like_stock_code(token: &str) -> bool {
@@ -871,6 +888,103 @@ mod tests {
             .iter()
             .any(|node| node.node_type == "StockArchetypeImpact"
                 && node.label == "Upstream servo suppliers"));
+    }
+
+    #[test]
+    fn target_from_claim_node_rejects_non_direct_beneficiary_labels_across_non_company_paths() {
+        let edge = claim_edge(
+            "source-1",
+            "target-1",
+            "impacts",
+            vec![evidence_id(33)],
+            0.81,
+        );
+
+        for node_type in [
+            "DemandFact",
+            "SupplyFact",
+            "PriceFact",
+            "PolicyFact",
+            "RegulatoryFact",
+            "SourceLabel",
+        ] {
+            let target = target_from_claim_node(
+                &claim_node(
+                    "target-1",
+                    node_type,
+                    "Peer beneficiary basket 600519.SH 000001.SZ",
+                    vec![evidence_id(34)],
+                    0.86,
+                ),
+                &edge,
+            );
+
+            assert!(
+                target.is_none(),
+                "expected {node_type} beneficiary list label to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn company_template_fallback_does_not_emit_beneficiary_list_source_labels() {
+        let order_graph = build_impact_hypothesis_graph(
+            &ClaimGraph::new(
+                "claim_graph_v1",
+                vec![claim_node(
+                    "order-1",
+                    "CompanyFact",
+                    "Peer beneficiary basket 600519.SH 000001.SZ wins major automation order",
+                    vec![evidence_id(35)],
+                    0.91,
+                )],
+                Vec::new(),
+            )
+            .unwrap(),
+            vec![Uuid::from_u128(2003)],
+            dt(2026, 7, 11, 11),
+        )
+        .unwrap();
+
+        assert!(order_graph
+            .nodes
+            .iter()
+            .all(|node| !(node.node_type == "RevenueImpact"
+                && node.label == "Peer beneficiary basket")));
+        assert!(order_graph
+            .nodes
+            .iter()
+            .any(|node| node.node_type == "RevenueImpact"
+                && node.label == "direct order beneficiary"));
+
+        let accident_graph = build_impact_hypothesis_graph(
+            &ClaimGraph::new(
+                "claim_graph_v1",
+                vec![claim_node(
+                    "accident-1",
+                    "OperationalFact",
+                    "Peer beneficiary basket 600519.SH 000001.SZ accident halts production",
+                    vec![evidence_id(36)],
+                    0.88,
+                )],
+                Vec::new(),
+            )
+            .unwrap(),
+            vec![Uuid::from_u128(2004)],
+            dt(2026, 7, 11, 12),
+        )
+        .unwrap();
+
+        assert!(accident_graph
+            .nodes
+            .iter()
+            .all(|node| !(node.node_type == "MarginImpact"
+                && node.label == "Peer beneficiary basket")));
+        assert!(accident_graph
+            .nodes
+            .iter()
+            .any(|node| node.node_type == "MarginImpact"
+                && node.label == "operationally exposed company margin"));
     }
 
     #[test]
