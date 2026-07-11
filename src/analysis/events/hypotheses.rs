@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::claims::{ClaimEdge, ClaimGraph, ClaimNode};
+use super::deltas::{EventDelta, ExpectationGap, NormalizedValue, RevisedValue, StatusChange};
 use crate::error::{AppError, Result};
 
 pub const IMPACT_HYPOTHESIS_SCHEMA_VERSION: &str = "impact_hypothesis_graph_v1";
@@ -211,21 +212,10 @@ impl FrozenImpactHypothesis {
     pub fn evolve(
         &self,
         claim_graph: &ClaimGraph,
-        based_on_claim_ids: Vec<Uuid>,
+        event_delta: &EventDelta,
         frozen_at: DateTime<Utc>,
     ) -> Result<Self> {
-        let canonical_ids = canonical_claim_ids(based_on_claim_ids)?;
-        let prior_ids = &self.graph.based_on_claim_ids;
-        let prior_preserved = prior_ids
-            .iter()
-            .all(|claim_id| canonical_ids.binary_search(claim_id).is_ok());
-        let has_new_fact = canonical_ids.len() > prior_ids.len();
-
-        if !prior_preserved || !has_new_fact {
-            return Err(AppError::BadRequest(
-                "frozen hypotheses require new facts to create a new version".to_string(),
-            ));
-        }
+        let canonical_ids = evolved_claim_ids(&self.graph.based_on_claim_ids, event_delta)?;
 
         let graph = build_impact_hypothesis_graph(claim_graph, canonical_ids, frozen_at)?;
         if !strictly_preserves_prior_graph_payload(&self.graph, &graph) {
@@ -528,6 +518,36 @@ fn canonical_claim_ids(mut claim_ids: Vec<Uuid>) -> Result<Vec<Uuid>> {
     Ok(claim_ids)
 }
 
+fn evolved_claim_ids(prior_claim_ids: &[Uuid], event_delta: &EventDelta) -> Result<Vec<Uuid>> {
+    if !event_delta.removed_claim_ids.is_empty()
+        || !event_delta.revised_values.is_empty()
+        || !event_delta.status_changes.is_empty()
+        || event_delta.expectation_gap.is_some()
+    {
+        return Err(AppError::BadRequest(
+            "frozen hypotheses only support additive EventDelta claim changes".to_string(),
+        ));
+    }
+
+    if event_delta.new_claim_ids.is_empty() {
+        return Err(AppError::BadRequest(
+            "frozen hypotheses require EventDelta new facts to create a new version".to_string(),
+        ));
+    }
+
+    let mut canonical_ids = prior_claim_ids.to_vec();
+    canonical_ids.extend(event_delta.new_claim_ids.iter().copied());
+    let canonical_ids = canonical_claim_ids(canonical_ids)?;
+
+    if canonical_ids.len() <= prior_claim_ids.len() {
+        return Err(AppError::BadRequest(
+            "frozen hypotheses require EventDelta new facts to create a new version".to_string(),
+        ));
+    }
+
+    Ok(canonical_ids)
+}
+
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
@@ -668,7 +688,7 @@ fn rejects_non_direct_target_label(value: &str) -> bool {
 
 fn is_stock_code_only_list_label(value: &str) -> bool {
     let tokens = value
-        .split_whitespace()
+        .split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ';' | '/'))
         .map(|token| token.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '.'))
         .filter(|token| !token.is_empty())
         .collect::<Vec<_>>();
@@ -1116,7 +1136,7 @@ mod tests {
                     Vec::new(),
                 )
                 .unwrap(),
-                vec![Uuid::from_u128(3001), Uuid::from_u128(3002)],
+                &event_delta().with_new_claim_ids(vec![Uuid::from_u128(3002)]),
                 dt(2026, 7, 11, 13),
             )
             .unwrap();
@@ -1168,7 +1188,7 @@ mod tests {
                     Vec::new(),
                 )
                 .unwrap(),
-                vec![Uuid::from_u128(4001)],
+                &event_delta(),
                 dt(2026, 7, 11, 15),
             )
             .unwrap_err();
@@ -1176,12 +1196,12 @@ mod tests {
         assert!(matches!(error, AppError::BadRequest(_)));
         assert_eq!(
             error.to_string(),
-            "frozen hypotheses require new facts to create a new version"
+            "frozen hypotheses require EventDelta new facts to create a new version"
         );
     }
 
     #[test]
-    fn frozen_hypotheses_reject_subset_claim_ids_when_evolving() {
+    fn frozen_hypotheses_reject_removed_claim_deltas_when_evolving() {
         let initial = FrozenImpactHypothesis::initial(
             &ClaimGraph::new(
                 "claim_graph_v1",
@@ -1214,7 +1234,9 @@ mod tests {
                     Vec::new(),
                 )
                 .unwrap(),
-                vec![Uuid::from_u128(5001)],
+                &event_delta()
+                    .with_new_claim_ids(vec![Uuid::from_u128(5003)])
+                    .with_removed_claim_ids(vec![Uuid::from_u128(5002)]),
                 dt(2026, 7, 11, 17),
             )
             .unwrap_err();
@@ -1222,12 +1244,12 @@ mod tests {
         assert!(matches!(error, AppError::BadRequest(_)));
         assert_eq!(
             error.to_string(),
-            "frozen hypotheses require new facts to create a new version"
+            "frozen hypotheses only support additive EventDelta claim changes"
         );
     }
 
     #[test]
-    fn frozen_hypotheses_reject_replacement_claim_ids_when_evolving() {
+    fn frozen_hypotheses_reject_revised_value_deltas_when_evolving() {
         let initial = FrozenImpactHypothesis::initial(
             &ClaimGraph::new(
                 "claim_graph_v1",
@@ -1260,8 +1282,8 @@ mod tests {
                         ),
                         claim_node(
                             "order-2",
-                            "CompanyFact",
-                            "Replacement order fact",
+                            "DemandFact",
+                            "Battery demand surges",
                             vec![evidence_id(44)],
                             0.85,
                         ),
@@ -1269,7 +1291,15 @@ mod tests {
                     Vec::new(),
                 )
                 .unwrap(),
-                vec![Uuid::from_u128(6001), Uuid::from_u128(6003)],
+                &event_delta()
+                    .with_new_claim_ids(vec![Uuid::from_u128(6003)])
+                    .with_revised_values(vec![RevisedValue {
+                        canonical_claim_id: "order_amount".to_string(),
+                        previous_claim_id: Uuid::from_u128(6002),
+                        current_claim_id: Uuid::from_u128(6004),
+                        previous: Some(normalized_value("1 billion", "cny", "1000000000", "cny")),
+                        current: Some(normalized_value("1.2 billion", "cny", "1200000000", "cny")),
+                    }]),
                 dt(2026, 7, 11, 19),
             )
             .unwrap_err();
@@ -1277,7 +1307,185 @@ mod tests {
         assert!(matches!(error, AppError::BadRequest(_)));
         assert_eq!(
             error.to_string(),
-            "frozen hypotheses require new facts to create a new version"
+            "frozen hypotheses only support additive EventDelta claim changes"
+        );
+    }
+
+    #[test]
+    fn frozen_hypotheses_reject_status_change_deltas_when_evolving() {
+        let initial = FrozenImpactHypothesis::initial(
+            &ClaimGraph::new(
+                "claim_graph_v1",
+                vec![claim_node(
+                    "rate-1",
+                    "MacroDataFact",
+                    "Central bank adds liquidity",
+                    vec![evidence_id(61)],
+                    0.89,
+                )],
+                Vec::new(),
+            )
+            .unwrap(),
+            vec![Uuid::from_u128(6101)],
+            dt(2026, 7, 11, 19),
+        )
+        .unwrap();
+
+        let error = initial
+            .evolve(
+                &ClaimGraph::new(
+                    "claim_graph_v1",
+                    vec![
+                        claim_node(
+                            "rate-1",
+                            "MacroDataFact",
+                            "Central bank adds liquidity",
+                            vec![evidence_id(61)],
+                            0.89,
+                        ),
+                        claim_node(
+                            "rate-2",
+                            "DemandFact",
+                            "Credit demand improves",
+                            vec![evidence_id(62)],
+                            0.85,
+                        ),
+                    ],
+                    Vec::new(),
+                )
+                .unwrap(),
+                &event_delta()
+                    .with_new_claim_ids(vec![Uuid::from_u128(6102)])
+                    .with_status_changes(vec![StatusChange {
+                        canonical_claim_id: "policy_rate".to_string(),
+                        previous_claim_id: Uuid::from_u128(6101),
+                        current_claim_id: Uuid::from_u128(6103),
+                        previous_status: Some("expected".to_string()),
+                        current_status: Some("confirmed".to_string()),
+                    }]),
+                dt(2026, 7, 11, 20),
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, AppError::BadRequest(_)));
+        assert_eq!(
+            error.to_string(),
+            "frozen hypotheses only support additive EventDelta claim changes"
+        );
+    }
+
+    #[test]
+    fn frozen_hypotheses_reject_expectation_gap_deltas_when_evolving() {
+        let initial = FrozenImpactHypothesis::initial(
+            &ClaimGraph::new(
+                "claim_graph_v1",
+                vec![claim_node(
+                    "policy-1",
+                    "PolicyFact",
+                    "Battery subsidy widened",
+                    vec![evidence_id(63)],
+                    0.9,
+                )],
+                Vec::new(),
+            )
+            .unwrap(),
+            vec![Uuid::from_u128(6201)],
+            dt(2026, 7, 11, 20),
+        )
+        .unwrap();
+
+        let error = initial
+            .evolve(
+                &ClaimGraph::new(
+                    "claim_graph_v1",
+                    vec![
+                        claim_node(
+                            "policy-1",
+                            "PolicyFact",
+                            "Battery subsidy widened",
+                            vec![evidence_id(63)],
+                            0.9,
+                        ),
+                        claim_node(
+                            "policy-2",
+                            "DemandFact",
+                            "Electric vehicle demand improves",
+                            vec![evidence_id(64)],
+                            0.84,
+                        ),
+                    ],
+                    Vec::new(),
+                )
+                .unwrap(),
+                &event_delta()
+                    .with_new_claim_ids(vec![Uuid::from_u128(6202)])
+                    .with_expectation_gap(Some(ExpectationGap {
+                        canonical_claim_id: "subsidy_realization".to_string(),
+                        expected: Some(normalized_value("10 percent", "pct", "10", "pct")),
+                        observed: Some(normalized_value("6 percent", "pct", "6", "pct")),
+                        expected_date: None,
+                        observed_date: None,
+                    })),
+                dt(2026, 7, 11, 21),
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, AppError::BadRequest(_)));
+        assert_eq!(
+            error.to_string(),
+            "frozen hypotheses only support additive EventDelta claim changes"
+        );
+    }
+
+    #[test]
+    fn frozen_hypotheses_reject_expectation_only_deltas_when_evolving() {
+        let initial = FrozenImpactHypothesis::initial(
+            &ClaimGraph::new(
+                "claim_graph_v1",
+                vec![claim_node(
+                    "policy-1",
+                    "PolicyFact",
+                    "Battery subsidy widened",
+                    vec![evidence_id(65)],
+                    0.9,
+                )],
+                Vec::new(),
+            )
+            .unwrap(),
+            vec![Uuid::from_u128(6301)],
+            dt(2026, 7, 11, 21),
+        )
+        .unwrap();
+
+        let error = initial
+            .evolve(
+                &ClaimGraph::new(
+                    "claim_graph_v1",
+                    vec![claim_node(
+                        "policy-1",
+                        "PolicyFact",
+                        "Battery subsidy widened",
+                        vec![evidence_id(65)],
+                        0.9,
+                    )],
+                    Vec::new(),
+                )
+                .unwrap(),
+                &event_delta().with_expectation_gap(Some(ExpectationGap {
+                    canonical_claim_id: "subsidy_realization".to_string(),
+                    expected: Some(normalized_value("10 percent", "pct", "10", "pct")),
+                    observed: Some(normalized_value("6 percent", "pct", "6", "pct")),
+                    expected_date: None,
+                    observed_date: None,
+                })),
+                dt(2026, 7, 11, 22),
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, AppError::BadRequest(_)));
+        assert_eq!(
+            error.to_string(),
+            "frozen hypotheses only support additive EventDelta claim changes"
         );
     }
 
@@ -1352,7 +1560,7 @@ mod tests {
                     )],
                 )
                 .unwrap(),
-                vec![Uuid::from_u128(7001), Uuid::from_u128(7002)],
+                &event_delta().with_new_claim_ids(vec![Uuid::from_u128(7002)]),
                 dt(2026, 7, 11, 21),
             )
             .unwrap_err();
@@ -1429,7 +1637,7 @@ mod tests {
                     Vec::new(),
                 )
                 .unwrap(),
-                vec![Uuid::from_u128(7101), Uuid::from_u128(7102)],
+                &event_delta().with_new_claim_ids(vec![Uuid::from_u128(7102)]),
                 dt(2026, 7, 11, 23),
             )
             .unwrap_err();
@@ -1443,61 +1651,67 @@ mod tests {
 
     #[test]
     fn linked_non_company_stock_code_lists_fall_back_instead_of_emitting_placeholder_targets() {
-        for node_type in [
-            "DemandFact",
-            "SupplyFact",
-            "PriceFact",
-            "PolicyFact",
-            "RegulatoryFact",
+        for list_label in [
+            "600519.SH,000001.SZ",
+            "600519.SH/000001.SZ",
+            "600519.SH; 000001.SZ",
         ] {
-            let graph = build_impact_hypothesis_graph(
-                &ClaimGraph::new(
-                    "claim_graph_v1",
-                    vec![
-                        claim_node(
+            for node_type in [
+                "DemandFact",
+                "SupplyFact",
+                "PriceFact",
+                "PolicyFact",
+                "RegulatoryFact",
+            ] {
+                let graph = build_impact_hypothesis_graph(
+                    &ClaimGraph::new(
+                        "claim_graph_v1",
+                        vec![
+                            claim_node(
+                                "policy-1",
+                                "PolicyFact",
+                                "Battery subsidy widened",
+                                vec![evidence_id(53)],
+                                0.9,
+                            ),
+                            claim_node(
+                                "linked-1",
+                                node_type,
+                                list_label,
+                                vec![evidence_id(54)],
+                                0.82,
+                            ),
+                        ],
+                        vec![claim_edge(
                             "policy-1",
-                            "PolicyFact",
-                            "Battery subsidy widened",
-                            vec![evidence_id(53)],
-                            0.9,
-                        ),
-                        claim_node(
                             "linked-1",
-                            node_type,
-                            "600519.SH 000001.SZ",
-                            vec![evidence_id(54)],
-                            0.82,
-                        ),
-                    ],
-                    vec![claim_edge(
-                        "policy-1",
-                        "linked-1",
-                        "affects",
-                        vec![evidence_id(55)],
-                        0.8,
-                    )],
+                            "affects",
+                            vec![evidence_id(55)],
+                            0.8,
+                        )],
+                    )
+                    .unwrap(),
+                    vec![Uuid::from_u128(7201)],
+                    dt(2026, 7, 12, 0),
                 )
-                .unwrap(),
-                vec![Uuid::from_u128(7201)],
-                dt(2026, 7, 12, 0),
-            )
-            .unwrap();
+                .unwrap();
 
-            assert!(
-                graph
-                    .nodes
-                    .iter()
-                    .all(|node| node.label != "directly mentioned entity"),
-                "expected {node_type} stock-code list label to be rejected before sanitization"
-            );
-            assert!(
-                graph
-                    .nodes
-                    .iter()
-                    .any(|node| node.node_type == "IndustryImpact"
-                        && node.label == "subsidy-linked industry demand"),
-                "expected {node_type} stock-code list label to fall back to the template target"
-            );
+                assert!(
+                    graph
+                        .nodes
+                        .iter()
+                        .all(|node| node.label != "directly mentioned entity"),
+                    "expected {node_type} stock-code list label {list_label} to be rejected before sanitization"
+                );
+                assert!(
+                    graph
+                        .nodes
+                        .iter()
+                        .any(|node| node.node_type == "IndustryImpact"
+                            && node.label == "subsidy-linked industry demand"),
+                    "expected {node_type} stock-code list label {list_label} to fall back to the template target"
+                );
+            }
         }
     }
 
@@ -1511,29 +1725,35 @@ mod tests {
             0.81,
         );
 
-        for node_type in [
-            "DemandFact",
-            "SupplyFact",
-            "PriceFact",
-            "PolicyFact",
-            "RegulatoryFact",
-            "SourceLabel",
+        for list_label in [
+            "600519.SH,000001.SZ",
+            "600519.SH/000001.SZ",
+            "600519.SH; 000001.SZ",
         ] {
-            let target = target_from_claim_node(
-                &claim_node(
-                    "target-1",
-                    node_type,
-                    "600519.SH 000001.SZ",
-                    vec![evidence_id(59)],
-                    0.86,
-                ),
-                &edge,
-            );
+            for node_type in [
+                "DemandFact",
+                "SupplyFact",
+                "PriceFact",
+                "PolicyFact",
+                "RegulatoryFact",
+                "SourceLabel",
+            ] {
+                let target = target_from_claim_node(
+                    &claim_node(
+                        "target-1",
+                        node_type,
+                        list_label,
+                        vec![evidence_id(59)],
+                        0.86,
+                    ),
+                    &edge,
+                );
 
-            assert!(
-                target.is_none(),
-                "expected {node_type} stock-code list label to be rejected"
-            );
+                assert!(
+                    target.is_none(),
+                    "expected {node_type} stock-code list label {list_label} to be rejected"
+                );
+            }
         }
     }
 
@@ -1545,7 +1765,7 @@ mod tests {
                 vec![claim_node(
                     "order-1",
                     "CompanyFact",
-                    "600519.SH 000001.SZ wins major automation order",
+                    "600519.SH,000001.SZ wins major automation order",
                     vec![evidence_id(56)],
                     0.91,
                 )],
@@ -1575,7 +1795,7 @@ mod tests {
                 vec![claim_node(
                     "accident-1",
                     "OperationalFact",
-                    "600519.SH 000001.SZ accident halts production",
+                    "600519.SH/000001.SZ accident halts production",
                     vec![evidence_id(60)],
                     0.88,
                 )],
@@ -1655,6 +1875,74 @@ mod tests {
             relation: relation.to_string(),
             evidence_ids,
             confidence,
+        }
+    }
+
+    struct EventDeltaBuilder {
+        delta: EventDelta,
+    }
+
+    fn event_delta() -> EventDeltaBuilder {
+        EventDeltaBuilder {
+            delta: EventDelta {
+                new_claim_ids: Vec::new(),
+                repeated_claim_ids: Vec::new(),
+                revised_values: Vec::new(),
+                removed_claim_ids: Vec::new(),
+                status_changes: Vec::new(),
+                expectation_gap: None,
+                new_uncertainties: Vec::new(),
+                resolved_uncertainties: Vec::new(),
+            },
+        }
+    }
+
+    impl EventDeltaBuilder {
+        fn with_new_claim_ids(mut self, new_claim_ids: Vec<Uuid>) -> Self {
+            self.delta.new_claim_ids = new_claim_ids;
+            self
+        }
+
+        fn with_revised_values(mut self, revised_values: Vec<RevisedValue>) -> Self {
+            self.delta.revised_values = revised_values;
+            self
+        }
+
+        fn with_removed_claim_ids(mut self, removed_claim_ids: Vec<Uuid>) -> Self {
+            self.delta.removed_claim_ids = removed_claim_ids;
+            self
+        }
+
+        fn with_status_changes(mut self, status_changes: Vec<StatusChange>) -> Self {
+            self.delta.status_changes = status_changes;
+            self
+        }
+
+        fn with_expectation_gap(mut self, expectation_gap: Option<ExpectationGap>) -> Self {
+            self.delta.expectation_gap = expectation_gap;
+            self
+        }
+    }
+
+    impl std::ops::Deref for EventDeltaBuilder {
+        type Target = EventDelta;
+
+        fn deref(&self) -> &Self::Target {
+            &self.delta
+        }
+    }
+
+    fn normalized_value(
+        raw_value: &str,
+        raw_unit: &str,
+        normalized_value: &str,
+        normalized_unit: &str,
+    ) -> NormalizedValue {
+        NormalizedValue {
+            raw_value: raw_value.to_string(),
+            raw_unit: Some(raw_unit.to_string()),
+            normalized_value: normalized_value.to_string(),
+            normalized_unit: Some(normalized_unit.to_string()),
         }
     }
 
