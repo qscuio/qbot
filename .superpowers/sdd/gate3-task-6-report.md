@@ -37,9 +37,9 @@
 - `src/analysis/events/mod.rs`
 - `.superpowers/sdd/gate3-task-6-report.md`
 
-## Commit hash
+## Implementation commit hash
 
-- `8391df68d4e4f3ec4a2199f4d951e994a2f681ce`
+- `260fbf5368388f1b2a5836052a6389cc1c8e79b2`
 
 ## Exact commands run and pass/fail output summary
 
