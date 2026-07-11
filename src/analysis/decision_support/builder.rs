@@ -8,6 +8,8 @@ use crate::analysis::decision_support::contracts::{
     DailyDecisionSupport, DataStatus, DecisionSupportConfig, MarketSummary, StatementBucket,
     SupportStatement,
 };
+use crate::analysis::decision_support::pattern_adapter::build_decision_candidates;
+use crate::analysis::decision_support::scan_ranker_adapter::load_scan_ranker_baseline;
 use crate::analysis::events::DailyEventBrief;
 use crate::error::AppError;
 use crate::error::Result;
@@ -22,6 +24,7 @@ use crate::storage::pattern_repository::PatternSetRow;
 
 #[derive(Clone)]
 pub struct DecisionSupport {
+    pool: PgPool,
     market_repo: MarketRepository,
     pattern_repo: PatternRepository,
     event_repo: EventRepository,
@@ -31,6 +34,7 @@ pub struct DecisionSupport {
 impl DecisionSupport {
     pub fn new(pool: PgPool) -> Self {
         Self {
+            pool: pool.clone(),
             market_repo: MarketRepository::new(pool.clone()),
             pattern_repo: PatternRepository::new(pool.clone()),
             event_repo: EventRepository::new(pool.clone()),
@@ -57,12 +61,15 @@ impl DecisionSupport {
             .market_repo
             .latest_market_snapshot(&config.market_snapshot_version)
             .await?;
+        let scan_candidates = load_scan_ranker_baseline(&self.pool, trade_date).await?;
+        let pattern_candidates = self.pattern_repo.list_shadow_candidates(trade_date).await?;
         let pattern_set = self.pattern_repo.latest_published_set().await?;
         let event_brief_row = self.event_repo.find_daily_brief(Some(trade_date)).await?;
         let event_summary = event_brief_row
             .as_ref()
             .map(parse_event_summary)
             .transpose()?;
+        let candidates = build_decision_candidates(scan_candidates, pattern_candidates);
         let data_status = data_status_from_snapshot(
             trade_date,
             &config.market_snapshot_version,
@@ -88,7 +95,7 @@ impl DecisionSupport {
         Ok(DailyDecisionSupport {
             trade_date,
             run_id,
-            candidates: Vec::new(),
+            candidates,
             market_summary: MarketSummary {
                 trade_date: snapshot.trade_date,
                 snapshot_version: snapshot.snapshot_version,
@@ -235,16 +242,20 @@ fn decision_support_input_fingerprint(
 #[cfg(test)]
 mod tests {
     use super::classify_statements;
+    use crate::analysis::decision_support::scan_ranker_adapter::BaselineCandidate;
     use crate::analysis::decision_support::{
-        DecisionSupport, DecisionSupportConfig, SupportStatement,
+        pattern_adapter::build_decision_candidates, DecisionSupport, DecisionSupportConfig,
+        SupportStatement,
     };
     use crate::analysis::events::DailyEventBrief;
     use crate::storage::decision_support_repository::DecisionSupportRepository;
     use crate::storage::event_repository::{DailyEventBriefRow, EventRepository};
     use crate::storage::market_repository::MarketRepository;
+    use crate::storage::pattern_repository::ShadowCandidateRow;
     use chrono::{NaiveDate, TimeZone, Utc};
     use serde_json::json;
     use sqlx::PgPool;
+    use uuid::Uuid;
 
     fn date(year: i32, month: u32, day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(year, month, day).unwrap()
@@ -252,6 +263,86 @@ mod tests {
 
     fn dt(year: i32, month: u32, day: u32, hour: u32) -> chrono::DateTime<Utc> {
         Utc.with_ymd_and_hms(year, month, day, hour, 0, 0).unwrap()
+    }
+
+    fn baseline_candidate(
+        code: &str,
+        name: &str,
+        horizon: &str,
+        tier: &str,
+        base_score: f64,
+        reasons: &[&str],
+    ) -> BaselineCandidate {
+        BaselineCandidate {
+            code: code.to_string(),
+            name: name.to_string(),
+            horizon: horizon.to_string(),
+            line_type: horizon.to_string(),
+            pool_id: format!("{horizon}-{tier}-pool"),
+            pool_name: format!("{horizon}-{tier} pool"),
+            tier: tier.to_string(),
+            base_source: "scan_ranker".to_string(),
+            base_score,
+            trigger_id: "breakout".to_string(),
+            trigger_name: "Breakout".to_string(),
+            reasons: reasons.iter().map(|reason| reason.to_string()).collect(),
+            risk_flags: vec!["thin_volume".to_string()],
+            factor_breakdown: vec![("trend".to_string(), 18.0)],
+        }
+    }
+
+    fn shadow_candidate(
+        code: &str,
+        name: &str,
+        horizon: &str,
+        shadow_tier: &str,
+        final_score: f64,
+        similarity_score: f64,
+        validated_lift: f64,
+    ) -> ShadowCandidateRow {
+        ShadowCandidateRow {
+            trade_date: date(2026, 7, 11),
+            code: code.to_string(),
+            name: Some(name.to_string()),
+            horizon: horizon.to_string(),
+            pattern_version_id: Uuid::new_v4(),
+            pattern_set_id: Uuid::new_v4(),
+            pattern_type: "strong_stock".to_string(),
+            similarity_score,
+            validated_lift,
+            final_score,
+            shadow_tier: shadow_tier.to_string(),
+            matched_features: json!({"raw": {"relative_strength_20d": 1.2}}),
+            risk_flags: json!({
+                "has_triggered": shadow_tier == "shadow_b",
+                "has_unevaluable": false,
+                "triggered": if shadow_tier == "shadow_b" {
+                    json!([{"feature": "extension_penalty", "status": "evaluated"}])
+                } else {
+                    json!([])
+                },
+                "unevaluable": [],
+                "risk_adjustment": 0.5
+            }),
+            supporting_signals: json!({
+                "score_components": {
+                    "validated_pattern_strength": 0.7,
+                    "current_similarity": 0.2,
+                    "risk_adjustment": 0.5
+                }
+            }),
+            invalidations: if shadow_tier == "reject" {
+                json!([{
+                    "reason": "insufficient_bar_history",
+                    "feature": "price_vs_ma50",
+                    "detail": "need 50 bars"
+                }])
+            } else {
+                json!([])
+            },
+            input_fingerprint: format!("fp-{code}-{horizon}-{shadow_tier}"),
+            created_at: dt(2026, 7, 11, 18),
+        }
     }
 
     #[test]
@@ -276,6 +367,132 @@ mod tests {
         assert_eq!(inferences.len(), 1);
         assert_eq!(unknowns.len(), 1);
         assert_eq!(facts[0].source_refs, vec!["evidence:1".to_string()]);
+    }
+
+    #[test]
+    fn build_decision_candidates_merges_scan_and_pattern_sources_without_rescaling_raw_scores() {
+        let candidates = build_decision_candidates(
+            vec![
+                baseline_candidate(
+                    "600000.SH",
+                    "Pudong Bank",
+                    "short",
+                    "A",
+                    91.4,
+                    &["Scan sees a short-term breakout."],
+                ),
+                baseline_candidate(
+                    "000001.SZ",
+                    "Ping An Bank",
+                    "mid",
+                    "B",
+                    81.2,
+                    &["Scan sees follow-through."],
+                ),
+            ],
+            vec![
+                shadow_candidate(
+                    "600000.SH",
+                    "Pudong Bank",
+                    "short",
+                    "shadow_b",
+                    1.72,
+                    0.81,
+                    1.14,
+                ),
+                shadow_candidate(
+                    "300001.SZ",
+                    "Tech One",
+                    "week",
+                    "shadow_a",
+                    2.31,
+                    0.93,
+                    1.28,
+                ),
+            ],
+        );
+
+        assert_eq!(candidates.len(), 3);
+
+        let combined = candidates
+            .iter()
+            .find(|candidate| candidate.code == "600000.SH" && candidate.horizon == "short")
+            .expect("expected combined candidate");
+        assert_eq!(combined.base_source, "combined");
+        assert_eq!(combined.base_score, 100.0);
+        assert_eq!(combined.pattern_score, Some(50.0));
+        assert_eq!(combined.final_score, combined.base_score);
+        assert_eq!(combined.support_tier, "A");
+        assert_eq!(combined.event_adjustment, 0.0);
+        assert!(combined
+            .inferences
+            .iter()
+            .any(|statement| statement.statement.contains("short-term breakout")));
+        assert!(combined
+            .calculations
+            .iter()
+            .any(|statement| statement.statement.contains("Pattern similarity score")));
+
+        let scan_only = candidates
+            .iter()
+            .find(|candidate| candidate.code == "000001.SZ")
+            .expect("expected scan-only candidate");
+        assert_eq!(scan_only.base_source, "scan_ranker");
+        assert_eq!(scan_only.base_score, 50.0);
+        assert_eq!(scan_only.pattern_score, None);
+        assert_eq!(scan_only.support_tier, "B");
+
+        let pattern_only = candidates
+            .iter()
+            .find(|candidate| candidate.code == "300001.SZ")
+            .expect("expected pattern-only candidate");
+        assert_eq!(pattern_only.base_source, "pattern_shadow");
+        assert_eq!(pattern_only.base_score, 100.0);
+        assert_eq!(pattern_only.pattern_score, Some(100.0));
+        assert_eq!(pattern_only.support_tier, "A");
+    }
+
+    #[test]
+    fn build_decision_candidates_adds_disagreement_risk_when_pattern_rejects_scan_a() {
+        let candidates = build_decision_candidates(
+            vec![baseline_candidate(
+                "600000.SH",
+                "Pudong Bank",
+                "short",
+                "A",
+                91.4,
+                &["Scan sees a short-term breakout."],
+            )],
+            vec![shadow_candidate(
+                "600000.SH",
+                "Pudong Bank",
+                "short",
+                "reject",
+                0.42,
+                0.33,
+                0.96,
+            )],
+        );
+
+        let candidate = &candidates[0];
+        assert_eq!(candidate.base_source, "combined");
+        assert_ne!(candidate.support_tier, "A");
+        assert!(candidate
+            .risk_flags
+            .iter()
+            .any(|flag| flag == "scan_pattern_disagreement"));
+        assert!(candidate
+            .inferences
+            .iter()
+            .any(|statement| statement.statement.contains("short-term breakout")));
+        assert!(candidate
+            .calculations
+            .iter()
+            .any(|statement| statement.statement.contains("validated lift")));
+        assert!(candidate
+            .invalidations
+            .iter()
+            .any(|item| item.contains("insufficient_bar_history")));
     }
 
     #[sqlx::test(migrations = "./migrations")]
