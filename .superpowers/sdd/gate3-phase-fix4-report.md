@@ -23,7 +23,7 @@
 
 ## Commit hash(es)
 
-- `ba067b7` - `fix: enforce gate3 observation and supplement rules`
+- `35cf798` - `fix: enforce gate3 observation and supplement rules`
 
 ## Commands run
 
