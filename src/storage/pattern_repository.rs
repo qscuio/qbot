@@ -243,6 +243,23 @@ impl PatternRepository {
         &self,
         trade_date: NaiveDate,
     ) -> Result<Vec<ShadowCandidateRow>> {
+        self.list_shadow_candidates_query(trade_date, None).await
+    }
+
+    pub async fn list_shadow_candidates_for_set(
+        &self,
+        trade_date: NaiveDate,
+        pattern_set_id: Uuid,
+    ) -> Result<Vec<ShadowCandidateRow>> {
+        self.list_shadow_candidates_query(trade_date, Some(pattern_set_id))
+            .await
+    }
+
+    async fn list_shadow_candidates_query(
+        &self,
+        trade_date: NaiveDate,
+        pattern_set_id: Option<Uuid>,
+    ) -> Result<Vec<ShadowCandidateRow>> {
         let rows = sqlx::query(
             r#"SELECT trade_date,
                       code,
@@ -263,9 +280,11 @@ impl PatternRepository {
                       created_at
                FROM analysis_shadow_candidates
                WHERE trade_date = $1
+                 AND ($2::uuid IS NULL OR pattern_set_id = $2)
                ORDER BY final_score DESC, code ASC, horizon ASC, pattern_version_id ASC"#,
         )
         .bind(trade_date)
+        .bind(pattern_set_id)
         .fetch_all(&self.pool)
         .await?;
 
@@ -1004,6 +1023,127 @@ mod tests {
         let rows = repo.list_shadow_candidates(trade_date).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0], second);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn list_shadow_candidates_for_set_filters_out_other_published_sets(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        insert_dataset_manifest(&pool, "dataset-shadow-filter").await?;
+        let stale_pattern_version_id = Uuid::new_v4();
+        let latest_pattern_version_id = Uuid::new_v4();
+        let stale_set_id = Uuid::new_v4();
+        let latest_set_id = Uuid::new_v4();
+        let trade_date = date(2026, 7, 11);
+
+        insert_pattern_version(
+            &pool,
+            stale_pattern_version_id,
+            "pattern-shadow-filter-stale",
+            "dataset-shadow-filter",
+            "published",
+            "week",
+            "trend",
+            Some("reviewer"),
+            Some(dt(2026, 7, 10, 8)),
+        )
+        .await?;
+        insert_pattern_version(
+            &pool,
+            latest_pattern_version_id,
+            "pattern-shadow-filter-latest",
+            "dataset-shadow-filter",
+            "published",
+            "week",
+            "trend",
+            Some("reviewer"),
+            Some(dt(2026, 7, 10, 9)),
+        )
+        .await?;
+        insert_pattern_set(
+            &pool,
+            stale_set_id,
+            "stale-set",
+            "published",
+            Some(dt(2026, 7, 10, 9)),
+        )
+        .await?;
+        insert_pattern_set(
+            &pool,
+            latest_set_id,
+            "latest-set",
+            "published",
+            Some(dt(2026, 7, 10, 10)),
+        )
+        .await?;
+        insert_pattern_set_member(&pool, stale_set_id, stale_pattern_version_id, 1).await?;
+        insert_pattern_set_member(&pool, latest_set_id, latest_pattern_version_id, 1).await?;
+
+        let repo = PatternRepository::new(pool.clone());
+        repo.upsert_shadow_candidates(&[
+            ShadowCandidateRow {
+                trade_date,
+                code: "600001.SH".to_string(),
+                name: Some("Alpha Bank".to_string()),
+                horizon: "week".to_string(),
+                pattern_version_id: stale_pattern_version_id,
+                pattern_set_id: stale_set_id,
+                pattern_type: "trend".to_string(),
+                similarity_score: 0.91,
+                validated_lift: 1.25,
+                final_score: 2.2,
+                shadow_tier: "shadow_a".to_string(),
+                matched_features: json!({"raw": {"relative_strength_20d": 1.2}}),
+                risk_flags: json!({
+                    "has_triggered": false,
+                    "has_unevaluable": false,
+                    "triggered": [],
+                    "unevaluable": [],
+                    "risk_adjustment": 0.0
+                }),
+                supporting_signals: json!({"score_components": {"validated_pattern_strength": 0.8}}),
+                invalidations: json!([]),
+                input_fingerprint: "shadow-filter-stale".to_string(),
+                created_at: dt(2026, 7, 10, 18),
+            },
+            ShadowCandidateRow {
+                trade_date,
+                code: "000001.SZ".to_string(),
+                name: Some("Beta Bank".to_string()),
+                horizon: "week".to_string(),
+                pattern_version_id: latest_pattern_version_id,
+                pattern_set_id: latest_set_id,
+                pattern_type: "trend".to_string(),
+                similarity_score: 0.87,
+                validated_lift: 1.15,
+                final_score: 1.9,
+                shadow_tier: "watch".to_string(),
+                matched_features: json!({"raw": {"relative_strength_20d": 1.0}}),
+                risk_flags: json!({
+                    "has_triggered": false,
+                    "has_unevaluable": false,
+                    "triggered": [],
+                    "unevaluable": [],
+                    "risk_adjustment": 0.0
+                }),
+                supporting_signals: json!({"score_components": {"validated_pattern_strength": 0.7}}),
+                invalidations: json!([]),
+                input_fingerprint: "shadow-filter-latest".to_string(),
+                created_at: dt(2026, 7, 10, 19),
+            },
+        ])
+        .await
+        .unwrap();
+
+        let rows = repo
+            .list_shadow_candidates_for_set(trade_date, latest_set_id)
+            .await
+            .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].pattern_set_id, latest_set_id);
+        assert_eq!(rows[0].code, "000001.SZ");
         Ok(())
     }
 

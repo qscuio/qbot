@@ -3308,6 +3308,46 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn decision_support_job_ignores_stale_shadow_rows_when_latest_set_has_no_candidates(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let state = test_state(pool.clone()).await;
+        let trade_date = date(2026, 7, 10);
+
+        seed_stock_daily_bar(&pool, trade_date, "600001.SH").await?;
+        seed_decision_market_snapshot(&pool, trade_date, true, Vec::new()).await;
+        seed_ranked_pool_candidate(&pool, trade_date, "600001.SH", "Alpha Bank", 95.0).await;
+
+        let (stale_set_id, _) =
+            seed_published_pattern_set_at(&pool, "stale-set", dt(2026, 7, 10, 9)).await?;
+        seed_shadow_candidate_for_pattern_set(&pool, trade_date, "600001.SH", stale_set_id).await?;
+        let (latest_set_id, _) =
+            seed_published_pattern_set_at(&pool, "latest-set", dt(2026, 7, 10, 10)).await?;
+
+        run_decision_support_job(state).await;
+
+        let repo = DecisionSupportRepository::new(pool.clone());
+        let run = repo
+            .find_run_by_trade_date(trade_date)
+            .await
+            .unwrap()
+            .expect("expected persisted decision support run");
+        assert_eq!(run.pattern_set_id, Some(latest_set_id));
+
+        let candidates = repo.list_candidates(run.run_id).await.unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].base_source, "scan_ranker");
+        assert_eq!(candidates[0].pattern_score, None);
+        assert!(!candidates[0]
+            .calculations
+            .to_string()
+            .contains("Pattern similarity score"));
+        assert!(candidates[0].unknowns.to_string().contains("pattern"));
+        assert!(candidates[0].unknowns.to_string().contains("missing"));
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn decision_support_job_handles_missing_event_brief_without_event_adjustments(
         pool: PgPool,
     ) -> sqlx::Result<()> {
@@ -3939,6 +3979,16 @@ mod tests {
     }
 
     async fn seed_published_pattern_set(pool: &PgPool) -> sqlx::Result<()> {
+        seed_published_pattern_set_at(pool, "published-set", dt(2026, 7, 10, 9))
+            .await
+            .map(|_| ())
+    }
+
+    async fn seed_published_pattern_set_at(
+        pool: &PgPool,
+        set_name: &str,
+        published_at: DateTime<Utc>,
+    ) -> sqlx::Result<(Uuid, Uuid)> {
         let dataset_version = format!("dataset-{}", Uuid::new_v4());
         sqlx::query(
             r#"INSERT INTO analysis_dataset_manifests
@@ -3975,9 +4025,11 @@ mod tests {
         let pattern_set_id = Uuid::new_v4();
         sqlx::query(
             r#"INSERT INTO analysis_pattern_sets (pattern_set_id, name, status, published_at)
-               VALUES ($1, 'published-set', 'published', '2026-07-10T09:00:00Z')"#,
+               VALUES ($1, $2, 'published', $3)"#,
         )
         .bind(pattern_set_id)
+        .bind(set_name)
+        .bind(published_at)
         .execute(pool)
         .await?;
         sqlx::query(
@@ -3989,7 +4041,26 @@ mod tests {
         .bind(pattern_version_id)
         .execute(pool)
         .await?;
-        Ok(())
+        Ok((pattern_set_id, pattern_version_id))
+    }
+
+    async fn seed_shadow_candidate_for_pattern_set(
+        pool: &PgPool,
+        trade_date: NaiveDate,
+        code: &str,
+        pattern_set_id: Uuid,
+    ) -> sqlx::Result<()> {
+        let pattern_version_id: Uuid = sqlx::query_scalar(
+            r#"SELECT pattern_version_id
+               FROM analysis_pattern_set_members
+               WHERE pattern_set_id = $1
+               LIMIT 1"#,
+        )
+        .bind(pattern_set_id)
+        .fetch_one(pool)
+        .await?;
+
+        seed_shadow_candidate_row(pool, trade_date, code, pattern_set_id, pattern_version_id).await
     }
 
     async fn seed_pattern_market_inputs(
@@ -4238,6 +4309,24 @@ mod tests {
         .fetch_one(pool)
         .await?;
 
+        seed_shadow_candidate_row(
+            pool,
+            trade_date,
+            code,
+            pattern_set.pattern_set_id,
+            pattern_version_id,
+        )
+        .await
+    }
+
+    async fn seed_shadow_candidate_row(
+        pool: &PgPool,
+        trade_date: NaiveDate,
+        code: &str,
+        pattern_set_id: Uuid,
+        pattern_version_id: Uuid,
+    ) -> sqlx::Result<()> {
+        let pattern_repo = PatternRepository::new(pool.clone());
         pattern_repo
             .upsert_shadow_candidates(&[ShadowCandidateRow {
                 trade_date,
@@ -4245,7 +4334,7 @@ mod tests {
                 name: Some("Alpha Bank".to_string()),
                 horizon: "week".to_string(),
                 pattern_version_id,
-                pattern_set_id: pattern_set.pattern_set_id,
+                pattern_set_id,
                 pattern_type: "trend".to_string(),
                 similarity_score: 0.91,
                 validated_lift: 1.25,

@@ -64,8 +64,15 @@ impl DecisionSupport {
             .latest_market_snapshot(&config.market_snapshot_version)
             .await?;
         let scan_candidates = load_scan_ranker_baseline(&self.pool, trade_date).await?;
-        let pattern_candidates = self.pattern_repo.list_shadow_candidates(trade_date).await?;
         let pattern_set = self.pattern_repo.latest_published_set().await?;
+        let pattern_candidates = match pattern_set.as_ref() {
+            Some(pattern_set) => {
+                self.pattern_repo
+                    .list_shadow_candidates_for_set(trade_date, pattern_set.pattern_set_id)
+                    .await?
+            }
+            None => Vec::new(),
+        };
         let event_brief_row = self.event_repo.find_daily_brief(Some(trade_date)).await?;
         let event_summary = event_brief_row
             .as_ref()
