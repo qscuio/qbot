@@ -449,7 +449,7 @@ git commit -m "feat: freeze evidence-based impact hypotheses"
 - Consumes frozen hypotheses and point-in-time market snapshots.
 - Never mutates hypotheses.
 
-- [ ] **Step 1: Define statuses**
+- [x] **Step 1: Define statuses**
 
 ```rust
 pub enum MarketObservationStatus {
@@ -462,7 +462,7 @@ pub enum MarketObservationStatus {
 }
 ```
 
-- [ ] **Step 2: Test abnormal return**
+- [x] **Step 2: Test abnormal return**
 
 ```text
 stock return 5%
@@ -472,7 +472,7 @@ market abnormal = 3%
 industry abnormal = 2%
 ```
 
-- [ ] **Step 3: Add confounder rules**
+- [x] **Step 3: Add confounder rules**
 
 Mark `Confounded` when the same entity/window contains:
 
@@ -482,13 +482,13 @@ Mark `Confounded` when the same entity/window contains:
 - major corporate action.
 - another high-importance event.
 
-- [ ] **Step 4: Keep causal confidence separate**
+- [x] **Step 4: Keep causal confidence separate**
 
 `market_alignment_score` can change by observed prices.
 
 `causal_confidence` is derived from evidence, timing, confounders, and identification quality; it must not increase solely because returns align.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 cargo test analysis::events::market_observation
@@ -616,8 +616,8 @@ git commit -m "feat: report evolving events and market alignment"
 - [ ] Two-stage clustering respects manual locks.
 - [x] EventDelta highlights new information.
 - [x] Hypotheses freeze before market observation.
-- [ ] Market alignment and causal confidence are separate.
-- [ ] Confounded windows are explicit.
+- [x] Market alignment and causal confidence are separate.
+- [x] Confounded windows are explicit.
 - [ ] Event-type baselines are point-in-time safe.
 - [ ] Event score remains zero.
 - [x] No indirect beneficiary stock list is generated.

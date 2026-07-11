@@ -67,3 +67,5 @@ Gate 2 Task 9: complete (commits dfb9fd3..1a1075e, review clean after cursor ide
 Gate 2 phase checklist gap: complete (commit a703326, review clean after enforcing fact-only ClaimGraph node types; verification: analysis::events::claims 4/4 passed with DATABASE_URL, full suite split 321/321 + config 1/1 passed, fmt check passed, diff check passed; forbidden-feature scan only matched the beneficiary regression fixture)
 
 Gate 3 Task 5: complete (commits 97d7773..27836dd, review clean after freeze payload, EventDelta evolution, and stock-list filtering fixes; verification: analysis::events::hypotheses 19/19 passed with DATABASE_URL, fmt check passed, diff check passed)
+
+Gate 3 Task 6: complete (commits cce5739..4f735dc, review clean; verification: analysis::events::market_observation 6/6 passed with DATABASE_URL, fmt check passed, diff check passed)
