@@ -63,7 +63,7 @@ Observed GREEN results:
 
 ## Commit hash
 
-- `fcbae09`
+- `9466083` (implementation commit)
 
 ## Concerns
 
