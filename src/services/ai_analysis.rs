@@ -33,12 +33,36 @@ pub struct TopStockInsight {
     #[serde(rename = "changePct")]
     pub change_pct: f64,
     pub trend: Option<TrendAnalysis>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DecisionCandidateInsight {
+    pub code: String,
+    pub name: String,
     #[serde(rename = "horizon", skip_serializing_if = "Option::is_none")]
     pub horizon: Option<String>,
     #[serde(rename = "supportTier", skip_serializing_if = "Option::is_none")]
     pub support_tier: Option<String>,
     #[serde(rename = "finalScore", skip_serializing_if = "Option::is_none")]
     pub final_score: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CompatibilityFieldStatus {
+    pub status: &'static str,
+    pub message: String,
+    #[serde(rename = "replacementField", skip_serializing_if = "Option::is_none")]
+    pub replacement_field: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CompatibilityMetadata {
+    #[serde(rename = "topSectors", skip_serializing_if = "Option::is_none")]
+    pub top_sectors: Option<CompatibilityFieldStatus>,
+    #[serde(rename = "bottomSectors", skip_serializing_if = "Option::is_none")]
+    pub bottom_sectors: Option<CompatibilityFieldStatus>,
+    #[serde(rename = "topStock", skip_serializing_if = "Option::is_none")]
+    pub top_stock: Option<CompatibilityFieldStatus>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -61,10 +85,17 @@ pub struct MarketOverviewResponse {
     pub bottom_sectors: Vec<SectorMove>,
     #[serde(rename = "topStock")]
     pub top_stock: Option<TopStockInsight>,
+    #[serde(
+        rename = "topDecisionCandidate",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub top_decision_candidate: Option<DecisionCandidateInsight>,
     /// Deprecated compatibility field. Rendered from the structured
     /// DecisionSupport brief, not from any LLM-generated narrative.
     #[serde(rename = "aiNarrative")]
     pub ai_narrative: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<CompatibilityMetadata>,
     pub report: String,
 }
 
@@ -82,6 +113,7 @@ impl AiAnalysisService {
         let context = load_or_build_for_date(&self.state, trade_date).await?;
 
         let mut response = MarketOverviewResponse::from_decision_support(&context);
+        self.populate_legacy_market_fields(&mut response, &context);
         response.report = self.build_report(&response, &context);
         Ok(response)
     }
@@ -143,16 +175,26 @@ impl AiAnalysisService {
 
         if let Some(top) = &overview.top_stock {
             lines.push(String::new());
-            lines.push("<b>Top Candidate Focus</b>".to_string());
-            lines.push(format!("{} {}", top.code, top.name));
-            if let Some(final_score) = top.final_score {
+            lines.push("<b>Top Gainer</b>".to_string());
+            lines.push(format!("{} {} {:+.2}%", top.code, top.name, top.change_pct));
+            if let Some(trend) = &top.trend {
                 lines.push(format!(
-                    "horizon={} | tier={} | score={:.2}",
-                    top.horizon.as_deref().unwrap_or("n/a"),
-                    top.support_tier.as_deref().unwrap_or("n/a"),
-                    final_score
+                    "trend={:?} | signal={:?} | score={:.1}",
+                    trend.trend_status, trend.buy_signal, trend.score
                 ));
             }
+        }
+
+        if let Some(candidate) = &overview.top_decision_candidate {
+            lines.push(String::new());
+            lines.push("<b>Top Decision Candidate</b>".to_string());
+            lines.push(format!("{} {}", candidate.code, candidate.name));
+            lines.push(format!(
+                "horizon={} | tier={} | score={:.2}",
+                candidate.horizon.as_deref().unwrap_or("n/a"),
+                candidate.support_tier.as_deref().unwrap_or("n/a"),
+                candidate.final_score.unwrap_or_default()
+            ));
         }
 
         if let Some(text) = overview.ai_narrative.as_deref() {
@@ -282,13 +324,97 @@ impl AiAnalysisService {
         )))
     }
 
-    fn top_stock(context: &DecisionSupportCompatibilityContext) -> Option<TopStockInsight> {
+    fn populate_legacy_market_fields(
+        &self,
+        response: &mut MarketOverviewResponse,
+        context: &DecisionSupportCompatibilityContext,
+    ) {
+        if context.top_sectors.is_empty() {
+            response.compatibility_mut().top_sectors = Some(CompatibilityFieldStatus {
+                status: "unavailable",
+                message: format!(
+                    "Legacy topSectors is unavailable for {} because sector_daily has no rows for that trade date.",
+                    context.trade_date
+                ),
+                replacement_field: None,
+            });
+        } else {
+            response.top_sectors = context
+                .top_sectors
+                .iter()
+                .map(|sector| SectorMove {
+                    name: sector.name.clone(),
+                    change_pct: sector.change_pct,
+                })
+                .collect();
+        }
+
+        if context.bottom_sectors.is_empty() {
+            response.compatibility_mut().bottom_sectors = Some(CompatibilityFieldStatus {
+                status: "unavailable",
+                message: format!(
+                    "Legacy bottomSectors is unavailable for {} because sector_daily has no rows for that trade date.",
+                    context.trade_date
+                ),
+                replacement_field: None,
+            });
+        } else {
+            response.bottom_sectors = context
+                .bottom_sectors
+                .iter()
+                .map(|sector| SectorMove {
+                    name: sector.name.clone(),
+                    change_pct: sector.change_pct,
+                })
+                .collect();
+        }
+
+        response.top_stock = context.top_stock.as_ref().map(|top_stock| TopStockInsight {
+            code: top_stock.code.clone(),
+            name: top_stock.name.clone(),
+            change_pct: top_stock.change_pct,
+            trend: top_stock.trend.clone(),
+        });
+        match response.top_stock.as_ref() {
+            Some(top_stock) if top_stock.trend.is_none() => {
+                response.compatibility_mut().top_stock = Some(CompatibilityFieldStatus {
+                    status: "partial",
+                    message: format!(
+                        "Legacy topStock for {} was loaded from stock_daily_bars, but trend is unavailable from the stored price history.",
+                        top_stock.code
+                    ),
+                    replacement_field: None,
+                });
+            }
+            None => {
+                response.compatibility_mut().top_stock = Some(CompatibilityFieldStatus {
+                    status: "unavailable",
+                    message: format!(
+                        "Legacy topStock is unavailable for {} because stock_daily_bars has no ranked gainer with a previous close.",
+                        context.trade_date
+                    ),
+                    replacement_field: Some("topDecisionCandidate".to_string()),
+                });
+            }
+            _ => {}
+        }
+
+        if response
+            .compatibility
+            .as_ref()
+            .is_some_and(CompatibilityMetadata::is_empty)
+        {
+            response.compatibility = None;
+        }
+    }
+
+    fn top_decision_candidate(
+        context: &DecisionSupportCompatibilityContext,
+    ) -> Option<DecisionCandidateInsight> {
         let candidate = context.candidates.first()?;
-        Some(TopStockInsight {
+        Some(DecisionCandidateInsight {
             code: candidate.code.clone(),
             name: candidate.name.clone(),
-            change_pct: 0.0,
-            trend: None,
             horizon: Some(candidate.horizon.clone()),
             support_tier: Some(candidate.support_tier.clone()),
             final_score: Some(candidate.final_score),
@@ -318,10 +444,23 @@ impl MarketOverviewResponse {
             total_amount: number_field(breadth, &["total_amount", "totalAmount"]),
             top_sectors: Vec::new(),
             bottom_sectors: Vec::new(),
-            top_stock: AiAnalysisService::top_stock(context),
+            top_stock: None,
+            top_decision_candidate: AiAnalysisService::top_decision_candidate(context),
             ai_narrative: AiAnalysisService::build_deprecated_ai_narrative(context),
+            compatibility: None,
             report: String::new(),
         }
+    }
+
+    fn compatibility_mut(&mut self) -> &mut CompatibilityMetadata {
+        self.compatibility
+            .get_or_insert_with(CompatibilityMetadata::default)
+    }
+}
+
+impl CompatibilityMetadata {
+    fn is_empty(&self) -> bool {
+        self.top_sectors.is_none() && self.bottom_sectors.is_none() && self.top_stock.is_none()
     }
 }
 
@@ -381,6 +520,7 @@ mod tests {
         DecisionBriefRow, DecisionCandidateRow, DecisionSupportRepository, DecisionSupportRunRow,
     };
     use crate::storage::market_repository::MarketRepository;
+    use crate::storage::postgres;
     use crate::telegram::pusher::TelegramPusher;
 
     #[sqlx::test(migrations = "./migrations")]
@@ -414,6 +554,63 @@ mod tests {
             Some("Persisted DecisionSupport brief")
         );
         assert!(overview.report.contains("Persisted DecisionSupport brief"));
+        let payload = serde_json::to_value(&overview).expect("serialize market overview");
+        assert_eq!(payload["topStock"], Value::Null);
+        assert_eq!(payload["topDecisionCandidate"]["code"], "600000.SH");
+        assert_eq!(
+            payload["compatibility"]["topSectors"]["status"],
+            "unavailable"
+        );
+        assert_eq!(
+            payload["compatibility"]["bottomSectors"]["status"],
+            "unavailable"
+        );
+        assert_eq!(
+            payload["compatibility"]["topStock"]["status"],
+            "unavailable"
+        );
+        assert_eq!(llm_calls.load(Ordering::SeqCst), 0);
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn market_overview_preserves_legacy_market_facts_and_separates_decision_candidate(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let llm_calls = Arc::new(AtomicUsize::new(0));
+        let (llm_base_url, llm_handle) = spawn_failing_llm_server(llm_calls.clone()).await;
+
+        let trade_date = date(2026, 7, 11);
+        seed_market_snapshot(&pool, trade_date).await?;
+        seed_persisted_decision_artifact(&pool, trade_date).await?;
+        seed_sector_rows(&pool, trade_date).await?;
+        seed_legacy_market_facts(&pool, trade_date).await?;
+
+        let state = test_state(pool, Some("test-ai-key"), &llm_base_url).await;
+
+        let overview = AiAnalysisService::new(state)
+            .market_overview(Some(trade_date))
+            .await
+            .expect("market overview should preserve legacy market facts");
+
+        llm_handle.abort();
+
+        let payload = serde_json::to_value(&overview).expect("serialize market overview");
+        assert_eq!(payload["topSectors"][0]["name"], "Semiconductor");
+        assert_eq!(payload["topSectors"][0]["changePct"], 3.8);
+        assert_eq!(payload["bottomSectors"][0]["name"], "Coal");
+        assert_eq!(payload["bottomSectors"][0]["changePct"], -2.4);
+        assert_eq!(payload["topStock"]["code"], "300750.SZ");
+        assert_eq!(payload["topStock"]["name"], "Momentum Tech");
+        let top_stock_change = payload["topStock"]["changePct"]
+            .as_f64()
+            .expect("top stock change pct");
+        assert!((top_stock_change - 1.4492753623188406).abs() < 1e-12);
+        assert_ne!(payload["topStock"]["trend"], Value::Null);
+        assert_eq!(payload["topDecisionCandidate"]["code"], "600000.SH");
+        assert_eq!(payload["topDecisionCandidate"]["finalScore"], 91.0);
+        assert!(payload.get("compatibility").is_none());
         assert_eq!(llm_calls.load(Ordering::SeqCst), 0);
 
         Ok(())
@@ -576,6 +773,93 @@ mod tests {
         repo.create_run(&run).await.unwrap();
         repo.save_candidates(&[candidate]).await.unwrap();
         repo.save_brief(&brief).await.unwrap();
+        Ok(())
+    }
+
+    async fn seed_sector_rows(pool: &PgPool, trade_date: NaiveDate) -> sqlx::Result<()> {
+        for (code, name, sector_type, change_pct, amount) in [
+            ("BK001", "Semiconductor", "industry", 3.8, 10_000.0),
+            ("BK002", "AI Infrastructure", "concept", 2.1, 8_000.0),
+            ("BK003", "Coal", "industry", -2.4, 6_000.0),
+        ] {
+            sqlx::query(
+                r#"INSERT INTO sector_daily
+                   (code, name, sector_type, change_pct, amount, trade_date)
+                   VALUES ($1, $2, $3, $4, $5, $6)"#,
+            )
+            .bind(code)
+            .bind(name)
+            .bind(sector_type)
+            .bind(change_pct)
+            .bind(amount)
+            .bind(trade_date)
+            .execute(pool)
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn seed_legacy_market_facts(pool: &PgPool, trade_date: NaiveDate) -> sqlx::Result<()> {
+        postgres::upsert_stock_info(
+            pool,
+            &[
+                StockInfo {
+                    code: "300750.SZ".to_string(),
+                    name: "Momentum Tech".to_string(),
+                    market: "SZ".to_string(),
+                    industry: Some("Battery".to_string()),
+                },
+                StockInfo {
+                    code: "600000.SH".to_string(),
+                    name: "Alpha Bank".to_string(),
+                    market: "SH".to_string(),
+                    industry: Some("Banking".to_string()),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+        let mut bars = Vec::new();
+        for offset in 0..61 {
+            let day = trade_date - chrono::Days::new((60 - offset) as u64);
+            let top_close = 10.0 + offset as f64;
+            let candidate_close = 20.0 + (offset as f64 * 0.2);
+
+            bars.push((
+                "300750.SZ".to_string(),
+                Candle {
+                    trade_date: day,
+                    open: top_close - 1.0,
+                    high: top_close + 1.0,
+                    low: top_close - 1.5,
+                    close: if offset == 60 { 70.0 } else { top_close },
+                    volume: 1_000_000,
+                    amount: 5_000_000.0,
+                    turnover: Some(2.0),
+                    pe: Some(20.0),
+                    pb: Some(3.0),
+                },
+            ));
+            bars.push((
+                "600000.SH".to_string(),
+                Candle {
+                    trade_date: day,
+                    open: candidate_close - 0.3,
+                    high: candidate_close + 0.3,
+                    low: candidate_close - 0.6,
+                    close: candidate_close,
+                    volume: 800_000,
+                    amount: 3_500_000.0,
+                    turnover: Some(1.0),
+                    pe: Some(8.0),
+                    pb: Some(0.8),
+                },
+            ));
+        }
+
+        postgres::upsert_daily_bars(pool, &bars).await.unwrap();
         Ok(())
     }
 
