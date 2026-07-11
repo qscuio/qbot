@@ -97,3 +97,5 @@ Gate 4 Task 7: complete (commits 534e8ba..05a28a1, review clean after atomic per
 Gate 4 Task 8: complete (commits 87861c0..e18db95, review clean after latest-pattern-set scoping fix; verification: scheduler::tests 31/31 passed with DATABASE_URL, storage::pattern_repository 12/12 passed with DATABASE_URL, fmt check passed, diff check passed)
 
 Gate 4 Task 9: complete (commits bac6431..216f75d, review clean after compatibility semantics and legacy top-stock fixes; verification: services::ai_analysis 4/4 passed with DATABASE_URL, fmt check passed, diff check passed)
+
+Gate 4 Task 10: complete (commits d618ba5..0f69dc1, review clean after verified release-gate docs and market-overview README wording fix; verification: Rust full suite 446/446 passed with DATABASE_URL, research pytest 90/90 passed via .venv, ruff passed, mypy passed, DB decision-support trading-table assertion returned 0, fmt check passed, diff check passed)

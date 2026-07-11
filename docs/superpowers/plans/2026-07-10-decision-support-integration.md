@@ -604,7 +604,7 @@ git commit -m "refactor: route market overview through decision support"
 **Interfaces:**
 - Documents actual release status and disabled features.
 
-- [ ] **Step 1: Run full Rust verification**
+- [x] **Step 1: Run full Rust verification**
 
 ```bash
 cargo fmt --all -- --check
@@ -612,7 +612,7 @@ cargo test --all --locked
 git diff --check
 ```
 
-- [ ] **Step 2: Run Python verification**
+- [x] **Step 2: Run Python verification**
 
 ```bash
 cd research
@@ -621,7 +621,7 @@ python -m ruff check .
 python -m mypy qbot_research
 ```
 
-- [ ] **Step 3: Run database assertions**
+- [x] **Step 3: Run database assertions**
 
 Execute SQL proving no DecisionSupport run inserted into trading tables:
 
@@ -632,7 +632,7 @@ WHERE signal_metadata ? 'decision_support_run_id';
 
 Expected: `0`.
 
-- [ ] **Step 4: Document production flags**
+- [x] **Step 4: Document production flags**
 
 README must show:
 
@@ -641,7 +641,7 @@ ENABLE_EVENT_SCORE_ADJUSTMENT=false
 MAX_EVENT_SCORE_ADJUSTMENT=0
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add README.md docs/reviews/2026-07-10-analysis-platform-review-resolution.md
@@ -652,12 +652,12 @@ git commit -m "docs: record decision-support release gates"
 
 ## Phase Completion Checklist
 
-- [ ] DecisionSupport is read-only.
-- [ ] Facts, calculations, inferences, and unknowns are separate.
-- [ ] `scan_ranker` remains the baseline.
-- [ ] Shadow patterns are not silently promoted to production.
-- [ ] Event context begins at zero weight.
-- [ ] Optional event adjustment is capped at 5.
-- [ ] Reject cannot become A because of events.
-- [ ] Existing market overview is a compatibility adapter.
-- [ ] No new analysis output enters auto trading.
+- [x] DecisionSupport is read-only.
+- [x] Facts, calculations, inferences, and unknowns are separate.
+- [x] `scan_ranker` remains the baseline.
+- [x] Shadow patterns are not silently promoted to production.
+- [x] Event context begins at zero weight.
+- [x] Optional event adjustment is capped at 5.
+- [x] Reject cannot become A because of events.
+- [x] Existing market overview is a compatibility adapter.
+- [x] No new analysis output enters auto trading.
