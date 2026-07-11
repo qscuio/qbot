@@ -205,6 +205,6 @@ Database integration tests require a valid `DATABASE_URL` or SQLx test database 
 - Consumes scan-ranker, shadow patterns, event intelligence, and market snapshots.
 - Produces read-only decision-support artifacts.
 
-- [ ] Execute every checkbox in the linked plan.
-- [ ] Confirm event adjustment defaults to zero and is hard-capped at five.
-- [ ] Confirm no new analysis output reaches trading tables.
+- [x] Execute every checkbox in the linked plan.
+- [x] Confirm event adjustment defaults to zero and is hard-capped at five.
+- [x] Confirm no new analysis output reaches trading tables.
