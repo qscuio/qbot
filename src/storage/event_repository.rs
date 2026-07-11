@@ -505,7 +505,8 @@ impl EventRepository {
     }
 
     pub async fn save_event_cluster_version(&self, row: &EventClusterRow) -> Result<()> {
-        save_event_cluster_version_in_txless(&self.pool, row).await
+        self.save_event_cluster_version_with_mentions(row, &[])
+            .await
     }
 
     pub async fn save_event_cluster_version_with_mentions(
@@ -520,10 +521,6 @@ impl EventRepository {
         }
         tx.commit().await?;
         Ok(())
-    }
-
-    pub async fn save_event_mention(&self, row: &EventMentionRow) -> Result<Uuid> {
-        save_event_mention_in_txless(&self.pool, row).await
     }
 
     pub async fn save_event_delta(&self, row: &EventDeltaRow) -> Result<()> {
@@ -1655,39 +1652,6 @@ async fn save_revision_in_tx(
     Ok(())
 }
 
-async fn save_event_cluster_version_in_txless(pool: &PgPool, row: &EventClusterRow) -> Result<()> {
-    sqlx::query(
-        r#"INSERT INTO market_event_clusters
-           (event_cluster_id, cluster_version, canonical_title, event_time,
-            first_seen_at, last_seen_at, lifecycle_status, primary_evidence_id,
-            representative_ids, source_entropy, independent_sources, mention_count,
-            cluster_payload, supersedes_version, created_at)
-           VALUES ($1, $2, $3, $4,
-                   $5, $6, $7, $8,
-                   $9, $10, $11, $12,
-                   $13, $14, $15)"#,
-    )
-    .bind(row.event_cluster_id)
-    .bind(row.cluster_version)
-    .bind(&row.canonical_title)
-    .bind(row.event_time)
-    .bind(row.first_seen_at)
-    .bind(row.last_seen_at)
-    .bind(&row.lifecycle_status)
-    .bind(row.primary_evidence_id)
-    .bind(&row.representative_ids)
-    .bind(row.source_entropy)
-    .bind(row.independent_sources)
-    .bind(row.mention_count)
-    .bind(&row.cluster_payload)
-    .bind(row.supersedes_version)
-    .bind(row.created_at)
-    .execute(pool)
-    .await?;
-
-    Ok(())
-}
-
 async fn save_event_cluster_version_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     row: &EventClusterRow,
@@ -1722,29 +1686,6 @@ async fn save_event_cluster_version_in_tx(
     .await?;
 
     Ok(())
-}
-
-async fn save_event_mention_in_txless(pool: &PgPool, row: &EventMentionRow) -> Result<Uuid> {
-    sqlx::query(
-        r#"INSERT INTO market_event_mentions
-           (mention_id, evidence_id, event_cluster_id, cluster_version, mention_time,
-            adds_new_fact, source_independence, mention_payload, created_at)
-           VALUES ($1, $2, $3, $4, $5,
-                   $6, $7, $8, $9)"#,
-    )
-    .bind(row.mention_id)
-    .bind(row.evidence_id)
-    .bind(row.event_cluster_id)
-    .bind(row.cluster_version)
-    .bind(row.mention_time)
-    .bind(row.adds_new_fact)
-    .bind(row.source_independence)
-    .bind(&row.mention_payload)
-    .bind(row.created_at)
-    .execute(pool)
-    .await?;
-
-    Ok(row.mention_id)
 }
 
 async fn save_event_mention_in_tx(
