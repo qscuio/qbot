@@ -91,18 +91,16 @@ impl DecisionSupport {
         let candidates =
             apply_event_score_adjustments(candidates, &config, data_status.data_complete);
         let run_id = if config.persist_run {
-            let run_id = self
-                .persist_run(
-                    trade_date,
-                    &config,
-                    &snapshot.input_fingerprint,
-                    pattern_set.as_ref(),
-                    event_brief_row.as_ref(),
-                )
-                .await?;
-            self.persist_artifacts(run_id, trade_date, &candidates, event_summary.as_ref())
-                .await?;
-            run_id
+            self.persist_run_with_artifacts(
+                trade_date,
+                &config,
+                &snapshot.input_fingerprint,
+                pattern_set.as_ref(),
+                event_brief_row.as_ref(),
+                &candidates,
+                event_summary.as_ref(),
+            )
+            .await?
         } else {
             Uuid::new_v4()
         };
@@ -125,13 +123,15 @@ impl DecisionSupport {
         })
     }
 
-    async fn persist_run(
+    async fn persist_run_with_artifacts(
         &self,
         trade_date: NaiveDate,
         config: &DecisionSupportConfig,
         market_input_fingerprint: &str,
         pattern_set: Option<&PatternSetRow>,
         event_brief_row: Option<&DailyEventBriefRow>,
+        candidates: &[DecisionCandidate],
+        event_summary: Option<&DailyEventBrief>,
     ) -> Result<Uuid> {
         let started_at = Utc::now();
         let run_id = Uuid::new_v4();
@@ -142,49 +142,41 @@ impl DecisionSupport {
             pattern_set,
             event_brief_row,
         );
-
-        self.decision_repo
-            .create_run(&DecisionSupportRunRow {
-                run_id,
-                trade_date,
-                support_version: config.support_version.clone(),
-                market_snapshot_version: config.market_snapshot_version.clone(),
-                pattern_set_id: pattern_set.map(|row| row.pattern_set_id),
-                event_brief_version: event_brief_row.map(|row| row.brief_version.clone()),
-                event_score_enabled: config.event_score_enabled,
-                event_score_limit: config.event_score_limit,
-                status: "completed".to_string(),
-                input_fingerprint,
-                started_at,
-                completed_at: Some(started_at),
-                error_message: None,
-            })
-            .await
-    }
-
-    async fn persist_artifacts(
-        &self,
-        run_id: Uuid,
-        trade_date: NaiveDate,
-        candidates: &[DecisionCandidate],
-        event_summary: Option<&DailyEventBrief>,
-    ) -> Result<()> {
-        let created_at = Utc::now();
         let candidate_rows = candidates
             .iter()
-            .map(|candidate| decision_candidate_row(run_id, candidate, created_at))
+            .map(|candidate| decision_candidate_row(run_id, candidate, started_at))
             .collect::<Result<Vec<_>>>()?;
-        self.decision_repo.save_candidates(&candidate_rows).await?;
+        let brief = DecisionBriefRow {
+            run_id,
+            trade_date,
+            content: decision_brief_content(trade_date, candidates, event_summary),
+            structured_payload: decision_brief_payload(trade_date, candidates, event_summary),
+            created_at: started_at,
+        };
+
         self.decision_repo
-            .save_brief(&DecisionBriefRow {
-                run_id,
-                trade_date,
-                content: decision_brief_content(trade_date, candidates, event_summary),
-                structured_payload: decision_brief_payload(trade_date, candidates, event_summary),
-                created_at,
-            })
+            .create_run_with_artifacts(
+                &DecisionSupportRunRow {
+                    run_id,
+                    trade_date,
+                    support_version: config.support_version.clone(),
+                    market_snapshot_version: config.market_snapshot_version.clone(),
+                    pattern_set_id: pattern_set.map(|row| row.pattern_set_id),
+                    event_brief_version: event_brief_row.map(|row| row.brief_version.clone()),
+                    event_score_enabled: config.event_score_enabled,
+                    event_score_limit: config.event_score_limit,
+                    status: "completed".to_string(),
+                    input_fingerprint,
+                    started_at,
+                    completed_at: Some(started_at),
+                    error_message: None,
+                },
+                &candidate_rows,
+                &brief,
+            )
             .await?;
-        Ok(())
+
+        Ok(run_id)
     }
 }
 
@@ -490,10 +482,12 @@ mod tests {
         EventScoreAdjustmentAudit, SupportStatement,
     };
     use crate::analysis::events::DailyEventBrief;
+    use crate::services::scan_ranker::POOL_SHORT_A_ID;
     use crate::storage::decision_support_repository::DecisionSupportRepository;
     use crate::storage::event_repository::{DailyEventBriefRow, EventRepository};
     use crate::storage::market_repository::MarketRepository;
     use crate::storage::pattern_repository::ShadowCandidateRow;
+    use crate::storage::postgres::{save_daily_signal_scan_results, DailySignalScanRow};
     use chrono::{NaiveDate, TimeZone, Utc};
     use serde_json::json;
     use sqlx::PgPool;
@@ -630,6 +624,61 @@ mod tests {
             cap: 0.0,
             reason: String::new(),
         }
+    }
+
+    async fn seed_market_snapshot(pool: &PgPool, trade_date: NaiveDate) {
+        MarketRepository::new(pool.clone())
+            .save_market_snapshot(&crate::analysis::market_snapshot::MarketSnapshot {
+                trade_date,
+                snapshot_version: crate::analysis::market_snapshot::MARKET_SNAPSHOT_VERSION
+                    .to_string(),
+                available_at: dt(2026, 7, 11, 18),
+                data_complete: true,
+                metrics: json!({"breadth": {"up_count": 123}}),
+                missing_inputs: Vec::new(),
+                input_fingerprint: "market-fingerprint".to_string(),
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn seed_ranked_pool_candidate(
+        pool: &PgPool,
+        trade_date: NaiveDate,
+        code: &str,
+        name: &str,
+        score: f64,
+        line_type: &str,
+    ) {
+        save_daily_signal_scan_results(
+            pool,
+            trade_date,
+            Uuid::new_v4(),
+            &[DailySignalScanRow {
+                code: code.to_string(),
+                name: name.to_string(),
+                signal_id: POOL_SHORT_A_ID.to_string(),
+                signal_name: "短线A档".to_string(),
+                icon: "🔥".to_string(),
+                metadata: json!({
+                    "line_type": line_type,
+                    "tier": "A",
+                    "trigger_id": "breakout",
+                    "trigger_name": "突破信号",
+                    "score": score,
+                    "reasons": ["突破确认"],
+                    "risk_flags": ["量能不足"],
+                    "factor_breakdown": [
+                        {"name": "trend", "score": 18.5},
+                        {"name": "volume", "score": 11.2}
+                    ],
+                    "supporting_signals": ["breakout"],
+                    "matched_setups": [{"id": "breakout", "name": "突破信号"}]
+                }),
+            }],
+        )
+        .await
+        .unwrap();
     }
 
     #[test]
@@ -1048,6 +1097,46 @@ mod tests {
             None,
             "default build_daily should remain read-only until run persistence is specified"
         );
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn build_daily_rolls_back_run_when_artifact_persistence_fails(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let trade_date = date(2026, 7, 11);
+        seed_market_snapshot(&pool, trade_date).await;
+        seed_ranked_pool_candidate(&pool, trade_date, "600000.SH", "Alpha Bank", 95.0, "short")
+            .await;
+        seed_ranked_pool_candidate(
+            &pool,
+            trade_date,
+            "000001.SZ",
+            "Broken Horizon",
+            80.0,
+            "short-horizon-overflow",
+        )
+        .await;
+
+        let err = DecisionSupport::new(pool.clone())
+            .build_daily(
+                trade_date,
+                DecisionSupportConfig {
+                    persist_run: true,
+                    ..DecisionSupportConfig::default()
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("value too long")
+                || err.to_string().contains("too long for type")
+        );
+
+        let repo = DecisionSupportRepository::new(pool);
+        assert_eq!(repo.latest_run().await.unwrap(), None);
 
         Ok(())
     }

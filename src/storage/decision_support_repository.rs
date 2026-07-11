@@ -64,32 +64,26 @@ impl DecisionSupportRepository {
         Self { pool }
     }
 
-    pub async fn create_run(&self, row: &DecisionSupportRunRow) -> Result<Uuid> {
-        sqlx::query(
-            r#"INSERT INTO analysis_decision_support_runs
-               (run_id, trade_date, support_version, market_snapshot_version, pattern_set_id,
-                event_brief_version, event_score_enabled, event_score_limit, status,
-                input_fingerprint, started_at, completed_at, error_message)
-               VALUES ($1, $2, $3, $4, $5,
-                       $6, $7, $8, $9,
-                       $10, $11, $12, $13)"#,
-        )
-        .bind(row.run_id)
-        .bind(row.trade_date)
-        .bind(&row.support_version)
-        .bind(&row.market_snapshot_version)
-        .bind(row.pattern_set_id)
-        .bind(&row.event_brief_version)
-        .bind(row.event_score_enabled)
-        .bind(row.event_score_limit)
-        .bind(&row.status)
-        .bind(&row.input_fingerprint)
-        .bind(row.started_at)
-        .bind(row.completed_at)
-        .bind(&row.error_message)
-        .execute(&self.pool)
-        .await?;
+    pub async fn create_run_with_artifacts(
+        &self,
+        run: &DecisionSupportRunRow,
+        candidates: &[DecisionCandidateRow],
+        brief: &DecisionBriefRow,
+    ) -> Result<Uuid> {
+        let mut tx = self.pool.begin().await?;
 
+        insert_run(&mut tx, run).await?;
+        for candidate in candidates {
+            insert_candidate(&mut tx, candidate).await?;
+        }
+        insert_brief(&mut tx, brief).await?;
+
+        tx.commit().await?;
+        Ok(run.run_id)
+    }
+
+    pub async fn create_run(&self, row: &DecisionSupportRunRow) -> Result<Uuid> {
+        insert_run_pool(&self.pool, row).await?;
         Ok(row.run_id)
     }
 
@@ -108,18 +102,7 @@ impl DecisionSupportRepository {
     }
 
     pub async fn save_brief(&self, row: &DecisionBriefRow) -> Result<()> {
-        sqlx::query(
-            r#"INSERT INTO analysis_decision_daily_briefs
-               (run_id, trade_date, content, structured_payload, created_at)
-               VALUES ($1, $2, $3, $4, $5)"#,
-        )
-        .bind(row.run_id)
-        .bind(row.trade_date)
-        .bind(&row.content)
-        .bind(&row.structured_payload)
-        .bind(row.created_at)
-        .execute(&self.pool)
-        .await?;
+        insert_brief_pool(&self.pool, row).await?;
         Ok(())
     }
 
@@ -262,6 +245,64 @@ impl DecisionSupportRepository {
     }
 }
 
+async fn insert_run_pool(pool: &PgPool, row: &DecisionSupportRunRow) -> Result<()> {
+    sqlx::query(
+        r#"INSERT INTO analysis_decision_support_runs
+           (run_id, trade_date, support_version, market_snapshot_version, pattern_set_id,
+            event_brief_version, event_score_enabled, event_score_limit, status,
+            input_fingerprint, started_at, completed_at, error_message)
+           VALUES ($1, $2, $3, $4, $5,
+                   $6, $7, $8, $9,
+                   $10, $11, $12, $13)"#,
+    )
+    .bind(row.run_id)
+    .bind(row.trade_date)
+    .bind(&row.support_version)
+    .bind(&row.market_snapshot_version)
+    .bind(row.pattern_set_id)
+    .bind(&row.event_brief_version)
+    .bind(row.event_score_enabled)
+    .bind(row.event_score_limit)
+    .bind(&row.status)
+    .bind(&row.input_fingerprint)
+    .bind(row.started_at)
+    .bind(row.completed_at)
+    .bind(&row.error_message)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+async fn insert_run(tx: &mut Transaction<'_, Postgres>, row: &DecisionSupportRunRow) -> Result<()> {
+    sqlx::query(
+        r#"INSERT INTO analysis_decision_support_runs
+           (run_id, trade_date, support_version, market_snapshot_version, pattern_set_id,
+            event_brief_version, event_score_enabled, event_score_limit, status,
+            input_fingerprint, started_at, completed_at, error_message)
+           VALUES ($1, $2, $3, $4, $5,
+                   $6, $7, $8, $9,
+                   $10, $11, $12, $13)"#,
+    )
+    .bind(row.run_id)
+    .bind(row.trade_date)
+    .bind(&row.support_version)
+    .bind(&row.market_snapshot_version)
+    .bind(row.pattern_set_id)
+    .bind(&row.event_brief_version)
+    .bind(row.event_score_enabled)
+    .bind(row.event_score_limit)
+    .bind(&row.status)
+    .bind(&row.input_fingerprint)
+    .bind(row.started_at)
+    .bind(row.completed_at)
+    .bind(&row.error_message)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
+}
+
 async fn insert_candidate(
     tx: &mut Transaction<'_, Postgres>,
     row: &DecisionCandidateRow,
@@ -301,6 +342,38 @@ async fn insert_candidate(
     .rows_affected();
 
     Ok(rows_affected as usize)
+}
+
+async fn insert_brief_pool(pool: &PgPool, row: &DecisionBriefRow) -> Result<()> {
+    sqlx::query(
+        r#"INSERT INTO analysis_decision_daily_briefs
+           (run_id, trade_date, content, structured_payload, created_at)
+           VALUES ($1, $2, $3, $4, $5)"#,
+    )
+    .bind(row.run_id)
+    .bind(row.trade_date)
+    .bind(&row.content)
+    .bind(&row.structured_payload)
+    .bind(row.created_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn insert_brief(tx: &mut Transaction<'_, Postgres>, row: &DecisionBriefRow) -> Result<()> {
+    sqlx::query(
+        r#"INSERT INTO analysis_decision_daily_briefs
+           (run_id, trade_date, content, structured_payload, created_at)
+           VALUES ($1, $2, $3, $4, $5)"#,
+    )
+    .bind(row.run_id)
+    .bind(row.trade_date)
+    .bind(&row.content)
+    .bind(&row.structured_payload)
+    .bind(row.created_at)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 fn map_run_row(row: &sqlx::postgres::PgRow) -> DecisionSupportRunRow {
@@ -408,6 +481,16 @@ mod tests {
         }
     }
 
+    fn brief_row(run_id: Uuid, trade_date: NaiveDate, content: &str) -> DecisionBriefRow {
+        DecisionBriefRow {
+            run_id,
+            trade_date,
+            content: content.to_string(),
+            structured_payload: json!({"headlines": [content]}),
+            created_at: dt(2026, 7, 11, 10),
+        }
+    }
+
     #[sqlx::test(migrations = "./migrations")]
     async fn create_run_enforces_one_run_per_trade_date_and_support_version(
         pool: PgPool,
@@ -475,6 +558,46 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn create_run_with_artifacts_rolls_back_when_candidate_insert_fails(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = DecisionSupportRepository::new(pool);
+        let run = run_row(
+            Uuid::new_v4(),
+            date(2026, 7, 11),
+            "support-v1",
+            dt(2026, 7, 11, 8),
+        );
+        let mut valid_candidate = candidate_row(run.run_id);
+        valid_candidate.code = "000001.SZ".to_string();
+        valid_candidate.final_score = 91.0;
+
+        let mut invalid_candidate = candidate_row(run.run_id);
+        invalid_candidate.horizon = "short-horizon-overflow".to_string();
+        invalid_candidate.final_score = 84.0;
+
+        let err = repo
+            .create_run_with_artifacts(
+                &run,
+                &[valid_candidate, invalid_candidate],
+                &brief_row(run.run_id, run.trade_date, "Daily brief"),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, AppError::Database(_)));
+        assert!(
+            err.to_string().contains("value too long")
+                || err.to_string().contains("too long for type")
+        );
+        assert_eq!(repo.find_run(run.run_id).await.unwrap(), None);
+        assert!(repo.list_candidates(run.run_id).await.unwrap().is_empty());
+        assert_eq!(repo.find_brief(run.run_id).await.unwrap(), None);
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn latest_run_and_brief_round_trip(pool: PgPool) -> sqlx::Result<()> {
         let repo = DecisionSupportRepository::new(pool.clone());
         let older_run = run_row(
@@ -492,13 +615,11 @@ mod tests {
 
         repo.create_run(&older_run).await.unwrap();
         repo.create_run(&newer_run).await.unwrap();
-        repo.save_brief(&DecisionBriefRow {
-            run_id: newer_run.run_id,
-            trade_date: newer_run.trade_date,
-            content: "Daily brief".to_string(),
-            structured_payload: json!({"headlines": ["A", "B"]}),
-            created_at: dt(2026, 7, 11, 10),
-        })
+        repo.save_brief(&brief_row(
+            newer_run.run_id,
+            newer_run.trade_date,
+            "Daily brief",
+        ))
         .await
         .unwrap();
 
@@ -515,7 +636,7 @@ mod tests {
         .await?;
 
         assert_eq!(stored.0, "Daily brief");
-        assert_eq!(stored.1, json!({"headlines": ["A", "B"]}));
+        assert_eq!(stored.1, json!({"headlines": ["Daily brief"]}));
 
         Ok(())
     }

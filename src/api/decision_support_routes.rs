@@ -139,16 +139,20 @@ async fn build_decision_support_job(
         .await;
 
     let view = match build_result {
-        Ok(support) => load_view_for_run_id(&state, support.run_id)
-            .await
-            .map_err(|error| crate::api::routes::api_error(&error.to_string()))?
-            .ok_or_else(|| {
-                crate::api::routes::api_error("persisted decision support run missing")
-            })?,
-        Err(error) if is_duplicate_run_error(&error) => load_view_for_date(&state, trade_date)
-            .await
-            .map_err(|load_error| crate::api::routes::api_error(&load_error.to_string()))?
-            .ok_or_else(|| crate::api::routes::api_error(&error.to_string()))?,
+        Ok(support) => {
+            let view = load_view_for_run_id(&state, support.run_id)
+                .await
+                .map_err(|error| crate::api::routes::api_error(&error.to_string()))?
+                .ok_or_else(|| {
+                    crate::api::routes::api_error("persisted decision support run missing")
+                })?;
+            if view.brief.is_none() || view.candidates.len() != support.candidates.len() {
+                return Err(crate::api::routes::api_error(
+                    "persisted decision support artifacts incomplete",
+                ));
+            }
+            view
+        }
         Err(error) => return Err(map_app_error(&error)),
     };
 
@@ -522,13 +526,6 @@ async fn telegram_send(state: &Arc<AppState>, chat_id: i64, text: &str) -> Resul
     state.pusher.push(&chat_id.to_string(), text).await
 }
 
-fn is_duplicate_run_error(error: &AppError) -> bool {
-    error
-        .to_string()
-        .contains("analysis_decision_support_runs_trade_date_support_version_key")
-        || error.to_string().contains("duplicate key")
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -759,6 +756,56 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn post_build_rejects_duplicate_run_when_existing_artifacts_are_incomplete(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let state = test_state(pool.clone()).await;
+        let repo = DecisionSupportRepository::new(pool.clone());
+        let trade_date = date(2026, 7, 11);
+        let stale_run = run_row(
+            Uuid::new_v4(),
+            trade_date,
+            DecisionSupportConfig::default().support_version.as_str(),
+            dt(2026, 7, 11, 8),
+        );
+        repo.create_run(&stale_run).await.unwrap();
+
+        seed_market_snapshot(&pool, trade_date).await?;
+        seed_ranked_pool_candidate(&pool, trade_date, "600000.SH", "Alpha Bank", 91.4).await?;
+
+        let response = authed_response(
+            decision_support_router(state),
+            Method::POST,
+            "/api/jobs/analysis/decision-support",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("analysis_decision_support_runs_trade_date_support_version_key")
+                || payload["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("duplicate key")
+        );
+        assert!(repo
+            .list_candidates(stale_run.run_id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(repo.find_brief(stale_run.run_id).await.unwrap().is_none());
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn telegram_reports_render_persisted_decision_support_views(
         pool: PgPool,
     ) -> sqlx::Result<()> {
@@ -817,8 +864,23 @@ mod tests {
         }
     }
 
-    async fn authed_json(mut router: Router, method: Method, path: &str) -> Value {
-        let response = router
+    async fn authed_json(router: Router, method: Method, path: &str) -> Value {
+        let response = authed_response(router, method, path).await;
+
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn authed_response(
+        mut router: Router,
+        method: Method,
+        path: &str,
+    ) -> axum::response::Response {
+        router
             .call(
                 Request::builder()
                     .method(method)
@@ -828,14 +890,7 @@ mod tests {
                     .unwrap(),
             )
             .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK, "{path}");
-
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        serde_json::from_slice(&body).unwrap()
+            .unwrap()
     }
 
     async fn seed_persisted_decision_artifact(
