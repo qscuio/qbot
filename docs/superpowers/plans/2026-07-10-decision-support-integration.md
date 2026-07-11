@@ -212,7 +212,7 @@ git commit -m "feat: add read-only decision-support module"
 - Converts them to a stable baseline contract.
 - Does not duplicate scan-ranker scoring logic.
 
-- [ ] **Step 1: Expose a stable metadata parser**
+- [x] **Step 1: Expose a stable metadata parser**
 
 Add a public read-only type:
 
@@ -238,7 +238,7 @@ pub fn ranked_pool_evidence(hit: &SignalHit) -> Option<RankedPoolEvidence>;
 
 Do not expose internal `Metrics` or classifier functions.
 
-- [ ] **Step 2: Implement adapter**
+- [x] **Step 2: Implement adapter**
 
 ```rust
 pub async fn load_scan_ranker_baseline(
@@ -249,11 +249,11 @@ pub async fn load_scan_ranker_baseline(
 
 Read `daily_signal_scan_results` for pool IDs only.
 
-- [ ] **Step 3: Test no rescoring**
+- [x] **Step 3: Test no rescoring**
 
 A metadata fixture must produce the same score and reasons without recalculating from candles.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ```bash
 cargo test scan_ranker_adapter

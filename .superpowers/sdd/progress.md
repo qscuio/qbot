@@ -83,3 +83,5 @@ Gate 3 phase review: complete (commits ada917a..df8f73c, phase review clean afte
 Gate 4 Task 1: complete (commits c91fc59..a4814eb, review clean after candidate insert deduplication; verification: storage::decision_support_repository 3/3 passed with DATABASE_URL, fmt check passed, diff check passed)
 
 Gate 4 Task 2: complete (commits 31380b3..c4c09ac, review clean after decision_support re-export warning fix; verification: analysis::decision_support 2/2 passed with DATABASE_URL, fmt check passed, diff check passed)
+
+Gate 4 Task 3: complete (commits 3aa038c..fe351b2, review clean after latest-run archive filtering fix; verification: scan_ranker_adapter 3/3 passed with DATABASE_URL, fmt check passed, diff check passed)
