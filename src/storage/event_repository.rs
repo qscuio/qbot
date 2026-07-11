@@ -724,7 +724,18 @@ impl EventRepository {
         evidence_id: Uuid,
     ) -> Result<Option<EventClusterRow>> {
         let row = sqlx::query(
-            r#"SELECT event_cluster_id,
+            r#"WITH linked_cluster_ids AS (
+                   SELECT event_cluster_id
+                   FROM market_event_clusters
+                   WHERE primary_evidence_id = $1
+                      OR $1 = ANY(representative_ids)
+                   UNION
+                   SELECT event_cluster_id
+                   FROM market_event_mentions
+                   WHERE evidence_id = $1
+                     AND event_cluster_id IS NOT NULL
+               )
+               SELECT event_cluster_id,
                       cluster_version,
                       canonical_title,
                       event_time,
@@ -740,8 +751,7 @@ impl EventRepository {
                       supersedes_version,
                       created_at
                FROM market_event_clusters
-               WHERE primary_evidence_id = $1
-                  OR $1 = ANY(representative_ids)
+               WHERE event_cluster_id IN (SELECT event_cluster_id FROM linked_cluster_ids)
                ORDER BY cluster_version DESC, created_at DESC
                LIMIT 1"#,
         )
@@ -3257,6 +3267,108 @@ mod tests {
 
         let stored_observations = repo
             .list_market_observations_for_evidence(current_evidence.evidence_id)
+            .await
+            .unwrap();
+        assert_eq!(stored_observations.len(), 1);
+        assert_eq!(
+            stored_observations[0].hypothesis_id,
+            latest_hypothesis.hypothesis_id
+        );
+        assert_eq!(stored_observations[0].observation_status, "market_aligned");
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn persisted_gate3_outputs_are_readable_for_mention_linked_evidence(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let repo = EventRepository::new(pool.clone());
+        let linked_evidence = evidence("gate3-linked", 1, "publishable");
+        let primary_v1 = evidence("gate3-primary-v1", 1, "publishable");
+        let primary_v2 = evidence("gate3-primary-v2", 1, "publishable");
+        save_evidence(&pool, &linked_evidence).await;
+        save_evidence(&pool, &primary_v1).await;
+        save_evidence(&pool, &primary_v2).await;
+
+        let cluster_id = Uuid::new_v4();
+        repo.save_event_cluster_version(&event_cluster(cluster_id, 1, primary_v1.evidence_id))
+            .await
+            .unwrap();
+        repo.save_event_cluster_version(&EventClusterRow {
+            representative_ids: vec![primary_v2.evidence_id],
+            ..event_cluster(cluster_id, 2, primary_v2.evidence_id)
+        })
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"INSERT INTO market_event_mentions
+               (mention_id, evidence_id, event_cluster_id, cluster_version, mention_time,
+                adds_new_fact, source_independence, mention_payload)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(linked_evidence.evidence_id)
+        .bind(cluster_id)
+        .bind(1_i32)
+        .bind(dt(2026, 7, 10, 13))
+        .bind(true)
+        .bind(0.91_f64)
+        .bind(json!({"link": "mention-only"}))
+        .execute(&pool)
+        .await?;
+
+        let delta = event_delta(cluster_id, 1, 2);
+        repo.save_event_delta(&delta).await.unwrap();
+
+        let prior_hypothesis = frozen_hypothesis(cluster_id, 1, None);
+        repo.save_frozen_hypothesis(&prior_hypothesis)
+            .await
+            .unwrap();
+        let latest_hypothesis = EventHypothesisRow {
+            hypothesis_version: 2,
+            supersedes_id: Some(prior_hypothesis.hypothesis_id),
+            ..frozen_hypothesis(cluster_id, 2, Some(prior_hypothesis.hypothesis_id))
+        };
+        repo.save_frozen_hypothesis(&latest_hypothesis)
+            .await
+            .unwrap();
+
+        let observation = market_observation(latest_hypothesis.hypothesis_id, "market_aligned");
+        repo.save_market_observation(&observation).await.unwrap();
+
+        let stored_cluster = repo
+            .find_latest_cluster_for_evidence(linked_evidence.evidence_id)
+            .await
+            .unwrap()
+            .expect("cluster linked by mention");
+        assert_eq!(stored_cluster.event_cluster_id, cluster_id);
+        assert_eq!(stored_cluster.cluster_version, 2);
+        assert_eq!(stored_cluster.primary_evidence_id, primary_v2.evidence_id);
+        assert!(!stored_cluster
+            .representative_ids
+            .contains(&linked_evidence.evidence_id));
+
+        let stored_delta = repo
+            .find_latest_delta_for_evidence(linked_evidence.evidence_id)
+            .await
+            .unwrap()
+            .expect("delta linked by mention");
+        assert_eq!(stored_delta.to_version, 2);
+
+        let stored_hypothesis = repo
+            .find_latest_hypothesis_for_evidence(linked_evidence.evidence_id)
+            .await
+            .unwrap()
+            .expect("hypothesis linked by mention");
+        assert_eq!(
+            stored_hypothesis.hypothesis_id,
+            latest_hypothesis.hypothesis_id
+        );
+        assert_eq!(stored_hypothesis.cluster_version, 2);
+
+        let stored_observations = repo
+            .list_market_observations_for_evidence(linked_evidence.evidence_id)
             .await
             .unwrap();
         assert_eq!(stored_observations.len(), 1);

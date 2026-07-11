@@ -4,13 +4,14 @@ use std::sync::Arc;
 use tokio_cron_scheduler::{Job, JobScheduler};
 use tracing::{info, warn};
 
+use crate::analysis::adapters::gdelt::GdeltEventSource;
 use crate::analysis::adapters::official_event_source::OfficialEventSource;
 use crate::analysis::adapters::{EventSource, FetchedEvent};
 use crate::analysis::events::claims::ClaimGraph;
 use crate::analysis::events::extraction::StockCodeDirectory;
 use crate::analysis::events::market_observation::{
     observe_market_alignment, CausalConfidenceInputs, MarketSnapshotObservationInput,
-    ObservationEntity, ObservationWindow,
+    ObservationEntity, ObservationWindow, ObservedReturn,
 };
 use crate::analysis::events::{
     compute_event_delta, render_daily_brief, AShareTradingDateResolver,
@@ -53,6 +54,7 @@ const DAILY_SIGNAL_ARCHIVE_JOB_CRON: &str = "0 5 20 * * Mon,Tue,Wed,Thu,Fri";
 const DAILY_REPORT_JOB_CRON: &str = "0 0 18 * * Mon,Tue,Wed,Thu,Fri";
 const WEEKLY_REPORT_JOB_CRON: &str = "0 0 20 * * Fri";
 const POINT_IN_TIME_REFERENCE_JOB_CRON: &str = "0 15 17 * * Fri";
+const EVENT_MARKET_BENCHMARK_CODE: &str = "000001.SH";
 static EVENT_FACT_BRIEF_JOB_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Fetch today's OHLCV, limit-up stocks, and sector data (17:00 job).
@@ -275,67 +277,35 @@ pub async fn run_daily_signal_archive_job(state: Arc<AppState>) {
 
 pub async fn run_event_ingestion_job(state: Arc<AppState>) {
     let _guard = state.analysis_job_lock.lock().await;
-    let now = Utc::now();
-    let source = match OfficialEventSource::from_config(state.config.as_ref()) {
-        Ok(Some(source)) => source,
-        Ok(None) => {
-            info!("Event ingestion skipped: OFFICIAL_EVENT_FEED_URL is not configured");
-            return;
-        }
+    let mut sources: Vec<Box<dyn EventSource>> = Vec::new();
+    match OfficialEventSource::from_config(state.config.as_ref()) {
+        Ok(Some(source)) => sources.push(Box::new(source)),
+        Ok(None) => {}
         Err(error) => {
-            warn!(
-                "Event ingestion skipped: official source config failed: {}",
-                error
-            );
-            return;
+            warn!("Event ingestion skipped official source config: {}", error);
         }
-    };
-
-    let cursor_key = event_cursor_key(source.source_id());
-    let current_cursor = match event_cursor_get(state.redis.clone(), &cursor_key).await {
-        Ok(cursor) => cursor,
+    }
+    match GdeltEventSource::from_config(state.config.as_ref()) {
+        Ok(Some(source)) => sources.push(Box::new(source)),
+        Ok(None) => {}
         Err(error) => {
-            warn!("Event ingestion skipped: cursor read failed: {}", error);
-            return;
-        }
-    };
-
-    let batch = match source.fetch(current_cursor.clone(), now).await {
-        Ok(batch) => batch,
-        Err(error) => {
-            warn!("Event ingestion fetch failed: {}", error);
-            return;
-        }
-    };
-
-    let repo = EventRepository::new(state.db.clone());
-    let mut ingest_failed = false;
-    for item in &batch.items {
-        if let Err(error) = ingest_fetched_event(&repo, &source, item, now).await {
-            ingest_failed = true;
-            warn!(
-                "Event ingestion upsert failed for source={} item={}: {}",
-                source.source_id(),
-                item.source_item_id,
-                error
-            );
+            warn!("Event ingestion skipped GDELT source config: {}", error);
         }
     }
 
-    if !ingest_failed {
-        if let Some(next_cursor) = batch.next_cursor.as_deref() {
-            if let Err(error) =
-                event_cursor_set(state.redis.clone(), &cursor_key, next_cursor).await
-            {
-                warn!("Event ingestion cursor write failed: {}", error);
-                return;
-            }
-        }
-    } else {
-        warn!(
-            "Event ingestion cursor preserved for source={} because at least one item failed",
-            source.source_id()
-        );
+    run_event_ingestion_sources(state.clone(), sources).await;
+}
+
+async fn run_event_ingestion_sources(state: Arc<AppState>, sources: Vec<Box<dyn EventSource>>) {
+    if sources.is_empty() {
+        info!("Event ingestion skipped: no event sources configured");
+        return;
+    }
+
+    let now = Utc::now();
+    let repo = EventRepository::new(state.db.clone());
+    for source in sources {
+        process_event_ingestion_source(state.clone(), &repo, source.as_ref(), now).await;
     }
 
     let stock_list = match state.provider.get_stock_list().await {
@@ -449,7 +419,8 @@ pub async fn run_event_cluster_refinement_job(state: Arc<AppState>) {
 pub async fn run_event_market_observation_job(state: Arc<AppState>) {
     let _guard = state.analysis_job_lock.lock().await;
     let repo = EventRepository::new(state.db.clone());
-    match persist_event_market_observations(&repo).await {
+    let market_repo = MarketRepository::new(state.db.clone());
+    match persist_event_market_observations(&repo, &market_repo).await {
         Ok(observation_count) => info!(
             "Event market observation persisted {} repository-backed observation rows",
             observation_count
@@ -587,7 +558,10 @@ async fn persist_event_cluster_refinement_outputs(
     Ok((persisted_deltas, persisted_hypotheses))
 }
 
-async fn persist_event_market_observations(repo: &EventRepository) -> Result<usize> {
+async fn persist_event_market_observations(
+    repo: &EventRepository,
+    market_repo: &MarketRepository,
+) -> Result<usize> {
     let hypotheses = repo.list_latest_hypotheses().await?;
     let mut persisted = 0usize;
 
@@ -606,7 +580,7 @@ async fn persist_event_market_observations(repo: &EventRepository) -> Result<usi
         };
         let context = PointInTimeContext {
             trade_date,
-            as_of: trade_date.and_hms_opt(9, 30, 0).unwrap().and_utc(),
+            as_of: trade_date.and_hms_opt(17, 0, 0).unwrap().and_utc(),
         };
         let existing = repo
             .list_market_observations_for_hypothesis(hypothesis_row.hypothesis_id)
@@ -621,17 +595,29 @@ async fn persist_event_market_observations(repo: &EventRepository) -> Result<usi
                 continue;
             }
 
+            let Some(observed_inputs) =
+                load_market_observation_inputs(market_repo, &entity, &context).await?
+            else {
+                info!(
+                    "Event market observation skipped: no eligible PIT market inputs for hypothesis={} entity={} trade_date={}",
+                    hypothesis_row.hypothesis_id,
+                    entity.entity_id,
+                    trade_date
+                );
+                continue;
+            };
+
             let observation = observe_market_alignment(&MarketSnapshotObservationInput {
                 context,
                 hypothesis: hypothesis.clone(),
                 entity: entity.clone(),
                 window: window.clone(),
-                stock_return: None,
-                market_return: None,
-                industry_return: None,
+                stock_return: Some(observed_inputs.stock_return),
+                market_return: Some(observed_inputs.market_return),
+                industry_return: Some(observed_inputs.industry_return),
                 snapshot_version: MARKET_SNAPSHOT_VERSION.to_string(),
-                benchmark_id: "unavailable".to_string(),
-                industry_benchmark_id: "unavailable".to_string(),
+                benchmark_id: observed_inputs.benchmark_id,
+                industry_benchmark_id: observed_inputs.industry_benchmark_id,
                 causal_inputs: CausalConfidenceInputs {
                     evidence_strength: 0.0,
                     timing_quality: 0.0,
@@ -648,7 +634,7 @@ async fn persist_event_market_observations(repo: &EventRepository) -> Result<usi
                 trade_date: observation.trade_date,
                 observation_status: serde_json::to_value(observation.observation_status)?
                     .as_str()
-                    .unwrap_or("not_observed")
+                    .expect("market observation status serializes to string")
                     .to_string(),
                 market_alignment_score: observation.market_alignment_score,
                 causal_confidence: observation.causal_confidence,
@@ -664,6 +650,248 @@ async fn persist_event_market_observations(repo: &EventRepository) -> Result<usi
     }
 
     Ok(persisted)
+}
+
+struct LoadedMarketObservationInputs {
+    stock_return: ObservedReturn,
+    market_return: ObservedReturn,
+    industry_return: ObservedReturn,
+    benchmark_id: String,
+    industry_benchmark_id: String,
+}
+
+async fn process_event_ingestion_source(
+    state: Arc<AppState>,
+    repo: &EventRepository,
+    source: &dyn EventSource,
+    now: chrono::DateTime<Utc>,
+) {
+    let cursor_key = event_cursor_key(source.source_id());
+    let current_cursor = match event_cursor_get(state.redis.clone(), &cursor_key).await {
+        Ok(cursor) => cursor,
+        Err(error) => {
+            warn!(
+                "Event ingestion skipped for source={}: cursor read failed: {}",
+                source.source_id(),
+                error
+            );
+            return;
+        }
+    };
+
+    let batch = match source.fetch(current_cursor.clone(), now).await {
+        Ok(batch) => batch,
+        Err(error) => {
+            warn!(
+                "Event ingestion fetch failed for source={}: {}",
+                source.source_id(),
+                error
+            );
+            return;
+        }
+    };
+
+    let mut ingest_failed = false;
+    for item in &batch.items {
+        if let Err(error) = ingest_fetched_event(repo, source, item, now).await {
+            ingest_failed = true;
+            warn!(
+                "Event ingestion upsert failed for source={} item={}: {}",
+                source.source_id(),
+                item.source_item_id,
+                error
+            );
+        }
+    }
+
+    if !ingest_failed {
+        if let Some(next_cursor) = batch.next_cursor.as_deref() {
+            if let Err(error) =
+                event_cursor_set(state.redis.clone(), &cursor_key, next_cursor).await
+            {
+                warn!(
+                    "Event ingestion cursor write failed for source={}: {}",
+                    source.source_id(),
+                    error
+                );
+            }
+        }
+    } else {
+        warn!(
+            "Event ingestion cursor preserved for source={} because at least one item failed",
+            source.source_id()
+        );
+    }
+}
+
+async fn load_market_observation_inputs(
+    market_repo: &MarketRepository,
+    entity: &ObservationEntity,
+    context: &PointInTimeContext,
+) -> Result<Option<LoadedMarketObservationInputs>> {
+    let Some(stock_return) = load_stock_return(
+        market_repo,
+        &entity.entity_id,
+        context.trade_date,
+        context.as_of,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    let Some(market_return) =
+        load_market_index_return(market_repo, context.trade_date, context.as_of).await?
+    else {
+        return Ok(None);
+    };
+    let Some((industry_benchmark_id, industry_return)) = load_industry_return(
+        market_repo,
+        &entity.entity_id,
+        context.trade_date,
+        context.as_of,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(LoadedMarketObservationInputs {
+        stock_return,
+        market_return,
+        industry_return,
+        benchmark_id: EVENT_MARKET_BENCHMARK_CODE.to_string(),
+        industry_benchmark_id,
+    }))
+}
+
+async fn load_stock_return(
+    market_repo: &MarketRepository,
+    code: &str,
+    trade_date: chrono::NaiveDate,
+    as_of: chrono::DateTime<Utc>,
+) -> Result<Option<ObservedReturn>> {
+    let bars = market_repo
+        .daily_bar_history_for_code_as_of(code, trade_date, as_of, 2)
+        .await?;
+    if bars.len() < 2
+        || bars
+            .last()
+            .map(|row| row.trade_date != trade_date)
+            .unwrap_or(true)
+    {
+        return Ok(None);
+    }
+    if bars.iter().any(|row| row.bar.is_none()) {
+        return Ok(None);
+    }
+
+    let bar_dates = bars.iter().map(|row| row.trade_date).collect::<Vec<_>>();
+    let factors = market_repo
+        .adjustment_factors_as_of(&[code.to_string()], bar_dates[0], trade_date, as_of)
+        .await?;
+    if factors.len() < bar_dates.len()
+        || bar_dates
+            .iter()
+            .any(|date| !factors.iter().any(|factor| factor.trade_date == *date))
+    {
+        return Ok(None);
+    }
+
+    let adjusted = crate::analysis::market_snapshot::adjustment::adjust_candles(
+        &bars
+            .iter()
+            .filter_map(|row| row.bar.clone())
+            .collect::<Vec<_>>(),
+        &factors,
+    )?;
+    let previous_close = adjusted[adjusted.len() - 2].close;
+    let current_close = adjusted[adjusted.len() - 1].close;
+    if previous_close == 0.0 {
+        return Ok(None);
+    }
+
+    let available_at = bars
+        .iter()
+        .map(|row| row.available_at)
+        .chain(factors.iter().map(|factor| factor.available_at))
+        .max()
+        .expect("stock returns require at least one available_at");
+
+    Ok(Some(ObservedReturn {
+        value: round_metric((current_close / previous_close) - 1.0),
+        available_at,
+        source: bars
+            .last()
+            .map(|row| row.source.clone())
+            .unwrap_or_else(|| "unknown".to_string()),
+    }))
+}
+
+async fn load_market_index_return(
+    market_repo: &MarketRepository,
+    trade_date: chrono::NaiveDate,
+    as_of: chrono::DateTime<Utc>,
+) -> Result<Option<ObservedReturn>> {
+    let bars = market_repo
+        .index_history(EVENT_MARKET_BENCHMARK_CODE, trade_date, as_of, 2)
+        .await?;
+    let Some(current) = bars.first() else {
+        return Ok(None);
+    };
+    if current.trade_date != trade_date {
+        return Ok(None);
+    }
+
+    let value = match current.change_pct {
+        Some(change_pct) => change_pct / 100.0,
+        None => {
+            if bars.len() < 2 || bars[1].close == 0.0 {
+                return Ok(None);
+            }
+            (current.close / bars[1].close) - 1.0
+        }
+    };
+
+    Ok(Some(ObservedReturn {
+        value: round_metric(value),
+        available_at: current.available_at,
+        source: current.source.clone(),
+    }))
+}
+
+async fn load_industry_return(
+    market_repo: &MarketRepository,
+    code: &str,
+    trade_date: chrono::NaiveDate,
+    as_of: chrono::DateTime<Utc>,
+) -> Result<Option<(String, ObservedReturn)>> {
+    let Some(industry_membership) = market_repo
+        .active_sector_memberships(code, trade_date, as_of)
+        .await?
+        .into_iter()
+        .find(|membership| membership.sector_type == "industry")
+    else {
+        return Ok(None);
+    };
+
+    let Some(sector_row) = market_repo
+        .sector_version_as_of(&industry_membership.sector_code, trade_date, as_of)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let Some(change_pct) = sector_row.change_pct else {
+        return Ok(None);
+    };
+
+    Ok(Some((
+        industry_membership.sector_code,
+        ObservedReturn {
+            value: round_metric(change_pct / 100.0),
+            available_at: std::cmp::max(industry_membership.available_at, sector_row.available_at),
+            source: sector_row.source,
+        },
+    )))
 }
 
 fn cluster_snapshot_from_row(
@@ -1119,7 +1347,7 @@ async fn event_cursor_set(
 
 async fn ingest_fetched_event(
     repo: &EventRepository,
-    source: &impl EventSource,
+    source: &dyn EventSource,
     item: &FetchedEvent,
     first_seen_at: chrono::DateTime<Utc>,
 ) -> crate::error::Result<()> {
@@ -1147,7 +1375,7 @@ async fn ingest_fetched_event(
             source_id: source.source_id().to_string(),
             source_item_id: item.source_item_id.clone(),
             source_url: Some(canonical_source_url),
-            source_tier: "official".to_string(),
+            source_tier: source_tier_for(source.source_id()).to_string(),
             source_terms_version: "terms-v1".to_string(),
             occurred_at: Some(item.published_at),
             published_at: Some(item.published_at),
@@ -1173,7 +1401,7 @@ async fn ingest_fetched_event(
         source_id: source.source_id().to_string(),
         source_item_id: item.source_item_id.clone(),
         source_url: Some(canonical_source_url),
-        source_tier: "official".to_string(),
+        source_tier: source_tier_for(source.source_id()).to_string(),
         source_terms_version: "terms-v1".to_string(),
         occurred_at: Some(item.published_at),
         published_at: Some(item.published_at),
@@ -1209,6 +1437,14 @@ fn latest_event_matches_fetched(
         && latest.raw_payload == fetched.raw_payload
 }
 
+fn source_tier_for(source_id: &str) -> &'static str {
+    if source_id.starts_with("gdelt:") {
+        "supplement"
+    } else {
+        "official"
+    }
+}
+
 fn event_content_hash(title: &str, content: Option<&str>) -> String {
     use sha2::{Digest, Sha256};
 
@@ -1220,6 +1456,10 @@ fn event_content_hash(title: &str, content: Option<&str>) -> String {
         hasher.update(normalize(content));
     }
     format!("{:x}", hasher.finalize())
+}
+
+fn round_metric(value: f64) -> f64 {
+    (value * 1_000_000.0).round() / 1_000_000.0
 }
 
 #[cfg(test)]
@@ -1254,6 +1494,9 @@ mod tests {
         EventRepository, ExtractionRow,
     };
     use crate::storage::market_repository::MarketRepository;
+
+    static EVENT_INGESTION_CURSOR_TEST_LOCK: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
 
     #[test]
     fn weekday_pipeline_runs_after_tushare_eod_window() {
@@ -1466,6 +1709,7 @@ mod tests {
     async fn event_ingestion_job_does_not_advance_cursor_when_any_item_ingest_fails(
         pool: PgPool,
     ) -> sqlx::Result<()> {
+        let _guard = EVENT_INGESTION_CURSOR_TEST_LOCK.lock().await;
         let state = test_state(pool.clone()).await;
         let (feed_url, server) = spawn_event_feed_server(
             r#"{
@@ -1765,7 +2009,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn event_market_observation_job_persists_not_observed_rows_when_market_inputs_are_unavailable(
+    async fn event_market_observation_job_persists_real_rows_when_market_inputs_exist(
         pool: PgPool,
     ) -> sqlx::Result<()> {
         let state = test_state(pool.clone()).await;
@@ -1790,11 +2034,15 @@ mod tests {
         .unwrap();
         let hypothesis = frozen_hypothesis_row(cluster_id, 1, 1, None, vec![Uuid::from_u128(301)]);
         repo.save_frozen_hypothesis(&hypothesis).await.unwrap();
+        seed_event_market_inputs(&pool, date(2026, 7, 11), "600519.SH").await?;
 
         run_event_market_observation_job(state).await;
 
-        let stored: (String, Option<f64>, Option<f64>) = sqlx::query_as(
-            r#"SELECT observation_status, market_alignment_score, abnormal_market_return
+        let stored: (String, Option<f64>, Option<f64>, Value) = sqlx::query_as(
+            r#"SELECT observation_status,
+                      market_alignment_score::float8,
+                      abnormal_market_return::float8,
+                      market_metrics
                FROM market_event_market_observations
                WHERE hypothesis_id = $1
                LIMIT 1"#,
@@ -1802,10 +2050,189 @@ mod tests {
         .bind(hypothesis.hypothesis_id)
         .fetch_one(&pool)
         .await?;
-        assert_eq!(stored.0, "not_observed");
-        assert_eq!(stored.1, None);
-        assert_eq!(stored.2, None);
+        assert_eq!(stored.0, "market_aligned");
+        assert_eq!(stored.1, Some(0.025));
+        assert_eq!(stored.2, Some(0.03));
+        assert_eq!(stored.3["benchmark_id"], json!("000001.SH"));
+        assert_eq!(stored.3["industry_benchmark_id"], json!("BANK"));
+        assert_eq!(stored.3["stock_return"], json!(0.05));
+        assert_eq!(stored.3["market_return"], json!(0.02));
+        assert_eq!(stored.3["industry_return"], json!(0.03));
 
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn event_market_observation_job_skips_placeholder_rows_when_market_inputs_are_unavailable(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let state = test_state(pool.clone()).await;
+        let repo = EventRepository::new(pool.clone());
+        let evidence = event_evidence(
+            "official:market_event",
+            "notice-market-observation-missing-inputs",
+            1,
+            "publishable",
+            date(2026, 7, 10),
+        );
+        repo.insert_evidence(&evidence).await.unwrap();
+
+        let cluster_id = Uuid::new_v4();
+        repo.save_event_cluster_version(&cluster_row_with_snapshot(
+            cluster_id,
+            1,
+            evidence.evidence_id,
+            vec![Uuid::from_u128(302)],
+        ))
+        .await
+        .unwrap();
+        let hypothesis = frozen_hypothesis_row(cluster_id, 1, 1, None, vec![Uuid::from_u128(302)]);
+        repo.save_frozen_hypothesis(&hypothesis).await.unwrap();
+
+        run_event_market_observation_job(state).await;
+
+        let count: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*)
+               FROM market_event_market_observations
+               WHERE hypothesis_id = $1"#,
+        )
+        .bind(hypothesis.hypothesis_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(count, 0);
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn event_ingestion_job_processes_gdelt_sources_with_independent_cursor_handling(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let _guard = EVENT_INGESTION_CURSOR_TEST_LOCK.lock().await;
+        let state = test_state(pool.clone()).await;
+        let (official_feed_url, official_server) = spawn_event_feed_server(
+            r#"{
+              "next_cursor": "official-cursor-2",
+              "items": [
+                {
+                  "source_item_id": "official-001",
+                  "published_at": "2026-07-10T08:15:00Z",
+                  "title": "Official exchange update",
+                  "content": "Full bulletin body.",
+                  "summary": "Exchange confirms normal trading conditions.",
+                  "source_url": "https://example.test/notices/official-001",
+                  "category": "market-status"
+                }
+              ]
+            }"#,
+        )
+        .await;
+        let (gdelt_feed_url, gdelt_server) = spawn_event_feed_server(
+            r#"{
+              "articles": [
+                {
+                  "source_item_id": "gdelt-001",
+                  "seendate": "20260710082000",
+                  "title": "Shipping disruption raises insurance costs",
+                  "url": "https://example.test/gdelt/gdelt-001",
+                  "language": "eng",
+                  "themes": ["MARITIME"],
+                  "locations": ["Red Sea"],
+                  "organizations": ["Global Shipping Co"],
+                  "description": "Macro logistics disruption continues."
+                },
+                {
+                  "source_item_id": "gdelt-002",
+                  "seendate": "20260710083000",
+                  "title": "Broken GDELT article",
+                  "url": "not-a-url",
+                  "language": "eng",
+                  "themes": ["MARITIME"],
+                  "locations": ["Red Sea"],
+                  "organizations": ["Global Shipping Co"],
+                  "description": "Invalid URL should fail ingestion."
+                }
+              ]
+            }"#,
+        )
+        .await;
+
+        let official_source = OfficialEventSource::new(
+            "official:market_event",
+            official_feed_url,
+            None,
+            crate::analysis::adapters::ContentRetentionPolicy::StoreSummaryOnly,
+            None,
+        )
+        .unwrap();
+        let gdelt_source = crate::analysis::adapters::gdelt::GdeltEventSource::with_endpoint(
+            "red sea shipping".to_string(),
+            250,
+            gdelt_feed_url,
+            None,
+        )
+        .unwrap();
+
+        let official_cursor_key = event_cursor_key("official:market_event");
+        let gdelt_cursor_key = event_cursor_key("gdelt:macro_event");
+        event_cursor_set(
+            state.redis.clone(),
+            &official_cursor_key,
+            "official-cursor-1",
+        )
+        .await
+        .unwrap();
+        event_cursor_set(
+            state.redis.clone(),
+            &gdelt_cursor_key,
+            "2026-07-10T08:10:00+00:00|gdelt-000",
+        )
+        .await
+        .unwrap();
+
+        run_event_ingestion_sources(
+            state.clone(),
+            vec![
+                Box::new(official_source) as Box<dyn EventSource>,
+                Box::new(gdelt_source) as Box<dyn EventSource>,
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            event_cursor_get(state.redis.clone(), &official_cursor_key)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("official-cursor-2")
+        );
+        assert_eq!(
+            event_cursor_get(state.redis.clone(), &gdelt_cursor_key)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("2026-07-10T08:10:00+00:00|gdelt-000")
+        );
+
+        let stored_sources: Vec<(String, String, Value)> = sqlx::query_as(
+            r#"SELECT source_id, source_item_id, raw_payload
+               FROM market_event_evidence
+               ORDER BY source_id, source_item_id"#,
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(stored_sources.len(), 2, "{stored_sources:?}");
+        assert_eq!(stored_sources[0].0, "gdelt:macro_event");
+        assert_eq!(stored_sources[0].1, "gdelt-001");
+        assert_eq!(stored_sources[0].2["sourceRole"], json!("macro_supplement"));
+        assert_eq!(stored_sources[0].2["companyFactEligible"], json!(false));
+        assert_eq!(stored_sources[1].0, "official:market_event");
+        assert_eq!(stored_sources[1].1, "official-001");
+
+        official_server.abort();
+        let _ = official_server.await;
+        gdelt_server.abort();
+        let _ = gdelt_server.await;
         Ok(())
     }
 
@@ -2214,6 +2641,80 @@ mod tests {
         .bind(available_at)
         .execute(pool)
         .await?;
+        Ok(())
+    }
+
+    async fn seed_event_market_inputs(
+        pool: &PgPool,
+        trade_date: NaiveDate,
+        code: &str,
+    ) -> sqlx::Result<()> {
+        let available_at = dt(2026, 7, 11, 16);
+        for (bar_date, close) in [(trade_date - Duration::days(1), 100.0), (trade_date, 105.0)] {
+            sqlx::query(
+                r#"INSERT INTO stock_daily_bar_versions
+                   (code, trade_date, open, high, low, close, volume, amount,
+                    turnover, pe, pb, available_at, availability_quality, source)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
+                           1.2, 12.0, 1.4, $9, 'observed', 'test')"#,
+            )
+            .bind(code)
+            .bind(bar_date)
+            .bind(close - 1.0)
+            .bind(close + 1.0)
+            .bind(close - 2.0)
+            .bind(close)
+            .bind(10_000_i64)
+            .bind(1_000_000.0)
+            .bind(available_at)
+            .execute(pool)
+            .await?;
+            sqlx::query(
+                r#"INSERT INTO stock_adjustment_factors
+                   (code, trade_date, adj_factor, available_at, availability_quality, source)
+                   VALUES ($1, $2, 1.0, $3, 'observed', 'test')"#,
+            )
+            .bind(code)
+            .bind(bar_date)
+            .bind(available_at)
+            .execute(pool)
+            .await?;
+        }
+
+        sqlx::query(
+            r#"INSERT INTO stock_sector_membership
+               (code, sector_code, sector_name, sector_type, valid_from,
+                available_at, availability_quality, source)
+               VALUES ($1, 'BANK', 'Banking', 'industry', '2020-01-01',
+                       $2, 'observed', 'test')"#,
+        )
+        .bind(code)
+        .bind(available_at)
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            r#"INSERT INTO sector_daily_versions
+               (code, name, sector_type, change_pct, amount, trade_date,
+                available_at, availability_quality, source)
+               VALUES ('BANK', 'Banking', 'industry', 3.0, 1000000.0, $1,
+                       $2, 'observed', 'test')"#,
+        )
+        .bind(trade_date)
+        .bind(available_at)
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            r#"INSERT INTO index_daily_bars
+               (code, trade_date, close, change_pct, volume, amount,
+                available_at, availability_quality, source)
+               VALUES ('000001.SH', $1, 3200.0, 2.0, 100000000, 1000000000.0,
+                       $2, 'observed', 'test')"#,
+        )
+        .bind(trade_date)
+        .bind(available_at)
+        .execute(pool)
+        .await?;
+
         Ok(())
     }
 

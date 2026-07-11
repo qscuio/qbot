@@ -63,6 +63,19 @@ pub struct PointInTimeDailyBarVersion {
     pub source: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct PointInTimeSectorVersion {
+    pub code: String,
+    pub name: String,
+    pub sector_type: String,
+    pub change_pct: Option<f64>,
+    pub amount: Option<f64>,
+    pub trade_date: NaiveDate,
+    pub available_at: DateTime<Utc>,
+    pub ingested_at: DateTime<Utc>,
+    pub source: String,
+}
+
 impl MarketRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -1233,6 +1246,116 @@ impl MarketRepository {
             .collect())
     }
 
+    pub async fn daily_bar_history_for_code_as_of(
+        &self,
+        code: &str,
+        end: NaiveDate,
+        as_of: DateTime<Utc>,
+        limit: i64,
+    ) -> Result<Vec<PointInTimeDailyBarVersion>> {
+        let rows: Vec<(
+            String,
+            NaiveDate,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+            Option<i64>,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+            DateTime<Utc>,
+            DateTime<Utc>,
+            String,
+        )> = sqlx::query_as(
+            r#"WITH latest AS (
+                   SELECT code, trade_date, open, high, low, close, volume, amount,
+                          turnover, pe, pb, available_at, ingested_at, source,
+                          ROW_NUMBER() OVER (
+                              PARTITION BY code, trade_date
+                              ORDER BY available_at DESC, ingested_at DESC, source ASC
+                          ) AS version_rank
+                   FROM stock_daily_bar_versions
+                   WHERE code = $1
+                     AND trade_date <= $2
+                     AND available_at <= $3
+               ),
+               ranked AS (
+                   SELECT code, trade_date, open, high, low, close, volume, amount,
+                          turnover, pe, pb, available_at, ingested_at, source,
+                          ROW_NUMBER() OVER (
+                              ORDER BY trade_date DESC
+                          ) AS history_rank
+                   FROM latest
+                   WHERE version_rank = 1
+               )
+               SELECT code, trade_date, open::float8, high::float8, low::float8,
+                      close::float8, volume, amount::float8, turnover::float8,
+                      pe::float8, pb::float8, available_at, ingested_at, source
+               FROM ranked
+               WHERE history_rank <= $4
+               ORDER BY trade_date ASC"#,
+        )
+        .bind(code)
+        .bind(end)
+        .bind(as_of)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    code,
+                    trade_date,
+                    open,
+                    high,
+                    low,
+                    close,
+                    volume,
+                    amount,
+                    turnover,
+                    pe,
+                    pb,
+                    available_at,
+                    ingested_at,
+                    source,
+                )| {
+                    let missing_critical_fields =
+                        daily_bar_missing_critical_fields(open, high, low, close, volume, amount);
+                    let bar = if missing_critical_fields.is_empty() {
+                        Some(Candle {
+                            trade_date,
+                            open: open.expect("checked daily bar open is present"),
+                            high: high.expect("checked daily bar high is present"),
+                            low: low.expect("checked daily bar low is present"),
+                            close: close.expect("checked daily bar close is present"),
+                            volume: volume.expect("checked daily bar volume is present"),
+                            amount: amount.expect("checked daily bar amount is present"),
+                            turnover,
+                            pe,
+                            pb,
+                        })
+                    } else {
+                        None
+                    };
+
+                    PointInTimeDailyBarVersion {
+                        code,
+                        trade_date,
+                        bar,
+                        missing_critical_fields,
+                        available_at,
+                        ingested_at,
+                        source,
+                    }
+                },
+            )
+            .collect())
+    }
+
     pub async fn latest_adjustment_factor(
         &self,
         code: &str,
@@ -1701,6 +1824,63 @@ impl MarketRepository {
                 },
             )
             .collect())
+    }
+
+    pub async fn sector_version_as_of(
+        &self,
+        code: &str,
+        trade_date: NaiveDate,
+        as_of: DateTime<Utc>,
+    ) -> Result<Option<PointInTimeSectorVersion>> {
+        let row: Option<(
+            String,
+            Option<String>,
+            Option<String>,
+            Option<f64>,
+            Option<f64>,
+            NaiveDate,
+            DateTime<Utc>,
+            DateTime<Utc>,
+            String,
+        )> = sqlx::query_as(
+            r#"SELECT code, name, sector_type, change_pct::float8, amount::float8, trade_date,
+                      available_at, ingested_at, source
+               FROM sector_daily_versions
+               WHERE code = $1
+                 AND trade_date = $2
+                 AND available_at <= $3
+               ORDER BY available_at DESC, ingested_at DESC, source ASC
+               LIMIT 1"#,
+        )
+        .bind(code)
+        .bind(trade_date)
+        .bind(as_of)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(
+            |(
+                code,
+                name,
+                sector_type,
+                change_pct,
+                amount,
+                trade_date,
+                available_at,
+                ingested_at,
+                source,
+            )| PointInTimeSectorVersion {
+                code,
+                name: name.unwrap_or_default(),
+                sector_type: sector_type.unwrap_or_else(|| "unknown".to_string()),
+                change_pct,
+                amount,
+                trade_date,
+                available_at,
+                ingested_at,
+                source,
+            },
+        ))
     }
 
     pub async fn index_history(

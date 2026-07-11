@@ -1379,6 +1379,151 @@ mod tests {
         Ok(())
     }
 
+    #[sqlx::test(migrations = "./migrations")]
+    async fn event_logic_endpoints_surface_persisted_rows_for_mention_linked_evidence(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let state = test_state(pool.clone()).await;
+        let mut router = event_router(state);
+        let repo = EventRepository::new(pool.clone());
+
+        let linked = evidence_row(
+            "linked-mention-only",
+            1,
+            "publishable",
+            "Linked mention only",
+            dt(2026, 7, 10, 8, 0, 0),
+        );
+        let primary_v1 = evidence_row(
+            "primary-v1",
+            1,
+            "publishable",
+            "Primary v1",
+            dt(2026, 7, 10, 8, 15, 0),
+        );
+        let primary_v2 = evidence_row(
+            "primary-v2",
+            1,
+            "publishable",
+            "Primary v2",
+            dt(2026, 7, 10, 8, 30, 0),
+        );
+        repo.insert_evidence(&linked).await.unwrap();
+        repo.insert_evidence(&primary_v1).await.unwrap();
+        repo.insert_evidence(&primary_v2).await.unwrap();
+
+        let cluster_id = Uuid::new_v4();
+        repo.save_event_cluster_version(&event_cluster_row(cluster_id, 1, primary_v1.evidence_id))
+            .await
+            .unwrap();
+        repo.save_event_cluster_version(&EventClusterRow {
+            representative_ids: vec![primary_v2.evidence_id],
+            ..event_cluster_row(cluster_id, 2, primary_v2.evidence_id)
+        })
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"INSERT INTO market_event_mentions
+               (mention_id, evidence_id, event_cluster_id, cluster_version, mention_time,
+                adds_new_fact, source_independence, mention_payload)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(linked.evidence_id)
+        .bind(cluster_id)
+        .bind(1_i32)
+        .bind(dt(2026, 7, 10, 8, 45, 0))
+        .bind(true)
+        .bind(0.93_f64)
+        .bind(json!({"path": "mention-only"}))
+        .execute(&pool)
+        .await?;
+
+        repo.save_event_delta(&event_delta_row(cluster_id, 1, 2))
+            .await
+            .unwrap();
+        let previous_hypothesis = frozen_hypothesis_row(cluster_id, 1, None);
+        repo.save_frozen_hypothesis(&previous_hypothesis)
+            .await
+            .unwrap();
+        let latest_hypothesis =
+            frozen_hypothesis_row(cluster_id, 2, Some(previous_hypothesis.hypothesis_id));
+        repo.save_frozen_hypothesis(&latest_hypothesis)
+            .await
+            .unwrap();
+        repo.save_market_observation(&market_observation_row(latest_hypothesis.hypothesis_id))
+            .await
+            .unwrap();
+
+        let evolution = router
+            .call(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!(
+                        "/api/analysis/events/{}/evolution",
+                        linked.evidence_id
+                    ))
+                    .header(header::AUTHORIZATION, "Bearer test-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(evolution.status(), StatusCode::OK);
+        let evolution_payload = response_json(evolution).await;
+        assert_eq!(evolution_payload["hasPersistedEvolution"], true);
+        assert_eq!(
+            evolution_payload["evolution"]["new_claim_ids"],
+            json!([Uuid::from_u128(202)])
+        );
+
+        let hypothesis = router
+            .call(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!(
+                        "/api/analysis/events/{}/hypothesis",
+                        linked.evidence_id
+                    ))
+                    .header(header::AUTHORIZATION, "Bearer test-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hypothesis.status(), StatusCode::OK);
+        let hypothesis_payload = response_json(hypothesis).await;
+        assert_eq!(hypothesis_payload["hasFrozenHypothesis"], true);
+        assert_eq!(
+            hypothesis_payload["hypothesis"]["graph"]["nodes"][0]["label"],
+            "600519.SH wins major automation order"
+        );
+
+        let observations = router
+            .call(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!(
+                        "/api/analysis/events/{}/market-observations",
+                        linked.evidence_id
+                    ))
+                    .header(header::AUTHORIZATION, "Bearer test-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(observations.status(), StatusCode::OK);
+        let observations_payload = response_json(observations).await;
+        assert_eq!(observations_payload["hasMarketObservations"], true);
+        assert_eq!(
+            observations_payload["observations"][0]["observation_status"],
+            "market_aligned"
+        );
+
+        Ok(())
+    }
+
     async fn response_json(response: axum::response::Response) -> Value {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
