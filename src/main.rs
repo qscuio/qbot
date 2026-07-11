@@ -235,14 +235,8 @@ async fn main() -> Result<()> {
         info!("Chip distribution loop started");
     }
 
-    if state.config.enable_ai_analysis && state.config.report_channel.is_some() {
-        let ai = services::ai_analysis::AiAnalysisService::new(state.clone());
-        let channel = state.config.report_channel.clone().unwrap_or_default();
-        let pusher_clone = pusher.clone();
-        tokio::spawn(async move {
-            ai.run_daily_loop(pusher_clone, channel).await;
-        });
-        info!("AI analysis loop started");
+    if state.config.enable_ai_analysis {
+        info!("ENABLE_AI_ANALYSIS no longer starts a free-form loop; DecisionSupport scheduler owns daily analysis generation");
     }
 
     // Check if first-run backfill needed

@@ -3784,7 +3784,7 @@ async fn handle_telegram_command(
             tg_send(
                 &state,
                 chat_id,
-                "🤖 正在生成今日 A 股复盘报告，请稍候（约 10-30 秒）...",
+                "🤖 正在读取今日 DecisionSupport 兼容复盘，请稍候（约 10-30 秒）...",
             )
             .await?;
             let report = AiAnalysisService::new(state.clone())
