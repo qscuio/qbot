@@ -32,7 +32,7 @@
 **Interfaces:**
 - Produces immutable daily artifacts and candidate details.
 
-- [ ] **Step 1: Create migration**
+- [x] **Step 1: Create migration**
 
 ```sql
 CREATE TABLE analysis_decision_support_runs (
@@ -87,7 +87,7 @@ CREATE INDEX idx_decision_candidates_rank
     ON analysis_decision_candidates(run_id, support_tier, final_score DESC);
 ```
 
-- [ ] **Step 2: Add repository tests**
+- [x] **Step 2: Add repository tests**
 
 Verify:
 
@@ -96,7 +96,7 @@ Verify:
 - candidate facts/calculations/inferences/unknowns remain separate.
 - repeated build upserts by deterministic run ID or rejects duplicate version.
 
-- [ ] **Step 3: Implement repository**
+- [x] **Step 3: Implement repository**
 
 ```rust
 pub async fn create_run(&self, row: &DecisionSupportRunRow) -> Result<Uuid>;
@@ -106,7 +106,7 @@ pub async fn latest_run(&self) -> Result<Option<DecisionSupportRunRow>>;
 pub async fn list_candidates(&self, run_id: Uuid) -> Result<Vec<DecisionCandidateRow>>;
 ```
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ```bash
 cargo test storage::decision_support_repository -- --nocapture
