@@ -69,3 +69,5 @@ Gate 2 phase checklist gap: complete (commit a703326, review clean after enforci
 Gate 3 Task 5: complete (commits 97d7773..27836dd, review clean after freeze payload, EventDelta evolution, and stock-list filtering fixes; verification: analysis::events::hypotheses 19/19 passed with DATABASE_URL, fmt check passed, diff check passed)
 
 Gate 3 Task 6: complete (commits cce5739..4f735dc, review clean; verification: analysis::events::market_observation 6/6 passed with DATABASE_URL, fmt check passed, diff check passed)
+
+Gate 3 Task 7: complete (commits aee0b23..7b4a02a, review clean; verification: analysis::events::event_statistics 3/3 passed, fmt check passed, diff check passed)

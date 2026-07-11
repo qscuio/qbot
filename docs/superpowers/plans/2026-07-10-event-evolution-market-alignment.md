@@ -508,7 +508,7 @@ git commit -m "feat: observe event market alignment without causal claims"
 - Produces versioned historical statistics.
 - Uses only events available before the statistics cutoff.
 
-- [ ] **Step 1: Define aggregation key**
+- [x] **Step 1: Define aggregation key**
 
 ```text
 event_type
@@ -519,11 +519,11 @@ data_cutoff
 logic_version
 ```
 
-- [ ] **Step 2: Test point-in-time cutoff**
+- [x] **Step 2: Test point-in-time cutoff**
 
 An event first seen after cutoff must not enter the baseline.
 
-- [ ] **Step 3: Calculate metrics**
+- [x] **Step 3: Calculate metrics**
 
 ```text
 sample_count
@@ -535,7 +535,7 @@ time_to_peak
 failure_rate
 ```
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ```bash
 cargo test analysis::events::event_statistics
@@ -618,6 +618,6 @@ git commit -m "feat: report evolving events and market alignment"
 - [x] Hypotheses freeze before market observation.
 - [x] Market alignment and causal confidence are separate.
 - [x] Confounded windows are explicit.
-- [ ] Event-type baselines are point-in-time safe.
+- [x] Event-type baselines are point-in-time safe.
 - [ ] Event score remains zero.
 - [x] No indirect beneficiary stock list is generated.
