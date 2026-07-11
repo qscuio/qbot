@@ -7,6 +7,23 @@ use super::contracts::{
 };
 use crate::error::{AppError, Result};
 
+pub(crate) const GATE3_EVENT_SCORE: f64 = 0.0;
+pub(crate) const GATE3_HYPOTHESIS_POLICY: &str = "inference_only";
+pub(crate) const GATE3_MARKET_CAUSALITY_POLICY: &str = "not_claimed";
+pub(crate) const GATE3_EVOLUTION_ABSENCE_MESSAGE: &str = "暂无已持久化的事件演化增量。";
+pub(crate) const GATE3_HYPOTHESIS_ABSENCE_MESSAGE: &str =
+    "暂无已冻结影响假设；后续内容仅作为推演性假设展示。";
+pub(crate) const GATE3_MARKET_OBSERVATION_ABSENCE_MESSAGE: &str =
+    "暂无已持久化的市场观察；即使后续出现对齐或矛盾，也不构成因果认定。";
+pub(crate) const GATE3_COUNTER_SCENARIO_ABSENCE_MESSAGE: &str = "暂无反向情景记录。";
+pub(crate) const GATE3_INVALIDATION_ABSENCE_MESSAGE: &str = "暂无失效条件记录。";
+pub(crate) const GATE3_HISTORICAL_BASELINE_ABSENCE_MESSAGE: &str = "暂无同类历史基线统计。";
+pub(crate) const GATE3_MARKET_LOGIC_NOTES: [&str; 3] = [
+    "冻结影响假设只作为推演性假设展示。",
+    "市场对齐或矛盾只记录观察结果，不构成因果认定。",
+    "不生成间接受益股票代码列表。",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BriefEvidenceRecord {
     pub evidence_id: Uuid,
@@ -193,6 +210,7 @@ pub(crate) fn render_daily_event_brief(brief: &DailyEventBrief) -> Result<String
             .map(|entity| Ok(format!("{}. {}", 0, entity.display_name)))
             .collect::<Result<Vec<_>>>()?,
     ));
+    sections.extend(render_gate3_sections());
     sections.push(render_sources_section(&brief.sources));
 
     Ok(sections.join("\n\n"))
@@ -324,6 +342,25 @@ fn render_sources_section(sources: &[BriefSource]) -> String {
     rendered
 }
 
+fn render_gate3_sections() -> Vec<String> {
+    vec![
+        render_single_line_section("今日事件增量", GATE3_EVOLUTION_ABSENCE_MESSAGE),
+        render_single_line_section("已冻结影响假设", GATE3_HYPOTHESIS_ABSENCE_MESSAGE),
+        render_single_line_section(
+            "市场对齐/矛盾/混杂",
+            GATE3_MARKET_OBSERVATION_ABSENCE_MESSAGE,
+        ),
+        render_single_line_section("观察指标", &format!("事件评分: {:.1}", GATE3_EVENT_SCORE)),
+        render_single_line_section("反向情景", GATE3_COUNTER_SCENARIO_ABSENCE_MESSAGE),
+        render_single_line_section("失效条件", GATE3_INVALIDATION_ABSENCE_MESSAGE),
+        render_single_line_section("同类历史基线", GATE3_HISTORICAL_BASELINE_ABSENCE_MESSAGE),
+    ]
+}
+
+fn render_single_line_section(title: &str, line: &str) -> String {
+    render_fact_section(title, vec![format!("0. {line}")])
+}
+
 fn fingerprint_json<T: Serialize>(value: &T) -> Result<String> {
     use sha2::{Digest, Sha256};
 
@@ -419,6 +456,27 @@ mod tests {
                 "直接涉及公司与行业\n",
                 "1. 浦发银行\n",
                 "2. 银行\n",
+                "\n",
+                "今日事件增量\n",
+                "1. 暂无已持久化的事件演化增量。\n",
+                "\n",
+                "已冻结影响假设\n",
+                "1. 暂无已冻结影响假设；后续内容仅作为推演性假设展示。\n",
+                "\n",
+                "市场对齐/矛盾/混杂\n",
+                "1. 暂无已持久化的市场观察；即使后续出现对齐或矛盾，也不构成因果认定。\n",
+                "\n",
+                "观察指标\n",
+                "1. 事件评分: 0.0\n",
+                "\n",
+                "反向情景\n",
+                "1. 暂无反向情景记录。\n",
+                "\n",
+                "失效条件\n",
+                "1. 暂无失效条件记录。\n",
+                "\n",
+                "同类历史基线\n",
+                "1. 暂无同类历史基线统计。\n",
                 "\n",
                 "来源\n",
                 "S1. 交易所临时停牌公告 | official:market_event / notice-001 | 2026-07-10T08:15:00+00:00\n",
@@ -518,6 +576,43 @@ mod tests {
                 .contains("brief fact 00000000-0000-0000-0000-00000000001f references unknown source evidence"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn gate3_sections_keep_event_score_zero_and_avoid_causal_or_indirect_stock_claims() {
+        let evidence_id = Uuid::from_u128(51);
+        let brief = DailyEventBrief {
+            trade_date: date(2026, 7, 10),
+            new_facts: vec![BriefFact {
+                fact_id: Uuid::from_u128(52),
+                summary: "公司披露正式事项。".to_string(),
+                evidence_ids: vec![evidence_id],
+            }],
+            revisions: Vec::new(),
+            unconfirmed: Vec::new(),
+            direct_entities: vec![BriefEntity {
+                entity_id: "600519.SH".to_string(),
+                display_name: "贵州茅台".to_string(),
+            }],
+            sources: vec![BriefSource {
+                evidence_id,
+                source_id: "official:market_event".to_string(),
+                source_item_id: "notice-051".to_string(),
+                published_at: Some(dt(2026, 7, 10, 10, 0, 0)),
+                available_at: dt(2026, 7, 10, 10, 0, 0),
+                title: "正式公告".to_string(),
+            }],
+            input_fingerprint: "fingerprint-v1".to_string(),
+        };
+
+        let rendered = render_daily_event_brief(&brief).unwrap();
+
+        assert!(rendered.contains("已冻结影响假设"));
+        assert!(rendered.contains("推演性假设"));
+        assert!(rendered.contains("市场对齐/矛盾/混杂"));
+        assert!(rendered.contains("不构成因果认定"));
+        assert!(rendered.contains("观察指标\n1. 事件评分: 0.0"));
+        assert!(!rendered.contains("600519.SH"));
     }
 
     fn date(year: i32, month: u32, day: u32) -> NaiveDate {

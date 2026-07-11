@@ -35,6 +35,8 @@ const SCAN_JOB_CRON: &str = "0 30 17 * * Mon,Tue,Wed,Thu,Fri";
 const PATTERN_SHADOW_JOB_CRON: &str = "0 40 17 * * Mon,Tue,Wed,Thu,Fri";
 const EVENT_INGESTION_JOB_CRON: &str = "0 5 9-17 * * Mon,Tue,Wed,Thu,Fri";
 const EVENT_FACT_BRIEF_JOB_CRON: &str = "0 50 17 * * Mon,Tue,Wed,Thu,Fri";
+const EVENT_CLUSTER_REFINEMENT_JOB_CRON: &str = "0 52 17 * * Mon,Tue,Wed,Thu,Fri";
+const EVENT_MARKET_OBSERVATION_JOB_CRON: &str = "0 54 17 * * Mon,Tue,Wed,Thu,Fri";
 const DAILY_SIGNAL_ARCHIVE_JOB_CRON: &str = "0 5 20 * * Mon,Tue,Wed,Thu,Fri";
 const DAILY_REPORT_JOB_CRON: &str = "0 0 18 * * Mon,Tue,Wed,Thu,Fri";
 const WEEKLY_REPORT_JOB_CRON: &str = "0 0 20 * * Fri";
@@ -420,6 +422,20 @@ pub async fn run_event_fact_brief_job(state: Arc<AppState>) {
     }
 }
 
+pub async fn run_event_cluster_refinement_job(state: Arc<AppState>) {
+    let _guard = state.analysis_job_lock.lock().await;
+    info!(
+        "Event cluster refinement skipped: no persisted event-cluster evolution output is available yet"
+    );
+}
+
+pub async fn run_event_market_observation_job(state: Arc<AppState>) {
+    let _guard = state.analysis_job_lock.lock().await;
+    info!(
+        "Event market observation skipped: no persisted frozen hypotheses or market observations are available yet"
+    );
+}
+
 /// Generate daily market report and push to Telegram (18:00 job).
 pub async fn run_daily_report_job(
     state: Arc<AppState>,
@@ -673,6 +689,36 @@ pub async fn start_scheduler(
             .await?;
     }
 
+    // 17:52 weekdays
+    {
+        let s = state.clone();
+        sched
+            .add(Job::new_async_tz(
+                EVENT_CLUSTER_REFINEMENT_JOB_CRON,
+                beijing_tz(),
+                move |_, _| {
+                    let s = s.clone();
+                    Box::pin(async move { run_event_cluster_refinement_job(s).await })
+                },
+            )?)
+            .await?;
+    }
+
+    // 17:54 weekdays
+    {
+        let s = state.clone();
+        sched
+            .add(Job::new_async_tz(
+                EVENT_MARKET_OBSERVATION_JOB_CRON,
+                beijing_tz(),
+                move |_, _| {
+                    let s = s.clone();
+                    Box::pin(async move { run_event_market_observation_job(s).await })
+                },
+            )?)
+            .await?;
+    }
+
     // 18:00 weekdays
     {
         let s = state.clone();
@@ -727,7 +773,7 @@ pub async fn start_scheduler(
     }
 
     sched.start().await?;
-    info!("Scheduler started with 11 jobs");
+    info!("Scheduler started with 13 jobs");
     Ok(sched)
 }
 
@@ -741,6 +787,8 @@ fn production_job_crons_in_registration_order() -> Vec<&'static str> {
         PATTERN_SHADOW_JOB_CRON,
         EVENT_INGESTION_JOB_CRON,
         EVENT_FACT_BRIEF_JOB_CRON,
+        EVENT_CLUSTER_REFINEMENT_JOB_CRON,
+        EVENT_MARKET_OBSERVATION_JOB_CRON,
         DAILY_REPORT_JOB_CRON,
         WEEKLY_REPORT_JOB_CRON,
         DAILY_SIGNAL_ARCHIVE_JOB_CRON,
@@ -929,6 +977,14 @@ mod tests {
     fn event_jobs_run_before_the_daily_market_report() {
         assert_eq!(EVENT_INGESTION_JOB_CRON, "0 5 9-17 * * Mon,Tue,Wed,Thu,Fri");
         assert_eq!(EVENT_FACT_BRIEF_JOB_CRON, "0 50 17 * * Mon,Tue,Wed,Thu,Fri");
+        assert_eq!(
+            EVENT_CLUSTER_REFINEMENT_JOB_CRON,
+            "0 52 17 * * Mon,Tue,Wed,Thu,Fri"
+        );
+        assert_eq!(
+            EVENT_MARKET_OBSERVATION_JOB_CRON,
+            "0 54 17 * * Mon,Tue,Wed,Thu,Fri"
+        );
     }
 
     #[test]
@@ -950,6 +1006,8 @@ mod tests {
                 "0 40 17 * * Mon,Tue,Wed,Thu,Fri",
                 "0 5 9-17 * * Mon,Tue,Wed,Thu,Fri",
                 "0 50 17 * * Mon,Tue,Wed,Thu,Fri",
+                "0 52 17 * * Mon,Tue,Wed,Thu,Fri",
+                "0 54 17 * * Mon,Tue,Wed,Thu,Fri",
                 "0 0 18 * * Mon,Tue,Wed,Thu,Fri",
                 "0 0 20 * * Fri",
                 "0 5 20 * * Mon,Tue,Wed,Thu,Fri",
@@ -1248,6 +1306,38 @@ mod tests {
             run.is_ok(),
             "fact brief job should not block on daily report lock"
         );
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn event_cluster_refinement_job_returns_cleanly_without_persisted_clusters(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let state = test_state(pool).await;
+
+        let run = timeout(
+            TokioDuration::from_secs(1),
+            run_event_cluster_refinement_job(state),
+        )
+        .await;
+
+        assert!(run.is_ok(), "cluster refinement job should return cleanly");
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn event_market_observation_job_returns_cleanly_without_persisted_observations(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let state = test_state(pool).await;
+
+        let run = timeout(
+            TokioDuration::from_secs(1),
+            run_event_market_observation_job(state),
+        )
+        .await;
+
+        assert!(run.is_ok(), "market observation job should return cleanly");
         Ok(())
     }
 

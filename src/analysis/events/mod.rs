@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::PgPool;
 use tracing::warn;
@@ -14,7 +15,9 @@ use self::extraction::{
 };
 use self::reporting::{
     build_daily_event_brief, render_daily_event_brief, BriefClaimRecord, BriefEntityRecord,
-    BriefEvidenceRecord,
+    BriefEvidenceRecord, GATE3_EVENT_SCORE, GATE3_EVOLUTION_ABSENCE_MESSAGE,
+    GATE3_HYPOTHESIS_ABSENCE_MESSAGE, GATE3_HYPOTHESIS_POLICY, GATE3_MARKET_CAUSALITY_POLICY,
+    GATE3_MARKET_LOGIC_NOTES, GATE3_MARKET_OBSERVATION_ABSENCE_MESSAGE,
 };
 use crate::error::{AppError, Result};
 use crate::storage::event_repository::{
@@ -63,6 +66,48 @@ pub enum EventReviewAction {
     Reject,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct EventEvolutionView {
+    pub event_id: Uuid,
+    pub event_score: f64,
+    pub has_persisted_evolution: bool,
+    pub evolution: Option<EventDelta>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct EventHypothesisView {
+    pub event_id: Uuid,
+    pub event_score: f64,
+    pub has_frozen_hypothesis: bool,
+    pub hypothesis_policy: String,
+    pub hypothesis: Option<FrozenImpactHypothesis>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct EventMarketObservationsView {
+    pub event_id: Uuid,
+    pub event_score: f64,
+    pub has_market_observations: bool,
+    pub market_causality: String,
+    pub observations: Vec<market_observation::MarketObservation>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketLogicBrief {
+    pub event_score: f64,
+    pub hypothesis_policy: String,
+    pub market_causality: String,
+    pub indirect_stock_codes: Vec<String>,
+    pub notes: Vec<String>,
+}
+
 pub struct EventIntelligence {
     deps: EventIntelligenceDependencies,
 }
@@ -92,14 +137,63 @@ impl EventIntelligence {
     }
 
     pub async fn get_event_detail(&self, event_id: Uuid) -> Result<EventDetail> {
-        let row = self
-            .deps
-            .repo
-            .find_evidence_by_id(event_id)
-            .await?
-            .ok_or_else(|| AppError::NotFound(format!("event evidence {event_id}")))?;
+        let row = self.load_event_row(event_id).await?;
 
         Ok(event_detail_from_row(&row))
+    }
+
+    pub async fn get_event_evolution(&self, event_id: Uuid) -> Result<EventEvolutionView> {
+        self.load_event_row(event_id).await?;
+
+        Ok(EventEvolutionView {
+            event_id,
+            event_score: GATE3_EVENT_SCORE,
+            has_persisted_evolution: false,
+            evolution: None,
+            message: GATE3_EVOLUTION_ABSENCE_MESSAGE.to_string(),
+        })
+    }
+
+    pub async fn get_event_hypothesis(&self, event_id: Uuid) -> Result<EventHypothesisView> {
+        self.load_event_row(event_id).await?;
+
+        Ok(EventHypothesisView {
+            event_id,
+            event_score: GATE3_EVENT_SCORE,
+            has_frozen_hypothesis: false,
+            hypothesis_policy: GATE3_HYPOTHESIS_POLICY.to_string(),
+            hypothesis: None,
+            message: GATE3_HYPOTHESIS_ABSENCE_MESSAGE.to_string(),
+        })
+    }
+
+    pub async fn get_event_market_observations(
+        &self,
+        event_id: Uuid,
+    ) -> Result<EventMarketObservationsView> {
+        self.load_event_row(event_id).await?;
+
+        Ok(EventMarketObservationsView {
+            event_id,
+            event_score: GATE3_EVENT_SCORE,
+            has_market_observations: false,
+            market_causality: GATE3_MARKET_CAUSALITY_POLICY.to_string(),
+            observations: Vec::new(),
+            message: GATE3_MARKET_OBSERVATION_ABSENCE_MESSAGE.to_string(),
+        })
+    }
+
+    pub fn market_logic_brief(&self) -> MarketLogicBrief {
+        MarketLogicBrief {
+            event_score: GATE3_EVENT_SCORE,
+            hypothesis_policy: GATE3_HYPOTHESIS_POLICY.to_string(),
+            market_causality: GATE3_MARKET_CAUSALITY_POLICY.to_string(),
+            indirect_stock_codes: Vec::new(),
+            notes: GATE3_MARKET_LOGIC_NOTES
+                .iter()
+                .map(|note| (*note).to_string())
+                .collect(),
+        }
     }
 
     pub async fn review_event(
@@ -328,6 +422,14 @@ impl EventIntelligence {
             self.deps.repo.clone(),
             Arc::clone(&self.deps.resolver),
         ))
+    }
+
+    async fn load_event_row(&self, event_id: Uuid) -> Result<EventEvidenceRow> {
+        self.deps
+            .repo
+            .find_evidence_by_id(event_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("event evidence {event_id}")))
     }
 
     async fn process_pending_evidence(&self, evidence: &EventEvidenceRow) -> Result<()> {

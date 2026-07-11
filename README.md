@@ -1,6 +1,6 @@
 # qbot
 
-A-share stock analysis bot. Fetches daily market data from Tushare, runs 24 signal detectors, ingests official market-event evidence, publishes a daily fact brief, archives daily signal snapshots, and pushes reports to a Telegram channel on a cron schedule.
+A-share stock analysis bot. Fetches daily market data from Tushare, runs 24 signal detectors, ingests official market-event evidence, publishes a daily fact brief, exposes Gate 3 event-evolution and market-observation read models with explicit non-causal absence contracts, archives daily signal snapshots, and pushes reports to a Telegram channel on a cron schedule.
 
 ---
 
@@ -182,6 +182,8 @@ Jobs are scheduled with fixed `UTC+08:00` in code (`Job::new_async_tz`).
 | 17:40 | Mon–Fri | Match latest published patterns against the latest complete market snapshot and persist shadow candidates |
 | Hourly at `:05` from 09:00 to 17:00 | Mon–Fri | Ingest official market-event feed with Redis-backed provider cursor state, run structured extraction, and publish eligible evidence |
 | 17:50 | Mon–Fri | Build and persist the daily evidence-backed market fact brief |
+| 17:52 | Mon–Fri | Run Gate 3 event-cluster refinement integration; current behavior is an explicit absence contract until persisted cluster outputs land |
+| 17:54 | Mon–Fri | Run Gate 3 market-observation integration; current behavior is an explicit absence contract until persisted hypotheses and observations land |
 | 18:00 | Mon–Fri | Generate daily report, push to Telegram |
 | 20:00 | Friday | Generate weekly report, push to Telegram |
 | 20:05 | Mon–Fri | Run full signal scan and archive triggered hits to `daily_signal_scan_results` |
@@ -380,6 +382,10 @@ curl -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
 | GET | `/api/scan/daily-stats` | Yes | Forward-return stats from daily archived signal snapshots (`days`, optional `signal_id`, optional `limit`) |
 | GET | `/api/analysis/patterns/shadow` | Yes | Persisted pattern shadow candidates from `analysis_shadow_candidates` (`date=YYYY-MM-DD`, optional `limit`) |
 | GET | `/api/analysis/patterns/shadow/{code}` | Yes | Persisted pattern shadow candidates for one stock code (`date=YYYY-MM-DD`, optional `limit`) |
+| GET | `/api/analysis/events/{id}/evolution` | Yes | Event evolution contract; returns explicit absence when no persisted Gate 3 delta exists and keeps `eventScore=0.0` |
+| GET | `/api/analysis/events/{id}/hypothesis` | Yes | Frozen-hypothesis contract; labels hypotheses as inference-only and returns explicit absence when nothing is persisted |
+| GET | `/api/analysis/events/{id}/market-observations` | Yes | Market-observation contract; makes no market-causality claim and returns explicit absence when nothing is persisted |
+| GET | `/api/analysis/events/market-logic-brief` | Yes | Gate 3 logic guardrails: zero event score, inference-only hypotheses, non-causal market observations, no indirect stock-code lists |
 | GET | `/api/report/daily` | Yes | Latest daily report from DB |
 | GET | `/api/report/signal_auto` | Yes | Latest signal auto-trading daily report from DB |
 | GET | `/api/report/limitup` | Yes | Latest standalone limit-up report from DB |

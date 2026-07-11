@@ -45,6 +45,22 @@ pub fn event_router(state: Arc<AppState>) -> Router {
         .route("/api/analysis/events/manual", post(submit_manual_event))
         .route("/api/analysis/events", get(list_events))
         .route("/api/analysis/events/daily-brief", get(get_daily_brief))
+        .route(
+            "/api/analysis/events/market-logic-brief",
+            get(get_market_logic_brief),
+        )
+        .route(
+            "/api/analysis/events/:id/evolution",
+            get(get_event_evolution),
+        )
+        .route(
+            "/api/analysis/events/:id/hypothesis",
+            get(get_event_hypothesis),
+        )
+        .route(
+            "/api/analysis/events/:id/market-observations",
+            get(get_event_market_observations),
+        )
         .route("/api/analysis/events/:id", get(get_event_detail))
         .route("/api/analysis/events/:id/review", post(review_event))
         .with_state(state)
@@ -291,6 +307,48 @@ async fn get_event_detail(
     Ok(Json(json!(detail)))
 }
 
+async fn get_event_evolution(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult {
+    require_auth(&headers, &state)?;
+    let event_id = parse_event_uuid(&id)?;
+    let detail = EventIntelligence::new(state.db.clone())
+        .get_event_evolution(event_id)
+        .await
+        .map_err(map_event_error)?;
+    Ok(Json(json!(detail)))
+}
+
+async fn get_event_hypothesis(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult {
+    require_auth(&headers, &state)?;
+    let event_id = parse_event_uuid(&id)?;
+    let detail = EventIntelligence::new(state.db.clone())
+        .get_event_hypothesis(event_id)
+        .await
+        .map_err(map_event_error)?;
+    Ok(Json(json!(detail)))
+}
+
+async fn get_event_market_observations(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult {
+    require_auth(&headers, &state)?;
+    let event_id = parse_event_uuid(&id)?;
+    let detail = EventIntelligence::new(state.db.clone())
+        .get_event_market_observations(event_id)
+        .await
+        .map_err(map_event_error)?;
+    Ok(Json(json!(detail)))
+}
+
 async fn review_event(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -331,6 +389,16 @@ async fn get_daily_brief(
         .await
         .map_err(map_event_error)?;
     Ok(Json(json!(brief)))
+}
+
+async fn get_market_logic_brief(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> ApiResult {
+    require_auth(&headers, &state)?;
+    Ok(Json(json!(
+        EventIntelligence::new(state.db.clone()).market_logic_brief()
+    )))
 }
 
 fn manual_submission_response(
@@ -511,6 +579,22 @@ mod tests {
                 Some(json!({"reviewedBy": "tester"}).to_string()),
             ),
             (Method::GET, "/api/analysis/events/daily-brief", None),
+            (
+                Method::GET,
+                "/api/analysis/events/11111111-1111-1111-1111-111111111111/evolution",
+                None,
+            ),
+            (
+                Method::GET,
+                "/api/analysis/events/11111111-1111-1111-1111-111111111111/hypothesis",
+                None,
+            ),
+            (
+                Method::GET,
+                "/api/analysis/events/11111111-1111-1111-1111-111111111111/market-observations",
+                None,
+            ),
+            (Method::GET, "/api/analysis/events/market-logic-brief", None),
         ] {
             let mut router = event_router(state.clone());
             let mut request = Request::builder().method(method).uri(path);
@@ -1096,6 +1180,80 @@ mod tests {
         assert_eq!(payload["briefVersion"], "brief-v1");
         assert_eq!(payload["content"], "Facts for the day");
         assert_eq!(payload["structuredPayload"], json!({"facts": ["A"]}));
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn event_logic_endpoints_return_explicit_non_causal_absence_contracts(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let state = test_state(pool.clone()).await;
+        let repo = EventRepository::new(pool.clone());
+        let row = evidence_row(
+            &Uuid::new_v4().to_string(),
+            1,
+            "publishable",
+            "Seeded event",
+            dt(2026, 7, 10, 8, 0, 0),
+        );
+        repo.insert_evidence(&row).await.unwrap();
+        let mut router = event_router(state);
+
+        for (path, availability_field) in [
+            (
+                format!("/api/analysis/events/{}/evolution", row.evidence_id),
+                "hasPersistedEvolution",
+            ),
+            (
+                format!("/api/analysis/events/{}/hypothesis", row.evidence_id),
+                "hasFrozenHypothesis",
+            ),
+            (
+                format!(
+                    "/api/analysis/events/{}/market-observations",
+                    row.evidence_id
+                ),
+                "hasMarketObservations",
+            ),
+        ] {
+            let response = router
+                .call(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(&path)
+                        .header(header::AUTHORIZATION, "Bearer test-key")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            let payload = response_json(response).await;
+            assert_eq!(payload["eventId"], row.evidence_id.to_string(), "{path}");
+            assert_eq!(payload["eventScore"], 0.0, "{path}");
+            assert_eq!(payload[availability_field], false, "{path}");
+        }
+
+        let response = router
+            .call(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/analysis/events/market-logic-brief")
+                    .header(header::AUTHORIZATION, "Bearer test-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert_eq!(payload["eventScore"], 0.0);
+        assert_eq!(payload["hypothesisPolicy"], "inference_only");
+        assert_eq!(payload["marketCausality"], "not_claimed");
+        assert_eq!(payload["indirectStockCodes"], json!([]));
 
         Ok(())
     }
