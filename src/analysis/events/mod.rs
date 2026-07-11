@@ -23,20 +23,27 @@ use crate::storage::event_repository::{
 };
 
 pub(crate) mod claims;
+pub mod clustering;
 pub mod contracts;
 mod dedup;
 pub(crate) mod entity_linking;
 mod evidence;
 pub(crate) mod extraction;
+pub mod mentions;
 mod reporting;
 mod time;
 
+pub use clustering::{
+    CandidateCluster, ClusterDecision, EndOfDayRefiner, IncrementalAssignment,
+    IncrementalClusterer, IncrementalClusteringConfig, LockedClusterRelations, RefinedCluster,
+};
 pub use contracts::{
     AShareTradingDateResolver, BriefEntity, BriefFact, BriefRevision, BriefSource,
     BriefUnconfirmed, DailyEventBrief, EventDetail, EventEvidence, EventListItem,
     EventProcessingSummary, EventReviewResult, ExistingEventEvidenceRelation, ManualEventInput,
     ManualEventSubmissionOutcome, PersistedDailyEventBrief, TradingDateResolver,
 };
+pub use mentions::{ClusterMention, EventMention};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventReviewAction {
