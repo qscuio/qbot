@@ -140,20 +140,20 @@ async fn load_factual_top_stock(
     let top_row: Option<(String, String, f64)> = sqlx::query_as(
         r#"WITH ranked AS (
              SELECT b.code,
-                    i.name,
+                    COALESCE(i.name, b.code) AS name,
                     b.trade_date,
                     b.close::float8 AS close,
                     LAG(b.close::float8) OVER (PARTITION BY b.code ORDER BY b.trade_date) AS prev_close
              FROM stock_daily_bars b
-             JOIN stock_info i ON i.code = b.code
+             LEFT JOIN stock_info i ON i.code = b.code
              WHERE b.trade_date <= $1
            )
            SELECT code,
                   name,
-                  ((close - prev_close) / NULLIF(prev_close, 0)) * 100 AS change_pct
+                  ((close - prev_close) / prev_close) * 100 AS change_pct
            FROM ranked
            WHERE trade_date = $1
-             AND prev_close IS NOT NULL
+             AND prev_close > 0
            ORDER BY change_pct DESC NULLS LAST
            LIMIT 1"#,
     )

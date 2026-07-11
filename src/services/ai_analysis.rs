@@ -616,6 +616,78 @@ mod tests {
         Ok(())
     }
 
+    #[sqlx::test(migrations = "./migrations")]
+    async fn market_overview_preserves_top_stock_when_metadata_is_missing(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let llm_calls = Arc::new(AtomicUsize::new(0));
+        let (llm_base_url, llm_handle) = spawn_failing_llm_server(llm_calls.clone()).await;
+
+        let trade_date = date(2026, 7, 11);
+        seed_market_snapshot(&pool, trade_date).await?;
+        seed_persisted_decision_artifact(&pool, trade_date).await?;
+        seed_sector_rows(&pool, trade_date).await?;
+        seed_top_stock_with_missing_metadata(&pool, trade_date).await?;
+
+        let state = test_state(pool, Some("test-ai-key"), &llm_base_url).await;
+
+        let overview = AiAnalysisService::new(state)
+            .market_overview(Some(trade_date))
+            .await
+            .expect("market overview should preserve legacy top stock fallback");
+
+        llm_handle.abort();
+
+        let payload = serde_json::to_value(&overview).expect("serialize market overview");
+        assert_eq!(payload["topStock"]["code"], "300999.SZ");
+        assert_eq!(payload["topStock"]["name"], "300999.SZ");
+        let top_stock_change = payload["topStock"]["changePct"]
+            .as_f64()
+            .expect("top stock change pct");
+        assert!((top_stock_change - 50.0).abs() < 1e-12);
+        assert_ne!(payload["topStock"]["trend"], Value::Null);
+        assert!(payload.get("compatibility").is_none());
+        assert_eq!(llm_calls.load(Ordering::SeqCst), 0);
+
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn market_overview_handles_zero_previous_close_without_decode_failure(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let llm_calls = Arc::new(AtomicUsize::new(0));
+        let (llm_base_url, llm_handle) = spawn_failing_llm_server(llm_calls.clone()).await;
+
+        let trade_date = date(2026, 7, 11);
+        seed_market_snapshot(&pool, trade_date).await?;
+        seed_persisted_decision_artifact(&pool, trade_date).await?;
+        seed_top_stock_with_zero_previous_close(&pool, trade_date).await?;
+
+        let state = test_state(pool, Some("test-ai-key"), &llm_base_url).await;
+
+        let overview = AiAnalysisService::new(state)
+            .market_overview(Some(trade_date))
+            .await
+            .expect("market overview should tolerate zero previous close rows");
+
+        llm_handle.abort();
+
+        let payload = serde_json::to_value(&overview).expect("serialize market overview");
+        assert_eq!(payload["topStock"], Value::Null);
+        assert_eq!(
+            payload["compatibility"]["topStock"]["status"],
+            "unavailable"
+        );
+        assert!(payload["compatibility"]["topStock"]["message"]
+            .as_str()
+            .expect("topStock compatibility message")
+            .contains("previous close"));
+        assert_eq!(llm_calls.load(Ordering::SeqCst), 0);
+
+        Ok(())
+    }
+
     async fn spawn_failing_llm_server(
         llm_calls: Arc<AtomicUsize>,
     ) -> (String, tokio::task::JoinHandle<()>) {
@@ -860,6 +932,120 @@ mod tests {
         }
 
         postgres::upsert_daily_bars(pool, &bars).await.unwrap();
+        Ok(())
+    }
+
+    async fn seed_top_stock_with_missing_metadata(
+        pool: &PgPool,
+        trade_date: NaiveDate,
+    ) -> sqlx::Result<()> {
+        postgres::upsert_stock_info(
+            pool,
+            &[StockInfo {
+                code: "600010.SH".to_string(),
+                name: "Covered Name".to_string(),
+                market: "SH".to_string(),
+                industry: Some("Utilities".to_string()),
+            }],
+        )
+        .await
+        .unwrap();
+
+        let mut bars = Vec::new();
+        for offset in 0..61 {
+            let day = trade_date - chrono::Days::new((60 - offset) as u64);
+            let fallback_close = if offset == 60 { 15.0 } else { 10.0 };
+            let covered_close = if offset == 60 { 10.5 } else { 10.0 };
+
+            bars.push((
+                "300999.SZ".to_string(),
+                Candle {
+                    trade_date: day,
+                    open: fallback_close - 0.5,
+                    high: fallback_close + 0.5,
+                    low: fallback_close - 0.8,
+                    close: fallback_close,
+                    volume: 900_000,
+                    amount: 4_500_000.0,
+                    turnover: Some(3.0),
+                    pe: Some(18.0),
+                    pb: Some(2.5),
+                },
+            ));
+            bars.push((
+                "600010.SH".to_string(),
+                Candle {
+                    trade_date: day,
+                    open: covered_close - 0.3,
+                    high: covered_close + 0.3,
+                    low: covered_close - 0.5,
+                    close: covered_close,
+                    volume: 700_000,
+                    amount: 3_100_000.0,
+                    turnover: Some(1.2),
+                    pe: Some(11.0),
+                    pb: Some(1.1),
+                },
+            ));
+        }
+
+        postgres::upsert_daily_bars(pool, &bars).await.unwrap();
+        Ok(())
+    }
+
+    async fn seed_top_stock_with_zero_previous_close(
+        pool: &PgPool,
+        trade_date: NaiveDate,
+    ) -> sqlx::Result<()> {
+        postgres::upsert_stock_info(
+            pool,
+            &[StockInfo {
+                code: "002001.SZ".to_string(),
+                name: "Zero Base".to_string(),
+                market: "SZ".to_string(),
+                industry: Some("Software".to_string()),
+            }],
+        )
+        .await
+        .unwrap();
+
+        postgres::upsert_daily_bars(
+            pool,
+            &[
+                (
+                    "002001.SZ".to_string(),
+                    Candle {
+                        trade_date: trade_date - chrono::Days::new(1),
+                        open: 0.0,
+                        high: 0.0,
+                        low: 0.0,
+                        close: 0.0,
+                        volume: 100_000,
+                        amount: 0.0,
+                        turnover: Some(0.0),
+                        pe: None,
+                        pb: None,
+                    },
+                ),
+                (
+                    "002001.SZ".to_string(),
+                    Candle {
+                        trade_date,
+                        open: 4.5,
+                        high: 5.5,
+                        low: 4.0,
+                        close: 5.0,
+                        volume: 120_000,
+                        amount: 600_000.0,
+                        turnover: Some(1.0),
+                        pe: Some(25.0),
+                        pb: Some(4.0),
+                    },
+                ),
+            ],
+        )
+        .await
+        .unwrap();
         Ok(())
     }
 
