@@ -371,7 +371,7 @@ git commit -m "feat: track event information deltas"
 - Produces a hypothesis graph from ClaimGraph and deterministic templates.
 - Freezes before market observation.
 
-- [ ] **Step 1: Define graph contracts**
+- [x] **Step 1: Define graph contracts**
 
 ```rust
 pub struct ImpactHypothesisGraph {
@@ -397,7 +397,7 @@ pub struct HypothesisEdge {
 }
 ```
 
-- [ ] **Step 2: Add deterministic templates**
+- [x] **Step 2: Add deterministic templates**
 
 Required templates:
 
@@ -410,7 +410,7 @@ company_order_v1
 company_accident_v1
 ```
 
-- [ ] **Step 3: Enforce freeze**
+- [x] **Step 3: Enforce freeze**
 
 After `frozen_at`:
 
@@ -418,7 +418,7 @@ After `frozen_at`:
 - market observation can only append separate rows.
 - new facts create a new hypothesis version.
 
-- [ ] **Step 4: Limit stock scope**
+- [x] **Step 4: Limit stock scope**
 
 Hypothesis output may name:
 

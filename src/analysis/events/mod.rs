@@ -30,6 +30,7 @@ pub mod deltas;
 pub(crate) mod entity_linking;
 mod evidence;
 pub(crate) mod extraction;
+pub mod hypotheses;
 pub mod mentions;
 mod reporting;
 mod time;
@@ -47,6 +48,10 @@ pub use contracts::{
 pub use deltas::{
     compute_event_delta, ClaimEntityRole, EventClaimSnapshot, EventClusterVersionSnapshot,
     EventDelta, ExpectationGap, ExpectationSnapshot, NormalizedValue, RevisedValue, StatusChange,
+};
+pub use hypotheses::{
+    build_impact_hypothesis_graph, FrozenImpactHypothesis, HypothesisEdge, HypothesisNode,
+    ImpactHypothesisGraph, IMPACT_HYPOTHESIS_SCHEMA_VERSION,
 };
 pub use mentions::{ClusterMention, EventMention};
 
