@@ -34,7 +34,7 @@ mod reporting;
 mod time;
 
 pub use clustering::{
-    CandidateCluster, ClusterDecision, EndOfDayRefiner, IncrementalAssignment,
+    CandidateCluster, ClusterDecision, ClusterVersionRef, EndOfDayRefiner, IncrementalAssignment,
     IncrementalClusterer, IncrementalClusteringConfig, LockedClusterRelations, RefinedCluster,
 };
 pub use contracts::{

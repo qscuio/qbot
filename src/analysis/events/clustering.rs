@@ -17,6 +17,8 @@ pub struct ClusterDecision {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CandidateCluster {
     pub event_cluster_id: Uuid,
+    pub cluster_version: Option<i32>,
+    pub input_cluster_versions: Vec<ClusterVersionRef>,
     pub mentions: Vec<ClusterMention>,
     pub review_required: bool,
 }
@@ -37,9 +39,18 @@ impl CandidateCluster {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ClusterVersionRef {
+    pub event_cluster_id: Uuid,
+    pub cluster_version: Option<i32>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RefinedCluster {
     pub event_cluster_id: Uuid,
+    pub cluster_version: i32,
+    pub supersedes_version: Option<i32>,
+    pub input_cluster_versions: Vec<ClusterVersionRef>,
     pub mentions: Vec<ClusterMention>,
     pub representative_evidence_id: Uuid,
     pub independent_sources: usize,
@@ -142,6 +153,11 @@ impl IncrementalClusterer {
         let event_cluster_id = Uuid::new_v4();
         self.clusters.push(CandidateCluster {
             event_cluster_id,
+            cluster_version: None,
+            input_cluster_versions: vec![ClusterVersionRef {
+                event_cluster_id,
+                cluster_version: None,
+            }],
             mentions: vec![ClusterMention {
                 origin_cluster_id: event_cluster_id,
                 duplicate_group_id,
@@ -264,6 +280,10 @@ fn score_mentions(
     let action_overlap = token_overlap(&left.action_tokens, &right.action_tokens);
     let location_overlap = location_overlap(&left.location_tokens, &right.location_tokens);
     let semantic_similarity = semantic_similarity(&left.semantic_vector, &right.semantic_vector);
+    let entity_intersection_non_empty =
+        has_non_empty_token_intersection(&left.entity_ids, &right.entity_ids);
+    let action_intersection_non_empty =
+        has_non_empty_token_intersection(&left.action_tokens, &right.action_tokens);
     let components = SimilarityComponents {
         time_proximity,
         entity_overlap,
@@ -271,7 +291,8 @@ fn score_mentions(
         location_overlap,
         semantic_similarity,
     };
-    let hard_conditions_met = time_is_compatible && entity_overlap > 0.0 && action_overlap > 0.0;
+    let hard_conditions_met =
+        time_is_compatible && entity_intersection_non_empty && action_intersection_non_empty;
 
     ClusterScore {
         event_cluster_id: Uuid::nil(),
@@ -305,14 +326,24 @@ fn merge_fragmented_clusters(
         let root = find_index(&mut parents, index);
         let entry = grouped.entry(root).or_insert_with(|| CandidateCluster {
             event_cluster_id: cluster.event_cluster_id,
+            cluster_version: cluster.cluster_version,
+            input_cluster_versions: cluster.input_cluster_versions.clone(),
             mentions: Vec::new(),
             review_required: false,
         });
-        if cluster.event_cluster_id < entry.event_cluster_id {
-            entry.event_cluster_id = cluster.event_cluster_id;
-        }
+        entry.input_cluster_versions = merged_cluster_version_refs(
+            &entry.input_cluster_versions,
+            &cluster.input_cluster_versions,
+        );
         entry.review_required |= cluster.review_required;
         entry.mentions.extend(cluster.mentions.iter().cloned());
+        entry.event_cluster_id = preferred_cluster_id(
+            cluster_origin_ids(entry),
+            &entry.input_cluster_versions,
+            entry.event_cluster_id,
+        );
+        entry.cluster_version =
+            cluster_version_for_id(&entry.input_cluster_versions, entry.event_cluster_id);
     }
 
     grouped.into_values().collect()
@@ -372,22 +403,33 @@ fn split_overbroad_cluster(
         .into_iter()
         .enumerate()
         .map(|(index, mentions)| {
-            let preferred_id = mentions
-                .iter()
-                .map(|mention| mention.origin_cluster_id)
-                .min()
-                .unwrap_or(cluster.event_cluster_id);
+            let input_cluster_versions =
+                input_cluster_versions_for_mentions(&mentions, &cluster.input_cluster_versions);
+            let preferred_id = preferred_cluster_id(
+                mentions
+                    .iter()
+                    .map(|mention| mention.origin_cluster_id)
+                    .collect(),
+                &input_cluster_versions,
+                cluster.event_cluster_id,
+            );
             let event_cluster_id = if used_ids.insert(preferred_id) {
                 preferred_id
             } else {
                 derived_split_cluster_id(preferred_id, index, mentions[0].mention.mention_id)
             };
+            let supersedes_version =
+                cluster_version_for_id(&input_cluster_versions, event_cluster_id);
+            let cluster_version = supersedes_version.map_or(1, |version| version + 1);
             let representative_evidence_id = representative_mention(&mentions)
                 .map(|mention| mention.mention.evidence_id)
                 .unwrap_or_else(Uuid::nil);
 
             RefinedCluster {
                 event_cluster_id,
+                cluster_version,
+                supersedes_version,
+                input_cluster_versions,
                 representative_evidence_id,
                 independent_sources: independent_source_count(&mentions),
                 source_entropy: source_entropy(&mentions),
@@ -492,6 +534,84 @@ fn cluster_origin_ids(cluster: &CandidateCluster) -> BTreeSet<Uuid> {
         .iter()
         .map(|mention| mention.origin_cluster_id)
         .collect()
+}
+
+fn preferred_cluster_id(
+    origin_ids: BTreeSet<Uuid>,
+    input_cluster_versions: &[ClusterVersionRef],
+    fallback: Uuid,
+) -> Uuid {
+    input_cluster_versions
+        .iter()
+        .filter(|cluster_ref| {
+            cluster_ref.cluster_version.is_some()
+                && origin_ids.contains(&cluster_ref.event_cluster_id)
+        })
+        .map(|cluster_ref| cluster_ref.event_cluster_id)
+        .min()
+        .or_else(|| origin_ids.iter().copied().min())
+        .unwrap_or(fallback)
+}
+
+fn cluster_version_for_id(
+    input_cluster_versions: &[ClusterVersionRef],
+    event_cluster_id: Uuid,
+) -> Option<i32> {
+    input_cluster_versions
+        .iter()
+        .find(|cluster_ref| cluster_ref.event_cluster_id == event_cluster_id)
+        .and_then(|cluster_ref| cluster_ref.cluster_version)
+}
+
+fn input_cluster_versions_for_mentions(
+    mentions: &[ClusterMention],
+    input_cluster_versions: &[ClusterVersionRef],
+) -> Vec<ClusterVersionRef> {
+    let component_origin_ids = mentions
+        .iter()
+        .map(|mention| mention.origin_cluster_id)
+        .collect::<BTreeSet<_>>();
+    input_cluster_versions
+        .iter()
+        .filter(|cluster_ref| component_origin_ids.contains(&cluster_ref.event_cluster_id))
+        .cloned()
+        .collect()
+}
+
+fn merged_cluster_version_refs(
+    left: &[ClusterVersionRef],
+    right: &[ClusterVersionRef],
+) -> Vec<ClusterVersionRef> {
+    let mut merged = BTreeMap::new();
+    for cluster_ref in left.iter().chain(right.iter()) {
+        merged
+            .entry(cluster_ref.event_cluster_id)
+            .and_modify(|current| {
+                if compare_cluster_versions(cluster_ref.cluster_version, *current)
+                    == Ordering::Greater
+                {
+                    *current = cluster_ref.cluster_version;
+                }
+            })
+            .or_insert(cluster_ref.cluster_version);
+    }
+
+    merged
+        .into_iter()
+        .map(|(event_cluster_id, cluster_version)| ClusterVersionRef {
+            event_cluster_id,
+            cluster_version,
+        })
+        .collect()
+}
+
+fn compare_cluster_versions(left: Option<i32>, right: Option<i32>) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        (Some(_), None) => Ordering::Greater,
+        (None, Some(_)) => Ordering::Less,
+        (None, None) => Ordering::Equal,
+    }
 }
 
 fn find_index(parents: &mut [usize], index: usize) -> usize {
@@ -644,6 +764,14 @@ fn token_overlap(left: &[String], right: &[String]) -> f64 {
     intersection as f64 / union as f64
 }
 
+fn has_non_empty_token_intersection(left: &[String], right: &[String]) -> bool {
+    let left_tokens = normalized_token_set(left);
+    let right_tokens = normalized_token_set(right);
+    !left_tokens.is_empty()
+        && !right_tokens.is_empty()
+        && left_tokens.intersection(&right_tokens).next().is_some()
+}
+
 fn location_overlap(left: &[String], right: &[String]) -> f64 {
     if left.is_empty() && right.is_empty() {
         return 1.0;
@@ -659,7 +787,7 @@ fn normalized_token_set(tokens: &[String]) -> BTreeSet<String> {
 }
 
 fn semantic_similarity(left: &[f32], right: &[f32]) -> f64 {
-    if left.is_empty() || right.is_empty() {
+    if left.is_empty() || right.is_empty() || left.len() != right.len() {
         return 0.0;
     }
 
@@ -715,8 +843,9 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        CandidateCluster, EndOfDayRefiner, IncrementalAssignment, IncrementalClusterer,
-        IncrementalClusteringConfig, LockedClusterRelations,
+        semantic_similarity, CandidateCluster, ClusterVersionRef, EndOfDayRefiner,
+        IncrementalAssignment, IncrementalClusterer, IncrementalClusteringConfig,
+        LockedClusterRelations,
     };
     use crate::analysis::events::mentions::{ClusterMention, EventMention};
 
@@ -786,6 +915,39 @@ mod tests {
                 &["shenzhen"],
                 true,
                 0.91,
+            ),
+            None,
+        );
+
+        assert!(matches!(outcome, IncrementalAssignment::NewCluster { .. }));
+        assert_eq!(clusterer.clusters().len(), 2);
+    }
+
+    #[test]
+    fn empty_entity_and_action_sets_do_not_satisfy_auto_join_hard_conditions() {
+        let mut clusterer = IncrementalClusterer::new(IncrementalClusteringConfig::default());
+
+        clusterer.ingest_mention(
+            mention(
+                "Market chatter points to a major update",
+                Some(dt(2026, 7, 10, 8)),
+                &[],
+                &[],
+                &["shanghai"],
+                true,
+                0.92,
+            ),
+            None,
+        );
+        let outcome = clusterer.ingest_mention(
+            mention(
+                "Market chatter points to a major update",
+                Some(dt(2026, 7, 10, 9)),
+                &[],
+                &[],
+                &["shanghai"],
+                false,
+                0.81,
             ),
             None,
         );
@@ -886,6 +1048,7 @@ mod tests {
         let clusters = vec![
             candidate_cluster(
                 left_cluster_id,
+                None,
                 vec![cluster_mention(
                     left_cluster_id,
                     Some(shared_duplicate_group_id),
@@ -903,6 +1066,7 @@ mod tests {
             ),
             candidate_cluster(
                 right_cluster_id,
+                None,
                 vec![cluster_mention(
                     right_cluster_id,
                     None,
@@ -941,6 +1105,7 @@ mod tests {
         let clusters = vec![
             candidate_cluster(
                 origin_cluster_id,
+                Some(4),
                 vec![
                     cluster_mention(
                         origin_cluster_id,
@@ -973,6 +1138,7 @@ mod tests {
             ),
             candidate_cluster(
                 second_origin_cluster_id,
+                Some(2),
                 vec![cluster_mention(
                     second_origin_cluster_id,
                     None,
@@ -1011,6 +1177,7 @@ mod tests {
         let clusters = vec![
             candidate_cluster(
                 left_cluster_id,
+                Some(5),
                 vec![cluster_mention(
                     left_cluster_id,
                     None,
@@ -1028,6 +1195,7 @@ mod tests {
             ),
             candidate_cluster(
                 right_cluster_id,
+                Some(1),
                 vec![cluster_mention(
                     right_cluster_id,
                     None,
@@ -1056,15 +1224,122 @@ mod tests {
         assert_eq!(refined[0].mentions.len(), 2);
     }
 
+    #[test]
+    fn end_of_day_refinement_assigns_initial_version_to_new_clusters() {
+        let cluster_id = Uuid::new_v4();
+        let clusters = vec![candidate_cluster(
+            cluster_id,
+            None,
+            vec![cluster_mention(
+                cluster_id,
+                None,
+                mention(
+                    "ACME opens a new production line",
+                    Some(dt(2026, 7, 10, 8)),
+                    &["acme"],
+                    &["open", "production"],
+                    &["suzhou"],
+                    true,
+                    0.91,
+                ),
+            )],
+            false,
+        )];
+
+        let refined = EndOfDayRefiner::new(IncrementalClusteringConfig::default())
+            .refine(&clusters, &LockedClusterRelations::default());
+
+        assert_eq!(refined.len(), 1);
+        assert_eq!(refined[0].event_cluster_id, cluster_id);
+        assert_eq!(refined[0].cluster_version, 1);
+        assert_eq!(refined[0].supersedes_version, None);
+        assert_eq!(
+            refined[0].input_cluster_versions,
+            vec![cluster_version_ref(cluster_id, None)]
+        );
+    }
+
+    #[test]
+    fn end_of_day_refinement_increments_existing_cluster_versions_and_tracks_inputs() {
+        let retained_cluster_id = Uuid::from_u128(10);
+        let merged_cluster_id = Uuid::from_u128(20);
+        let clusters = vec![
+            candidate_cluster(
+                retained_cluster_id,
+                Some(7),
+                vec![cluster_mention(
+                    retained_cluster_id,
+                    None,
+                    mention(
+                        "ACME expands battery output",
+                        Some(dt(2026, 7, 10, 8)),
+                        &["acme"],
+                        &["expand", "battery"],
+                        &["suzhou"],
+                        true,
+                        0.94,
+                    ),
+                )],
+                false,
+            ),
+            candidate_cluster(
+                merged_cluster_id,
+                Some(2),
+                vec![cluster_mention(
+                    merged_cluster_id,
+                    None,
+                    mention(
+                        "ACME battery expansion update",
+                        Some(dt(2026, 7, 10, 9)),
+                        &["acme"],
+                        &["expand", "battery"],
+                        &["suzhou"],
+                        false,
+                        0.75,
+                    ),
+                )],
+                false,
+            ),
+        ];
+
+        let refined = EndOfDayRefiner::new(IncrementalClusteringConfig::default())
+            .refine(&clusters, &LockedClusterRelations::default());
+
+        assert_eq!(refined.len(), 1);
+        assert_eq!(refined[0].event_cluster_id, retained_cluster_id);
+        assert_eq!(refined[0].cluster_version, 8);
+        assert_eq!(refined[0].supersedes_version, Some(7));
+        assert_eq!(
+            refined[0].input_cluster_versions,
+            vec![
+                cluster_version_ref(retained_cluster_id, Some(7)),
+                cluster_version_ref(merged_cluster_id, Some(2)),
+            ]
+        );
+    }
+
     fn candidate_cluster(
         event_cluster_id: Uuid,
+        cluster_version: Option<i32>,
         mentions: Vec<ClusterMention>,
         review_required: bool,
     ) -> CandidateCluster {
         CandidateCluster {
             event_cluster_id,
+            cluster_version,
+            input_cluster_versions: vec![cluster_version_ref(event_cluster_id, cluster_version)],
             mentions,
             review_required,
+        }
+    }
+
+    fn cluster_version_ref(
+        event_cluster_id: Uuid,
+        cluster_version: Option<i32>,
+    ) -> ClusterVersionRef {
+        ClusterVersionRef {
+            event_cluster_id,
+            cluster_version,
         }
     }
 
@@ -1166,6 +1441,11 @@ mod tests {
 
     fn dt(year: i32, month: u32, day: u32, hour: u32) -> chrono::DateTime<Utc> {
         Utc.with_ymd_and_hms(year, month, day, hour, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn semantic_similarity_rejects_mismatched_vector_dimensions() {
+        assert_eq!(semantic_similarity(&[1.0, 0.0, 0.5], &[1.0, 0.0]), 0.0);
     }
 
     #[test]
