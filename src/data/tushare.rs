@@ -113,7 +113,10 @@ impl TushareClient {
 
     fn safe_i64(v: &Value) -> i64 {
         match v {
-            Value::Number(n) => n.as_i64().unwrap_or(0),
+            Value::Number(n) => n
+                .as_i64()
+                .or_else(|| n.as_f64().map(|value| value as i64))
+                .unwrap_or(0),
             Value::String(s) => s.parse().unwrap_or(0),
             _ => 0,
         }
@@ -1477,6 +1480,14 @@ mod tests {
         assert_eq!(TushareClient::safe_f64(&serde_json::json!(1.5)), 1.5);
         assert_eq!(TushareClient::safe_f64(&serde_json::json!("2.3")), 2.3);
         assert_eq!(TushareClient::safe_f64(&serde_json::json!(null)), 0.0);
+    }
+
+    #[test]
+    fn safe_i64_accepts_decimal_json_numbers() {
+        assert_eq!(
+            TushareClient::safe_i64(&serde_json::json!(30_828.0)),
+            30_828
+        );
     }
 
     #[test]

@@ -30,6 +30,20 @@ test("signal markers share the most recent available bar", () => {
   assert.equal(markers[1].text, "Top 20");
 });
 
+test("activity histogram uses amount when stored volumes are missing", () => {
+  const activity = chartModule.activitySeries([
+    { time: "2026-07-17", open: 10, close: 11, volume: 0, amount: 1_250_000 },
+    { time: "2026-07-18", open: 11, close: 10, volume: 0, amount: 980_000 },
+  ]);
+
+  assert.equal(activity.metric, "amount");
+  assert.equal(activity.label, "AMOUNT · volume unavailable");
+  assert.deepEqual(activity.data.map(({ time, value }) => ({ time, value })), [
+    { time: "2026-07-17", value: 1_250_000 },
+    { time: "2026-07-18", value: 980_000 },
+  ]);
+});
+
 test("initial chart view waits for layout and shows the most recent 120 bars", () => {
   assert.equal(typeof chartModule.fitChartAfterLayout, "function");
   const frames = [];

@@ -40,6 +40,23 @@ export function signalMarkers(bars, hits) {
   }));
 }
 
+export function activitySeries(bars) {
+  const usableVolume = bars.filter((bar) => Number(bar.volume) > 0).length;
+  const metric = bars.length > 0 && usableVolume / bars.length >= 0.8 ? "volume" : "amount";
+  const label = metric === "volume" ? "VOL" : "AMOUNT · volume unavailable";
+  return {
+    metric,
+    label,
+    data: bars.map((bar) => ({
+      time: bar.time,
+      value: Math.max(0, Number(bar[metric]) || 0),
+      color: Number(bar.close) >= Number(bar.open)
+        ? "rgba(239,83,80,.45)"
+        : "rgba(38,166,154,.45)",
+    })),
+  };
+}
+
 function addSeries(chart, type, options) {
   if (typeof chart.addSeries === "function") {
     return chart.addSeries(window.LightweightCharts[type], options);
@@ -100,16 +117,13 @@ export function mountChart(container, bars, hits = []) {
   });
   candleSeries.setData(bars.map(({ time, open, high, low, close }) => ({ time, open, high, low, close })));
 
-  const volume = addSeries(chart, "HistogramSeries", {
+  const activity = activitySeries(bars);
+  const activityHistogram = addSeries(chart, "HistogramSeries", {
     priceFormat: { type: "volume" },
-    priceScaleId: "volume",
+    priceScaleId: "activity",
   });
-  volume.priceScale().applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
-  volume.setData(bars.map((bar) => ({
-    time: bar.time,
-    value: bar.volume || 0,
-    color: Number(bar.close) >= Number(bar.open) ? "rgba(239,83,80,.45)" : "rgba(38,166,154,.45)",
-  })));
+  activityHistogram.priceScale().applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+  activityHistogram.setData(activity.data);
 
   [[5, "#dcdcaa"], [10, "#4ec9b0"], [20, "#569cd6"], [60, "#c586c0"]].forEach(([windowSize, color]) => {
     const series = addSeries(chart, "LineSeries", {

@@ -122,6 +122,7 @@ test("stock detail fills the viewport without an evidence sidebar", async ({ pag
   await mockApi(page, true, denseHits);
   await page.goto("/dashboard/");
   await page.locator("tbody tr").first().click();
+  await expect(page.locator(".chart-activity")).toHaveText("VOL");
 
   const layout = await page.evaluate(() => {
     const root = document.scrollingElement;

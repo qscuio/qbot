@@ -131,6 +131,7 @@ button { cursor: pointer; }
 .chart-legend { display: flex; align-items: center; gap: 14px; padding: 0 10px; color: var(--muted); font: 10px var(--font-mono); }
 .chart-period { margin-right: auto; color: #bdbdbd; font-weight: 500; }
 .chart-legend span::before { content: ""; display: inline-block; width: 10px; height: 2px; margin-right: 5px; vertical-align: 3px; background: currentColor; }
+.chart-activity { color: #858585; }
 .ma5 { color: #dcdcaa; } .ma10 { color: #4ec9b0; } .ma20 { color: #569cd6; } .ma60 { color: #c586c0; }
 .chart { min-height: 460px; }
 .chart-watermark { position: absolute; left: 12px; bottom: 8px; z-index: 2; color: #666; font-size: 10px; }

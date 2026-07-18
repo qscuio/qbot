@@ -1,5 +1,5 @@
-import { dashboardApi, ApiError } from "./api.js?v=20260718.4";
-import { mountChart } from "./chart.js?v=20260718.4";
+import { dashboardApi, ApiError } from "./api.js?v=20260718.5";
+import { activitySeries, mountChart } from "./chart.js?v=20260718.5";
 import {
   applyFilters,
   closeTab,
@@ -8,7 +8,7 @@ import {
   openStockTab,
   sortRows,
   updateTab,
-} from "./state.js?v=20260718.4";
+} from "./state.js?v=20260718.5";
 
 const app = document.querySelector("#app");
 let bootstrap = null;
@@ -179,9 +179,10 @@ function stockTemplate(tab, detail) {
   const index = activeRows.findIndex((row) => row.code === tab.code);
   const periods = [["daily", "D", "Daily"], ["weekly", "W", "Weekly"], ["monthly", "M", "Monthly"]];
   const periodName = periods.find(([period]) => period === detail.period)?.[2] || "Daily";
+  const activity = activitySeries(detail.bars);
   return `<section class="stock-view">
     <header class="stock-toolbar"><div class="stock-identity"><h1>${escapeHtml(detail.name)}<span>${escapeHtml(detail.code)}</span></h1><div class="muted mono">${latest ? escapeHtml(latest.time) : "No market history"}${detail.partial ? " · partial data" : ""}</div></div><div class="stock-quote"><span class="stock-price">${formatNumber(latest?.close)}</span><span class="number ${changeClass(change)}">${change == null ? "—" : `${change > 0 ? "+" : ""}${formatNumber(change)}%`}</span></div><div class="periods" aria-label="Chart period">${periods.map(([period, label, name]) => `<button class="period-button ${tab.period === period ? "active" : ""}" data-period="${period}" aria-label="${name}" title="${name}">${label}</button>`).join("")}</div><div class="nav-buttons"><button class="ghost-button" data-neighbor="${escapeHtml(activeRows[index - 1]?.code || "")}" ${index <= 0 ? "disabled" : ""}>← Prev</button><button class="ghost-button" data-neighbor="${escapeHtml(activeRows[index + 1]?.code || "")}" ${index < 0 || index >= activeRows.length - 1 ? "disabled" : ""}>Next →</button></div></header>
-    ${detail.bars.length ? `<div class="stock-content"><div class="chart-pane"><div class="chart-legend"><strong class="chart-period">${periodName} · ${detail.bars.length} bars · ${detail.hits.length} signals</strong><span class="ma5">MA5</span><span class="ma10">MA10</span><span class="ma20">MA20</span><span class="ma60">MA60</span></div><div class="chart" id="stock-chart"></div><a class="chart-watermark" href="https://www.tradingview.com/" target="_blank" rel="noopener">Charts by TradingView</a></div></div>` : `<div class="empty-state"><strong>No usable chart history</strong><span>No historical bars are available for this period.</span></div>`}
+    ${detail.bars.length ? `<div class="stock-content"><div class="chart-pane"><div class="chart-legend"><strong class="chart-period">${periodName} · ${detail.bars.length} bars · ${detail.hits.length} signals</strong><span class="chart-activity">${escapeHtml(activity.label)}</span><span class="ma5">MA5</span><span class="ma10">MA10</span><span class="ma20">MA20</span><span class="ma60">MA60</span></div><div class="chart" id="stock-chart"></div><a class="chart-watermark" href="https://www.tradingview.com/" target="_blank" rel="noopener">Charts by TradingView</a></div></div>` : `<div class="empty-state"><strong>No usable chart history</strong><span>No historical bars are available for this period.</span></div>`}
   </section>`;
 }
 
