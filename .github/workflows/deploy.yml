@@ -382,26 +382,21 @@ jobs:
             sudo systemctl enable qbot
             sudo systemctl restart qbot
 
-            # Wait for service readiness (can be slower on first boot).
+            # Wait for application readiness, not only the brief systemd
+            # "active" state before startup validation and migrations finish.
             for i in $(seq 1 30); do
               status="$(sudo systemctl is-active qbot || true)"
-              if [ "$status" = "active" ]; then
-                echo "qbot restarted successfully"
+              if [ "$status" = "active" ] && curl -fsS http://127.0.0.1:8080/health >/dev/null; then
+                echo "qbot is healthy"
                 break
               fi
-              if [ "$status" = "failed" ]; then
-                echo "qbot failed during startup"
-                sudo systemctl status qbot --no-pager || true
-                sudo journalctl -u qbot -n 120 --no-pager || true
-                exit 1
-              fi
-              echo "qbot status: $status (attempt $i/30), waiting..."
+              echo "qbot status: $status; health not ready (attempt $i/30)"
               sleep 2
             done
 
             final_status="$(sudo systemctl is-active qbot || true)"
-            if [ "$final_status" != "active" ]; then
-              echo "qbot did not reach active state within timeout (final status: $final_status)"
+            if [ "$final_status" != "active" ] || ! curl -fsS http://127.0.0.1:8080/health >/dev/null; then
+              echo "qbot did not become healthy (final status: $final_status)"
               sudo systemctl status qbot --no-pager || true
               sudo journalctl -u qbot -n 120 --no-pager || true
               exit 1
