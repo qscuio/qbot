@@ -17,6 +17,10 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+fn api_bind_addr(api_port: u16) -> std::net::SocketAddr {
+    std::net::SocketAddr::from(([127, 0, 0, 1], api_port))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -278,7 +282,7 @@ async fn main() -> Result<()> {
 
     // Start Axum REST API
     let router = api::build_router(state.clone());
-    let addr = format!("0.0.0.0:{}", api_port).parse::<std::net::SocketAddr>()?;
+    let addr = api_bind_addr(api_port);
     info!("API server listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -290,4 +294,17 @@ async fn main() -> Result<()> {
         .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::api_bind_addr;
+
+    #[test]
+    fn api_listener_is_loopback_only() {
+        let addr = api_bind_addr(8080);
+
+        assert!(addr.ip().is_loopback());
+        assert_eq!(addr.port(), 8080);
+    }
 }

@@ -431,13 +431,14 @@ jobs:
         if: steps.check.outputs.skip != 'true'
         run: |
           for i in $(seq 1 12); do
+            root_status="$(curl -LsS -o /dev/null -w '%{http_code}' https://dash.qscuio.com/ || true)"
             shell_status="$(curl -sS -o /dev/null -w '%{http_code}' https://dash.qscuio.com/dashboard/ || true)"
             api_status="$(curl -sS -o /dev/null -w '%{http_code}' https://dash.qscuio.com/api/dashboard/bootstrap || true)"
-            if [ "$shell_status" = "200" ] && [ "$api_status" = "401" ]; then
+            if [ "$root_status" = "200" ] && [ "$shell_status" = "200" ] && [ "$api_status" = "401" ]; then
               echo "Cloudflare dashboard smoke check passed"
               exit 0
             fi
-            echo "Dashboard not ready (shell=$shell_status api=$api_status, attempt $i/12)"
+            echo "Dashboard not ready (root=$root_status shell=$shell_status api=$api_status, attempt $i/12)"
             sleep 5
           done
           exit 1
