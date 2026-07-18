@@ -3,6 +3,8 @@ pub mod burst_monitor;
 pub mod chip_dist;
 pub mod daban;
 pub mod daban_sim;
+pub mod dashboard;
+pub mod dashboard_auth;
 pub(crate) mod decision_support_compat;
 pub mod limit_up;
 pub mod market;

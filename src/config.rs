@@ -20,6 +20,10 @@ pub struct Config {
     // API
     pub api_port: u16,
     pub api_key: Option<String>,
+    pub dashboard_public_url: Option<String>,
+    pub dashboard_username: Option<String>,
+    pub dashboard_password_hash: Option<String>,
+    pub dashboard_session_secret: Option<String>,
     pub ai_api_key: Option<String>,
     pub ai_base_url: String,
     pub ai_model: String,
@@ -70,6 +74,10 @@ impl Config {
                 .parse()
                 .unwrap_or(8080),
             api_key: std::env::var("API_KEY").ok(),
+            dashboard_public_url: optional_nonblank_env_var("DASHBOARD_PUBLIC_URL"),
+            dashboard_username: optional_nonblank_env_var("DASHBOARD_USERNAME"),
+            dashboard_password_hash: optional_nonblank_env_var("DASHBOARD_PASSWORD_HASH"),
+            dashboard_session_secret: optional_nonblank_env_var("DASHBOARD_SESSION_SECRET"),
             ai_api_key: std::env::var("AI_API_KEY").ok(),
             ai_base_url: std::env::var("AI_BASE_URL")
                 .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
@@ -115,6 +123,21 @@ impl Config {
                 .unwrap_or_else(|_| "false".to_string())
                 == "true",
         })
+    }
+
+    pub fn dashboard_enabled(&self) -> bool {
+        self.dashboard_public_url
+            .as_deref()
+            .is_some_and(|url| url.starts_with("https://"))
+            && self.dashboard_username.is_some()
+            && self
+                .dashboard_password_hash
+                .as_deref()
+                .is_some_and(|hash| hash.starts_with("$argon2"))
+            && self
+                .dashboard_session_secret
+                .as_deref()
+                .is_some_and(|secret| secret.len() >= 32)
     }
 }
 
@@ -272,6 +295,28 @@ mod tests {
         assert!(cfg.enable_gdelt_events);
         assert_eq!(cfg.gdelt_event_query, "red sea shipping");
         assert_eq!(cfg.gdelt_max_records, 25);
+    }
+
+    #[test]
+    fn dashboard_config_is_disabled_when_credentials_are_incomplete() {
+        let env = ScopedEnvGuard::lock(&[
+            "TUSHARE_TOKEN",
+            "TELEGRAM_BOT_TOKEN",
+            "DASHBOARD_PUBLIC_URL",
+            "DASHBOARD_USERNAME",
+            "DASHBOARD_PASSWORD_HASH",
+            "DASHBOARD_SESSION_SECRET",
+        ]);
+        env.set_var("TUSHARE_TOKEN", "test_token");
+        env.set_var("TELEGRAM_BOT_TOKEN", "123:abc");
+        env.set_var("DASHBOARD_PUBLIC_URL", "https://dash.qscuio.com");
+        env.set_var("DASHBOARD_USERNAME", "admin");
+        env.remove_var("DASHBOARD_PASSWORD_HASH");
+        env.set_var("DASHBOARD_SESSION_SECRET", "secret");
+
+        let config = Config::from_env().unwrap();
+
+        assert!(!config.dashboard_enabled());
     }
 
     #[test]

@@ -11,7 +11,57 @@ on:
         default: false
 
 jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: qbot
+          POSTGRES_PASSWORD: qbot
+          POSTGRES_DB: qbot
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U qbot"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://qbot:qbot@127.0.0.1:5432/qbot
+      REDIS_URL: redis://127.0.0.1:6379
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Rust tests
+        run: cargo test --locked
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/dashboard/package-lock.json
+      - name: Dashboard checks
+        working-directory: web/dashboard
+        run: |
+          npm ci
+          npm run check
+          npm audit --audit-level=high
+          npx playwright install --with-deps chromium
+          npm run test:browser
+
   deploy:
+    needs: verify
     runs-on: ubuntu-latest
     environment: VPS
 
@@ -62,6 +112,10 @@ jobs:
             ENABLE_DABAN_LIVE=${{ secrets.ENABLE_DABAN_LIVE || 'false' }}
             ENABLE_AI_ANALYSIS=${{ secrets.ENABLE_AI_ANALYSIS || 'false' }}
             ENABLE_CHIP_DIST=${{ secrets.ENABLE_CHIP_DIST || 'true' }}
+            DASHBOARD_PUBLIC_URL=${{ secrets.DASHBOARD_PUBLIC_URL || 'https://dash.qscuio.com' }}
+            DASHBOARD_USERNAME=${{ secrets.DASHBOARD_USERNAME }}
+            DASHBOARD_PASSWORD_HASH=${{ secrets.DASHBOARD_PASSWORD_HASH }}
+            DASHBOARD_SESSION_SECRET=${{ secrets.DASHBOARD_SESSION_SECRET }}
             ENVEOF
             chmod 600 /opt/qbot/.env
             echo ".env written"
@@ -69,10 +123,14 @@ jobs:
       - name: Deploy to VPS
         if: steps.check.outputs.skip != 'true'
         uses: appleboy/ssh-action@v1.0.3
+        env:
+          CLOUDFLARE_ORIGIN_CERT: ${{ secrets.CLOUDFLARE_ORIGIN_CERT }}
+          CLOUDFLARE_ORIGIN_KEY: ${{ secrets.CLOUDFLARE_ORIGIN_KEY }}
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
+          envs: CLOUDFLARE_ORIGIN_CERT,CLOUDFLARE_ORIGIN_KEY
           script: |
             set -e
             REPO_DIR="/opt/qbot"
@@ -285,6 +343,22 @@ jobs:
 
             configure_nginx_proxy
 
+            # Install the dashboard as a separate virtual host. Public 443 is
+            # already handled by the server's SNI stream proxy.
+            if [ -z "${CLOUDFLARE_ORIGIN_CERT:-}" ] || [ -z "${CLOUDFLARE_ORIGIN_KEY:-}" ]; then
+              echo "Dashboard origin certificate secrets are required"
+              exit 1
+            fi
+            sudo install -d -m 755 /etc/nginx/cloudflare
+            printf '%s\n' "$CLOUDFLARE_ORIGIN_CERT" | sudo tee /etc/nginx/cloudflare/dash.qscuio.com.pem >/dev/null
+            printf '%s\n' "$CLOUDFLARE_ORIGIN_KEY" | sudo tee /etc/nginx/cloudflare/dash.qscuio.com.key >/dev/null
+            sudo chmod 644 /etc/nginx/cloudflare/dash.qscuio.com.pem
+            sudo chmod 600 /etc/nginx/cloudflare/dash.qscuio.com.key
+            sudo cp deploy/qbot-dashboard.nginx.conf /etc/nginx/sites-available/qbot-dashboard.conf
+            sudo ln -sfn /etc/nginx/sites-available/qbot-dashboard.conf /etc/nginx/sites-enabled/qbot-dashboard.conf
+            sudo nginx -t
+            sudo systemctl reload nginx
+
             # Install/update service definition on every deploy.
             SERVICE_USER="$(id -un)"
             sudo cp deploy/qbot.service /etc/systemd/system/qbot.service
@@ -318,6 +392,12 @@ jobs:
               exit 1
             fi
 
+            shell_status="$(curl -ksS -o /dev/null -w '%{http_code}' --resolve dash.qscuio.com:8445:127.0.0.1 https://dash.qscuio.com:8445/dashboard/)"
+            api_status="$(curl -ksS -o /dev/null -w '%{http_code}' --resolve dash.qscuio.com:8445:127.0.0.1 https://dash.qscuio.com:8445/api/dashboard/bootstrap)"
+            test "$shell_status" = "200"
+            test "$api_status" = "401"
+            echo "Dashboard origin checks passed"
+
       - name: Health check
         if: steps.check.outputs.skip != 'true'
         uses: appleboy/ssh-action@v1.0.3
@@ -336,3 +416,18 @@ jobs:
             done
             echo "Health check failed after retries"
             exit 1
+
+      - name: Cloudflare dashboard smoke check
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          for i in $(seq 1 12); do
+            shell_status="$(curl -sS -o /dev/null -w '%{http_code}' https://dash.qscuio.com/dashboard/ || true)"
+            api_status="$(curl -sS -o /dev/null -w '%{http_code}' https://dash.qscuio.com/api/dashboard/bootstrap || true)"
+            if [ "$shell_status" = "200" ] && [ "$api_status" = "401" ]; then
+              echo "Cloudflare dashboard smoke check passed"
+              exit 0
+            fi
+            echo "Dashboard not ready (shell=$shell_status api=$api_status, attempt $i/12)"
+            sleep 5
+          done
+          exit 1

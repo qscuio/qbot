@@ -111,6 +111,10 @@ Copy `.env.example` to `.env` and fill in:
 | `DATABASE_URL` | Yes | PostgreSQL URL (default: `postgresql://qbot:qbot@127.0.0.1/qbot`) |
 | `REDIS_URL` | Yes | Redis URL (default: `redis://127.0.0.1:6379`) |
 | `API_PORT` | No | REST API port (default: `8080`) |
+| `DASHBOARD_PUBLIC_URL` | No | Exact dashboard origin used for login/logout origin validation (production: `https://dash.qscuio.com`) |
+| `DASHBOARD_USERNAME` | No | Private dashboard username; all four dashboard variables must be set to enable login |
+| `DASHBOARD_PASSWORD_HASH` | No | Argon2id password hash; never use or store a plaintext dashboard password |
+| `DASHBOARD_SESSION_SECRET` | No | Random dashboard session HMAC secret (at least 32 random bytes) |
 | `ENABLE_DABAN_LIVE` | No | Enable intraday daban live loop (`true`/`false`, default `false`) |
 | `ENABLE_AI_ANALYSIS` | No | Legacy compatibility flag; no longer starts the free-form AI analysis loop (`true`/`false`, default `false`) |
 | `ENABLE_CHIP_DIST` | No | Enable scheduled chip-distribution refresh (`true`/`false`, default `true`) |
@@ -221,11 +225,12 @@ Time basis:
 
 Push to `main` triggers `.github/workflows/deploy.yml`, which:
 
-1. Writes `.env` to `/opt/qbot/.env` from GitHub secrets
-2. SSH into VPS → `git pull` → `cargo build --release`
-3. Auto-configures Nginx reverse proxy when `WEBHOOK_URL` is set
-4. Restarts `qbot.service` via systemd
-5. Hits `/health` to confirm
+1. Runs Rust, dashboard unit, asset, audit, and browser smoke checks.
+2. Writes `.env` to `/opt/qbot/.env` from GitHub secrets.
+3. SSH into the VPS, checks out `main`, and builds the release binary.
+4. Preserves the Telegram host and installs a separate `dash.qscuio.com` Nginx virtual host.
+5. Installs the Cloudflare origin certificate and restarts `qbot.service`.
+6. Verifies health, the dashboard shell, and unauthenticated API rejection at both the origin and Cloudflare edge.
 
 **GitHub secrets used by deploy workflow** (Settings → Environments → `VPS`):
 
@@ -253,6 +258,22 @@ Push to `main` triggers `.github/workflows/deploy.yml`, which:
 | `AI_BASE_URL` | No | Optional override for the LLM event extractor API base URL (default OpenAI v1) |
 | `AI_MODEL` | No | Optional override for the LLM event extractor model |
 | `DATA_PROXY` | No | Optional HTTP/SOCKS proxy URL |
+| `DASHBOARD_PUBLIC_URL` | Yes* | Dashboard origin; defaults to `https://dash.qscuio.com` (`*` required when dashboard is enabled) |
+| `DASHBOARD_USERNAME` | Yes* | Private dashboard username |
+| `DASHBOARD_PASSWORD_HASH` | Yes* | Argon2id hash generated offline, for example with `argon2` or an equivalent trusted tool |
+| `DASHBOARD_SESSION_SECRET` | Yes* | At least 32 cryptographically random bytes, preferably encoded as hex or base64 |
+| `CLOUDFLARE_ORIGIN_CERT` | Yes* | Cloudflare Origin CA certificate valid for `dash.qscuio.com` (full PEM block) |
+| `CLOUDFLARE_ORIGIN_KEY` | Yes* | Matching Cloudflare Origin CA private key (full PEM block) |
+
+The `dash.qscuio.com` DNS record should remain proxied (orange cloud) and the Cloudflare SSL/TLS mode should be **Full (strict)**. Before the first successful workflow deployment, Cloudflare can return `526` because the origin certificate and dashboard virtual host do not exist yet; that is expected.
+
+Generate an Argon2id password hash without putting the plaintext password in shell history:
+
+```bash
+read -s DASHBOARD_PASSWORD
+printf '%s' "$DASHBOARD_PASSWORD" | cargo run --quiet --example dashboard_password_hash
+unset DASHBOARD_PASSWORD
+```
 
 ### VPS First-Run Setup
 

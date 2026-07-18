@@ -9,6 +9,7 @@ use crate::services::scan_ranker::{empty_ranked_pool_map, rank_scan_inputs, Rank
 use crate::signals::base::StockContext;
 use crate::signals::registry::SignalRegistry;
 use crate::state::AppState;
+use crate::storage::dashboard_repository::DashboardRepository;
 use crate::storage::postgres;
 use crate::storage::redis_cache::RedisCache;
 
@@ -92,12 +93,12 @@ impl ScannerService {
         ScannerService { state }
     }
 
-    async fn collect_scan_results(&self) -> Result<HashMap<String, Vec<SignalHit>>> {
+    async fn collect_scan_results(&self) -> Result<(HashMap<String, Vec<SignalHit>>, usize)> {
         let signals = SignalRegistry::get_enabled();
 
         if signals.is_empty() {
             warn!("No signals enabled");
-            return Ok(HashMap::new());
+            return Ok((HashMap::new(), 0));
         }
 
         let codes = postgres::get_stock_codes_with_data(&self.state.db).await?;
@@ -216,23 +217,39 @@ impl ScannerService {
             checked, total_hits
         );
 
-        Ok(results)
+        Ok((results, checked))
     }
 
     pub async fn run_full_scan(&self) -> Result<HashMap<String, Vec<SignalHit>>> {
         info!("Starting full stock scan...");
         let run_id = Uuid::new_v4();
-        let results = self.collect_scan_results().await?;
+        let repo = DashboardRepository::new(self.state.db.clone());
+        repo.start_scan_run(run_id).await?;
+        let (results, stocks_checked) = match self.collect_scan_results().await {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = repo.fail_scan_run(run_id, &error.to_string()).await;
+                return Err(error);
+            }
+        };
 
         let db_inserts = flatten_scan_results_for_storage(&results);
         if !db_inserts.is_empty() {
-            postgres::save_scan_results(&self.state.db, run_id, &db_inserts).await?;
+            if let Err(error) =
+                postgres::save_scan_results(&self.state.db, run_id, &db_inserts).await
+            {
+                let _ = repo.fail_scan_run(run_id, &error.to_string()).await;
+                return Err(error);
+            }
         }
 
         // Cache results
         let json = serde_json::to_value(&results).unwrap_or_default();
         let mut cache = RedisCache::new(self.state.redis.clone());
         let _ = cache.cache_scan_results(&json).await;
+
+        repo.complete_scan_run(run_id, stocks_checked, db_inserts.len())
+            .await?;
 
         Ok(results)
     }
@@ -243,7 +260,7 @@ impl ScannerService {
     ) -> Result<DailySignalArchiveSummary> {
         info!("Starting daily signal archive scan for {}", scan_date);
         let run_id = Uuid::new_v4();
-        let results = self.collect_scan_results().await?;
+        let (results, _) = self.collect_scan_results().await?;
         let rows = flatten_scan_results_for_daily_archive(&results);
         let saved =
             postgres::save_daily_signal_scan_results(&self.state.db, scan_date, run_id, &rows)

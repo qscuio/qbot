@@ -28,6 +28,10 @@ uuid = { version = "=1.11.0", features = ["v4", "serde"] }
 async-trait = "0.1"
 tempfile = "=3.10.1"
 sha2 = "0.10"
+argon2 = "0.5"
+base64 = "0.22"
+hmac = "0.12"
+rand = "0.8"
 
 [dev-dependencies]
 tokio-test = "0.4"

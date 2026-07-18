@@ -1,0 +1,16 @@
+{
+  "name": "qbot-dashboard",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "test:browser": "playwright test",
+    "check": "npm test && node scripts/check-assets.mjs"
+  },
+  "dependencies": {
+    "lightweight-charts": "5.0.8"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.61.1"
+  }
+}

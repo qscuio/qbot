@@ -384,6 +384,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .with_state(state.clone())
         .merge(crate::api::analysis_routes::analysis_router(state.clone()))
+        .merge(crate::api::dashboard_routes::dashboard_router(
+            state.clone(),
+        ))
         .merge(crate::api::decision_support_routes::decision_support_router(state.clone()))
         .merge(crate::api::event_routes::event_router(state.clone()))
         .merge(crate::api::pattern_routes::pattern_router(state.clone()))
