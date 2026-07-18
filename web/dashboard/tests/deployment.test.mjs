@@ -12,11 +12,27 @@ test("dashboard redirects never expose the private origin port", async () => {
   );
 });
 
-test("dashboard assets cannot be retained as a stale frontend", async () => {
+test("dashboard HTML is fresh while versioned assets can be cached", async () => {
   const config = await readFile("../../deploy/qbot-dashboard.nginx.conf", "utf8");
-  const cacheHeader = config.indexOf('add_header Cache-Control "no-store" always;');
-  const dashboardLocation = config.indexOf("location /dashboard/ {");
+  const html = await readFile("index.html", "utf8");
+  const app = await readFile("js/app.js", "utf8");
+  const versions = [
+    ...html.matchAll(/(?:dashboard\.css|lightweight-charts\.js|app\.js)\?v=([\w.-]+)/g),
+    ...app.matchAll(/(?:api\.js|chart\.js|state\.js)\?v=([\w.-]+)/g),
+  ].map((match) => match[1]);
 
-  assert.notEqual(cacheHeader, -1);
-  assert.ok(cacheHeader < dashboardLocation);
+  assert.equal(versions.length, 6);
+  assert.equal(new Set(versions).size, 1);
+  assert.match(config, /set \$dashboard_cache_control "no-store";/);
+  assert.match(
+    config,
+    /set \$dashboard_cache_control "public, max-age=31536000, immutable";/,
+  );
+  assert.ok(
+    config.includes(
+      'if ($request_uri ~* "^/dashboard/.+\\.(?:css|js)\\?v=[A-Za-z0-9._-]+$") {',
+    ),
+  );
+  assert.doesNotMatch(config, /if \(\$uri /);
+  assert.match(config, /add_header Cache-Control \$dashboard_cache_control always;/);
 });
