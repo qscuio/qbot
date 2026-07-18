@@ -122,6 +122,10 @@ impl TushareClient {
         }
     }
 
+    fn volume_lots_to_shares(v: &Value) -> i64 {
+        (Self::safe_f64(v) * 100.0).round() as i64
+    }
+
     fn optional_f64(v: Option<&Value>) -> Option<f64> {
         match v {
             Some(Value::Number(n)) => n.as_f64(),
@@ -1164,7 +1168,7 @@ impl DataProvider for TushareClient {
                         high: Self::safe_f64(arr.get(i_high)?),
                         low: Self::safe_f64(arr.get(i_low)?),
                         close: Self::safe_f64(arr.get(i_close)?),
-                        volume: Self::safe_i64(arr.get(i_vol)?) * 100, // lots -> shares
+                        volume: Self::volume_lots_to_shares(arr.get(i_vol)?),
                         amount: Self::safe_f64(arr.get(i_amt)?) * 1000.0, // thousands -> yuan
                         turnover: None,
                         pe: None,
@@ -1224,7 +1228,7 @@ impl DataProvider for TushareClient {
                     high: Self::safe_f64(arr.get(i_high)?),
                     low: Self::safe_f64(arr.get(i_low)?),
                     close: Self::safe_f64(arr.get(i_close)?),
-                    volume: Self::safe_i64(arr.get(i_vol)?) * 100,
+                    volume: Self::volume_lots_to_shares(arr.get(i_vol)?),
                     amount: Self::safe_f64(arr.get(i_amt)?) * 1000.0,
                     turnover: None,
                     pe: None,
@@ -1487,6 +1491,18 @@ mod tests {
         assert_eq!(
             TushareClient::safe_i64(&serde_json::json!(30_828.0)),
             30_828
+        );
+    }
+
+    #[test]
+    fn volume_lots_to_shares_preserves_fractional_lots() {
+        assert_eq!(
+            TushareClient::volume_lots_to_shares(&serde_json::json!(0.03)),
+            3
+        );
+        assert_eq!(
+            TushareClient::volume_lots_to_shares(&serde_json::json!(30_828.0)),
+            3_082_800
         );
     }
 
