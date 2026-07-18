@@ -21,6 +21,10 @@ fn api_bind_addr(api_port: u16) -> std::net::SocketAddr {
     std::net::SocketAddr::from(([127, 0, 0, 1], api_port))
 }
 
+fn repair_daily_bars_requested(args: impl IntoIterator<Item = String>) -> bool {
+    args.into_iter().any(|arg| arg == "--repair-daily-bars")
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -30,6 +34,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    let repair_daily_bars = repair_daily_bars_requested(std::env::args());
     info!("qbot starting...");
 
     let config = config::Config::from_env()?;
@@ -58,6 +63,7 @@ async fn main() -> Result<()> {
         config.data_proxy.as_deref(),
     ));
     let tushare_provider: Arc<dyn DataProvider> = tushare_client.clone();
+    let repair_provider = tushare_provider.clone();
     let point_in_time_provider: Arc<dyn data::point_in_time_provider::PointInTimeDataProvider> =
         tushare_client.clone();
     let eastmoney_provider: Arc<dyn DataProvider> = Arc::new(
@@ -118,9 +124,11 @@ async fn main() -> Result<()> {
         ("dbcheck", "检查数据库"),
         ("dbsync", "同步今日数据"),
     ];
-    match pusher.set_my_commands(&bot_commands).await {
-        Ok(_) => info!("Telegram bot commands registered"),
-        Err(e) => warn!("Telegram setMyCommands failed: {}", e),
+    if !repair_daily_bars {
+        match pusher.set_my_commands(&bot_commands).await {
+            Ok(_) => info!("Telegram bot commands registered"),
+            Err(e) => warn!("Telegram setMyCommands failed: {}", e),
+        }
     }
 
     let state = Arc::new(state::AppState {
@@ -136,6 +144,26 @@ async fn main() -> Result<()> {
         daily_report_job_lock: Arc::new(Mutex::new(())),
         weekly_report_job_lock: Arc::new(Mutex::new(())),
     });
+
+    if repair_daily_bars {
+        let service = services::stock_history::StockHistoryService::new(state, repair_provider);
+        let report = service.repair_invalid_daily_bars().await?;
+        info!(
+            "Daily bar repair finished: attempted_dates={}, repaired_dates={}, failed_dates={}, remaining_rows={}",
+            report.attempted_dates,
+            report.repaired_dates,
+            report.failed_dates.len(),
+            report.remaining_rows
+        );
+        if !report.failed_dates.is_empty() || report.remaining_rows > 0 {
+            anyhow::bail!(
+                "daily bar repair incomplete: {} dates failed and {} invalid rows remain; rerun the workflow to resume",
+                report.failed_dates.len(),
+                report.remaining_rows
+            );
+        }
+        return Ok(());
+    }
 
     {
         let probe_provider = state.point_in_time_provider.clone();
@@ -298,7 +326,7 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::api_bind_addr;
+    use super::{api_bind_addr, repair_daily_bars_requested};
 
     #[test]
     fn api_listener_is_loopback_only() {
@@ -306,5 +334,17 @@ mod tests {
 
         assert!(addr.ip().is_loopback());
         assert_eq!(addr.port(), 8080);
+    }
+
+    #[test]
+    fn repair_mode_only_activates_for_explicit_flag() {
+        assert!(repair_daily_bars_requested([
+            "qbot".to_string(),
+            "--repair-daily-bars".to_string(),
+        ]));
+        assert!(!repair_daily_bars_requested([
+            "qbot".to_string(),
+            "--run-now".to_string(),
+        ]));
     }
 }

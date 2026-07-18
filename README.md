@@ -230,7 +230,10 @@ Push to `main` triggers `.github/workflows/deploy.yml`, which:
 3. SSH into the VPS, checks out `main`, and builds the release binary.
 4. Preserves the Telegram host and installs a separate `dash.qscuio.com` Nginx virtual host.
 5. Obtains a Let’s Encrypt certificate automatically and restarts `qbot.service`.
-6. Verifies health, the dashboard shell, and unauthenticated API rejection at both the origin and Cloudflare edge.
+6. Verifies service health, then runs the resumable OHLCV repair against rows whose traded amount is positive but volume is missing.
+7. Verifies the dashboard shell and unauthenticated API rejection at both the origin and Cloudflare edge.
+
+The first repair may take a long time because it reloads every affected trading date. Each date is committed independently, so rerunning a failed workflow resumes from the rows that remain invalid. The repair-only process does not register Telegram commands, start schedulers, or bind an API port.
 
 **GitHub secrets used by deploy workflow** (Settings → Environments → `VPS`):
 
@@ -492,7 +495,7 @@ curl -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
 
 ## Gotchas
 
-- **Non-trading days**: `update_today()` returns empty from Tushare on weekends/holidays — jobs run cleanly but store no data.
+- **Non-trading days**: Incremental sync resolves the latest open market date from the preceding 14 days, so weekend and holiday runs refresh the most recent trading session.
 - **First run backfill**: On first start with no data, a 3-year OHLCV backfill runs in the background. This takes time; the API is live during backfill.
 - **Rust version**: Requires stable ≥ 1.85 (via `rustup`). The system `/usr/lib/rust-1.80/` is too old — `getrandom 0.4+` requires edition 2024.
 - **Redis**: Assumed to be running natively. `scripts/local-test.sh` checks this before starting.

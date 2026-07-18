@@ -36,3 +36,14 @@ test("dashboard HTML is fresh while versioned assets can be cached", async () =>
   assert.doesNotMatch(config, /if \(\$uri /);
   assert.match(config, /add_header Cache-Control \$dashboard_cache_control always;/);
 });
+
+test("deployment runs the resumable daily-bar repair after the service is healthy", async () => {
+  const workflow = await readFile("../../.github/workflows/deploy.yml", "utf8");
+  const healthCheck = workflow.indexOf("- name: Health check");
+  const repair = workflow.indexOf("- name: Repair persisted OHLCV data");
+
+  assert.ok(healthCheck >= 0);
+  assert.ok(repair > healthCheck);
+  assert.match(workflow, /command_timeout:\s*6h/);
+  assert.match(workflow, /--repair-daily-bars/);
+});
