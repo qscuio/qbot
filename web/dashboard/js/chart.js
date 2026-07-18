@@ -7,8 +7,8 @@ const COLORS = {
 
 export const CHART_INTERACTION_OPTIONS = {
   handleScroll: {
-    pressedMouseMove: false,
-    horzTouchDrag: false,
+    pressedMouseMove: true,
+    horzTouchDrag: true,
   },
   handleScale: {
     axisPressedMouseMove: { time: false, price: true },
@@ -55,10 +55,16 @@ function addSeries(chart, type, options) {
 export function fitChartAfterLayout(
   timeScale,
   scheduleFrame = (callback) => window.requestAnimationFrame(callback),
+  barCount = 0,
 ) {
   let active = true;
   scheduleFrame(() => scheduleFrame(() => {
-    if (active) timeScale.fitContent();
+    if (!active) return;
+    if (barCount > 120) {
+      timeScale.setVisibleLogicalRange({ from: barCount - 120, to: barCount - 1 });
+    } else {
+      timeScale.fitContent();
+    }
   }));
   return () => { active = false; };
 }
@@ -124,7 +130,7 @@ export function mountChart(container, bars, hits = []) {
       candleSeries.setMarkers(markers);
     }
   }
-  const cancelInitialFit = fitChartAfterLayout(chart.timeScale());
+  const cancelInitialFit = fitChartAfterLayout(chart.timeScale(), undefined, bars.length);
   return {
     destroy: () => {
       cancelInitialFit();

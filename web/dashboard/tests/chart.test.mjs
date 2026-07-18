@@ -30,13 +30,17 @@ test("signal markers share the most recent available bar", () => {
   assert.equal(markers[1].text, "Top 20");
 });
 
-test("initial chart fit waits until the browser has measured the container", () => {
+test("initial chart view waits for layout and shows the most recent 120 bars", () => {
   assert.equal(typeof chartModule.fitChartAfterLayout, "function");
   const frames = [];
   let fits = 0;
-  const timeScale = { fitContent: () => { fits += 1; } };
+  const ranges = [];
+  const timeScale = {
+    fitContent: () => { fits += 1; },
+    setVisibleLogicalRange: (range) => ranges.push(range),
+  };
 
-  chartModule.fitChartAfterLayout(timeScale, (callback) => frames.push(callback));
+  chartModule.fitChartAfterLayout(timeScale, (callback) => frames.push(callback), 500);
 
   assert.equal(fits, 0);
   assert.equal(frames.length, 1);
@@ -44,14 +48,30 @@ test("initial chart fit waits until the browser has measured the container", () 
   assert.equal(fits, 0);
   assert.equal(frames.length, 1);
   frames.shift()();
+  assert.equal(fits, 0);
+  assert.deepEqual(ranges, [{ from: 380, to: 499 }]);
+});
+
+test("initial chart view fits all data when fewer than 120 bars exist", () => {
+  const frames = [];
+  let fits = 0;
+  const timeScale = {
+    fitContent: () => { fits += 1; },
+    setVisibleLogicalRange: () => assert.fail("short histories should fit fully"),
+  };
+
+  chartModule.fitChartAfterLayout(timeScale, (callback) => frames.push(callback), 80);
+  frames.shift()();
+  frames.shift()();
+
   assert.equal(fits, 1);
 });
 
-test("chart interaction cannot drag candles outside the data boundaries", () => {
+test("chart interaction pans inside fixed data boundaries", () => {
   assert.deepEqual(chartModule.CHART_INTERACTION_OPTIONS, {
     handleScroll: {
-      pressedMouseMove: false,
-      horzTouchDrag: false,
+      pressedMouseMove: true,
+      horzTouchDrag: true,
     },
     handleScale: {
       axisPressedMouseMove: { time: false, price: true },
