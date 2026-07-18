@@ -227,6 +227,41 @@ pub async fn latest_stock_trade_date(pool: &PgPool) -> Result<Option<NaiveDate>>
     Ok(row.0)
 }
 
+pub async fn trade_dates_with_invalid_volume(pool: &PgPool) -> Result<Vec<NaiveDate>> {
+    let rows: Vec<(NaiveDate,)> = sqlx::query_as(
+        r#"SELECT DISTINCT trade_date
+           FROM stock_daily_bars
+           WHERE amount > 0 AND COALESCE(volume, 0) <= 0
+           ORDER BY trade_date"#,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(date,)| date).collect())
+}
+
+pub async fn invalid_volume_count_for_date(pool: &PgPool, trade_date: NaiveDate) -> Result<i64> {
+    let row: (i64,) = sqlx::query_as(
+        r#"SELECT COUNT(*)
+           FROM stock_daily_bars
+           WHERE trade_date = $1 AND amount > 0 AND COALESCE(volume, 0) <= 0"#,
+    )
+    .bind(trade_date)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
+}
+
+pub async fn invalid_volume_count(pool: &PgPool) -> Result<i64> {
+    let row: (i64,) = sqlx::query_as(
+        r#"SELECT COUNT(*)
+           FROM stock_daily_bars
+           WHERE amount > 0 AND COALESCE(volume, 0) <= 0"#,
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
+}
+
 /// Upsert stock info
 pub async fn upsert_stock_info(pool: &PgPool, stocks: &[StockInfo]) -> Result<()> {
     let mut tx = pool.begin().await?;
@@ -1038,6 +1073,28 @@ mod tests {
         .await?;
 
         assert_eq!(row, (10.0, 11.0, 9.5, 10.5, 1_000, 10_500.0, Some(1.1)));
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn invalid_volume_dates_only_include_traded_zero_volume_rows(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        sqlx::query(
+            r#"INSERT INTO stock_daily_bars
+               (code, trade_date, open, high, low, close, volume, amount)
+               VALUES
+               ('600000.SH', '2026-07-14', 10, 11, 9, 10.5, 0, 10000),
+               ('600000.SH', '2026-07-15', 10, 11, 9, 10.5, 0, 0),
+               ('600000.SH', '2026-07-16', 10, 11, 9, 10.5, 1000, 10000),
+               ('600000.SH', '2026-07-17', 10, 11, 9, 10.5, 0, 10000)"#,
+        )
+        .execute(&pool)
+        .await?;
+
+        let dates = trade_dates_with_invalid_volume(&pool).await.unwrap();
+
+        assert_eq!(dates, vec![d("2026-07-14"), d("2026-07-17")]);
         Ok(())
     }
 

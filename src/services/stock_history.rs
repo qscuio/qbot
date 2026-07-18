@@ -9,9 +9,21 @@ use crate::state::AppState;
 use crate::storage::market_repository::MarketRepository;
 use crate::storage::{postgres, upsert_stock_info};
 
+fn latest_trading_date(dates: &[NaiveDate], today: NaiveDate) -> Option<NaiveDate> {
+    dates.iter().copied().filter(|date| *date <= today).max()
+}
+
 pub struct StockHistoryService {
     state: Arc<AppState>,
     provider: Arc<dyn DataProvider>,
+}
+
+#[derive(Debug, Default)]
+pub struct DailyBarRepairReport {
+    pub attempted_dates: usize,
+    pub repaired_dates: usize,
+    pub failed_dates: Vec<(NaiveDate, String)>,
+    pub remaining_rows: i64,
 }
 
 impl StockHistoryService {
@@ -76,12 +88,27 @@ impl StockHistoryService {
         Ok(())
     }
 
-    /// Daily incremental update: fetch today's bars for all known stocks
-    pub async fn update_today(&self) -> Result<()> {
+    /// Incremental update: fetch the latest open market date, including when
+    /// manually triggered on weekends or holidays.
+    pub async fn update_latest_trading_day(&self) -> Result<NaiveDate> {
         let today = beijing_today();
-        info!("Daily update for {}", today);
+        let dates = self
+            .provider
+            .get_trading_dates(today - Duration::days(14), today)
+            .await?;
+        let trade_date = latest_trading_date(&dates, today).ok_or_else(|| {
+            crate::error::AppError::DataProvider(format!(
+                "no trading date found in the 14 days ending {today}"
+            ))
+        })?;
+        info!("Incremental daily update for {}", trade_date);
 
-        let bars = self.provider.get_daily_bars_by_date(today).await?;
+        let bars = self.provider.get_daily_bars_by_date(trade_date).await?;
+        if bars.is_empty() {
+            return Err(crate::error::AppError::DataProvider(format!(
+                "provider returned no daily bars for {trade_date}"
+            )));
+        }
         let count = bars.len();
         let mut tx = self.state.db.begin().await?;
         postgres::upsert_daily_bars_in_tx(&mut tx, &bars).await?;
@@ -94,14 +121,80 @@ impl StockHistoryService {
         )
         .await?;
         tx.commit().await?;
-        info!("Daily update: {} bars saved for {}", count, today);
+        info!("Daily update: {} bars saved for {}", count, trade_date);
 
         // Also refresh stock info
         let stocks = self.provider.get_stock_list().await?;
         upsert_stock_info(&self.state.db, &stocks).await?;
         info!("Stock info refreshed: {} stocks", stocks.len());
 
-        Ok(())
+        Ok(trade_date)
+    }
+
+    pub async fn update_today(&self) -> Result<()> {
+        self.update_latest_trading_day().await.map(|_| ())
+    }
+
+    pub async fn repair_invalid_daily_bars(&self) -> Result<DailyBarRepairReport> {
+        let dates = postgres::trade_dates_with_invalid_volume(&self.state.db).await?;
+        let total_dates = dates.len();
+        let mut report = DailyBarRepairReport::default();
+        info!(
+            "Daily bar repair starting: {} invalid trade dates",
+            total_dates
+        );
+
+        for (index, trade_date) in dates.into_iter().enumerate() {
+            if postgres::invalid_volume_count_for_date(&self.state.db, trade_date).await? == 0 {
+                continue;
+            }
+            report.attempted_dates += 1;
+            let repair_result = async {
+                let fetched = self.provider.get_daily_bars_by_date(trade_date).await?;
+                let bars: Vec<_> = fetched
+                    .into_iter()
+                    .filter(|(_, bar)| bar.trade_date == trade_date)
+                    .collect();
+                if bars.is_empty() {
+                    return Err(crate::error::AppError::DataProvider(format!(
+                        "provider returned no matching bars for {trade_date}"
+                    )));
+                }
+                postgres::upsert_daily_bars(&self.state.db, &bars).await?;
+                let remaining =
+                    postgres::invalid_volume_count_for_date(&self.state.db, trade_date).await?;
+                if remaining > 0 {
+                    return Err(crate::error::AppError::DataProvider(format!(
+                        "{remaining} invalid traded rows remain after repair"
+                    )));
+                }
+                Ok(())
+            }
+            .await;
+
+            match repair_result {
+                Ok(()) => report.repaired_dates += 1,
+                Err(error) => {
+                    warn!("Daily bar repair failed for {}: {}", trade_date, error);
+                    report.failed_dates.push((trade_date, error.to_string()));
+                }
+            }
+            if (index + 1) % 50 == 0 || index + 1 == total_dates {
+                info!(
+                    "Daily bar repair progress: {}/{} dates, repaired={}, failed={}",
+                    index + 1,
+                    total_dates,
+                    report.repaired_dates,
+                    report.failed_dates.len()
+                );
+            }
+            if index + 1 < total_dates {
+                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+            }
+        }
+
+        report.remaining_rows = postgres::invalid_volume_count(&self.state.db).await?;
+        Ok(report)
     }
 
     /// Check if the history table already has any data.
@@ -316,6 +409,61 @@ mod tests {
         Ok(())
     }
 
+    #[sqlx::test(migrations = "./migrations")]
+    async fn repair_invalid_daily_bars_replaces_zero_volume_and_is_resumable(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let trade_date = date(2026, 7, 10);
+        sqlx::query(
+            r#"INSERT INTO stock_daily_bars
+               (code, trade_date, open, high, low, close, volume, amount)
+               VALUES ('600000.SH', $1, 10, 11, 9.5, 10.5, 0, 1000000)"#,
+        )
+        .bind(trade_date)
+        .execute(&pool)
+        .await?;
+        let provider = Arc::new(FakeProvider {
+            trading_dates: vec![trade_date],
+            stocks: Vec::new(),
+            bars: vec![(
+                "600000.SH".to_string(),
+                Candle {
+                    trade_date,
+                    open: 10.0,
+                    high: 11.0,
+                    low: 9.5,
+                    close: 10.5,
+                    volume: 123_456,
+                    amount: 1_000_000.0,
+                    turnover: None,
+                    pe: None,
+                    pb: None,
+                },
+            )],
+        });
+        let state = test_state(pool.clone(), provider.clone()).await;
+        let service = StockHistoryService::new(state, provider);
+
+        let report = service.repair_invalid_daily_bars().await.unwrap();
+
+        assert_eq!(report.attempted_dates, 1);
+        assert_eq!(report.repaired_dates, 1);
+        assert!(report.failed_dates.is_empty());
+        assert_eq!(report.remaining_rows, 0);
+        let (volume,): (i64,) = sqlx::query_as(
+            "SELECT volume FROM stock_daily_bars WHERE code = '600000.SH' AND trade_date = $1",
+        )
+        .bind(trade_date)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(volume, 123_456);
+
+        let second = service.repair_invalid_daily_bars().await.unwrap();
+        assert_eq!(second.attempted_dates, 0);
+        assert_eq!(second.remaining_rows, 0);
+        Ok(())
+    }
+
     async fn test_state(pool: PgPool, provider: Arc<dyn DataProvider>) -> Arc<AppState> {
         let redis_url =
             std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
@@ -374,5 +522,16 @@ mod tests {
 
     fn date(year: i32, month: u32, day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(year, month, day).unwrap()
+    }
+
+    #[test]
+    fn incremental_sync_uses_latest_market_date_on_weekend() {
+        let saturday = date(2026, 7, 18);
+        let dates = vec![date(2026, 7, 16), date(2026, 7, 17)];
+
+        assert_eq!(
+            latest_trading_date(&dates, saturday),
+            Some(date(2026, 7, 17))
+        );
     }
 }
