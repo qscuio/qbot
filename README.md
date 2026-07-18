@@ -229,7 +229,7 @@ Push to `main` triggers `.github/workflows/deploy.yml`, which:
 2. Writes `.env` to `/opt/qbot/.env` from GitHub secrets.
 3. SSH into the VPS, checks out `main`, and builds the release binary.
 4. Preserves the Telegram host and installs a separate `dash.qscuio.com` Nginx virtual host.
-5. Installs the Cloudflare origin certificate and restarts `qbot.service`.
+5. Obtains a Let’s Encrypt certificate automatically and restarts `qbot.service`.
 6. Verifies health, the dashboard shell, and unauthenticated API rejection at both the origin and Cloudflare edge.
 
 **GitHub secrets used by deploy workflow** (Settings → Environments → `VPS`):
@@ -262,10 +262,7 @@ Push to `main` triggers `.github/workflows/deploy.yml`, which:
 | `DASHBOARD_USERNAME` | Yes* | Private dashboard username |
 | `DASHBOARD_PASSWORD_HASH` | Yes* | Argon2id hash generated offline, for example with `argon2` or an equivalent trusted tool |
 | `DASHBOARD_SESSION_SECRET` | Yes* | At least 32 cryptographically random bytes, preferably encoded as hex or base64 |
-| `CLOUDFLARE_ORIGIN_CERT` | Yes* | Cloudflare Origin CA certificate valid for `dash.qscuio.com` (full PEM block) |
-| `CLOUDFLARE_ORIGIN_KEY` | Yes* | Matching Cloudflare Origin CA private key (full PEM block) |
-
-The `dash.qscuio.com` DNS record should remain proxied (orange cloud) and the Cloudflare SSL/TLS mode should be **Full (strict)**. Before the first successful workflow deployment, Cloudflare can return `526` because the origin certificate and dashboard virtual host do not exist yet; that is expected.
+The `dash.qscuio.com` DNS record should remain proxied (orange cloud) and the Cloudflare SSL/TLS mode should be **Full (strict)**. Before the first successful workflow deployment, Cloudflare can return `526` because the origin certificate and dashboard virtual host do not exist yet; that is expected. GitHub Actions serves the ACME challenge over HTTP, obtains the Let’s Encrypt certificate, and then enables the HTTPS virtual host automatically.
 
 Generate an Argon2id password hash without putting the plaintext password in shell history:
 

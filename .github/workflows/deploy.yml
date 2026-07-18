@@ -123,14 +123,10 @@ jobs:
       - name: Deploy to VPS
         if: steps.check.outputs.skip != 'true'
         uses: appleboy/ssh-action@v1.0.3
-        env:
-          CLOUDFLARE_ORIGIN_CERT: ${{ secrets.CLOUDFLARE_ORIGIN_CERT }}
-          CLOUDFLARE_ORIGIN_KEY: ${{ secrets.CLOUDFLARE_ORIGIN_KEY }}
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
-          envs: CLOUDFLARE_ORIGIN_CERT,CLOUDFLARE_ORIGIN_KEY
           script: |
             set -e
             REPO_DIR="/opt/qbot"
@@ -343,17 +339,29 @@ jobs:
 
             configure_nginx_proxy
 
-            # Install the dashboard as a separate virtual host. Public 443 is
-            # already handled by the server's SNI stream proxy.
-            if [ -z "${CLOUDFLARE_ORIGIN_CERT:-}" ] || [ -z "${CLOUDFLARE_ORIGIN_KEY:-}" ]; then
-              echo "Dashboard origin certificate secrets are required"
-              exit 1
+            # Install the dashboard as a separate virtual host. Obtain a
+            # publicly trusted origin certificate automatically on first deploy.
+            dashboard_cert="/etc/letsencrypt/live/dash.qscuio.com/fullchain.pem"
+            dashboard_key="/etc/letsencrypt/live/dash.qscuio.com/privkey.pem"
+            if [ ! -f "$dashboard_cert" ] || [ ! -f "$dashboard_key" ]; then
+              if ! command -v certbot >/dev/null 2>&1; then
+                sudo apt-get update
+                sudo apt-get install -y certbot
+              fi
+              sudo install -d -m 755 /var/www/html
+              sudo cp deploy/qbot-dashboard-acme.nginx.conf /etc/nginx/sites-available/qbot-dashboard.conf
+              sudo ln -sfn /etc/nginx/sites-available/qbot-dashboard.conf /etc/nginx/sites-enabled/qbot-dashboard.conf
+              sudo nginx -t
+              sudo systemctl reload nginx
+              cert_email="${LETSENCRYPT_EMAIL:-admin@dash.qscuio.com}"
+              sudo certbot certonly \
+                --webroot \
+                --webroot-path /var/www/html \
+                --domain dash.qscuio.com \
+                --non-interactive \
+                --agree-tos \
+                --email "$cert_email"
             fi
-            sudo install -d -m 755 /etc/nginx/cloudflare
-            printf '%s\n' "$CLOUDFLARE_ORIGIN_CERT" | sudo tee /etc/nginx/cloudflare/dash.qscuio.com.pem >/dev/null
-            printf '%s\n' "$CLOUDFLARE_ORIGIN_KEY" | sudo tee /etc/nginx/cloudflare/dash.qscuio.com.key >/dev/null
-            sudo chmod 644 /etc/nginx/cloudflare/dash.qscuio.com.pem
-            sudo chmod 600 /etc/nginx/cloudflare/dash.qscuio.com.key
             sudo cp deploy/qbot-dashboard.nginx.conf /etc/nginx/sites-available/qbot-dashboard.conf
             sudo ln -sfn /etc/nginx/sites-available/qbot-dashboard.conf /etc/nginx/sites-enabled/qbot-dashboard.conf
             sudo nginx -t
