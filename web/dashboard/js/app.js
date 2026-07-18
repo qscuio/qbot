@@ -91,8 +91,7 @@ async function loadBootstrap({ quiet = false } = {}) {
   try {
     bootstrap = await dashboardApi.bootstrap();
     rows = normalizeRows(bootstrap.results);
-    renderWorkspace();
-    openHashStock();
+    restoreLocation();
   } catch (error) {
     if (error instanceof ApiError && error.status === 401) return renderLogin();
     if (quiet) return showTransientError("Refresh failed. Existing results are unchanged.");
@@ -116,16 +115,11 @@ function shellTemplate(body) {
   const visible = visibleRows();
   return `
     <div class="shell">
-      <header class="titlebar">
-        <span class="window-mark">QB</span><span class="titlebar-title">QBot</span>
-        <span class="titlebar-center">MARKET INTELLIGENCE · READ ONLY</span>
-        <button class="ghost-button mobile-filter" id="mobile-filter">Filters</button>
-        <button class="ghost-button" id="logout">Sign out</button>
-      </header>
       <div class="workspace">
-        <nav class="activitybar" aria-label="Workspace"><button class="activity-button active" title="Scan explorer">⌁</button><span class="activity-spacer"></span><button class="activity-button" title="Read-only session">⚙</button></nav>
+        <nav class="activitybar" aria-label="Workspace"><button class="activity-button active" title="Scan explorer">⌁</button><span class="activity-spacer"></span><button class="activity-button" id="settings" aria-label="Settings" aria-expanded="false">⚙</button></nav>
+        <div class="settings-popover hidden" id="settings-menu"><strong>QBot</strong><span>Market intelligence · read only</span><button class="outline-button" id="logout">Sign out</button></div>
         ${sidebarTemplate()}
-        <main class="editor"><div class="tabs" role="tablist">${tabsTemplate()}</div><div class="editor-body">${body}</div></main>
+        <main class="editor"><div class="tabs" role="tablist"><button class="ghost-button mobile-filter" id="mobile-filter">Filters</button><button class="ghost-button mobile-settings" id="mobile-settings" aria-label="Settings">⚙</button>${tabsTemplate()}</div><div class="editor-body">${body}</div></main>
       </div>
       <footer class="statusbar">
         <span><i class="status-dot"></i>API connected</span>
@@ -187,12 +181,8 @@ function stockTemplate(tab, detail) {
   const periodName = periods.find(([period]) => period === detail.period)?.[2] || "Daily";
   return `<section class="stock-view">
     <header class="stock-toolbar"><div class="stock-identity"><h1>${escapeHtml(detail.name)}<span>${escapeHtml(detail.code)}</span></h1><div class="muted mono">${latest ? escapeHtml(latest.time) : "No market history"}${detail.partial ? " · partial data" : ""}</div></div><div class="stock-quote"><span class="stock-price">${formatNumber(latest?.close)}</span><span class="number ${changeClass(change)}">${change == null ? "—" : `${change > 0 ? "+" : ""}${formatNumber(change)}%`}</span></div><div class="periods" aria-label="Chart period">${periods.map(([period, label, name]) => `<button class="period-button ${tab.period === period ? "active" : ""}" data-period="${period}" aria-label="${name}" title="${name}">${label}</button>`).join("")}</div><div class="nav-buttons"><button class="ghost-button" data-neighbor="${escapeHtml(activeRows[index - 1]?.code || "")}" ${index <= 0 ? "disabled" : ""}>← Prev</button><button class="ghost-button" data-neighbor="${escapeHtml(activeRows[index + 1]?.code || "")}" ${index < 0 || index >= activeRows.length - 1 ? "disabled" : ""}>Next →</button></div></header>
-    ${detail.bars.length ? `<div class="stock-content"><div class="chart-pane"><div class="chart-legend"><strong class="chart-period">${periodName} · ${detail.bars.length} bars</strong><span class="ma5">MA5</span><span class="ma10">MA10</span><span class="ma20">MA20</span><span class="ma60">MA60</span></div><div class="chart" id="stock-chart"></div><a class="chart-watermark" href="https://www.tradingview.com/" target="_blank" rel="noopener">Charts by TradingView</a></div>${evidenceTemplate(detail.hits)}</div>` : `<div class="empty-state"><strong>No usable chart history</strong><span>Signal evidence remains available below.</span></div>${evidenceTemplate(detail.hits)}`}
+    ${detail.bars.length ? `<div class="stock-content"><div class="chart-pane"><div class="chart-legend"><strong class="chart-period">${periodName} · ${detail.bars.length} bars · ${detail.hits.length} signals</strong><span class="ma5">MA5</span><span class="ma10">MA10</span><span class="ma20">MA20</span><span class="ma60">MA60</span></div><div class="chart" id="stock-chart"></div><a class="chart-watermark" href="https://www.tradingview.com/" target="_blank" rel="noopener">Charts by TradingView</a></div></div>` : `<div class="empty-state"><strong>No usable chart history</strong><span>No historical bars are available for this period.</span></div>`}
   </section>`;
-}
-
-function evidenceTemplate(hits) {
-  return `<aside class="evidence-pane"><div class="evidence-header">Signal evidence · ${hits.length}</div>${hits.length ? hits.map((hit) => `<article class="evidence-card ${hit.isRankedPool ? "ranked" : ""}"><div class="evidence-title"><span>${escapeHtml(hit.icon)}</span><span>${escapeHtml(hit.name)}</span></div><div class="evidence-meta">${escapeHtml(hit.signalId)} · ${escapeHtml(hit.group)}${hit.isRankedPool ? " · ranked pool" : ""}</div><details><summary>Raw metadata</summary><pre>${escapeHtml(JSON.stringify(hit.metadata, null, 2))}</pre></details></article>`).join("") : `<div class="empty-state"><strong>No scan hits</strong><span>This stock is not present in the active scan.</span></div>`}</aside>`;
 }
 
 function renderWorkspace() {
@@ -214,6 +204,13 @@ function bindShell(activeTab) {
   app.querySelector("#logout").addEventListener("click", async () => {
     try { await dashboardApi.logout(); } finally { renderLogin(); }
   });
+  const settingsMenu = app.querySelector("#settings-menu");
+  const toggleSettings = () => {
+    settingsMenu.classList.toggle("hidden");
+    app.querySelector("#settings").setAttribute("aria-expanded", String(!settingsMenu.classList.contains("hidden")));
+  };
+  app.querySelector("#settings").addEventListener("click", toggleSettings);
+  app.querySelector("#mobile-settings")?.addEventListener("click", toggleSettings);
   app.querySelector("#mobile-filter")?.addEventListener("click", () => app.querySelector("#sidebar").classList.toggle("open"));
   app.querySelector("#filters").addEventListener("input", (event) => {
     const form = event.currentTarget;
@@ -233,13 +230,14 @@ function bindShell(activeTab) {
     if (event.target.closest("[data-close]")) return;
     workspace = { ...workspace, activeTab: button.dataset.tab };
     const tab = workspace.tabs.find((item) => item.id === button.dataset.tab);
-    history.replaceState(null, "", tab?.type === "stock" ? `#stock/${tab.code}` : "#scan");
+    pushRoute(tab?.type === "stock" ? stockRoute(tab.code) : "#scan");
     renderWorkspace();
   }));
   app.querySelectorAll("[data-close]").forEach((button) => button.addEventListener("click", (event) => {
     event.stopPropagation();
     workspace = closeTab(workspace, button.dataset.close);
-    history.replaceState(null, "", workspace.activeTab === "scan" ? "#scan" : `#stock/${workspace.tabs.find((tab) => tab.id === workspace.activeTab)?.code}`);
+    const active = workspace.tabs.find((tab) => tab.id === workspace.activeTab);
+    pushRoute(active?.type === "stock" ? stockRoute(active.code) : "#scan");
     renderWorkspace();
   }));
   app.querySelector("#refresh")?.addEventListener("click", () => loadBootstrap({ quiet: true }));
@@ -255,10 +253,18 @@ function bindShell(activeTab) {
   });
 }
 
-function openStock(code) {
+function stockRoute(code) {
+  return `#stock/${encodeURIComponent(code)}`;
+}
+
+function pushRoute(route) {
+  if (location.hash !== route) history.pushState(null, "", route);
+}
+
+function openStock(code, { updateHistory = true } = {}) {
   const row = rows.find((item) => item.code === code) || { code, name: code };
   workspace = openStockTab(workspace, row);
-  history.replaceState(null, "", `#stock/${encodeURIComponent(code)}`);
+  if (updateHistory) pushRoute(stockRoute(code));
   renderWorkspace();
 }
 
@@ -273,9 +279,15 @@ async function loadStock(tab) {
   if (workspace.activeTab === tab.id && workspace.tabs.find((item) => item.id === tab.id)?.period === tab.period) renderWorkspace();
 }
 
-function openHashStock() {
+function restoreLocation() {
   const match = location.hash.match(/^#stock\/(.+)$/);
-  if (match) openStock(decodeURIComponent(match[1]));
+  if (match) {
+    openStock(decodeURIComponent(match[1]), { updateHistory: false });
+    return;
+  }
+  workspace = { ...workspace, activeTab: "scan" };
+  if (location.hash !== "#scan") history.replaceState(null, "", "#scan");
+  renderWorkspace();
 }
 
 function showTransientError(message) {
@@ -300,3 +312,6 @@ async function start() {
 }
 
 start();
+window.addEventListener("popstate", () => {
+  if (bootstrap) restoreLocation();
+});

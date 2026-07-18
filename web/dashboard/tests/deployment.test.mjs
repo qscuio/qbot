@@ -11,3 +11,12 @@ test("dashboard redirects never expose the private origin port", async () => {
     2,
   );
 });
+
+test("dashboard assets cannot be retained as a stale frontend", async () => {
+  const config = await readFile("../../deploy/qbot-dashboard.nginx.conf", "utf8");
+  const cacheHeader = config.indexOf('add_header Cache-Control "no-store" always;');
+  const dashboardLocation = config.indexOf("location /dashboard/ {");
+
+  assert.notEqual(cacheHeader, -1);
+  assert.ok(cacheHeader < dashboardLocation);
+});

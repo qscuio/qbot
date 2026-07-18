@@ -46,3 +46,15 @@ test("initial chart fit waits until the browser has measured the container", () 
   frames.shift()();
   assert.equal(fits, 1);
 });
+
+test("chart interaction cannot drag candles outside the data boundaries", () => {
+  assert.deepEqual(chartModule.CHART_INTERACTION_OPTIONS, {
+    handleScroll: {
+      pressedMouseMove: false,
+      horzTouchDrag: false,
+    },
+    handleScale: {
+      axisPressedMouseMove: { time: false, price: true },
+    },
+  });
+});

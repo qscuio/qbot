@@ -83,11 +83,12 @@ test("login, filter, stock chart, periods, and logout", async ({ page }) => {
   await page.locator("tbody tr").click();
   await expect(page.getByRole("heading", { name: /贵州茅台/ })).toBeVisible();
   await expect(page.locator("#stock-chart canvas").first()).toBeVisible();
-  await expect(page.locator(".chart-period")).toHaveText("Daily · 90 bars");
+  await expect(page.locator(".chart-period")).toHaveText("Daily · 90 bars · 2 signals");
   await page.getByRole("button", { name: "Weekly" }).click();
   await expect(page.getByRole("button", { name: "Weekly" })).toHaveClass(/active/);
-  await expect(page.locator(".chart-period")).toHaveText("Weekly · 18 bars");
+  await expect(page.locator(".chart-period")).toHaveText("Weekly · 18 bars · 2 signals");
   expect(requestedPeriods).toContain("weekly");
+  await page.getByRole("button", { name: "Settings" }).click();
   await page.getByRole("button", { name: "Sign out" }).click();
   await expect(page.getByRole("button", { name: "Sign in" })).toBeVisible();
 });
@@ -101,7 +102,17 @@ test("narrow layout exposes the filter drawer", async ({ page }) => {
   await expect(page.getByLabel("Stock search")).toBeVisible();
 });
 
-test("stock detail confines scrolling to an invisible evidence scroller", async ({ page }) => {
+test("top chrome is consolidated into the left settings menu", async ({ page }) => {
+  await mockApi(page);
+  await page.goto("/dashboard/");
+
+  await expect(page.locator(".titlebar")).toHaveCount(0);
+  await page.getByRole("button", { name: "Settings" }).click();
+  await expect(page.getByText("Market intelligence · read only")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Sign out" })).toBeVisible();
+});
+
+test("stock detail fills the viewport without an evidence sidebar", async ({ page }) => {
   await page.setViewportSize({ width: 1883, height: 937 });
   const denseHits = Array.from({ length: 10 }, (_, index) => ({
     ...bootstrap.results[0].hits[index % bootstrap.results[0].hits.length],
@@ -115,20 +126,35 @@ test("stock detail confines scrolling to an invisible evidence scroller", async 
   const layout = await page.evaluate(() => {
     const root = document.scrollingElement;
     const editor = document.querySelector(".editor-body");
-    const evidence = document.querySelector(".evidence-pane");
     return {
       page: { client: root.clientHeight, scroll: root.scrollHeight },
       editor: { client: editor.clientHeight, scroll: editor.scrollHeight },
-      evidence: {
-        client: evidence.clientHeight,
-        scroll: evidence.scrollHeight,
-        scrollbarWidth: getComputedStyle(evidence).scrollbarWidth,
-      },
     };
   });
 
   expect(layout.page.scroll).toBe(layout.page.client);
   expect(layout.editor.scroll).toBe(layout.editor.client);
-  expect(layout.evidence.scroll).toBeGreaterThan(layout.evidence.client);
-  expect(layout.evidence.scrollbarWidth).toBe("none");
+  await expect(page.locator(".evidence-pane")).toHaveCount(0);
+  await expect(page.locator(".statusbar")).toHaveCSS("background-color", "rgb(24, 24, 24)");
+});
+
+test("browser back and forward restore scan and stock pages", async ({ page }) => {
+  await mockApi(page);
+  await page.goto("/dashboard/");
+
+  await page.locator("tbody tr").nth(0).click();
+  await expect(page).toHaveURL(/#stock\/600519$/);
+  await page.getByRole("tab", { name: /Latest scan/ }).click();
+  await expect(page).toHaveURL(/#scan$/);
+  await page.locator("tbody tr").nth(1).click();
+  await expect(page).toHaveURL(/#stock\/000001$/);
+
+  await page.goBack();
+  await expect(page.getByRole("heading", { name: "Latest scan" })).toBeVisible();
+  await page.goBack();
+  await expect(page).toHaveURL(/#stock\/600519$/);
+  await page.goForward();
+  await expect(page.getByRole("heading", { name: "Latest scan" })).toBeVisible();
+  await page.goForward();
+  await expect(page).toHaveURL(/#stock\/000001$/);
 });

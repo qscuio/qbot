@@ -5,6 +5,16 @@ const COLORS = {
   text: "#a9a9a9",
 };
 
+export const CHART_INTERACTION_OPTIONS = {
+  handleScroll: {
+    pressedMouseMove: false,
+    horzTouchDrag: false,
+  },
+  handleScale: {
+    axisPressedMouseMove: { time: false, price: true },
+  },
+};
+
 export function movingAverage(bars, window) {
   const values = [];
   let sum = 0;
@@ -58,6 +68,7 @@ export function mountChart(container, bars, hits = []) {
   container.replaceChildren();
   const chart = window.LightweightCharts.createChart(container, {
     autoSize: true,
+    ...CHART_INTERACTION_OPTIONS,
     layout: { background: { color: "#1e1e1e" }, textColor: COLORS.text },
     grid: {
       vertLines: { color: COLORS.grid },
