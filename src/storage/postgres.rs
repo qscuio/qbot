@@ -117,6 +117,32 @@ pub async fn get_stock_history(pool: &PgPool, code: &str, days: usize) -> Result
     )
 }
 
+/// Fetch the complete monthly OHLCV history for a stock, aggregating in PostgreSQL
+/// so the API transfers only one row per month instead of every daily candle.
+pub async fn get_stock_monthly_history(pool: &PgPool, code: &str) -> Result<Vec<Candle>> {
+    get_stock_history_query(
+        sqlx::query_as(
+            r#"SELECT MAX(trade_date) AS trade_date,
+                      ((array_agg(open ORDER BY trade_date ASC))[1])::float8 AS open,
+                      MAX(high)::float8 AS high,
+                      MIN(low)::float8 AS low,
+                      ((array_agg(close ORDER BY trade_date DESC))[1])::float8 AS close,
+                      SUM(volume)::bigint AS volume,
+                      SUM(amount)::float8 AS amount,
+                      ((array_agg(turnover ORDER BY trade_date DESC))[1])::float8 AS turnover,
+                      ((array_agg(pe ORDER BY trade_date DESC))[1])::float8 AS pe,
+                      ((array_agg(pb ORDER BY trade_date DESC))[1])::float8 AS pb
+               FROM stock_daily_bars
+               WHERE code = $1
+               GROUP BY date_trunc('month', trade_date)
+               ORDER BY MAX(trade_date) ASC"#,
+        )
+        .bind(code)
+        .fetch_all(pool)
+        .await?,
+    )
+}
+
 /// Fetch OHLCV history for a stock up to and including an as-of trade date (sorted ascending)
 pub async fn get_stock_history_as_of(
     pool: &PgPool,
@@ -956,6 +982,67 @@ mod tests {
         .await?;
 
         assert_eq!(row, (10.8, 2.2, 13.3, 1.4));
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn monthly_history_aggregates_complete_daily_history(pool: PgPool) -> sqlx::Result<()> {
+        let bars = [
+            Candle {
+                trade_date: d("2026-01-02"),
+                open: 10.0,
+                high: 12.0,
+                low: 9.0,
+                close: 11.0,
+                volume: 100,
+                amount: 1_000.0,
+                turnover: Some(1.0),
+                pe: Some(10.0),
+                pb: Some(1.0),
+            },
+            Candle {
+                trade_date: d("2026-01-30"),
+                open: 11.0,
+                high: 14.0,
+                low: 8.0,
+                close: 13.0,
+                volume: 200,
+                amount: 2_000.0,
+                turnover: Some(2.0),
+                pe: Some(11.0),
+                pb: Some(1.1),
+            },
+            Candle {
+                trade_date: d("2026-02-03"),
+                open: 13.0,
+                high: 15.0,
+                low: 12.0,
+                close: 14.0,
+                volume: 300,
+                amount: 3_000.0,
+                turnover: Some(3.0),
+                pe: Some(12.0),
+                pb: Some(1.2),
+            },
+        ];
+        let rows: Vec<_> = bars
+            .into_iter()
+            .map(|bar| ("600000.SH".to_string(), bar))
+            .collect();
+        upsert_daily_bars(&pool, &rows).await.unwrap();
+
+        let monthly = get_stock_monthly_history(&pool, "600000.SH").await.unwrap();
+
+        assert_eq!(monthly.len(), 2);
+        assert_eq!(monthly[0].trade_date, d("2026-01-30"));
+        assert_eq!(monthly[0].open, 10.0);
+        assert_eq!(monthly[0].high, 14.0);
+        assert_eq!(monthly[0].low, 8.0);
+        assert_eq!(monthly[0].close, 13.0);
+        assert_eq!(monthly[0].volume, 300);
+        assert_eq!(monthly[0].amount, 3_000.0);
+        assert_eq!(monthly[0].turnover, Some(2.0));
+        assert_eq!(monthly[1].trade_date, d("2026-02-03"));
         Ok(())
     }
 

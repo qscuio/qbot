@@ -200,7 +200,7 @@ async fn stock_detail(
         }
     };
     match DashboardService::new(state)
-        .stock_detail(&code, period, query.days.unwrap_or(500))
+        .stock_detail(&code, period, query.days)
         .await
     {
         Ok(payload) => Json(payload).into_response(),

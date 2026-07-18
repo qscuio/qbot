@@ -27,6 +27,6 @@ export const dashboardApi = {
   logout: () => request("/api/dashboard/auth/logout", { method: "POST", body: "{}" }),
   bootstrap: () => request("/api/dashboard/bootstrap"),
   stock: (code, period = "daily") => request(
-    `/api/dashboard/stocks/${encodeURIComponent(code)}?period=${encodeURIComponent(period)}&days=500`,
+    `/api/dashboard/stocks/${encodeURIComponent(code)}?period=${encodeURIComponent(period)}`,
   ),
 };

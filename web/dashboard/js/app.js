@@ -1,5 +1,5 @@
-import { dashboardApi, ApiError } from "./api.js?v=20260718.3";
-import { mountChart } from "./chart.js?v=20260718.3";
+import { dashboardApi, ApiError } from "./api.js?v=20260718.4";
+import { mountChart } from "./chart.js?v=20260718.4";
 import {
   applyFilters,
   closeTab,
@@ -8,7 +8,7 @@ import {
   openStockTab,
   sortRows,
   updateTab,
-} from "./state.js?v=20260718.3";
+} from "./state.js?v=20260718.4";
 
 const app = document.querySelector("#app");
 let bootstrap = null;

@@ -241,7 +241,7 @@ impl DashboardService {
         &self,
         raw_code: &str,
         period: DashboardPeriod,
-        days: usize,
+        requested_days: Option<usize>,
     ) -> Result<DashboardStockDetail> {
         let code = postgres::resolve_stock_code(&self.state.db, raw_code)
             .await?
@@ -249,9 +249,18 @@ impl DashboardService {
         let name = postgres::get_stock_name(&self.state.db, &code)
             .await?
             .unwrap_or_else(|| code.clone());
-        let daily =
-            postgres::get_stock_history(&self.state.db, &code, days.clamp(30, 5_000)).await?;
-        let period_bars = resample_dashboard_bars(&daily, period);
+        let period_bars = if period == DashboardPeriod::Monthly {
+            postgres::get_stock_monthly_history(&self.state.db, &code).await?
+        } else {
+            let daily = postgres::get_stock_history(
+                &self.state.db,
+                &code,
+                requested_days.unwrap_or(500).clamp(30, 5_000),
+            )
+            .await?;
+            resample_dashboard_bars(&daily, period)
+        };
+        let partial = period_bars.is_empty();
         let latest = period_bars.last().map(DashboardBar::from);
         let bars = period_bars.iter().map(DashboardBar::from).collect();
 
@@ -271,7 +280,7 @@ impl DashboardService {
             code,
             name,
             period: period.as_str().to_string(),
-            partial: daily.is_empty(),
+            partial,
             latest,
             bars,
             hits,
