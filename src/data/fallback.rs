@@ -17,6 +17,17 @@ impl FallbackDataProvider {
     }
 }
 
+fn daily_bar_batch_is_usable(bars: &[(String, Candle)]) -> bool {
+    !bars.is_empty()
+        && bars.iter().all(|(_, bar)| {
+            bar.open > 0.0
+                && bar.high > 0.0
+                && bar.low > 0.0
+                && bar.close > 0.0
+                && (bar.amount <= 0.0 || bar.volume > 0)
+        })
+}
+
 #[async_trait]
 impl DataProvider for FallbackDataProvider {
     fn name(&self) -> &'static str {
@@ -49,12 +60,13 @@ impl DataProvider for FallbackDataProvider {
         let mut last_err: Option<AppError> = None;
         for p in &self.providers {
             match p.get_daily_bars_by_date(trade_date).await {
-                Ok(data) if !data.is_empty() => return Ok(data),
-                Ok(_) => {
+                Ok(data) if daily_bar_batch_is_usable(&data) => return Ok(data),
+                Ok(data) => {
                     warn!(
-                        "provider {} returned empty bars for {}, trying fallback",
+                        "provider {} returned unusable bars for {} (rows={}), trying fallback",
                         p.name(),
-                        trade_date
+                        trade_date,
+                        data.len()
                     )
                 }
                 Err(e) => {
@@ -200,5 +212,40 @@ impl DataProvider for FallbackDataProvider {
         } else {
             Ok(vec![])
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn candle(volume: i64, amount: f64) -> Candle {
+        Candle {
+            trade_date: NaiveDate::from_ymd_opt(2026, 7, 17).unwrap(),
+            open: 10.0,
+            high: 11.0,
+            low: 9.0,
+            close: 10.5,
+            volume,
+            amount,
+            turnover: None,
+            pe: None,
+            pb: None,
+        }
+    }
+
+    #[test]
+    fn daily_bar_batch_rejects_traded_rows_with_missing_volume() {
+        let bars = vec![("600000.SH".to_string(), candle(0, 10_000.0))];
+        assert!(!daily_bar_batch_is_usable(&bars));
+    }
+
+    #[test]
+    fn daily_bar_batch_accepts_suspended_rows_beside_valid_trades() {
+        let bars = vec![
+            ("600000.SH".to_string(), candle(1_000, 10_000.0)),
+            ("600001.SH".to_string(), candle(0, 0.0)),
+        ];
+        assert!(daily_bar_batch_is_usable(&bars));
     }
 }

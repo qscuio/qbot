@@ -1,5 +1,5 @@
 use chrono::NaiveDate;
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{PgPool, Postgres, QueryBuilder, Transaction};
 use uuid::Uuid;
 
 use crate::data::types::{Candle, LimitUpStock, SectorData, StockInfo};
@@ -70,30 +70,37 @@ pub async fn upsert_daily_bars_in_tx(
 ) -> Result<usize> {
     let mut count = 0usize;
 
-    for (code, bar) in bars {
-        sqlx::query(
+    for chunk in bars.chunks(1_000) {
+        let mut query = QueryBuilder::<Postgres>::new(
             r#"INSERT INTO stock_daily_bars
-               (code, trade_date, open, high, low, close, volume, amount, turnover, pe, pb)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-               ON CONFLICT (code, trade_date) DO UPDATE SET
-               open=EXCLUDED.open, high=EXCLUDED.high, low=EXCLUDED.low,
-               close=EXCLUDED.close, volume=EXCLUDED.volume, amount=EXCLUDED.amount,
-               turnover=EXCLUDED.turnover, pe=EXCLUDED.pe, pb=EXCLUDED.pb"#,
-        )
-        .bind(code)
-        .bind(bar.trade_date)
-        .bind(bar.open)
-        .bind(bar.high)
-        .bind(bar.low)
-        .bind(bar.close)
-        .bind(bar.volume)
-        .bind(bar.amount)
-        .bind(bar.turnover)
-        .bind(bar.pe)
-        .bind(bar.pb)
-        .execute(&mut **tx)
-        .await?;
-        count += 1;
+               (code, trade_date, open, high, low, close, volume, amount, turnover, pe, pb) "#,
+        );
+        query.push_values(chunk, |mut row, (code, bar)| {
+            row.push_bind(code)
+                .push_bind(bar.trade_date)
+                .push_bind(bar.open)
+                .push_bind(bar.high)
+                .push_bind(bar.low)
+                .push_bind(bar.close)
+                .push_bind(bar.volume)
+                .push_bind(bar.amount)
+                .push_bind(bar.turnover)
+                .push_bind(bar.pe)
+                .push_bind(bar.pb);
+        });
+        query.push(
+            r#" ON CONFLICT (code, trade_date) DO UPDATE SET
+                open=CASE WHEN EXCLUDED.open > 0 THEN EXCLUDED.open ELSE stock_daily_bars.open END,
+                high=CASE WHEN EXCLUDED.high > 0 THEN EXCLUDED.high ELSE stock_daily_bars.high END,
+                low=CASE WHEN EXCLUDED.low > 0 THEN EXCLUDED.low ELSE stock_daily_bars.low END,
+                close=CASE WHEN EXCLUDED.close > 0 THEN EXCLUDED.close ELSE stock_daily_bars.close END,
+                volume=CASE WHEN EXCLUDED.volume > 0 THEN EXCLUDED.volume ELSE stock_daily_bars.volume END,
+                amount=CASE WHEN EXCLUDED.amount > 0 THEN EXCLUDED.amount ELSE stock_daily_bars.amount END,
+                turnover=COALESCE(EXCLUDED.turnover, stock_daily_bars.turnover),
+                pe=COALESCE(EXCLUDED.pe, stock_daily_bars.pe),
+                pb=COALESCE(EXCLUDED.pb, stock_daily_bars.pb)"#,
+        );
+        count += query.build().execute(&mut **tx).await?.rows_affected() as usize;
     }
 
     Ok(count)
@@ -982,6 +989,55 @@ mod tests {
         .await?;
 
         assert_eq!(row, (10.8, 2.2, 13.3, 1.4));
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn daily_bar_upsert_does_not_replace_valid_market_data_with_zeroes(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let initial = Candle {
+            trade_date: d("2026-07-10"),
+            open: 10.0,
+            high: 11.0,
+            low: 9.5,
+            close: 10.5,
+            volume: 1_000,
+            amount: 10_500.0,
+            turnover: Some(1.1),
+            pe: Some(12.2),
+            pb: Some(1.3),
+        };
+        let invalid = Candle {
+            open: 0.0,
+            high: 0.0,
+            low: 0.0,
+            close: 0.0,
+            volume: 0,
+            amount: 0.0,
+            turnover: None,
+            pe: None,
+            pb: None,
+            ..initial.clone()
+        };
+
+        upsert_daily_bars(&pool, &[("600000.SH".to_string(), initial)])
+            .await
+            .unwrap();
+        upsert_daily_bars(&pool, &[("600000.SH".to_string(), invalid)])
+            .await
+            .unwrap();
+
+        let row: (f64, f64, f64, f64, i64, f64, Option<f64>) = sqlx::query_as(
+            r#"SELECT open::float8, high::float8, low::float8, close::float8,
+                      volume, amount::float8, turnover::float8
+               FROM stock_daily_bars
+               WHERE code = '600000.SH' AND trade_date = '2026-07-10'"#,
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(row, (10.0, 11.0, 9.5, 10.5, 1_000, 10_500.0, Some(1.1)));
         Ok(())
     }
 
