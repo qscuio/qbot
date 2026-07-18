@@ -29,7 +29,7 @@ const bars = Array.from({ length: 90 }, (_, index) => {
   return { time: date, open: close - 3, high: close + 8, low: close - 10, close, volume: 1000000 + index * 1000, amount: 1 };
 });
 
-async function mockApi(page, initiallyAuthenticated = true) {
+async function mockApi(page, initiallyAuthenticated = true, stockHits = bootstrap.results[0].hits, requestedPeriods = []) {
   let authenticated = initiallyAuthenticated;
   await page.route("**/api/dashboard/**", async (route) => {
     const url = new URL(route.request().url());
@@ -42,22 +42,34 @@ async function mockApi(page, initiallyAuthenticated = true) {
     }
     if (url.pathname.endsWith("/auth/logout")) return route.fulfill({ status: 204, body: "" });
     if (!authenticated) return route.fulfill({ status: 401, json: { error: "unauthorized" } });
-    if (url.pathname.endsWith("/bootstrap")) return route.fulfill({ status: 200, json: bootstrap });
+    if (url.pathname.endsWith("/bootstrap")) return route.fulfill({
+      status: 200,
+      json: {
+        ...bootstrap,
+        results: bootstrap.results.map((row) => row.code === "600519" ? { ...row, hits: stockHits } : row),
+      },
+    });
+    const period = url.searchParams.get("period") || "daily";
+    requestedPeriods.push(period);
+    const periodBars = period === "daily"
+      ? bars
+      : bars.filter((_, index) => (index + 1) % (period === "weekly" ? 5 : 20) === 0);
     return route.fulfill({ status: 200, json: {
       runId: bootstrap.runId,
       code: "600519",
       name: "贵州茅台",
-      period: url.searchParams.get("period") || "daily",
+      period,
       partial: false,
-      latest: bars.at(-1),
-      bars,
-      hits: bootstrap.results[0].hits,
+      latest: periodBars.at(-1),
+      bars: periodBars,
+      hits: stockHits,
     } });
   });
 }
 
 test("login, filter, stock chart, periods, and logout", async ({ page }) => {
-  await mockApi(page, false);
+  const requestedPeriods = [];
+  await mockApi(page, false, bootstrap.results[0].hits, requestedPeriods);
   await page.goto("/dashboard/");
   await expect(page.getByRole("heading", { name: "QBot Market Intelligence" })).toBeVisible();
   await page.getByLabel("Username").fill("analyst");
@@ -71,8 +83,11 @@ test("login, filter, stock chart, periods, and logout", async ({ page }) => {
   await page.locator("tbody tr").click();
   await expect(page.getByRole("heading", { name: /贵州茅台/ })).toBeVisible();
   await expect(page.locator("#stock-chart canvas").first()).toBeVisible();
-  await page.getByRole("button", { name: "W" }).click();
-  await expect(page.getByRole("button", { name: "W" })).toHaveClass(/active/);
+  await expect(page.locator(".chart-period")).toHaveText("Daily · 90 bars");
+  await page.getByRole("button", { name: "Weekly" }).click();
+  await expect(page.getByRole("button", { name: "Weekly" })).toHaveClass(/active/);
+  await expect(page.locator(".chart-period")).toHaveText("Weekly · 18 bars");
+  expect(requestedPeriods).toContain("weekly");
   await page.getByRole("button", { name: "Sign out" }).click();
   await expect(page.getByRole("button", { name: "Sign in" })).toBeVisible();
 });
@@ -84,4 +99,36 @@ test("narrow layout exposes the filter drawer", async ({ page }) => {
   await page.getByRole("button", { name: "Filters", exact: true }).click();
   await expect(page.locator("#sidebar")).toHaveClass(/open/);
   await expect(page.getByLabel("Stock search")).toBeVisible();
+});
+
+test("stock detail confines scrolling to an invisible evidence scroller", async ({ page }) => {
+  await page.setViewportSize({ width: 1883, height: 937 });
+  const denseHits = Array.from({ length: 10 }, (_, index) => ({
+    ...bootstrap.results[0].hits[index % bootstrap.results[0].hits.length],
+    signalId: `signal-${index}`,
+    name: `Signal ${index + 1}`,
+  }));
+  await mockApi(page, true, denseHits);
+  await page.goto("/dashboard/");
+  await page.locator("tbody tr").first().click();
+
+  const layout = await page.evaluate(() => {
+    const root = document.scrollingElement;
+    const editor = document.querySelector(".editor-body");
+    const evidence = document.querySelector(".evidence-pane");
+    return {
+      page: { client: root.clientHeight, scroll: root.scrollHeight },
+      editor: { client: editor.clientHeight, scroll: editor.scrollHeight },
+      evidence: {
+        client: evidence.clientHeight,
+        scroll: evidence.scrollHeight,
+        scrollbarWidth: getComputedStyle(evidence).scrollbarWidth,
+      },
+    };
+  });
+
+  expect(layout.page.scroll).toBe(layout.page.client);
+  expect(layout.editor.scroll).toBe(layout.editor.client);
+  expect(layout.evidence.scroll).toBeGreaterThan(layout.evidence.client);
+  expect(layout.evidence.scrollbarWidth).toBe("none");
 });

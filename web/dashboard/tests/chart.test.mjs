@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { movingAverage, signalMarkers } from "../js/chart.js";
+import * as chartModule from "../js/chart.js";
+
+const { movingAverage, signalMarkers } = chartModule;
 
 test("moving average begins when the requested window is complete", () => {
   const bars = [1, 2, 3, 4, 5, 6].map((close, index) => ({
@@ -26,4 +28,21 @@ test("signal markers share the most recent available bar", () => {
   assert.equal(markers.length, 2);
   assert.equal(markers[0].time, "2026-07-18");
   assert.equal(markers[1].text, "Top 20");
+});
+
+test("initial chart fit waits until the browser has measured the container", () => {
+  assert.equal(typeof chartModule.fitChartAfterLayout, "function");
+  const frames = [];
+  let fits = 0;
+  const timeScale = { fitContent: () => { fits += 1; } };
+
+  chartModule.fitChartAfterLayout(timeScale, (callback) => frames.push(callback));
+
+  assert.equal(fits, 0);
+  assert.equal(frames.length, 1);
+  frames.shift()();
+  assert.equal(fits, 0);
+  assert.equal(frames.length, 1);
+  frames.shift()();
+  assert.equal(fits, 1);
 });

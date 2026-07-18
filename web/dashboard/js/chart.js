@@ -42,6 +42,17 @@ function addSeries(chart, type, options) {
   return chart[legacy[type]](options);
 }
 
+export function fitChartAfterLayout(
+  timeScale,
+  scheduleFrame = (callback) => window.requestAnimationFrame(callback),
+) {
+  let active = true;
+  scheduleFrame(() => scheduleFrame(() => {
+    if (active) timeScale.fitContent();
+  }));
+  return () => { active = false; };
+}
+
 export function mountChart(container, bars, hits = []) {
   if (!window.LightweightCharts || !container) return { destroy() {} };
   container.replaceChildren();
@@ -53,7 +64,13 @@ export function mountChart(container, bars, hits = []) {
       horzLines: { color: COLORS.grid },
     },
     rightPriceScale: { borderColor: "#333333" },
-    timeScale: { borderColor: "#333333", timeVisible: false },
+    timeScale: {
+      borderColor: "#333333",
+      timeVisible: false,
+      rightOffset: 0,
+      fixLeftEdge: true,
+      fixRightEdge: true,
+    },
     crosshair: { mode: 0 },
     localization: { locale: "zh-CN" },
   });
@@ -96,6 +113,11 @@ export function mountChart(container, bars, hits = []) {
       candleSeries.setMarkers(markers);
     }
   }
-  chart.timeScale().fitContent();
-  return { destroy: () => chart.remove() };
+  const cancelInitialFit = fitChartAfterLayout(chart.timeScale());
+  return {
+    destroy: () => {
+      cancelInitialFit();
+      chart.remove();
+    },
+  };
 }
