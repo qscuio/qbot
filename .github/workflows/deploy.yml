@@ -141,6 +141,13 @@ jobs:
             fi
 
             git -C "$REPO_DIR" fetch --depth 1 origin main
+            if ! git -C "$REPO_DIR" diff --quiet \
+              || ! git -C "$REPO_DIR" diff --cached --quiet \
+              || [ -n "$(git -C "$REPO_DIR" ls-files --others --exclude-standard)" ]; then
+              echo "Preserving local deployment-tree changes before checkout"
+              git -C "$REPO_DIR" stash push --include-untracked \
+                --message "pre-deploy-${{ github.sha }}"
+            fi
             git -C "$REPO_DIR" checkout -B main FETCH_HEAD
 
             cd "$REPO_DIR"
