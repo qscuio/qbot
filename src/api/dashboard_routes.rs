@@ -1,12 +1,12 @@
 use axum::extract::DefaultBodyLimit;
 use axum::{
     extract::{Path, Query, State},
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
-use serde::Deserialize;
+use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::json;
 use std::{str::FromStr, sync::Arc};
 use tower_http::services::ServeDir;
@@ -39,7 +39,7 @@ impl DashboardDetailQuery {
 #[derive(Debug, Deserialize)]
 pub(crate) struct DashboardFinancialQuery {
     frequency: Option<String>,
-    limit: Option<String>,
+    limit: Option<usize>,
     cursor: Option<String>,
 }
 
@@ -54,33 +54,44 @@ impl DashboardFinancialQuery {
     }
 
     fn parsed_limit(&self) -> crate::error::Result<usize> {
-        parsed_company_page_limit(self.limit.as_deref())
+        parsed_company_page_limit(self.limit)
     }
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct DashboardDividendQuery {
-    limit: Option<String>,
+    limit: Option<usize>,
     cursor: Option<String>,
 }
 
 impl DashboardDividendQuery {
     fn parsed_limit(&self) -> crate::error::Result<usize> {
-        parsed_company_page_limit(self.limit.as_deref())
+        parsed_company_page_limit(self.limit)
     }
 }
 
-fn parsed_company_page_limit(value: Option<&str>) -> crate::error::Result<usize> {
+fn parsed_company_page_limit(value: Option<usize>) -> crate::error::Result<usize> {
     match value {
         None => Ok(50),
-        Some(value) => value
-            .parse::<usize>()
-            .ok()
-            .filter(|limit| (1..=100).contains(limit))
-            .ok_or_else(|| {
-                crate::error::AppError::BadRequest("limit must be between 1 and 100".to_string())
-            }),
+        Some(value) if (1..=100).contains(&value) => Ok(value),
+        Some(_) => Err(crate::error::AppError::BadRequest(
+            "limit must be between 1 and 100".to_string(),
+        )),
     }
+}
+
+fn parse_dashboard_query<T: DeserializeOwned>(uri: &Uri) -> Result<T, Response> {
+    Query::<T>::try_from_uri(uri)
+        .map(|Query(query)| query)
+        .map_err(|_| {
+            private_no_store(
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "invalid query parameters"})),
+                )
+                    .into_response(),
+            )
+        })
 }
 
 pub fn dashboard_router(state: Arc<AppState>) -> Router {
@@ -299,11 +310,15 @@ async fn stock_financials(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(code): Path<String>,
-    Query(query): Query<DashboardFinancialQuery>,
+    uri: Uri,
 ) -> Response {
     if let Err(response) = authorized(&state, &headers).await {
         return private_no_store(response);
     }
+    let query = match parse_dashboard_query::<DashboardFinancialQuery>(&uri) {
+        Ok(query) => query,
+        Err(response) => return response,
+    };
     let frequency = match query.parsed_frequency() {
         Ok(frequency) => frequency,
         Err(error) => return private_no_store(dashboard_company_error(error)),
@@ -331,11 +346,15 @@ async fn stock_dividends(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(code): Path<String>,
-    Query(query): Query<DashboardDividendQuery>,
+    uri: Uri,
 ) -> Response {
     if let Err(response) = authorized(&state, &headers).await {
         return private_no_store(response);
     }
+    let query = match parse_dashboard_query::<DashboardDividendQuery>(&uri) {
+        Ok(query) => query,
+        Err(response) => return response,
+    };
     let service = match company_service(&state) {
         Ok(service) => service,
         Err(response) => return private_no_store(response),
@@ -419,8 +438,11 @@ fn internal_error(message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{body::Body, http::Request};
+    use serde_json::Value;
     use sqlx::PgPool;
     use tokio::sync::Mutex;
+    use tower::Service;
     use uuid::Uuid;
 
     use crate::config::Config;
@@ -551,43 +573,23 @@ mod tests {
             State(state.clone()),
             headers(None),
             Path("999999.SH".to_string()),
-            Query(DashboardFinancialQuery {
-                frequency: Some("monthly".to_string()),
-                limit: None,
-                cursor: None,
-            }),
+            "/?frequency=monthly".parse().unwrap(),
         )
         .await;
         assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
         assert_private_no_store(&unauthenticated);
         let cookie = authenticated_cookie(&state).await;
-        for query in [
-            DashboardFinancialQuery {
-                frequency: Some("monthly".to_string()),
-                limit: None,
-                cursor: None,
-            },
-            DashboardFinancialQuery {
-                frequency: None,
-                limit: Some("0".to_string()),
-                cursor: None,
-            },
-            DashboardFinancialQuery {
-                frequency: None,
-                limit: Some("not-a-number".to_string()),
-                cursor: None,
-            },
-            DashboardFinancialQuery {
-                frequency: None,
-                limit: None,
-                cursor: Some("invalid".to_string()),
-            },
+        for uri in [
+            "/?frequency=monthly",
+            "/?limit=0",
+            "/?limit=not-a-number",
+            "/?cursor=invalid",
         ] {
             let response = stock_financials(
                 State(state.clone()),
                 headers(Some(&cookie)),
                 Path("600519.SH".to_string()),
-                Query(query),
+                uri.parse().unwrap(),
             )
             .await;
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -613,11 +615,7 @@ mod tests {
             State(state.clone()),
             headers(Some(&cookie)),
             Path("600519.SH".to_string()),
-            Query(DashboardFinancialQuery {
-                frequency: Some("annual".to_string()),
-                limit: Some("10".to_string()),
-                cursor: None,
-            }),
+            "/?frequency=annual&limit=10".parse().unwrap(),
         )
         .await;
         assert_eq!(financials.status(), StatusCode::OK);
@@ -626,14 +624,91 @@ mod tests {
             State(state),
             headers(Some(&cookie)),
             Path("600519.SH".to_string()),
-            Query(DashboardDividendQuery {
-                limit: Some("10".to_string()),
-                cursor: None,
-            }),
+            "/?limit=10".parse().unwrap(),
         )
         .await;
         assert_eq!(dividends.status(), StatusCode::OK);
         assert_private_no_store(&dividends);
+        Ok(())
+    }
+
+    async fn router_get(router: &mut Router, uri: &str, cookie: Option<&str>) -> Response {
+        let mut request = Request::builder().uri(uri);
+        if let Some(cookie) = cookie {
+            request = request.header(header::COOKIE, cookie);
+        }
+        router
+            .call(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    async fn assert_safe_query_error(response: Response) {
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_private_no_store(&response);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload, json!({"error": "invalid query parameters"}));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn router_authenticates_before_rejecting_malformed_company_queries(
+        pool: PgPool,
+    ) -> crate::error::Result<()> {
+        sqlx::query(
+            r#"INSERT INTO stock_info (code, name, market, industry)
+               VALUES ('600519.SH', '贵州茅台', 'SH', '白酒')"#,
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            r#"INSERT INTO security_master_versions
+               (code, name, market, exchange, list_status, list_date, available_at,
+                availability_quality, source)
+               VALUES ('600519.SH', '贵州茅台', '主板', 'SSE', 'L', '2001-08-27',
+                       '2026-01-01T00:00:00Z', 'observed', 'tushare')"#,
+        )
+        .execute(&pool)
+        .await?;
+        let state = test_state(pool).await;
+        let cookie = authenticated_cookie(&state).await;
+        let mut router = dashboard_router(state);
+
+        for uri in [
+            "/api/dashboard/stocks/999999.SH/financials?limit=10&limit=11",
+            "/api/dashboard/stocks/999999.SH/dividends?limit=%FF",
+        ] {
+            let response = router_get(&mut router, uri, None).await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+            assert_private_no_store(&response);
+        }
+
+        let duplicate = router_get(
+            &mut router,
+            "/api/dashboard/stocks/600519.SH/financials?limit=10&limit=11",
+            Some(&cookie),
+        )
+        .await;
+        assert_safe_query_error(duplicate).await;
+
+        let malformed = router_get(
+            &mut router,
+            "/api/dashboard/stocks/600519.SH/dividends?limit=%FF",
+            Some(&cookie),
+        )
+        .await;
+        assert_safe_query_error(malformed).await;
+
+        for uri in [
+            "/api/dashboard/stocks/600519.SH/financials?frequency=annual&limit=10",
+            "/api/dashboard/stocks/600519.SH/dividends?limit=10",
+        ] {
+            let response = router_get(&mut router, uri, Some(&cookie)).await;
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            assert_private_no_store(&response);
+        }
         Ok(())
     }
 }
