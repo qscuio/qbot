@@ -2,12 +2,28 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  activeFilterCount,
   applyFilters,
+  clampInspectorWidth,
   createWorkspaceState,
+  loadInspectorPreferences,
   normalizeRows,
   openStockTab,
+  saveInspectorPreferences,
   sortRows,
 } from "../js/state.js";
+
+function memoryStorage() {
+  const values = new Map();
+  return {
+    getItem(key) {
+      return values.get(key) ?? null;
+    },
+    setItem(key, value) {
+      values.set(key, value);
+    },
+  };
+}
 
 const rows = normalizeRows([
   {
@@ -43,6 +59,49 @@ test("filters by text, group, signal, and ranked membership", () => {
 test("sorts deterministically and keeps codes as strings", () => {
   assert.deepEqual(sortRows(rows, "change", "asc").map((row) => row.code), ["000001", "600519"]);
   assert.deepEqual(sortRows(rows, "code", "asc").map((row) => row.code), ["000001", "600519"]);
+});
+
+test("counts only active scan filters", () => {
+  assert.equal(activeFilterCount({
+    search: "茅台",
+    group: "trend",
+    signal: "",
+    rankedOnly: false,
+    sort: "ranked",
+    direction: "desc",
+  }), 2);
+  assert.equal(activeFilterCount({ signal: "top20", rankedOnly: true }), 2);
+});
+
+test("clamps and persists inspector preferences", () => {
+  assert.equal(clampInspectorWidth(120, 1600), 300);
+  assert.equal(clampInspectorWidth(1200, 1600), 800);
+  const storage = memoryStorage();
+  saveInspectorPreferences(storage, { width: 440, collapsed: true });
+  assert.deepEqual(loadInspectorPreferences(storage, 1600), { width: 440, collapsed: true });
+});
+
+test("uses safe inspector defaults for missing or invalid storage", () => {
+  assert.deepEqual(loadInspectorPreferences(memoryStorage(), 1600), {
+    width: 380,
+    collapsed: false,
+  });
+  assert.deepEqual(loadInspectorPreferences({ getItem: () => "not json" }, 600), {
+    width: 300,
+    collapsed: false,
+  });
+  assert.deepEqual(loadInspectorPreferences({ getItem: () => { throw new Error("blocked"); } }, 1600), {
+    width: 380,
+    collapsed: false,
+  });
+});
+
+test("ignores inspector storage quota errors", () => {
+  assert.doesNotThrow(() => saveInspectorPreferences({
+    setItem() {
+      throw new Error("quota exceeded");
+    },
+  }, { width: 440, collapsed: true }));
 });
 
 test("opening a stock creates a stable editor tab", () => {

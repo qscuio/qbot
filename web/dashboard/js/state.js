@@ -1,4 +1,42 @@
 const collator = new Intl.Collator("zh-CN", { numeric: true, sensitivity: "base" });
+const inspectorPreferencesKey = "qbot.dashboard.inspector.v1";
+const defaultInspectorWidth = 380;
+const minimumInspectorWidth = 300;
+
+export function activeFilterCount(filters = {}) {
+  return [filters.search, filters.group, filters.signal, filters.rankedOnly]
+    .filter(Boolean)
+    .length;
+}
+
+export function clampInspectorWidth(width, viewportWidth) {
+  const maximumWidth = Math.max(minimumInspectorWidth, Math.floor(viewportWidth * 0.5));
+  const preferredWidth = Number.isFinite(width) ? width : defaultInspectorWidth;
+  return Math.min(Math.max(preferredWidth, minimumInspectorWidth), maximumWidth);
+}
+
+export function loadInspectorPreferences(storage, viewportWidth) {
+  try {
+    const stored = JSON.parse(storage.getItem(inspectorPreferencesKey));
+    return {
+      width: clampInspectorWidth(stored?.width, viewportWidth),
+      collapsed: stored?.collapsed === true,
+    };
+  } catch {
+    return {
+      width: clampInspectorWidth(defaultInspectorWidth, viewportWidth),
+      collapsed: false,
+    };
+  }
+}
+
+export function saveInspectorPreferences(storage, preferences) {
+  try {
+    storage.setItem(inspectorPreferencesKey, JSON.stringify(preferences));
+  } catch {
+    // Browser storage may be unavailable or over quota.
+  }
+}
 
 export function normalizeRows(results = []) {
   return results.map((result) => {
