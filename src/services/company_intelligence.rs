@@ -1618,12 +1618,10 @@ where
     }
 
     pub async fn backfill_chips(&self) -> Result<ChipBackfillReport> {
-        let Some(mut preflight) = acquire_chip_connection(&self.pool).await? else {
-            return Ok(ChipBackfillReport {
-                pending: 1,
-                ..Default::default()
-            });
-        };
+        // A repair is durable batch work, not a latency-sensitive daily probe.
+        // Wait for its preflight connection so transient pool pressure cannot
+        // turn the whole backfill into a successful no-op.
+        let mut preflight = self.pool.acquire().await?;
         let decision = latest_validation_decision_in_connection(&mut preflight, CHIP_MODEL_VERSION)
             .await?
             .ok_or_else(|| {
@@ -4220,7 +4218,9 @@ mod tests {
         let provider = Arc::new(RecordingChipProvider::default());
         let service = CompanyIntelligenceService::new_at(pool.clone(), provider, date(2018, 1, 2));
 
-        service.backfill_chips().await.unwrap();
+        let report = service.backfill_chips().await.unwrap();
+        assert_eq!(report.completed, 1);
+        assert_eq!(report.pending, 0);
         let rows: Vec<(NaiveDate, String, Option<String>, bool, f64, f64, f64, f64)> =
             sqlx::query_as(
                 r#"SELECT trade_date, source, model_version, validated,
@@ -4509,7 +4509,9 @@ mod tests {
             start + ChronoDuration::days(2),
         );
 
-        service.backfill_chips().await.unwrap();
+        let report = service.backfill_chips().await.unwrap();
+        assert_eq!(report.completed, 1);
+        assert_eq!(report.pending, 0);
         let (through_date, factor): (NaiveDate, f64) = sqlx::query_as(
             r#"SELECT through_date, last_adjustment_factor::float8
                FROM chip_model_states WHERE code = $1 AND model_version = 'qbot-chip-v2'"#,

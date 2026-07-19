@@ -56,4 +56,4 @@ jobs:
         run: cargo check --locked
 
       - name: Rust tests
-        run: cargo test --locked
+        run: cargo test --locked -- --test-threads=1
