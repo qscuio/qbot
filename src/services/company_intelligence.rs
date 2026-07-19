@@ -485,7 +485,7 @@ where
 
         let started_at = Utc::now();
         let run_id = Uuid::new_v4();
-        match self.execute_chip_benchmark().await {
+        match self.execute_chip_benchmark(&mut serialization).await {
             Ok((sample, report, decision)) => {
                 repository
                     .save_validation_run_in_transaction(
@@ -545,6 +545,7 @@ where
 
     async fn execute_chip_benchmark(
         &self,
+        transaction: &mut Transaction<'_, Postgres>,
     ) -> std::result::Result<
         (
             ChipValidationSample,
@@ -554,7 +555,7 @@ where
         ChipBenchmarkFailure,
     > {
         let (universe, observations, actions) = self
-            .load_validation_inputs()
+            .load_validation_inputs_in_transaction(transaction)
             .await
             .map_err(|error| ChipBenchmarkFailure::before_sample("load_inputs", error))?;
         let sample =
@@ -568,26 +569,30 @@ where
                 error,
             )
         })?;
-        let report = self.execute_chip_sample(&sample).await.map_err(|error| {
-            ChipBenchmarkFailure::after_sample(
-                "provider_or_comparison",
-                sample.clone(),
-                json!({
-                    "sample_stocks": sample.stocks.len(),
-                    "performance_pairs": sample.stocks.iter()
-                        .map(|stock| stock.performance_dates.len()).sum::<usize>(),
-                    "distribution_pairs": sample.stocks.iter()
-                        .map(|stock| stock.distribution_dates.len()).sum::<usize>(),
-                }),
-                error,
-            )
-        })?;
+        let report = self
+            .execute_chip_sample(transaction, &sample)
+            .await
+            .map_err(|error| {
+                ChipBenchmarkFailure::after_sample(
+                    "provider_or_comparison",
+                    sample.clone(),
+                    json!({
+                        "sample_stocks": sample.stocks.len(),
+                        "performance_pairs": sample.stocks.iter()
+                            .map(|stock| stock.performance_dates.len()).sum::<usize>(),
+                        "distribution_pairs": sample.stocks.iter()
+                            .map(|stock| stock.distribution_dates.len()).sum::<usize>(),
+                    }),
+                    error,
+                )
+            })?;
         let decision = decide_chip_source(&report);
         Ok((sample, report, decision))
     }
 
     async fn execute_chip_sample(
         &self,
+        transaction: &mut Transaction<'_, Postgres>,
         sample: &ChipValidationSample,
     ) -> Result<crate::services::chip_validation::ChipValidationReport> {
         let mut comparisons = Vec::new();
@@ -603,7 +608,9 @@ where
                 .iter()
                 .copied()
                 .collect::<BTreeSet<_>>();
-            let history = self.load_chip_history(&sampled.code).await?;
+            let history = self
+                .load_chip_history_in_transaction(transaction, &sampled.code)
+                .await?;
             let estimates =
                 estimate_history_at_dates(history.into_iter().map(|row| row.input), &requested)?;
             ensure_exact_dates("local estimator", &requested, estimates.keys().copied())?;
@@ -785,15 +792,45 @@ where
                     // Estimates are useful fallback evidence but are explicitly
                     // unvalidated and the checkpoint remains retryable.
                     if decision == ChipSourceDecision::Official {
-                        let failure = format!("official chip data unavailable: {error}");
-                        chip_repository
+                        let provider_failure = format!("official chip data unavailable: {error}");
+                        // Provider calls can outlive the lease. Re-fence before
+                        // any fallback write so an expired worker cannot mutate
+                        // a window already reclaimed by another worker.
+                        let lease = company_repository
+                            .renew_checkpoint(&lease, self.lease_ttl)
+                            .await
+                            .map_err(|renewal| {
+                                AppError::DataProvider(format!(
+                                    "{provider_failure}; lease renewal failed after provider failure: {renewal}"
+                                ))
+                            })?;
+                        match chip_repository
                             .persist_unvalidated_estimates_and_fail(
                                 &lease,
                                 &fallback_estimates,
-                                &failure,
+                                &provider_failure,
                             )
-                            .await?;
-                        return Err(AppError::DataProvider(failure));
+                            .await
+                        {
+                            Ok(_) => return Err(AppError::DataProvider(provider_failure)),
+                            Err(storage) => {
+                                let cleanup_error = format!(
+                                    "{provider_failure}; fallback persistence failed: {storage}"
+                                );
+                                let release = match company_repository
+                                    .fail_checkpoint(&lease, &cleanup_error)
+                                    .await
+                                {
+                                    Ok(()) => "checkpoint release succeeded".to_string(),
+                                    Err(error) => {
+                                        format!("checkpoint release failed: {error}")
+                                    }
+                                };
+                                return Err(AppError::DataProvider(format!(
+                                    "{cleanup_error}; {release}"
+                                )));
+                            }
+                        }
                     }
                     let failure = format!("official chip data unavailable: {error}");
                     company_repository.fail_checkpoint(&lease, &failure).await?;
@@ -918,8 +955,9 @@ where
         Ok(rows)
     }
 
-    async fn load_validation_inputs(
+    async fn load_validation_inputs_in_transaction(
         &self,
+        transaction: &mut Transaction<'_, Postgres>,
     ) -> Result<(
         Vec<ValidationStock>,
         Vec<ValidationObservation>,
@@ -936,7 +974,7 @@ where
                  AND (delist_date IS NULL OR delist_date > $1)"#,
         )
         .bind(self.today)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut **transaction)
         .await?;
         let stocks = sqlx::query_as::<_, (String, String, f64)>(
             r#"WITH latest_master AS (
@@ -960,7 +998,7 @@ where
                ORDER BY master.code"#,
         )
         .bind(self.today)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut **transaction)
         .await?
         .into_iter()
         .map(|(code, exchange, market_value)| ValidationStock {
@@ -981,11 +1019,15 @@ where
                 stocks.len()
             )));
         }
-        let codes = stocks
+        let current_codes = stocks
             .iter()
             .map(|stock| stock.code.clone())
             .collect::<Vec<_>>();
-        let raw = sqlx::query_as::<_, (String, NaiveDate, f64, f64)>(
+        // Stage one returns one summary row per eligible stock. These true
+        // full-history means and the corporate-action flag are sufficient for
+        // deterministic stratified stock selection, without materializing the
+        // whole market's daily history in the application.
+        let summaries = sqlx::query_as::<_, (String, f64, f64, Option<NaiveDate>)>(
             r#"WITH base AS (
                    SELECT bars.code, bars.trade_date, bars.close::float8 AS close,
                           COALESCE(bars.turnover::float8, basic.turnover_rate) AS turnover
@@ -1016,135 +1058,244 @@ where
                    FROM with_returns
                    GROUP BY code
                    HAVING COUNT(*) >= 24
-               ), ranked AS (
-                   SELECT rows.code, rows.trade_date, stats.observation_count,
-                          stats.average_turnover, stats.average_volatility,
-                          ROW_NUMBER() OVER
-                              (PARTITION BY rows.code ORDER BY rows.trade_date) AS position
-                   FROM with_returns rows
-                   JOIN stats USING (code)
-               ), targets AS (
-                   SELECT stats.code,
-                          1 + FLOOR(index * (stats.observation_count - 1)::numeric / 23)::bigint
-                              AS position
-                   FROM stats CROSS JOIN generate_series(0, 23) AS index
+               ), actions AS (
+                   SELECT code,
+                          MIN(COALESCE(ex_date, record_date, announcement_date)) AS action_date
+                   FROM corporate_action_versions
+                   WHERE code = ANY($1)
+                     AND COALESCE(ex_date, record_date, announcement_date) IS NOT NULL
+                   GROUP BY code
                )
-               SELECT ranked.code, ranked.trade_date,
-                      ranked.average_turnover, ranked.average_volatility
+               SELECT stats.code, stats.average_turnover, stats.average_volatility,
+                      actions.action_date
+               FROM stats
+               LEFT JOIN actions USING (code)
+               ORDER BY stats.code"#,
+        )
+        .bind(&current_codes)
+        .bind(self.today)
+        .fetch_all(&mut **transaction)
+        .await?;
+
+        let summary_by_code = summaries
+            .iter()
+            .map(|(code, turnover, volatility, action_date)| {
+                (code.clone(), (*turnover, *volatility, *action_date))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let summary_observations = summaries
+            .iter()
+            .map(
+                |(code, average_turnover, average_volatility, _)| ValidationObservation {
+                    code: code.clone(),
+                    // Only the stratum is used in this first pass. Real dates
+                    // are selected by the bounded second-stage query below.
+                    trade_date: self.today,
+                    turnover_rate: *average_turnover,
+                    volatility: *average_volatility,
+                },
+            )
+            .collect::<Vec<_>>();
+        let summary_actions = summaries
+            .iter()
+            .filter_map(|(code, _, _, action_date)| {
+                action_date.map(|action_date| ValidationCorporateAction {
+                    code: code.clone(),
+                    action_date,
+                })
+            })
+            .collect::<Vec<_>>();
+        let selected = build_validation_sample(
+            CHIP_MODEL_VERSION,
+            &stocks,
+            &summary_observations,
+            &summary_actions,
+        )?;
+        let selected_codes = selected
+            .stocks
+            .iter()
+            .map(|stock| stock.code.clone())
+            .collect::<Vec<_>>();
+        let selected_code_set = selected_codes.iter().cloned().collect::<BTreeSet<_>>();
+        let stocks = stocks
+            .into_iter()
+            .filter(|stock| selected_code_set.contains(&stock.code))
+            .collect::<Vec<_>>();
+
+        // Stage two reads only the chosen codes and emits exactly 24 dates per
+        // eligible stock. Summary values are carried forward unchanged so
+        // strata reflect the true full-history averages rather than the sample.
+        let sampled_dates = sqlx::query_as::<_, (String, NaiveDate)>(
+            r#"WITH base AS (
+                   SELECT bars.code, bars.trade_date, bars.close::float8 AS close,
+                          COALESCE(bars.turnover::float8, basic.turnover_rate) AS turnover
+                   FROM stock_daily_bars bars
+                   LEFT JOIN LATERAL (
+                       SELECT turnover_rate::float8 AS turnover_rate
+                       FROM stock_daily_basic_versions daily
+                       WHERE daily.code = bars.code AND daily.trade_date = bars.trade_date
+                       ORDER BY daily.available_at DESC, daily.ingested_at DESC
+                       LIMIT 1
+                   ) basic ON TRUE
+                   WHERE bars.code = ANY($1)
+                     AND bars.trade_date >= DATE '2018-01-01'
+                     AND bars.trade_date <= $2
+               ), valid AS (
+                   SELECT code, trade_date FROM base
+                   WHERE close IS NOT NULL AND close > 0
+                     AND turnover IS NOT NULL AND turnover BETWEEN 0 AND 100
+               ), ranked AS (
+                   SELECT code, trade_date,
+                          COUNT(*) OVER (PARTITION BY code) AS observation_count,
+                          ROW_NUMBER() OVER
+                              (PARTITION BY code ORDER BY trade_date) AS position
+                   FROM valid
+               ), targets AS (
+                   SELECT code,
+                          1 + FLOOR(index * (MAX(observation_count) - 1)::numeric / 23)::bigint
+                              AS position
+                   FROM ranked CROSS JOIN generate_series(0, 23) AS index
+                   GROUP BY code, index
+               )
+               SELECT ranked.code, ranked.trade_date
                FROM ranked
                JOIN targets USING (code, position)
                ORDER BY ranked.code, ranked.trade_date"#,
         )
-        .bind(&codes)
+        .bind(&selected_codes)
         .bind(self.today)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut **transaction)
         .await?;
-        if raw.len() > stocks.len() * 24 {
+        let expected_observations = selected_codes.len() * 24;
+        if sampled_dates.len() != expected_observations {
             return Err(AppError::Internal(format!(
-                "bounded chip validation query returned {} rows for {} stocks",
-                raw.len(),
-                stocks.len()
+                "bounded chip validation query returned {} rows; expected {expected_observations} for {} selected stocks",
+                sampled_dates.len(), selected_codes.len()
             )));
         }
-        let observations = raw
+        let observations = sampled_dates
             .into_iter()
-            .map(
-                |(code, trade_date, turnover_rate, volatility)| ValidationObservation {
+            .map(|(code, trade_date)| {
+                let (turnover_rate, volatility, _) =
+                    summary_by_code.get(&code).ok_or_else(|| {
+                        AppError::Internal(format!(
+                            "selected chip validation stock lacks summary: {code}"
+                        ))
+                    })?;
+                Ok(ValidationObservation {
                     code,
                     trade_date,
-                    turnover_rate,
-                    volatility,
-                },
-            )
+                    turnover_rate: *turnover_rate,
+                    volatility: *volatility,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let actions = summary_actions
+            .into_iter()
+            .filter(|action| selected_code_set.contains(&action.code))
             .collect();
-        let actions = sqlx::query_as::<_, (String, NaiveDate)>(
-            r#"SELECT DISTINCT ON (code, action_date) code, action_date
-               FROM (
-                   SELECT code, COALESCE(ex_date, record_date, announcement_date) AS action_date,
-                          available_at, ingested_at
-                   FROM corporate_action_versions
-                   WHERE code = ANY($1)
-               ) actions
-               WHERE action_date IS NOT NULL
-               ORDER BY code, action_date, available_at DESC, ingested_at DESC"#,
-        )
-        .bind(&codes)
-        .fetch_all(&self.pool)
-        .await?
-        .into_iter()
-        .map(|(code, action_date)| ValidationCorporateAction { code, action_date })
-        .collect();
         Ok((stocks, observations, actions))
     }
 
-    async fn load_chip_history(&self, code: &str) -> Result<Vec<ChipHistoryRow>> {
-        self.load_raw_chip_history(code)
+    async fn load_chip_history_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        code: &str,
+    ) -> Result<Vec<ChipHistoryRow>> {
+        fetch_raw_chip_history(&mut **transaction, code, self.today)
             .await?
             .into_iter()
             .map(|row| row.into_input(code).map(|input| ChipHistoryRow { input }))
             .collect()
     }
 
-    async fn load_raw_chip_history(&self, code: &str) -> Result<Vec<RawChipHistoryRow>> {
-        let rows = sqlx::query_as::<
-            _,
-            (
-                NaiveDate,
-                Option<f64>,
-                Option<f64>,
-                Option<f64>,
-                Option<f64>,
-                Option<f64>,
-                Option<f64>,
-                Option<f64>,
-            ),
-        >(
-            r#"SELECT bars.trade_date, bars.open::float8, bars.high::float8,
-                      bars.low::float8, bars.close::float8, bars.volume::float8,
-                      COALESCE(bars.turnover::float8, basic.turnover_rate),
-                      COALESCE(factor.adj_factor, 1.0)::float8
-               FROM stock_daily_bars bars
-               LEFT JOIN LATERAL (
-                   SELECT turnover_rate::float8 AS turnover_rate
-                   FROM stock_daily_basic_versions daily
-                   WHERE daily.code = bars.code AND daily.trade_date = bars.trade_date
-                   ORDER BY daily.available_at DESC, daily.ingested_at DESC
-                   LIMIT 1
-               ) basic ON TRUE
-               LEFT JOIN LATERAL (
-                   SELECT adj_factor
-                   FROM stock_adjustment_factors adjustment
-                   WHERE adjustment.code = bars.code
-                     AND adjustment.trade_date <= bars.trade_date
-                   ORDER BY adjustment.trade_date DESC, adjustment.available_at DESC,
-                            adjustment.ingested_at DESC
-                   LIMIT 1
-               ) factor ON TRUE
-               WHERE bars.code = $1 AND bars.trade_date <= $2
-               ORDER BY bars.trade_date ASC"#,
-        )
-        .bind(code)
-        .bind(self.today)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(
-                |(trade_date, open, high, low, close, volume, turnover_rate, adjustment_factor)| {
-                    RawChipHistoryRow {
-                        trade_date,
-                        open,
-                        high,
-                        low,
-                        close,
-                        volume,
-                        turnover_rate,
-                        adjustment_factor,
-                    }
-                },
-            )
-            .collect())
+    #[cfg(test)]
+    async fn load_validation_inputs(
+        &self,
+    ) -> Result<(
+        Vec<ValidationStock>,
+        Vec<ValidationObservation>,
+        Vec<ValidationCorporateAction>,
+    )> {
+        let mut transaction = self.pool.begin().await?;
+        let inputs = self
+            .load_validation_inputs_in_transaction(&mut transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(inputs)
     }
+
+    async fn load_raw_chip_history(&self, code: &str) -> Result<Vec<RawChipHistoryRow>> {
+        fetch_raw_chip_history(&self.pool, code, self.today).await
+    }
+}
+
+async fn fetch_raw_chip_history<'e, E>(
+    executor: E,
+    code: &str,
+    today: NaiveDate,
+) -> Result<Vec<RawChipHistoryRow>>
+where
+    E: sqlx::Executor<'e, Database = Postgres>,
+{
+    let rows = sqlx::query_as::<
+        _,
+        (
+            NaiveDate,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+        ),
+    >(
+        r#"SELECT bars.trade_date, bars.open::float8, bars.high::float8,
+                  bars.low::float8, bars.close::float8, bars.volume::float8,
+                  COALESCE(bars.turnover::float8, basic.turnover_rate),
+                  COALESCE(factor.adj_factor, 1.0)::float8
+           FROM stock_daily_bars bars
+           LEFT JOIN LATERAL (
+               SELECT turnover_rate::float8 AS turnover_rate
+               FROM stock_daily_basic_versions daily
+               WHERE daily.code = bars.code AND daily.trade_date = bars.trade_date
+               ORDER BY daily.available_at DESC, daily.ingested_at DESC
+               LIMIT 1
+           ) basic ON TRUE
+           LEFT JOIN LATERAL (
+               SELECT adj_factor
+               FROM stock_adjustment_factors adjustment
+               WHERE adjustment.code = bars.code
+                 AND adjustment.trade_date <= bars.trade_date
+               ORDER BY adjustment.trade_date DESC, adjustment.available_at DESC,
+                        adjustment.ingested_at DESC
+               LIMIT 1
+           ) factor ON TRUE
+           WHERE bars.code = $1 AND bars.trade_date <= $2
+           ORDER BY bars.trade_date ASC"#,
+    )
+    .bind(code)
+    .bind(today)
+    .fetch_all(executor)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(trade_date, open, high, low, close, volume, turnover_rate, adjustment_factor)| {
+                RawChipHistoryRow {
+                    trade_date,
+                    open,
+                    high,
+                    low,
+                    close,
+                    volume,
+                    turnover_rate,
+                    adjustment_factor,
+                }
+            },
+        )
+        .collect())
 }
 
 fn json_value(value: &impl Serialize) -> Result<serde_json::Value> {
@@ -1407,7 +1558,7 @@ mod tests {
     use async_trait::async_trait;
     use chrono::{Duration as ChronoDuration, NaiveDate, TimeZone, Utc};
     use serde_json::json;
-    use sqlx::PgPool;
+    use sqlx::{postgres::PgPoolOptions, PgPool};
 
     use super::{
         bounded_date_windows, estimate_history_at_dates, official_snapshot,
@@ -1421,7 +1572,7 @@ mod tests {
         CompanyDataProvider, DividendRecord, FinancialFrequency, FinancialReport,
     };
     use crate::error::{AppError, Result};
-    use crate::storage::company_repository::CompanyRepository;
+    use crate::storage::company_repository::{CheckpointClaimOutcome, CompanyRepository};
 
     #[derive(Default)]
     struct RecordingChipProvider {
@@ -1706,8 +1857,16 @@ mod tests {
     }
 
     async fn seed_benchmark_universe(pool: &PgPool) -> String {
+        seed_benchmark_universe_with_shape(pool, 201, Some(23)).await
+    }
+
+    async fn seed_benchmark_universe_with_shape(
+        pool: &PgPool,
+        stock_count: usize,
+        final_stock_bar_count: Option<usize>,
+    ) -> String {
         let start = date(2020, 1, 1);
-        let codes = (1..=201)
+        let codes = (1..=stock_count)
             .map(|index| format!("{index:06}.SZ"))
             .collect::<Vec<_>>();
         let list_dates = vec![start; codes.len()];
@@ -1742,7 +1901,11 @@ mod tests {
         let mut bar_dates = Vec::new();
         let mut prices = Vec::new();
         for (index, code) in codes.iter().enumerate() {
-            let count = if *code == recent_code { 23 } else { 25 };
+            let count = if *code == recent_code {
+                final_stock_bar_count.unwrap_or(25)
+            } else {
+                25
+            };
             for offset in 0..count {
                 bar_codes.push(code.clone());
                 bar_dates.push(start + ChronoDuration::days(offset as i64));
@@ -1963,15 +2126,23 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn concurrent_full_benchmark_runs_once_with_bounded_eligible_sample(pool: PgPool) {
         let recent_code = seed_benchmark_universe(&pool).await;
+        let constrained_pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(pool.connect_options().as_ref().clone())
+            .await
+            .unwrap();
         let provider = Arc::new(RecordingChipProvider::default());
         let service = Arc::new(CompanyIntelligenceService::new_at(
-            pool.clone(),
+            constrained_pool,
             provider.clone(),
             date(2026, 7, 19),
         ));
 
-        let (first, second) =
-            tokio::join!(service.run_chip_benchmark(), service.run_chip_benchmark());
+        let (first, second) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(service.run_chip_benchmark(), service.run_chip_benchmark())
+        })
+        .await
+        .expect("pool-sized concurrent benchmark callers must not deadlock");
         let first = first.unwrap();
         let second = second.unwrap();
         assert_eq!(first.decision, second.decision);
@@ -2004,6 +2175,64 @@ mod tests {
         let input_rows = service.load_validation_inputs().await.unwrap().1.len();
         assert_eq!(input_rows, 200 * 24);
         assert!(input_rows <= 201 * 24);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn full_benchmark_succeeds_with_one_database_connection(pool: PgPool) {
+        seed_benchmark_universe(&pool).await;
+        let constrained_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(pool.connect_options().as_ref().clone())
+            .await
+            .unwrap();
+        let provider = Arc::new(RecordingChipProvider::default());
+        let service = CompanyIntelligenceService::new_at(
+            constrained_pool,
+            provider.clone(),
+            date(2026, 7, 19),
+        );
+
+        let report = tokio::time::timeout(Duration::from_secs(10), service.run_chip_benchmark())
+            .await
+            .expect("benchmark must not reacquire its own single-connection pool")
+            .unwrap();
+
+        assert!(!report.reused);
+        assert_eq!(*provider.official_calls.lock().unwrap(), 250);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn validation_inputs_select_200_before_materializing_exactly_24_dates_each(pool: PgPool) {
+        seed_benchmark_universe_with_shape(&pool, 205, None).await;
+        let service = CompanyIntelligenceService::new_at(
+            pool,
+            Arc::new(RecordingChipProvider::default()),
+            date(2026, 7, 19),
+        );
+
+        let (stocks, observations, _) = service.load_validation_inputs().await.unwrap();
+
+        assert_eq!(
+            stocks.len(),
+            200,
+            "selection must precede daily row loading"
+        );
+        assert_eq!(observations.len(), 200 * 24);
+        let selected_codes = stocks
+            .iter()
+            .map(|stock| stock.code.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(selected_codes.len(), 200);
+        assert!(observations
+            .iter()
+            .all(|row| selected_codes.contains(row.code.as_str())));
+        assert!(selected_codes.iter().all(|code| {
+            observations
+                .iter()
+                .filter(|row| row.code.as_str() == *code)
+                .count()
+                == 24
+        }));
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -2229,6 +2458,131 @@ mod tests {
             .unwrap();
         assert_eq!(checkpoint.status, "completed");
         assert_eq!(checkpoint.attempts, 1);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn delayed_provider_failure_renews_before_fallback_and_cannot_touch_new_owner(
+        pool: PgPool,
+    ) {
+        let code = "000001.SZ";
+        let start = date(2020, 1, 2);
+        let end = start + ChronoDuration::days(1);
+        seed_current_stock(&pool, code, start).await;
+        seed_chip_decision(&pool, ChipSourceDecision::Official).await;
+        seed_chip_bars(&pool, code, start, 2).await;
+        let service = CompanyIntelligenceService::new_at(
+            pool.clone(),
+            Arc::new(RecordingChipProvider {
+                fail_official: true,
+                official_delay: Duration::from_millis(300),
+                ..Default::default()
+            }),
+            end,
+        )
+        .with_lease_ttl(Duration::from_millis(100));
+        let worker = tokio::spawn(async move { service.backfill_chips().await });
+        let checkpoints = CompanyRepository::new(pool.clone());
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if checkpoints
+                    .checkpoint_window("chip_backfill", code, start, end)
+                    .await
+                    .unwrap()
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("first worker must publish its checkpoint claim");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let second = checkpoints
+            .claim_checkpoint_window("chip_backfill", code, start, end, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let CheckpointClaimOutcome::Claimed(second) = second else {
+            panic!("expired provider worker must be reclaimable")
+        };
+
+        let error = worker.await.unwrap().unwrap_err().to_string();
+
+        assert!(error.contains("injected official failure"));
+        assert!(error.contains("lease renewal failed after provider failure"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM chip_distribution")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        let checkpoint = checkpoints
+            .checkpoint_window("chip_backfill", code, start, end)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.status, "running");
+        assert_eq!(checkpoint.attempts, second.attempt);
+        assert_eq!(checkpoint.lease_token, Some(second.token));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn fallback_storage_failure_releases_checkpoint_with_combined_error_context(
+        pool: PgPool,
+    ) {
+        let code = "000001.SZ";
+        let start = date(2020, 1, 2);
+        let end = start + ChronoDuration::days(1);
+        seed_current_stock(&pool, code, start).await;
+        seed_chip_decision(&pool, ChipSourceDecision::Official).await;
+        seed_chip_bars(&pool, code, start, 2).await;
+        sqlx::raw_sql(
+            r#"CREATE FUNCTION reject_service_fallback() RETURNS trigger AS $$
+               BEGIN
+                   RAISE EXCEPTION 'injected fallback storage failure';
+               END;
+               $$ LANGUAGE plpgsql;
+               CREATE TRIGGER reject_service_fallback
+               BEFORE INSERT ON chip_distribution
+               FOR EACH ROW EXECUTE FUNCTION reject_service_fallback();"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let service = CompanyIntelligenceService::new_at(
+            pool.clone(),
+            Arc::new(RecordingChipProvider {
+                fail_official: true,
+                ..Default::default()
+            }),
+            end,
+        );
+
+        let error = service.backfill_chips().await.unwrap_err().to_string();
+
+        assert!(error.contains("injected official failure"));
+        assert!(error.contains("injected fallback storage failure"));
+        assert!(error.contains("checkpoint release succeeded"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM chip_distribution")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        let checkpoint = CompanyRepository::new(pool)
+            .checkpoint_window("chip_backfill", code, start, end)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.status, "failed");
+        assert!(checkpoint.lease_token.is_none());
+        assert!(checkpoint
+            .last_error
+            .unwrap()
+            .contains("injected official failure"));
     }
 
     #[sqlx::test(migrations = "./migrations")]
