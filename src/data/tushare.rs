@@ -6,7 +6,9 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
-use tokio::sync::RwLock;
+use std::time::Duration as StdDuration;
+use tokio::sync::{Mutex, RwLock};
+use tokio::time::Instant;
 use tracing::warn;
 
 use crate::analysis::market_snapshot::{
@@ -37,6 +39,7 @@ pub struct TushareClient {
     token: String,
     client: Client,
     point_in_time_capabilities: RwLock<Option<PointInTimeCapabilities>>,
+    company_request_next: Mutex<HashMap<String, Instant>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +49,7 @@ struct FinancialJoinIdentity {
     report_type: Option<String>,
     update_flag: Option<String>,
     announcement_date: Option<NaiveDate>,
+    final_announcement_date: Option<NaiveDate>,
 }
 
 impl TushareClient {
@@ -62,10 +66,12 @@ impl TushareClient {
             token,
             client: builder.build().unwrap_or_default(),
             point_in_time_capabilities: RwLock::new(None),
+            company_request_next: Mutex::new(HashMap::new()),
         }
     }
 
     async fn call(&self, api_name: &str, params: Value, fields: &str) -> Result<Value> {
+        self.wait_for_company_request_slot(api_name).await;
         let body = json!({
             "api_name": api_name,
             "token": self.token,
@@ -90,6 +96,28 @@ impl TushareClient {
             ))
         })?;
         Self::decode_response_body(api_name, status, &response_body)
+    }
+
+    fn company_request_spacing(api_name: &str) -> Option<StdDuration> {
+        match api_name {
+            // Leave margin below the account's observed 200 requests/minute cap.
+            "income" => Some(StdDuration::from_millis(310)),
+            // These endpoints can have a 60 requests/minute cap depending on
+            // the account tier. A small margin avoids boundary-window bursts.
+            "fina_indicator" | "dividend" => Some(StdDuration::from_millis(1_010)),
+            _ => None,
+        }
+    }
+
+    async fn wait_for_company_request_slot(&self, api_name: &str) {
+        let Some(spacing) = Self::company_request_spacing(api_name) else {
+            return;
+        };
+        let mut next_by_endpoint = self.company_request_next.lock().await;
+        if let Some(next) = next_by_endpoint.get(api_name).copied() {
+            tokio::time::sleep_until(next).await;
+        }
+        next_by_endpoint.insert(api_name.to_string(), Instant::now() + spacing);
     }
 
     fn decode_response_body(api_name: &str, status: StatusCode, body: &str) -> Result<Value> {
@@ -886,11 +914,11 @@ impl TushareClient {
         row: &serde_json::Map<String, Value>,
         endpoint: &str,
     ) -> Result<FinancialJoinIdentity> {
-        let announcement_date = if endpoint == "income" {
+        let announcement_date = Self::optional_company_date(row, endpoint, "ann_date")?;
+        let final_announcement_date = if endpoint == "income" {
             Self::optional_company_date(row, endpoint, "f_ann_date")?
-                .or(Self::optional_company_date(row, endpoint, "ann_date")?)
         } else {
-            Self::optional_company_date(row, endpoint, "ann_date")?
+            None
         };
         Ok(FinancialJoinIdentity {
             code: Self::required_company_text(row, endpoint, "ts_code")?,
@@ -898,6 +926,7 @@ impl TushareClient {
             report_type: Self::optional_company_text(row, endpoint, "report_type")?,
             update_flag: Self::optional_company_text(row, endpoint, "update_flag")?,
             announcement_date,
+            final_announcement_date,
         })
     }
 
@@ -912,7 +941,15 @@ impl TushareClient {
                 .as_ref()
                 .is_none_or(|report_type| income.report_type.as_ref() == Some(report_type))
             && income.update_flag == indicator.update_flag
-            && income.announcement_date == indicator.announcement_date
+            && match indicator.announcement_date {
+                Some(date) => {
+                    income.announcement_date == Some(date)
+                        || income.final_announcement_date == Some(date)
+                }
+                None => {
+                    income.announcement_date.is_none() && income.final_announcement_date.is_none()
+                }
+            }
     }
 
     fn parse_financial_report_row(
@@ -3900,6 +3937,51 @@ mod tests {
             .find(|row| row.net_profit_parent == Some(decimal("101.01")))
             .unwrap();
         assert_eq!(unmatched_income.roe, None);
+    }
+
+    #[test]
+    fn financial_join_uses_original_announcement_date_not_final_announcement_date() {
+        let fetched_at = Utc.with_ymd_and_hms(2026, 7, 19, 12, 30, 0).unwrap();
+        let income = serde_json::json!({
+            "fields": [
+                "ts_code", "end_date", "report_type", "update_flag", "ann_date",
+                "f_ann_date", "n_income_attr_p"
+            ],
+            "items": [[
+                "000008.SZ", "20231231", "1", "1", "20240427", "20240430", "12.34"
+            ]]
+        });
+        let indicators = serde_json::json!({
+            "fields": [
+                "ts_code", "end_date", "update_flag", "ann_date", "roe"
+            ],
+            "items": [["000008.SZ", "20231231", "1", "20240427", "8.88"]]
+        });
+
+        let rows =
+            TushareClient::parse_financial_reports(&income, &indicators, fetched_at).unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].net_profit_parent, Some(decimal("12.34")));
+        assert_eq!(rows[0].roe, Some(decimal("8.88")));
+        assert_eq!(rows[0].announcement_date.unwrap().to_string(), "2024-04-30");
+    }
+
+    #[test]
+    fn company_endpoint_spacing_stays_below_provider_minute_limits() {
+        assert!(
+            TushareClient::company_request_spacing("income")
+                >= Some(std::time::Duration::from_millis(310))
+        );
+        assert!(
+            TushareClient::company_request_spacing("fina_indicator")
+                >= Some(std::time::Duration::from_millis(1_010))
+        );
+        assert!(
+            TushareClient::company_request_spacing("dividend")
+                >= Some(std::time::Duration::from_millis(1_010))
+        );
+        assert_eq!(TushareClient::company_request_spacing("daily"), None);
     }
 
     #[tokio::test]
