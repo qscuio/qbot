@@ -84,17 +84,46 @@ ALTER TABLE chip_distribution
 
 ALTER TABLE chip_distribution
     ADD CONSTRAINT chip_distribution_metrics_valid CHECK (
-        (avg_cost IS NULL
-         OR (avg_cost::TEXT <> 'NaN' AND avg_cost > 0))
-        AND (profit_ratio IS NULL
-             OR (profit_ratio::TEXT <> 'NaN'
-                 AND profit_ratio BETWEEN 0 AND 100))
-        AND (concentration IS NULL
-             OR (concentration::TEXT <> 'NaN'
-                 AND concentration BETWEEN 0 AND 100))
-        AND (dominant_peak_price IS NULL
-             OR (dominant_peak_price::TEXT <> 'NaN'
-                 AND dominant_peak_price > 0))
+        (source = 'legacy'
+         AND (avg_cost IS NULL
+              OR (avg_cost::TEXT <> 'NaN' AND avg_cost > 0))
+         AND (profit_ratio IS NULL
+              OR (profit_ratio::TEXT <> 'NaN'
+                  AND profit_ratio BETWEEN 0 AND 100))
+         AND (concentration IS NULL
+              OR (concentration::TEXT <> 'NaN'
+                  AND concentration BETWEEN 0 AND 100))
+         AND (dominant_peak_price IS NULL
+              OR (dominant_peak_price::TEXT <> 'NaN'
+                  AND dominant_peak_price > 0)))
+        OR
+        (source IN ('qbot_estimate', 'tushare')
+         AND avg_cost IS NOT NULL
+         AND avg_cost::TEXT <> 'NaN'
+         AND avg_cost > 0
+         AND profit_ratio IS NOT NULL
+         AND profit_ratio::TEXT <> 'NaN'
+         AND profit_ratio BETWEEN 0 AND 100
+         AND concentration IS NOT NULL
+         AND concentration::TEXT <> 'NaN'
+         AND concentration BETWEEN 0 AND 100
+         AND dominant_peak_price IS NOT NULL
+         AND dominant_peak_price::TEXT <> 'NaN'
+         AND dominant_peak_price > 0)
+    );
+
+ALTER TABLE chip_distribution
+    DROP CONSTRAINT IF EXISTS chip_distribution_canonical_shape_valid;
+
+ALTER TABLE chip_distribution
+    ADD CONSTRAINT chip_distribution_canonical_shape_valid CHECK (
+        source = 'legacy'
+        OR
+        CASE
+            WHEN JSONB_TYPEOF(distribution) = 'array'
+                THEN JSONB_ARRAY_LENGTH(distribution) > 0
+            ELSE FALSE
+        END
     );
 
 CREATE TABLE IF NOT EXISTS chip_model_states (

@@ -894,6 +894,70 @@ mod tests {
         .execute(&pool)
         .await
         .is_err());
+
+        for (source_index, (source, model)) in [("qbot_estimate", Some("v2")), ("tushare", None)]
+            .into_iter()
+            .enumerate()
+        {
+            for (metric_index, null_column) in [
+                "avg_cost",
+                "profit_ratio",
+                "concentration",
+                "dominant_peak_price",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let code = format!("N{source_index}{metric_index}");
+                let statement = r#"INSERT INTO chip_distribution
+                       (code, trade_date, distribution, avg_cost, profit_ratio,
+                        concentration, dominant_peak_price, source, model_version,
+                        validated, distribution_format)
+                       VALUES ($1, DATE '2026-07-18', $3,
+                               CASE WHEN $2 = 'avg_cost' THEN NULL ELSE 10 END,
+                               CASE WHEN $2 = 'profit_ratio' THEN NULL ELSE 50 END,
+                               CASE WHEN $2 = 'concentration' THEN NULL ELSE 50 END,
+                               CASE WHEN $2 = 'dominant_peak_price' THEN NULL ELSE 10 END,
+                               $4, $5, FALSE, 'normalized_probability')"#;
+                assert!(sqlx::query(statement)
+                    .bind(&code)
+                    .bind(null_column)
+                    .bind(&normalized)
+                    .bind(source)
+                    .bind(model)
+                    .execute(&pool)
+                    .await
+                    .is_err());
+            }
+        }
+
+        for (code, invalid_distribution) in [("EMPTYOBJ", json!({})), ("EMPTYARR", json!([]))] {
+            assert!(sqlx::query(
+                r#"INSERT INTO chip_distribution
+                   (code, trade_date, distribution, avg_cost, profit_ratio,
+                    concentration, dominant_peak_price, source, model_version,
+                    validated, distribution_format)
+                   VALUES ($1, DATE '2026-07-19', $2, 10, 50, 50, 10,
+                           'qbot_estimate', 'v2', FALSE,
+                           'normalized_probability')"#,
+            )
+            .bind(code)
+            .bind(invalid_distribution)
+            .execute(&pool)
+            .await
+            .is_err());
+        }
+
+        sqlx::query(
+            r#"INSERT INTO chip_distribution
+               (code, trade_date, distribution, avg_cost, profit_ratio,
+                concentration, dominant_peak_price, source, model_version,
+                validated, distribution_format)
+               VALUES ('LEGNULL', DATE '2026-07-17', '{}', NULL, NULL, NULL,
+                       NULL, 'legacy', NULL, FALSE, 'legacy_peak_relative')"#,
+        )
+        .execute(&pool)
+        .await?;
         Ok(())
     }
 
@@ -1025,6 +1089,11 @@ mod tests {
         .bind(&legacy)
         .execute(&pool)
         .await?;
+        sqlx::query(
+            "INSERT INTO chip_distribution (code, trade_date) VALUES ('LEGNULL', DATE '2020-01-03')",
+        )
+        .execute(&pool)
+        .await?;
 
         sqlx::raw_sql(include_str!(
             "../../migrations/025_historical_chip_intelligence.sql"
@@ -1047,6 +1116,18 @@ mod tests {
         assert!(!row.2);
         assert_eq!(row.3, "legacy_peak_relative");
         assert!(row.4.is_none());
+
+        let empty_legacy: (serde_json::Value, Option<f64>, Option<f64>, Option<f64>, String) =
+            sqlx::query_as(
+                "SELECT distribution, avg_cost::float8, profit_ratio::float8, concentration::float8, source FROM chip_distribution WHERE code = 'LEGNULL'",
+            )
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(empty_legacy.0, json!({}));
+        assert_eq!(empty_legacy.1, None);
+        assert_eq!(empty_legacy.2, None);
+        assert_eq!(empty_legacy.3, None);
+        assert_eq!(empty_legacy.4, "legacy");
 
         let decoded = ChipRepository::new(pool)
             .latest_snapshot("000001.SZ")
