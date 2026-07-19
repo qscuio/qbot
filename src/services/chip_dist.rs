@@ -17,6 +17,7 @@ use crate::storage::postgres;
 
 const DEFAULT_LOOKBACK_DAYS: i64 = 120;
 const NUM_BUCKETS: usize = 30;
+const DAILY_CATEGORY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UpdateDecision {
@@ -32,13 +33,12 @@ pub fn next_chip_update_attempt(
     observed_date: Option<NaiveDate>,
     attempts: usize,
 ) -> UpdateDecision {
-    if observed_date.is_some_and(|observed| observed >= expected_date) || attempts >= 5 {
-        return UpdateDecision::StopForDay;
-    }
-
     let minutes = now.hour() * 60 + now.minute();
     if minutes < 18 * 60 {
         return UpdateDecision::Wait;
+    }
+    if observed_date.is_some_and(|observed| observed >= expected_date) || attempts >= 5 {
+        return UpdateDecision::StopForDay;
     }
     if minutes > 20 * 60 {
         return UpdateDecision::StopForDay;
@@ -118,13 +118,44 @@ where
     CE: std::fmt::Display,
     KE: std::fmt::Display,
 {
-    let (company, company_error) = match company().await {
-        Ok(report) => (Some(report), None),
-        Err(error) => (None, Some(error.to_string())),
+    run_daily_category_attempt_with_timeout(DAILY_CATEGORY_TIMEOUT, company, chips).await
+}
+
+async fn run_daily_category_attempt_with_timeout<
+    Company,
+    CompanyFuture,
+    Chip,
+    ChipFuture,
+    C,
+    K,
+    CE,
+    KE,
+>(
+    timeout: std::time::Duration,
+    company: Company,
+    chips: Chip,
+) -> DailyCategoryAttemptReport<C, K>
+where
+    Company: FnOnce() -> CompanyFuture,
+    CompanyFuture: Future<Output = std::result::Result<C, CE>>,
+    Chip: FnOnce() -> ChipFuture,
+    ChipFuture: Future<Output = std::result::Result<K, KE>>,
+    CE: std::fmt::Display,
+    KE: std::fmt::Display,
+{
+    let (company_result, chip_result) = tokio::join!(
+        tokio::time::timeout(timeout, company()),
+        tokio::time::timeout(timeout, chips())
+    );
+    let (company, company_error) = match company_result {
+        Ok(Ok(report)) => (Some(report), None),
+        Ok(Err(error)) => (None, Some(error.to_string())),
+        Err(_) => (None, Some("company update timed out".to_string())),
     };
-    let (chips, chip_error) = match chips().await {
-        Ok(report) => (Some(report), None),
-        Err(error) => (None, Some(error.to_string())),
+    let (chips, chip_error) = match chip_result {
+        Ok(Ok(report)) => (Some(report), None),
+        Ok(Err(error)) => (None, Some(error.to_string())),
+        Err(_) => (None, Some("chip update timed out".to_string())),
     };
     DailyCategoryAttemptReport {
         company,
@@ -268,7 +299,8 @@ mod schedule_tests {
     use chrono::{NaiveDate, TimeZone};
 
     use super::{
-        next_chip_update_attempt, run_daily_category_attempt, ChipUpdateController, UpdateDecision,
+        next_chip_update_attempt, run_daily_category_attempt,
+        run_daily_category_attempt_with_timeout, ChipUpdateController, UpdateDecision,
     };
     use crate::market_time::beijing_tz;
 
@@ -283,13 +315,18 @@ mod schedule_tests {
     }
 
     #[test]
-    fn daily_chip_schedule_honors_all_boundaries() {
+    fn next_chip_update_attempt_honors_all_boundaries() {
         let today = date(20);
         let yesterday = date(19);
 
         assert_eq!(
             next_chip_update_attempt(bj(20, 17, 59), today, None, 0),
             UpdateDecision::Wait
+        );
+        assert_eq!(
+            next_chip_update_attempt(bj(20, 17, 59), today, Some(today), 1),
+            UpdateDecision::Wait,
+            "the before-18:00 contract wins even when readiness was already observed"
         );
         assert_eq!(
             next_chip_update_attempt(bj(20, 18, 0), today, None, 0),
@@ -322,7 +359,7 @@ mod schedule_tests {
     }
 
     #[test]
-    fn daily_chip_schedule_stops_after_success_or_attempt_cap() {
+    fn next_chip_update_attempt_stops_after_success_or_attempt_cap() {
         let today = date(20);
 
         assert_eq!(
@@ -388,6 +425,23 @@ mod schedule_tests {
         assert_eq!(report.company_error.as_deref(), Some("financial failure"));
         assert_eq!(report.chips, Some(date(20)));
         assert!(report.chip_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn daily_categories_bound_a_hung_company_update_without_blocking_chips() {
+        let report = run_daily_category_attempt_with_timeout(
+            std::time::Duration::from_millis(20),
+            || async { std::future::pending::<Result<(), &str>>().await },
+            || async { Ok::<_, &str>(date(20)) },
+        )
+        .await;
+
+        assert_eq!(report.chips, Some(date(20)));
+        assert!(report.chip_error.is_none());
+        assert!(report
+            .company_error
+            .as_deref()
+            .is_some_and(|error| error.contains("timed out")));
     }
 }
 
@@ -677,27 +731,39 @@ where
     P: CompanyDataProvider + OfficialChipProvider + 'static,
 {
     let mut controller = ChipUpdateController::default();
-    let mut controller_date = None;
-    let mut expected_date = None;
-    let mut observed_date = None;
 
     loop {
         let now = beijing_now();
-        if controller_date != Some(now.date_naive()) {
-            controller_date = Some(now.date_naive());
-            expected_date = None;
-            observed_date = None;
+        let minutes = now.hour() * 60 + now.minute();
+        if !(18 * 60..=20 * 60).contains(&minutes) {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            continue;
         }
-
-        let scheduling_date = expected_date.unwrap_or(NaiveDate::MIN);
-        match controller.decision(now, scheduling_date, observed_date) {
+        let service =
+            CompanyIntelligenceService::new_at(pool.clone(), provider.clone(), now.date_naive());
+        let expected_date = match service.expected_chip_trade_date().await {
+            Ok(Some(expected_date)) => expected_date,
+            Ok(None) => {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                continue;
+            }
+            Err(error) => {
+                warn!("canonical chip readiness check failed: {error}");
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                continue;
+            }
+        };
+        let observed_date = match service.observed_chip_trade_date(expected_date).await {
+            Ok(observed_date) => observed_date,
+            Err(error) => {
+                warn!("canonical chip observation check failed: {error}");
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                continue;
+            }
+        };
+        match controller.decision(now, expected_date, observed_date) {
             UpdateDecision::Run | UpdateDecision::Retry => {
                 controller.record_attempt(now);
-                let service = CompanyIntelligenceService::new_at(
-                    pool.clone(),
-                    provider.clone(),
-                    now.date_naive(),
-                );
                 let attempt = run_daily_category_attempt(
                     || service.update_latest(),
                     || service.update_daily_chips(),
@@ -713,8 +779,6 @@ where
                     warn!("18:00 company update incomplete: {error}");
                 }
                 if let Some(report) = attempt.chips {
-                    expected_date = report.expected_date;
-                    observed_date = report.observed_date;
                     info!(
                         "18:00 canonical chip update: expected={:?}, observed={:?}, completed={}, failed={}, pending={}, snapshots={}",
                         report.expected_date,
