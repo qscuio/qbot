@@ -965,7 +965,16 @@ impl TushareClient {
         let code = Self::required_company_text(identity_row, identity_endpoint, "ts_code")?;
         let end_date = Self::required_company_date(identity_row, identity_endpoint, "end_date")?;
         let report_type =
-            Self::required_company_text(identity_row, identity_endpoint, "report_type")?;
+            match Self::optional_company_text(identity_row, identity_endpoint, "report_type")? {
+                Some(report_type) => report_type,
+                None if identity_endpoint == "fina_indicator" => "indicator".to_string(),
+                None => {
+                    return Err(Self::malformed_company_data(
+                        identity_endpoint,
+                        &format!("missing {identity_endpoint}.report_type"),
+                    ));
+                }
+            };
         let frequency = Self::financial_frequency(end_date)?;
 
         let income_announcement = match income {
@@ -1050,7 +1059,7 @@ impl TushareClient {
             .map(|row| Self::financial_join_identity(row, "fina_indicator"))
             .collect::<Result<Vec<_>>>()?;
         let mut indicator_for_income = vec![None; income_rows.len()];
-        let mut typed_indicator_only = Vec::new();
+        let mut indicator_only = Vec::new();
         for (indicator_index, indicator_identity) in indicator_identities.iter().enumerate() {
             let candidates: Vec<usize> = income_identities
                 .iter()
@@ -1061,8 +1070,14 @@ impl TushareClient {
                 .map(|(index, _)| index)
                 .collect();
 
-            if candidates.is_empty() && indicator_identity.report_type.is_some() {
-                typed_indicator_only.push(indicator_index);
+            let period_has_income = income_identities.iter().any(|income_identity| {
+                income_identity.code == indicator_identity.code
+                    && income_identity.end_date == indicator_identity.end_date
+            });
+            if candidates.is_empty()
+                && (indicator_identity.report_type.is_some() || !period_has_income)
+            {
+                indicator_only.push(indicator_index);
                 continue;
             }
             if candidates.len() != 1 {
@@ -1104,7 +1119,7 @@ impl TushareClient {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        for indicator_index in typed_indicator_only {
+        for indicator_index in indicator_only {
             reports.push(Self::parse_financial_report_row(
                 None,
                 Some(&indicator_rows[indicator_index]),
@@ -3894,6 +3909,28 @@ mod tests {
             rows[0].source_revision,
             TushareClient::content_revision(&rows[0].raw_payload)
         );
+    }
+
+    #[test]
+    fn untyped_indicator_is_preserved_when_the_period_has_no_income_rows() {
+        let fetched_at = Utc.with_ymd_and_hms(2026, 7, 19, 12, 30, 0).unwrap();
+        let income = serde_json::json!({ "fields": [], "items": [] });
+        let indicators = serde_json::json!({
+            "fields": [
+                "ts_code", "end_date", "update_flag", "ann_date", "roe"
+            ],
+            "items": [["000001.SZ", "19990630", "0", "19990831", "8.88"]]
+        });
+
+        let rows =
+            TushareClient::parse_financial_reports(&income, &indicators, fetched_at).unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].code, "000001.SZ");
+        assert_eq!(rows[0].end_date.to_string(), "1999-06-30");
+        assert_eq!(rows[0].report_type, "indicator");
+        assert_eq!(rows[0].roe, Some(decimal("8.88")));
+        assert!(rows[0].raw_payload["income"].is_null());
     }
 
     #[test]
