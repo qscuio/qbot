@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{Datelike, NaiveDate};
 use sqlx::PgPool;
@@ -6,12 +7,13 @@ use sqlx::PgPool;
 use crate::data::company::CompanyDataProvider;
 use crate::error::{AppError, Result};
 use crate::market_time::beijing_today;
-use crate::storage::company_repository::CompanyRepository;
+use crate::storage::company_repository::{
+    CheckpointClaimOutcome, CheckpointLease, CompanyRepository,
+};
 
 const FINANCIAL_BACKFILL_PHASE: &str = "financials";
 const DIVIDEND_BACKFILL_PHASE: &str = "dividends";
-const FINANCIAL_LATEST_PHASE: &str = "financials_latest";
-const DIVIDEND_LATEST_PHASE: &str = "dividends_latest";
+const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CompanySyncReport {
@@ -58,6 +60,7 @@ pub struct CompanyIntelligenceService<P: CompanyDataProvider> {
     repository: CompanyRepository,
     provider: Arc<P>,
     today: NaiveDate,
+    lease_ttl: Duration,
 }
 
 impl<P: CompanyDataProvider> CompanyIntelligenceService<P> {
@@ -71,13 +74,19 @@ impl<P: CompanyDataProvider> CompanyIntelligenceService<P> {
             pool,
             provider,
             today,
+            lease_ttl: DEFAULT_LEASE_TTL,
         }
+    }
+
+    pub fn with_lease_ttl(mut self, lease_ttl: Duration) -> Self {
+        self.lease_ttl = lease_ttl;
+        self
     }
 
     pub async fn backfill_financials(&self) -> Result<CompanySyncReport> {
         self.finish(
             Dataset::Financials,
-            self.synchronize(Dataset::Financials, FINANCIAL_BACKFILL_PHASE, true, false)
+            self.synchronize(Dataset::Financials, FINANCIAL_BACKFILL_PHASE, false)
                 .await?,
         )
     }
@@ -85,17 +94,19 @@ impl<P: CompanyDataProvider> CompanyIntelligenceService<P> {
     pub async fn backfill_dividends(&self) -> Result<CompanySyncReport> {
         self.finish(
             Dataset::Dividends,
-            self.synchronize(Dataset::Dividends, DIVIDEND_BACKFILL_PHASE, true, false)
+            self.synchronize(Dataset::Dividends, DIVIDEND_BACKFILL_PHASE, false)
                 .await?,
         )
     }
 
     pub async fn update_latest(&self) -> Result<CompanyIntelligenceUpdateReport> {
+        let financial_phase = latest_phase(Dataset::Financials, self.today);
+        let dividend_phase = latest_phase(Dataset::Dividends, self.today);
         let financials = self
-            .synchronize(Dataset::Financials, FINANCIAL_LATEST_PHASE, false, true)
+            .synchronize(Dataset::Financials, &financial_phase, true)
             .await;
         let dividends = self
-            .synchronize(Dataset::Dividends, DIVIDEND_LATEST_PHASE, false, true)
+            .synchronize(Dataset::Dividends, &dividend_phase, true)
             .await;
 
         let mut errors = Vec::new();
@@ -138,24 +149,12 @@ impl<P: CompanyDataProvider> CompanyIntelligenceService<P> {
         &self,
         dataset: Dataset,
         phase: &str,
-        skip_completed: bool,
         latest_only: bool,
     ) -> Result<SyncOutcome> {
         let stocks = self.current_stocks().await?;
         let mut outcome = SyncOutcome::default();
 
         for stock in stocks {
-            if skip_completed
-                && self
-                    .repository
-                    .checkpoint(phase, &stock.code)
-                    .await?
-                    .is_some_and(|checkpoint| checkpoint.status == "completed")
-            {
-                outcome.report.completed += 1;
-                continue;
-            }
-
             let windows = if latest_only {
                 latest_windows(stock.list_date, self.today)
             } else {
@@ -167,91 +166,123 @@ impl<P: CompanyDataProvider> CompanyIntelligenceService<P> {
                 outcome.report.pending += 1;
                 continue;
             }
-            let checkpoint_start = windows.first().map(|window| window.0);
-            let checkpoint_end = windows.last().map(|window| window.1);
-            let lease = match self
-                .repository
-                .claim_checkpoint(phase, &stock.code, checkpoint_start, checkpoint_end)
-                .await
-            {
-                Ok(lease) => lease,
-                Err(AppError::BadRequest(message)) if message.contains("already running") => {
-                    outcome.report.pending += 1;
-                    continue;
-                }
-                Err(error) => {
-                    outcome.report.failed += 1;
-                    outcome.errors.push(format!(
-                        "{}/{}/claim: {error}",
-                        dataset.label(),
-                        stock.code
-                    ));
-                    continue;
-                }
-            };
-
-            let work = async {
-                for (start, end) in windows {
-                    match dataset {
-                        Dataset::Financials => {
-                            let reports = self
-                                .provider
-                                .financial_reports(&stock.code, start, end)
-                                .await?;
-                            self.repository.upsert_financial_reports(&reports).await?;
-                        }
-                        Dataset::Dividends => {
-                            let records = self.provider.dividends(&stock.code, start, end).await?;
-                            self.repository.upsert_dividends(&records).await?;
-                        }
-                    }
-                }
-                Result::<()>::Ok(())
-            }
-            .await;
-
-            if let Err(error) = work {
-                outcome.report.failed += 1;
-                let release = self
+            let mut stock_failed = false;
+            let mut stock_pending = false;
+            for (start, end) in windows {
+                let claim = self
                     .repository
-                    .fail_checkpoint(&lease, &error.to_string())
+                    .claim_checkpoint_window(phase, &stock.code, start, end, self.lease_ttl)
                     .await;
-                let release_suffix = release
-                    .err()
-                    .map(|release_error| format!("; checkpoint release failed: {release_error}"))
-                    .unwrap_or_default();
-                outcome.errors.push(format!(
-                    "{}/{}: {error}{release_suffix}",
-                    dataset.label(),
-                    stock.code
-                ));
-                continue;
+                let lease = match claim {
+                    Ok(CheckpointClaimOutcome::Claimed(lease)) => lease,
+                    Ok(CheckpointClaimOutcome::Completed) => continue,
+                    Ok(CheckpointClaimOutcome::Busy) => {
+                        stock_pending = true;
+                        continue;
+                    }
+                    Err(error) => {
+                        stock_failed = true;
+                        outcome.errors.push(format!(
+                            "{}/{}/{start}..{end}/claim: {error}",
+                            dataset.label(),
+                            stock.code
+                        ));
+                        continue;
+                    }
+                };
+
+                if let Err(error) = self
+                    .synchronize_claimed_window(dataset, &stock.code, start, end, lease)
+                    .await
+                {
+                    stock_failed = true;
+                    outcome.errors.push(error);
+                }
             }
 
-            match self.repository.complete_checkpoint(&lease).await {
-                Ok(()) => outcome.report.completed += 1,
-                Err(error) => {
-                    outcome.report.failed += 1;
-                    let release = self
-                        .repository
-                        .fail_checkpoint(&lease, &error.to_string())
-                        .await;
-                    let release_suffix = release
-                        .err()
-                        .map(|release_error| {
-                            format!("; checkpoint release failed: {release_error}")
-                        })
-                        .unwrap_or_default();
-                    outcome.errors.push(format!(
-                        "{}/{}/complete: {error}{release_suffix}",
-                        dataset.label(),
-                        stock.code
-                    ));
-                }
+            if stock_failed {
+                outcome.report.failed += 1;
+            } else if stock_pending {
+                outcome.report.pending += 1;
+            } else {
+                outcome.report.completed += 1;
             }
         }
 
         Ok(outcome)
+    }
+
+    async fn synchronize_claimed_window(
+        &self,
+        dataset: Dataset,
+        code: &str,
+        start: NaiveDate,
+        end: NaiveDate,
+        mut lease: CheckpointLease,
+    ) -> std::result::Result<(), String> {
+        match dataset {
+            Dataset::Financials => {
+                let reports = match self.provider.financial_reports(code, start, end).await {
+                    Ok(reports) => reports,
+                    Err(error) => return Err(self.fail_owned_window(dataset, lease, error).await),
+                };
+                lease = match self
+                    .repository
+                    .renew_checkpoint(&lease, self.lease_ttl)
+                    .await
+                {
+                    Ok(lease) => lease,
+                    Err(error) => return Err(self.fail_owned_window(dataset, lease, error).await),
+                };
+                if let Err(error) = self.repository.upsert_financial_reports(&reports).await {
+                    return Err(self.fail_owned_window(dataset, lease, error).await);
+                }
+            }
+            Dataset::Dividends => {
+                let records = match self.provider.dividends(code, start, end).await {
+                    Ok(records) => records,
+                    Err(error) => return Err(self.fail_owned_window(dataset, lease, error).await),
+                };
+                lease = match self
+                    .repository
+                    .renew_checkpoint(&lease, self.lease_ttl)
+                    .await
+                {
+                    Ok(lease) => lease,
+                    Err(error) => return Err(self.fail_owned_window(dataset, lease, error).await),
+                };
+                if let Err(error) = self.repository.upsert_dividends(&records).await {
+                    return Err(self.fail_owned_window(dataset, lease, error).await);
+                }
+            }
+        }
+
+        if let Err(error) = self.repository.complete_checkpoint(&lease).await {
+            return Err(self.fail_owned_window(dataset, lease, error).await);
+        }
+        Ok(())
+    }
+
+    async fn fail_owned_window(
+        &self,
+        dataset: Dataset,
+        lease: CheckpointLease,
+        error: AppError,
+    ) -> String {
+        let release_suffix = self
+            .repository
+            .fail_checkpoint(&lease, &error.to_string())
+            .await
+            .err()
+            .map(|release_error| format!("; checkpoint release failed: {release_error}"))
+            .unwrap_or_default();
+        format!(
+            "{}/{}/{}..{}: {error}{release_suffix}",
+            dataset.label(),
+            lease.code,
+            lease.start_date,
+            lease.end_date
+        )
     }
 
     async fn current_stocks(&self) -> Result<Vec<CurrentStock>> {
@@ -311,6 +342,10 @@ fn error_summary(errors: &[String]) -> String {
     summary
 }
 
+fn latest_phase(dataset: Dataset, today: NaiveDate) -> String {
+    format!("{}_latest:{today}", dataset.label())
+}
+
 fn yearly_windows(list_date: NaiveDate, today: NaiveDate) -> Vec<(NaiveDate, NaiveDate)> {
     if list_date > today {
         return Vec::new();
@@ -335,6 +370,7 @@ fn latest_windows(list_date: NaiveDate, today: NaiveDate) -> Vec<(NaiveDate, Nai
 mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use async_trait::async_trait;
     use chrono::{NaiveDate, TimeZone, Utc};
@@ -366,6 +402,7 @@ mod tests {
     struct RecordingProvider {
         calls: Mutex<Vec<ProviderCall>>,
         financial_failures: Mutex<HashMap<String, usize>>,
+        financial_window_failures: Mutex<HashMap<(String, NaiveDate), usize>>,
         dividend_failures: Mutex<HashMap<String, usize>>,
         financial_results: Mutex<HashMap<String, Vec<FinancialReport>>>,
         dividend_results: Mutex<HashMap<String, Vec<DividendRecord>>>,
@@ -381,6 +418,13 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(code.to_string(), times);
+        }
+
+        fn fail_financial_window(&self, code: &str, start: NaiveDate, times: usize) {
+            self.financial_window_failures
+                .lock()
+                .unwrap()
+                .insert((code.to_string(), start), times);
         }
 
         fn clear_failure(&self, code: &str) {
@@ -424,6 +468,16 @@ mod tests {
                 start,
                 end,
             });
+            let mut window_failures = self.financial_window_failures.lock().unwrap();
+            if let Some(remaining) = window_failures.get_mut(&(code.to_string(), start)) {
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    return Err(AppError::DataProvider(format!(
+                        "recording provider failed for {code}/{start}"
+                    )));
+                }
+            }
+            drop(window_failures);
             let mut failures = self.financial_failures.lock().unwrap();
             if let Some(remaining) = failures.get_mut(code) {
                 if *remaining > 0 {
@@ -604,6 +658,12 @@ mod tests {
                     start: date(2025, 1, 1),
                     end: date(2025, 12, 31),
                 },
+                ProviderCall {
+                    kind: CallKind::Financials,
+                    code: "000002.SZ".to_string(),
+                    start: date(2026, 1, 1),
+                    end: date(2026, 7, 19),
+                },
             ]
         );
 
@@ -627,12 +687,107 @@ mod tests {
         );
         let repo = CompanyRepository::new(pool);
         assert_eq!(
-            repo.checkpoint("financials", "000002.SZ")
-                .await
-                .unwrap()
-                .unwrap()
-                .status,
+            repo.checkpoint_window(
+                "financials",
+                "000002.SZ",
+                date(2025, 1, 1),
+                date(2025, 12, 31),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
             "completed"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn late_year_failure_keeps_completed_windows_and_retry_fetches_only_failed_window(
+        pool: PgPool,
+    ) {
+        seed_current_stock(&pool, "000001.SZ", date(2024, 1, 1)).await;
+        let provider = Arc::new(RecordingProvider::default());
+        provider.fail_financial_window("000001.SZ", date(2025, 1, 1), 1);
+        let service =
+            CompanyIntelligenceService::new_at(pool.clone(), provider.clone(), date(2026, 7, 19));
+
+        let first_error = service.backfill_financials().await.unwrap_err();
+        assert!(first_error
+            .to_string()
+            .contains("completed=0, failed=1, pending=0"));
+        assert_eq!(
+            provider
+                .calls()
+                .iter()
+                .map(|call| call.start)
+                .collect::<Vec<_>>(),
+            [date(2024, 1, 1), date(2025, 1, 1), date(2026, 1, 1)],
+            "a failed window must not stop later independent windows"
+        );
+
+        let repo = CompanyRepository::new(pool);
+        assert_eq!(
+            repo.checkpoint_window(
+                "financials",
+                "000001.SZ",
+                date(2024, 1, 1),
+                date(2024, 12, 31),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+            "completed"
+        );
+        assert_eq!(
+            repo.checkpoint_window(
+                "financials",
+                "000001.SZ",
+                date(2025, 1, 1),
+                date(2025, 12, 31),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+            "failed"
+        );
+        assert_eq!(
+            repo.checkpoint_window(
+                "financials",
+                "000001.SZ",
+                date(2026, 1, 1),
+                date(2026, 7, 19),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+            "completed"
+        );
+
+        let report = service.backfill_financials().await.unwrap();
+        assert_eq!(
+            report,
+            super::CompanySyncReport {
+                completed: 1,
+                failed: 0,
+                pending: 0,
+            }
+        );
+        assert_eq!(
+            provider
+                .calls()
+                .iter()
+                .map(|call| call.start)
+                .collect::<Vec<_>>(),
+            [
+                date(2024, 1, 1),
+                date(2025, 1, 1),
+                date(2026, 1, 1),
+                date(2025, 1, 1),
+            ],
+            "retry must fetch only the failed window"
         );
     }
 
@@ -652,12 +807,22 @@ mod tests {
 
         let repo = CompanyRepository::new(pool);
         let financials = repo
-            .checkpoint("financials", "000001.SZ")
+            .checkpoint_window(
+                "financials",
+                "000001.SZ",
+                date(2026, 1, 1),
+                date(2026, 7, 19),
+            )
             .await
             .unwrap()
             .unwrap();
         let dividends = repo
-            .checkpoint("dividends", "000001.SZ")
+            .checkpoint_window(
+                "dividends",
+                "000001.SZ",
+                date(2026, 1, 1),
+                date(2026, 7, 19),
+            )
             .await
             .unwrap()
             .unwrap();
@@ -690,7 +855,12 @@ mod tests {
             ["000001.SZ", "000002.SZ", "000003.SZ"]
         );
         let failed = CompanyRepository::new(pool)
-            .checkpoint("financials", "000002.SZ")
+            .checkpoint_window(
+                "financials",
+                "000002.SZ",
+                date(2026, 1, 1),
+                date(2026, 7, 19),
+            )
             .await
             .unwrap()
             .unwrap();
@@ -720,7 +890,12 @@ mod tests {
         .unwrap();
         assert_eq!(stored, 0);
         let checkpoint = CompanyRepository::new(pool)
-            .checkpoint("financials", "000001.SZ")
+            .checkpoint_window(
+                "financials",
+                "000001.SZ",
+                date(2026, 1, 1),
+                date(2026, 7, 19),
+            )
             .await
             .unwrap()
             .unwrap();
@@ -730,17 +905,22 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn active_checkpoint_ownership_is_pending_and_never_stolen(pool: PgPool) {
-        seed_current_stock(&pool, "000001.SZ", date(2026, 1, 1)).await;
+        seed_current_stock(&pool, "000001.SZ", date(2025, 1, 1)).await;
         let repo = CompanyRepository::new(pool.clone());
         let owner = repo
-            .claim_checkpoint(
+            .claim_checkpoint_window(
                 "financials",
                 "000001.SZ",
-                Some(date(2026, 1, 1)),
-                Some(date(2026, 7, 19)),
+                date(2025, 1, 1),
+                date(2025, 12, 31),
+                Duration::from_secs(300),
             )
             .await
             .unwrap();
+        let crate::storage::company_repository::CheckpointClaimOutcome::Claimed(owner) = owner
+        else {
+            panic!("test owner should claim the window")
+        };
         let provider = Arc::new(RecordingProvider::default());
         let service = CompanyIntelligenceService::new_at(pool, provider.clone(), date(2026, 7, 19));
 
@@ -753,16 +933,124 @@ mod tests {
                 pending: 1,
             }
         );
-        assert!(provider.calls().is_empty());
         assert_eq!(
-            repo.checkpoint("financials", "000001.SZ")
-                .await
-                .unwrap()
-                .unwrap()
-                .lease_token,
+            provider
+                .calls()
+                .iter()
+                .map(|call| (call.start, call.end))
+                .collect::<Vec<_>>(),
+            [(date(2026, 1, 1), date(2026, 7, 19))],
+            "a busy window must not block another window for the same stock"
+        );
+        assert_eq!(
+            repo.checkpoint_window(
+                "financials",
+                "000001.SZ",
+                date(2025, 1, 1),
+                date(2025, 12, 31),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .lease_token,
             Some(owner.token)
         );
         repo.fail_checkpoint(&owner, "test cleanup").await.unwrap();
+
+        assert_eq!(service.backfill_financials().await.unwrap().completed, 1);
+        assert_eq!(
+            provider
+                .calls()
+                .iter()
+                .map(|call| call.start)
+                .collect::<Vec<_>>(),
+            [date(2026, 1, 1), date(2025, 1, 1)],
+            "retry fetches only the released window"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn checkpoint_claim_database_error_counts_failed_and_continues_other_stocks(
+        pool: PgPool,
+    ) {
+        for code in ["000001.SZ", "000002.SZ", "000003.SZ"] {
+            seed_current_stock(&pool, code, date(2026, 1, 1)).await;
+        }
+        sqlx::raw_sql(
+            r#"CREATE FUNCTION reject_one_company_checkpoint_claim() RETURNS trigger AS $$
+               BEGIN
+                   IF NEW.code = '000002.SZ' THEN
+                       RAISE EXCEPTION 'injected checkpoint claim failure';
+                   END IF;
+                   RETURN NEW;
+               END;
+               $$ LANGUAGE plpgsql;
+               CREATE TRIGGER reject_one_company_checkpoint_claim
+               BEFORE INSERT ON company_data_repair_checkpoints
+               FOR EACH ROW EXECUTE FUNCTION reject_one_company_checkpoint_claim();"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let provider = Arc::new(RecordingProvider::default());
+        let service = CompanyIntelligenceService::new_at(pool, provider.clone(), date(2026, 7, 19));
+
+        let error = service.backfill_financials().await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("completed=2, failed=1, pending=0"));
+        assert_eq!(
+            provider
+                .calls()
+                .iter()
+                .map(|call| call.code.as_str())
+                .collect::<Vec<_>>(),
+            ["000001.SZ", "000003.SZ"]
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn checkpoint_completion_error_releases_window_and_continues_other_stocks(pool: PgPool) {
+        for code in ["000001.SZ", "000002.SZ", "000003.SZ"] {
+            seed_current_stock(&pool, code, date(2026, 1, 1)).await;
+        }
+        sqlx::raw_sql(
+            r#"CREATE FUNCTION reject_one_company_checkpoint_completion() RETURNS trigger AS $$
+               BEGIN
+                   IF OLD.code = '000002.SZ' AND NEW.status = 'completed' THEN
+                       RAISE EXCEPTION 'injected checkpoint completion failure';
+                   END IF;
+                   RETURN NEW;
+               END;
+               $$ LANGUAGE plpgsql;
+               CREATE TRIGGER reject_one_company_checkpoint_completion
+               BEFORE UPDATE ON company_data_repair_checkpoints
+               FOR EACH ROW EXECUTE FUNCTION reject_one_company_checkpoint_completion();"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let provider = Arc::new(RecordingProvider::default());
+        let service =
+            CompanyIntelligenceService::new_at(pool.clone(), provider.clone(), date(2026, 7, 19));
+
+        let error = service.backfill_financials().await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("completed=2, failed=1, pending=0"));
+        assert_eq!(provider.calls().len(), 3);
+        let failed = CompanyRepository::new(pool)
+            .checkpoint_window(
+                "financials",
+                "000002.SZ",
+                date(2026, 1, 1),
+                date(2026, 7, 19),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.status, "failed");
+        assert!(failed.lease_token.is_none());
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -818,28 +1106,40 @@ mod tests {
             ]
         );
 
-        service.update_latest().await.unwrap();
+        let same_day = service.update_latest().await.unwrap();
+        assert_eq!(same_day.financials.completed, 2);
+        assert_eq!(same_day.dividends.completed, 2);
         assert_eq!(
             provider.calls().len(),
-            12,
-            "latest refreshes revisions again"
+            6,
+            "same-day completed latest windows must be skipped atomically"
         );
         let repo = CompanyRepository::new(pool);
         assert_eq!(
-            repo.checkpoint("financials_latest", "000001.SZ")
-                .await
-                .unwrap()
-                .unwrap()
-                .attempts,
-            2
+            repo.checkpoint_window(
+                "financials_latest:2026-07-19",
+                "000001.SZ",
+                date(2025, 1, 1),
+                date(2025, 12, 31),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .attempts,
+            1
         );
         assert_eq!(
-            repo.checkpoint("dividends_latest", "000001.SZ")
-                .await
-                .unwrap()
-                .unwrap()
-                .attempts,
-            2
+            repo.checkpoint_window(
+                "dividends_latest:2026-07-19",
+                "000001.SZ",
+                date(2025, 1, 1),
+                date(2025, 12, 31),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .attempts,
+            1
         );
     }
 
@@ -880,7 +1180,11 @@ mod tests {
         assert_eq!(service.backfill_dividends().await.unwrap().completed, 1);
         let repo = CompanyRepository::new(pool);
         for phase in ["financials", "dividends"] {
-            let checkpoint = repo.checkpoint(phase, "000001.SZ").await.unwrap().unwrap();
+            let checkpoint = repo
+                .checkpoint_window(phase, "000001.SZ", date(2026, 1, 1), date(2026, 7, 19))
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(checkpoint.status, "completed");
             assert!(checkpoint.lease_token.is_none());
         }
@@ -912,15 +1216,25 @@ mod tests {
         assert_eq!(stored, 0);
         let repo = CompanyRepository::new(pool);
         assert_eq!(
-            repo.checkpoint("financials", "000001.SZ")
-                .await
-                .unwrap()
-                .unwrap()
-                .status,
+            repo.checkpoint_window(
+                "financials",
+                "000001.SZ",
+                date(2026, 1, 1),
+                date(2026, 7, 19),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
             "completed"
         );
         let failed = repo
-            .checkpoint("dividends", "000001.SZ")
+            .checkpoint_window(
+                "dividends",
+                "000001.SZ",
+                date(2026, 1, 1),
+                date(2026, 7, 19),
+            )
             .await
             .unwrap()
             .unwrap();
@@ -944,19 +1258,29 @@ mod tests {
             .any(|call| call.kind == CallKind::Dividends));
         let repo = CompanyRepository::new(pool);
         assert_eq!(
-            repo.checkpoint("financials_latest", "000001.SZ")
-                .await
-                .unwrap()
-                .unwrap()
-                .status,
+            repo.checkpoint_window(
+                "financials_latest:2026-07-19",
+                "000001.SZ",
+                date(2026, 1, 1),
+                date(2026, 7, 19),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
             "failed"
         );
         assert_eq!(
-            repo.checkpoint("dividends_latest", "000001.SZ")
-                .await
-                .unwrap()
-                .unwrap()
-                .status,
+            repo.checkpoint_window(
+                "dividends_latest:2026-07-19",
+                "000001.SZ",
+                date(2026, 1, 1),
+                date(2026, 7, 19),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
             "completed"
         );
     }

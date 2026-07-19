@@ -2,6 +2,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use serde_json::Value;
 use sqlx::{FromRow, PgPool};
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::data::company::{DividendRecord, FinancialFrequency, FinancialReport};
@@ -48,12 +49,13 @@ pub struct DividendHistoryPage {
 pub struct CompanyRepairCheckpoint {
     pub phase: String,
     pub code: String,
-    pub start_date: Option<NaiveDate>,
-    pub end_date: Option<NaiveDate>,
+    pub start_date: NaiveDate,
+    pub end_date: NaiveDate,
     pub status: String,
     pub attempts: i32,
     pub last_error: Option<String>,
     pub lease_token: Option<Uuid>,
+    pub lease_expires_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
@@ -63,8 +65,18 @@ pub struct CompanyRepairCheckpoint {
 pub struct CheckpointLease {
     pub phase: String,
     pub code: String,
+    pub start_date: NaiveDate,
+    pub end_date: NaiveDate,
     pub attempt: i32,
     pub token: Uuid,
+    pub lease_expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckpointClaimOutcome {
+    Claimed(CheckpointLease),
+    Completed,
+    Busy,
 }
 
 #[derive(Debug, FromRow)]
@@ -486,46 +498,141 @@ impl CompanyRepository {
         Ok(DividendHistoryPage { items, next_cursor })
     }
 
-    pub async fn claim_checkpoint(
+    pub async fn claim_checkpoint_window(
         &self,
         phase: &str,
         code: &str,
-        start_date: Option<NaiveDate>,
-        end_date: Option<NaiveDate>,
-    ) -> Result<CheckpointLease> {
+        start_date: NaiveDate,
+        end_date: NaiveDate,
+        lease_ttl: Duration,
+    ) -> Result<CheckpointClaimOutcome> {
+        if start_date > end_date {
+            return Err(AppError::BadRequest(format!(
+                "checkpoint window starts after it ends: {start_date} > {end_date}"
+            )));
+        }
+        let lease_ttl_seconds = lease_ttl_seconds(lease_ttl)?;
         let token = Uuid::new_v4();
-        let claimed: Option<(i32, Uuid)> = sqlx::query_as(
+        let (status, attempt, lease_token, lease_expires_at, owns_lease): (
+            String,
+            i32,
+            Option<Uuid>,
+            Option<DateTime<Utc>>,
+            bool,
+        ) = sqlx::query_as(
             r#"INSERT INTO company_data_repair_checkpoints
-               (phase, code, start_date, end_date, status, attempts, lease_token)
-               VALUES ($1, $2, $3, $4, 'running', 1, $5)
-               ON CONFLICT (phase, code) DO UPDATE SET
-                 start_date = EXCLUDED.start_date,
-                 end_date = EXCLUDED.end_date,
-                 status = 'running',
-                 attempts = company_data_repair_checkpoints.attempts + 1,
-                 last_error = NULL,
-                 lease_token = EXCLUDED.lease_token,
-                 updated_at = NOW(),
-                 completed_at = NULL
-               WHERE company_data_repair_checkpoints.status <> 'running'
-               RETURNING attempts, lease_token"#,
+               (phase, code, start_date, end_date, status, attempts, lease_token,
+                lease_expires_at)
+               VALUES ($1, $2, $3, $4, 'running', 1, $5,
+                       NOW() + ($6::double precision * INTERVAL '1 second'))
+               ON CONFLICT (phase, code, start_date, end_date) DO UPDATE SET
+                 status = CASE
+                   WHEN company_data_repair_checkpoints.status = 'failed'
+                     OR (company_data_repair_checkpoints.status = 'running'
+                         AND company_data_repair_checkpoints.lease_expires_at <= NOW())
+                   THEN 'running'
+                   ELSE company_data_repair_checkpoints.status
+                 END,
+                 attempts = CASE
+                   WHEN company_data_repair_checkpoints.status = 'failed'
+                     OR (company_data_repair_checkpoints.status = 'running'
+                         AND company_data_repair_checkpoints.lease_expires_at <= NOW())
+                   THEN company_data_repair_checkpoints.attempts + 1
+                   ELSE company_data_repair_checkpoints.attempts
+                 END,
+                 last_error = CASE
+                   WHEN company_data_repair_checkpoints.status = 'failed'
+                     OR (company_data_repair_checkpoints.status = 'running'
+                         AND company_data_repair_checkpoints.lease_expires_at <= NOW())
+                   THEN NULL
+                   ELSE company_data_repair_checkpoints.last_error
+                 END,
+                 lease_token = CASE
+                   WHEN company_data_repair_checkpoints.status = 'failed'
+                     OR (company_data_repair_checkpoints.status = 'running'
+                         AND company_data_repair_checkpoints.lease_expires_at <= NOW())
+                   THEN EXCLUDED.lease_token
+                   ELSE company_data_repair_checkpoints.lease_token
+                 END,
+                 lease_expires_at = CASE
+                   WHEN company_data_repair_checkpoints.status = 'failed'
+                     OR (company_data_repair_checkpoints.status = 'running'
+                         AND company_data_repair_checkpoints.lease_expires_at <= NOW())
+                   THEN EXCLUDED.lease_expires_at
+                   ELSE company_data_repair_checkpoints.lease_expires_at
+                 END,
+                 updated_at = CASE
+                   WHEN company_data_repair_checkpoints.status = 'failed'
+                     OR (company_data_repair_checkpoints.status = 'running'
+                         AND company_data_repair_checkpoints.lease_expires_at <= NOW())
+                   THEN NOW()
+                   ELSE company_data_repair_checkpoints.updated_at
+                 END,
+                 completed_at = CASE
+                   WHEN company_data_repair_checkpoints.status = 'failed'
+                     OR (company_data_repair_checkpoints.status = 'running'
+                         AND company_data_repair_checkpoints.lease_expires_at <= NOW())
+                   THEN NULL
+                   ELSE company_data_repair_checkpoints.completed_at
+                 END
+               RETURNING status, attempts, lease_token, lease_expires_at,
+                         COALESCE(lease_token = $5, FALSE)"#,
         )
         .bind(phase)
         .bind(code)
         .bind(start_date)
         .bind(end_date)
         .bind(token)
-        .fetch_optional(&self.pool)
+        .bind(lease_ttl_seconds)
+        .fetch_one(&self.pool)
         .await?;
 
-        let (attempt, token) = claimed.ok_or_else(|| {
-            AppError::BadRequest(format!("checkpoint already running: {phase}/{code}"))
-        })?;
+        if owns_lease {
+            Ok(CheckpointClaimOutcome::Claimed(CheckpointLease {
+                phase: phase.to_string(),
+                code: code.to_string(),
+                start_date,
+                end_date,
+                attempt,
+                token: lease_token.expect("an owned running checkpoint has a token"),
+                lease_expires_at: lease_expires_at
+                    .expect("an owned running checkpoint has an expiry"),
+            }))
+        } else if status == "completed" {
+            Ok(CheckpointClaimOutcome::Completed)
+        } else {
+            Ok(CheckpointClaimOutcome::Busy)
+        }
+    }
+
+    pub async fn renew_checkpoint(
+        &self,
+        lease: &CheckpointLease,
+        lease_ttl: Duration,
+    ) -> Result<CheckpointLease> {
+        let lease_ttl_seconds = lease_ttl_seconds(lease_ttl)?;
+        let lease_expires_at: Option<DateTime<Utc>> = sqlx::query_scalar(
+            r#"UPDATE company_data_repair_checkpoints
+               SET lease_expires_at = NOW() + ($7::double precision * INTERVAL '1 second'),
+                   updated_at = NOW()
+               WHERE phase = $1 AND code = $2 AND start_date = $3 AND end_date = $4
+                 AND status = 'running' AND attempts = $5 AND lease_token = $6
+                 AND lease_expires_at > NOW()
+               RETURNING lease_expires_at"#,
+        )
+        .bind(&lease.phase)
+        .bind(&lease.code)
+        .bind(lease.start_date)
+        .bind(lease.end_date)
+        .bind(lease.attempt)
+        .bind(lease.token)
+        .bind(lease_ttl_seconds)
+        .fetch_optional(&self.pool)
+        .await?;
+        let lease_expires_at = lease_expires_at.ok_or_else(|| stale_lease_error(lease))?;
         Ok(CheckpointLease {
-            phase: phase.to_string(),
-            code: code.to_string(),
-            attempt,
-            token,
+            lease_expires_at,
+            ..lease.clone()
         })
     }
 
@@ -533,12 +640,16 @@ impl CompanyRepository {
         let rows_affected = sqlx::query(
             r#"UPDATE company_data_repair_checkpoints
                SET status = 'completed', last_error = NULL,
-                   lease_token = NULL, updated_at = NOW(), completed_at = NOW()
-               WHERE phase = $1 AND code = $2 AND status = 'running'
-                 AND attempts = $3 AND lease_token = $4"#,
+                   lease_token = NULL, lease_expires_at = NULL,
+                   updated_at = NOW(), completed_at = NOW()
+               WHERE phase = $1 AND code = $2 AND start_date = $3 AND end_date = $4
+                 AND status = 'running' AND attempts = $5 AND lease_token = $6
+                 AND lease_expires_at > NOW()"#,
         )
         .bind(&lease.phase)
         .bind(&lease.code)
+        .bind(lease.start_date)
+        .bind(lease.end_date)
         .bind(lease.attempt)
         .bind(lease.token)
         .execute(&self.pool)
@@ -552,13 +663,17 @@ impl CompanyRepository {
         let rows_affected = sqlx::query(
             r#"UPDATE company_data_repair_checkpoints
                SET status = 'failed', last_error = $3,
-                   lease_token = NULL, updated_at = NOW(), completed_at = NULL
-               WHERE phase = $1 AND code = $2 AND status = 'running'
-                 AND attempts = $4 AND lease_token = $5"#,
+                   lease_token = NULL, lease_expires_at = NULL,
+                   updated_at = NOW(), completed_at = NULL
+               WHERE phase = $1 AND code = $2 AND start_date = $4 AND end_date = $5
+                 AND status = 'running' AND attempts = $6 AND lease_token = $7
+                 AND lease_expires_at > NOW()"#,
         )
         .bind(&lease.phase)
         .bind(&lease.code)
         .bind(bounded_error)
+        .bind(lease.start_date)
+        .bind(lease.end_date)
         .bind(lease.attempt)
         .bind(lease.token)
         .execute(&self.pool)
@@ -567,32 +682,49 @@ impl CompanyRepository {
         checkpoint_transition_result(rows_affected, lease)
     }
 
-    pub async fn checkpoint(
+    pub async fn checkpoint_window(
         &self,
         phase: &str,
         code: &str,
+        start_date: NaiveDate,
+        end_date: NaiveDate,
     ) -> Result<Option<CompanyRepairCheckpoint>> {
         Ok(sqlx::query_as::<_, CompanyRepairCheckpoint>(
             r#"SELECT phase, code, start_date, end_date, status, attempts, last_error,
-                      lease_token, created_at, updated_at, completed_at
+                      lease_token, lease_expires_at, created_at, updated_at, completed_at
                FROM company_data_repair_checkpoints
-               WHERE phase = $1 AND code = $2"#,
+               WHERE phase = $1 AND code = $2 AND start_date = $3 AND end_date = $4"#,
         )
         .bind(phase)
         .bind(code)
+        .bind(start_date)
+        .bind(end_date)
         .fetch_optional(&self.pool)
         .await?)
     }
+}
+
+fn lease_ttl_seconds(lease_ttl: Duration) -> Result<f64> {
+    if lease_ttl.is_zero() {
+        return Err(AppError::BadRequest(
+            "checkpoint lease TTL must be positive".to_string(),
+        ));
+    }
+    Ok(lease_ttl.as_secs_f64())
+}
+
+fn stale_lease_error(lease: &CheckpointLease) -> AppError {
+    AppError::BadRequest(format!(
+        "stale or missing checkpoint lease: {}/{}/{}..{} attempt {}",
+        lease.phase, lease.code, lease.start_date, lease.end_date, lease.attempt
+    ))
 }
 
 fn checkpoint_transition_result(rows_affected: u64, lease: &CheckpointLease) -> Result<()> {
     if rows_affected == 1 {
         Ok(())
     } else {
-        Err(AppError::BadRequest(format!(
-            "stale or missing checkpoint lease: {}/{} attempt {}",
-            lease.phase, lease.code, lease.attempt
-        )))
+        Err(stale_lease_error(lease))
     }
 }
 
@@ -659,13 +791,15 @@ fn dividend_history_item(row: DividendHistoryRow) -> DividendHistoryItem {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use chrono::{NaiveDate, TimeZone, Utc};
     use rust_decimal::Decimal;
     use serde_json::json;
     use sqlx::PgPool;
     use uuid::Uuid;
 
-    use super::{CheckpointLease, CompanyRepository};
+    use super::{CheckpointClaimOutcome, CheckpointLease, CompanyRepository};
     use crate::data::company::{DividendRecord, FinancialFrequency, FinancialReport};
 
     fn date(year: i32, month: u32, day: u32) -> NaiveDate {
@@ -683,6 +817,14 @@ mod tests {
     fn migration_022_sql() -> String {
         std::fs::read_to_string(format!(
             "{}/migrations/022_preserve_company_dividend_versions.sql",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap_or_default()
+    }
+
+    fn migration_023_sql() -> String {
+        std::fs::read_to_string(format!(
+            "{}/migrations/023_windowed_company_checkpoint_leases.sql",
             env!("CARGO_MANIFEST_DIR")
         ))
         .unwrap_or_default()
@@ -1348,37 +1490,375 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn migration_023_preserves_and_normalizes_legacy_stock_level_checkpoints(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        sqlx::raw_sql(
+            r#"DROP TABLE company_data_repair_checkpoints;
+               CREATE TABLE company_data_repair_checkpoints (
+                   phase VARCHAR(32) NOT NULL CHECK (phase <> ''),
+                   code VARCHAR(12) NOT NULL CHECK (code <> ''),
+                   start_date DATE,
+                   end_date DATE,
+                   status VARCHAR(16) NOT NULL
+                       CHECK (status IN ('running', 'completed', 'failed')),
+                   attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+                   last_error VARCHAR(500),
+                   lease_token UUID,
+                   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                   completed_at TIMESTAMPTZ,
+                   PRIMARY KEY (phase, code),
+                   CHECK (start_date IS NULL OR end_date IS NULL OR start_date <= end_date),
+                   CONSTRAINT company_repair_checkpoint_state_consistent CHECK (
+                       (status = 'running' AND lease_token IS NOT NULL
+                        AND completed_at IS NULL AND last_error IS NULL)
+                       OR
+                       (status = 'completed' AND lease_token IS NULL
+                        AND completed_at IS NOT NULL AND last_error IS NULL)
+                       OR
+                       (status = 'failed' AND lease_token IS NULL
+                        AND completed_at IS NULL AND last_error IS NOT NULL)
+                   )
+               );"#,
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            r#"INSERT INTO company_data_repair_checkpoints
+               (phase, code, start_date, end_date, status, attempts, completed_at)
+               VALUES ('financials', '000001.SZ', '2020-01-01', '2026-12-31',
+                       'completed', 2, NOW())"#,
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            r#"INSERT INTO company_data_repair_checkpoints
+               (phase, code, status, attempts, lease_token)
+               VALUES ('financials', '000002.SZ', 'running', 1, $1)"#,
+        )
+        .bind(Uuid::new_v4())
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            r#"INSERT INTO company_data_repair_checkpoints
+               (phase, code, start_date, status, attempts, last_error)
+               VALUES ('dividends', '000003.SZ', '2025-01-01', 'failed', 3, 'timeout')"#,
+        )
+        .execute(&pool)
+        .await?;
+
+        let migration_sql = migration_023_sql();
+        assert!(!migration_sql.is_empty(), "migration 023 must exist");
+        sqlx::raw_sql(&migration_sql).execute(&pool).await?;
+
+        let completed: (NaiveDate, NaiveDate, String, Option<Uuid>) = sqlx::query_as(
+            r#"SELECT start_date, end_date, status, lease_token
+               FROM company_data_repair_checkpoints
+               WHERE phase = 'financials' AND code = '000001.SZ'"#,
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(completed.0, date(2020, 1, 1));
+        assert_eq!(completed.1, date(2026, 12, 31));
+        assert_eq!(completed.2, "completed");
+        assert!(completed.3.is_none());
+
+        let running: (NaiveDate, NaiveDate, String, Option<chrono::DateTime<Utc>>) =
+            sqlx::query_as(
+                r#"SELECT start_date, end_date, status, lease_expires_at
+               FROM company_data_repair_checkpoints
+               WHERE phase = 'financials' AND code = '000002.SZ'"#,
+            )
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(running.0, date(1, 1, 1));
+        assert_eq!(running.1, date(9999, 12, 31));
+        assert_eq!(running.2, "running");
+        assert!(
+            running.3.is_some(),
+            "legacy running lease becomes expirable"
+        );
+
+        let failed: (NaiveDate, NaiveDate, String) = sqlx::query_as(
+            r#"SELECT start_date, end_date, status
+               FROM company_data_repair_checkpoints
+               WHERE phase = 'dividends' AND code = '000003.SZ'"#,
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(failed.0, date(2025, 1, 1));
+        assert_eq!(failed.1, date(9999, 12, 31));
+        assert_eq!(failed.2, "failed");
+
+        sqlx::query(
+            r#"INSERT INTO company_data_repair_checkpoints
+               (phase, code, start_date, end_date, status, attempts, completed_at)
+               VALUES ('financials', '000001.SZ', '2027-01-01', '2027-12-31',
+                       'completed', 1, NOW())"#,
+        )
+        .execute(&pool)
+        .await?;
+        let window_count: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM company_data_repair_checkpoints
+               WHERE phase = 'financials' AND code = '000001.SZ'"#,
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(window_count, 2);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn checkpoint_claims_and_completion_are_scoped_to_exact_windows(
+        pool: PgPool,
+    ) -> crate::error::Result<()> {
+        let repo = CompanyRepository::new(pool);
+        let first_window = (date(2024, 1, 1), date(2024, 12, 31));
+        let second_window = (date(2025, 1, 1), date(2025, 12, 31));
+
+        let first = repo
+            .claim_checkpoint_window(
+                "financials",
+                "600519.SH",
+                first_window.0,
+                first_window.1,
+                Duration::from_secs(300),
+            )
+            .await?;
+        let CheckpointClaimOutcome::Claimed(first) = first else {
+            panic!("the first window should be claimed")
+        };
+        repo.complete_checkpoint(&first).await?;
+
+        let second = repo
+            .claim_checkpoint_window(
+                "financials",
+                "600519.SH",
+                second_window.0,
+                second_window.1,
+                Duration::from_secs(300),
+            )
+            .await?;
+        assert!(matches!(second, CheckpointClaimOutcome::Claimed(_)));
+        assert!(matches!(
+            repo.claim_checkpoint_window(
+                "financials",
+                "600519.SH",
+                first_window.0,
+                first_window.1,
+                Duration::from_secs(300),
+            )
+            .await?,
+            CheckpointClaimOutcome::Completed
+        ));
+        assert_eq!(
+            repo.checkpoint_window("financials", "600519.SH", first_window.0, first_window.1,)
+                .await?
+                .unwrap()
+                .status,
+            "completed"
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn expired_checkpoint_has_one_atomic_takeover_winner_and_stale_owner_is_rejected(
+        pool: PgPool,
+    ) -> crate::error::Result<()> {
+        let repo = CompanyRepository::new(pool.clone());
+        let window = (date(2025, 1, 1), date(2025, 12, 31));
+        let initial = repo
+            .claim_checkpoint_window(
+                "financials",
+                "600519.SH",
+                window.0,
+                window.1,
+                Duration::from_secs(300),
+            )
+            .await?;
+        let CheckpointClaimOutcome::Claimed(initial) = initial else {
+            panic!("initial worker should own the window")
+        };
+
+        assert!(matches!(
+            repo.claim_checkpoint_window(
+                "financials",
+                "600519.SH",
+                window.0,
+                window.1,
+                Duration::from_secs(300),
+            )
+            .await?,
+            CheckpointClaimOutcome::Busy
+        ));
+        sqlx::query(
+            r#"UPDATE company_data_repair_checkpoints
+               SET lease_expires_at = NOW() - INTERVAL '1 second'
+               WHERE phase = 'financials' AND code = '600519.SH'
+                 AND start_date = $1 AND end_date = $2"#,
+        )
+        .bind(window.0)
+        .bind(window.1)
+        .execute(&pool)
+        .await?;
+
+        let first_claim = repo.claim_checkpoint_window(
+            "financials",
+            "600519.SH",
+            window.0,
+            window.1,
+            Duration::from_secs(300),
+        );
+        let second_claim = repo.claim_checkpoint_window(
+            "financials",
+            "600519.SH",
+            window.0,
+            window.1,
+            Duration::from_secs(300),
+        );
+        let (first_claim, second_claim) = tokio::join!(first_claim, second_claim);
+        let outcomes = [first_claim?, second_claim?];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, CheckpointClaimOutcome::Claimed(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, CheckpointClaimOutcome::Busy))
+                .count(),
+            1
+        );
+        let winner = outcomes
+            .into_iter()
+            .find_map(|outcome| match outcome {
+                CheckpointClaimOutcome::Claimed(lease) => Some(lease),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(winner.attempt, 2);
+
+        let stale_error = repo.complete_checkpoint(&initial).await.unwrap_err();
+        assert!(stale_error
+            .to_string()
+            .contains("stale or missing checkpoint lease"));
+        repo.complete_checkpoint(&winner).await?;
+        assert!(matches!(
+            repo.claim_checkpoint_window(
+                "financials",
+                "600519.SH",
+                window.0,
+                window.1,
+                Duration::from_secs(300),
+            )
+            .await?,
+            CheckpointClaimOutcome::Completed
+        ));
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn active_checkpoint_can_be_renewed_but_expired_owner_cannot_heartbeat(
+        pool: PgPool,
+    ) -> crate::error::Result<()> {
+        let repo = CompanyRepository::new(pool.clone());
+        let window = (date(2025, 1, 1), date(2025, 12, 31));
+        let claimed = repo
+            .claim_checkpoint_window(
+                "dividends",
+                "600519.SH",
+                window.0,
+                window.1,
+                Duration::from_secs(60),
+            )
+            .await?;
+        let CheckpointClaimOutcome::Claimed(claimed) = claimed else {
+            panic!("window should be claimed")
+        };
+        let renewed = repo
+            .renew_checkpoint(&claimed, Duration::from_secs(600))
+            .await?;
+        assert!(renewed.lease_expires_at > claimed.lease_expires_at);
+
+        sqlx::query(
+            r#"UPDATE company_data_repair_checkpoints
+               SET lease_expires_at = NOW() - INTERVAL '1 second'
+               WHERE phase = 'dividends' AND code = '600519.SH'
+                 AND start_date = $1 AND end_date = $2"#,
+        )
+        .bind(window.0)
+        .bind(window.1)
+        .execute(&pool)
+        .await?;
+        assert!(repo
+            .renew_checkpoint(&renewed, Duration::from_secs(600))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("stale or missing checkpoint lease"));
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn checkpoint_lifecycle_counts_claims_and_bounds_failures(
         pool: PgPool,
     ) -> crate::error::Result<()> {
         let repo = CompanyRepository::new(pool);
 
         let first_lease = repo
-            .claim_checkpoint(
+            .claim_checkpoint_window(
                 "financials",
                 "600519.SH",
-                Some(date(1998, 1, 1)),
-                Some(date(2026, 12, 31)),
+                date(1998, 1, 1),
+                date(2026, 12, 31),
+                Duration::from_secs(300),
             )
             .await?;
+        let CheckpointClaimOutcome::Claimed(first_lease) = first_lease else {
+            panic!("first attempt should claim the window")
+        };
         repo.fail_checkpoint(&first_lease, &"超".repeat(600))
             .await?;
 
-        let failed = repo.checkpoint("financials", "600519.SH").await?.unwrap();
+        let failed = repo
+            .checkpoint_window(
+                "financials",
+                "600519.SH",
+                date(1998, 1, 1),
+                date(2026, 12, 31),
+            )
+            .await?
+            .unwrap();
         assert_eq!(failed.status, "failed");
         assert_eq!(failed.attempts, 1);
         assert_eq!(failed.last_error.unwrap().chars().count(), 500);
 
         let second_lease = repo
-            .claim_checkpoint(
+            .claim_checkpoint_window(
                 "financials",
                 "600519.SH",
-                Some(date(1998, 1, 1)),
-                Some(date(2026, 12, 31)),
+                date(1998, 1, 1),
+                date(2026, 12, 31),
+                Duration::from_secs(300),
             )
             .await?;
+        let CheckpointClaimOutcome::Claimed(second_lease) = second_lease else {
+            panic!("failed window should be reclaimable")
+        };
         repo.complete_checkpoint(&second_lease).await?;
-        let completed = repo.checkpoint("financials", "600519.SH").await?.unwrap();
+        let completed = repo
+            .checkpoint_window(
+                "financials",
+                "600519.SH",
+                date(1998, 1, 1),
+                date(2026, 12, 31),
+            )
+            .await?
+            .unwrap();
         assert_eq!(completed.status, "completed");
         assert_eq!(completed.attempts, 2);
         assert!(completed.last_error.is_none());
@@ -1392,34 +1872,43 @@ mod tests {
     ) -> crate::error::Result<()> {
         let repo = CompanyRepository::new(pool);
         let first = repo
-            .claim_checkpoint(
+            .claim_checkpoint_window(
                 "dividends",
                 "600519.SH",
-                Some(date(1998, 1, 1)),
-                Some(date(2026, 12, 31)),
+                date(1998, 1, 1),
+                date(2026, 12, 31),
+                Duration::from_secs(300),
             )
             .await?;
+        let CheckpointClaimOutcome::Claimed(first) = first else {
+            panic!("first attempt should claim the window")
+        };
 
-        let active_error = repo
-            .claim_checkpoint(
+        assert!(matches!(
+            repo.claim_checkpoint_window(
                 "dividends",
                 "600519.SH",
-                Some(date(1998, 1, 1)),
-                Some(date(2026, 12, 31)),
+                date(1998, 1, 1),
+                date(2026, 12, 31),
+                Duration::from_secs(300),
             )
-            .await
-            .unwrap_err();
-        assert!(active_error.to_string().contains("already running"));
+            .await?,
+            CheckpointClaimOutcome::Busy
+        ));
 
         repo.fail_checkpoint(&first, "retry").await?;
         let second = repo
-            .claim_checkpoint(
+            .claim_checkpoint_window(
                 "dividends",
                 "600519.SH",
-                Some(date(1998, 1, 1)),
-                Some(date(2026, 12, 31)),
+                date(1998, 1, 1),
+                date(2026, 12, 31),
+                Duration::from_secs(300),
             )
             .await?;
+        let CheckpointClaimOutcome::Claimed(second) = second else {
+            panic!("failed window should be reclaimable")
+        };
         assert_eq!(second.attempt, 2);
 
         let stale_error = repo.complete_checkpoint(&first).await.unwrap_err();
@@ -1431,8 +1920,11 @@ mod tests {
         let missing = CheckpointLease {
             phase: "financials".to_string(),
             code: "missing.SH".to_string(),
+            start_date: date(2025, 1, 1),
+            end_date: date(2025, 12, 31),
             attempt: 1,
             token: Uuid::new_v4(),
+            lease_expires_at: Utc::now(),
         };
         let missing_error = repo.fail_checkpoint(&missing, "missing").await.unwrap_err();
         assert!(missing_error
@@ -1445,7 +1937,8 @@ mod tests {
     async fn company_schema_separates_dividend_revisions_and_guards_checkpoint_leases(
         pool: PgPool,
     ) -> sqlx::Result<()> {
-        let (dividend_table, latest_index, effective_date_index, lease_column): (
+        let (dividend_table, latest_index, effective_date_index, lease_column, expiry_column): (
+            bool,
             bool,
             bool,
             bool,
@@ -1459,6 +1952,12 @@ mod tests {
                         FROM information_schema.columns
                         WHERE table_name = 'company_data_repair_checkpoints'
                           AND column_name = 'lease_token'
+                      ),
+                      EXISTS (
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_name = 'company_data_repair_checkpoints'
+                          AND column_name = 'lease_expires_at'
                       )"#,
         )
         .fetch_one(&pool)
@@ -1468,6 +1967,7 @@ mod tests {
         assert!(latest_index);
         assert!(effective_date_index);
         assert!(lease_column);
+        assert!(expiry_column);
 
         let (constraint_definition,): (String,) = sqlx::query_as(
             r#"SELECT pg_get_constraintdef(oid)
@@ -1477,7 +1977,18 @@ mod tests {
         .fetch_one(&pool)
         .await?;
         assert!(constraint_definition.contains("lease_token"));
+        assert!(constraint_definition.contains("lease_expires_at"));
         assert!(constraint_definition.contains("completed_at"));
+
+        let primary_key: String = sqlx::query_scalar(
+            r#"SELECT pg_get_constraintdef(oid)
+               FROM pg_constraint
+               WHERE conrelid = 'company_data_repair_checkpoints'::regclass
+                 AND contype = 'p'"#,
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert!(primary_key.contains("phase, code, start_date, end_date"));
         Ok(())
     }
 }
