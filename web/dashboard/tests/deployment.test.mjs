@@ -207,6 +207,20 @@ test("dashboard HTML is fresh while versioned assets can be cached", async () =>
   assert.match(config, /add_header Cache-Control \$dashboard_cache_control always;/);
 });
 
+test("test workflow provisions the dependencies required by SQLx tests", async () => {
+  const workflow = await readFile("../../.github/workflows/test.yml", "utf8");
+
+  assert.match(workflow, /services:[\s\S]*?postgres:[\s\S]*?image:\s*postgres:16/);
+  assert.match(workflow, /services:[\s\S]*?redis:[\s\S]*?image:\s*redis:7-alpine/);
+  assert.match(
+    workflow,
+    /DATABASE_URL:\s*postgresql:\/\/qbot:qbot@127\.0\.0\.1:5432\/qbot/,
+  );
+  assert.match(workflow, /REDIS_URL:\s*redis:\/\/127\.0\.0\.1:6379/);
+  assert.match(workflow, /run:\s*cargo test --locked/);
+  assert.doesNotMatch(workflow, /Tests \(no DB needed\)/);
+});
+
 test("deployment runs the resumable daily-bar repair after the service is healthy", async () => {
   const workflow = await readFile("../../.github/workflows/deploy.yml", "utf8");
   const healthCheck = workflow.indexOf("- name: Health check");

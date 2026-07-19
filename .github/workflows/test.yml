@@ -8,6 +8,33 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: qbot
+          POSTGRES_PASSWORD: qbot
+          POSTGRES_DB: qbot
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U qbot"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://qbot:qbot@127.0.0.1:5432/qbot
+      REDIS_URL: redis://127.0.0.1:6379
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
 
@@ -26,7 +53,7 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Cargo check
-        run: cargo check
+        run: cargo check --locked
 
-      - name: Tests (no DB needed)
-        run: cargo test --bins -- --skip storage::postgres::tests
+      - name: Rust tests
+        run: cargo test --locked
