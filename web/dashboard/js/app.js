@@ -1,6 +1,6 @@
-import { dashboardApi, ApiError } from "./api.js?v=20260719.6";
-import { activitySeries, mountChart } from "./chart.js?v=20260719.6";
-import { chipPanel, companyPanel, dividendPanel, financialPanel } from "./company-panels.js?v=20260719.6";
+import { dashboardApi, ApiError } from "./api.js?v=20260719.7";
+import { activitySeries, mountChart } from "./chart.js?v=20260719.7";
+import { chipPanel, companyPanel, dividendPanel, financialPanel } from "./company-panels.js?v=20260719.7";
 import {
   activeFilterCount,
   applyFilters,
@@ -16,7 +16,7 @@ import {
   saveInspectorPreferences,
   sortRows,
   updateTab,
-} from "./state.js?v=20260719.6";
+} from "./state.js?v=20260719.7";
 
 const app = document.querySelector("#app");
 let bootstrap = null;
