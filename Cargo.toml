@@ -16,7 +16,7 @@ sqlx = { version = "0.7", features = ["runtime-tokio-native-tls", "postgres", "c
 redis = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
 reqwest = { version = "0.11", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["arbitrary_precision"] }
 tokio-cron-scheduler = { version = "0.10", features = ["signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

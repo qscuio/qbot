@@ -1,7 +1,27 @@
+use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::error::Result;
+
+#[async_trait]
+pub trait CompanyDataProvider: Send + Sync {
+    async fn financial_reports(
+        &self,
+        code: &str,
+        start: NaiveDate,
+        end: NaiveDate,
+    ) -> Result<Vec<FinancialReport>>;
+
+    async fn dividends(
+        &self,
+        code: &str,
+        start: NaiveDate,
+        end: NaiveDate,
+    ) -> Result<Vec<DividendRecord>>;
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
