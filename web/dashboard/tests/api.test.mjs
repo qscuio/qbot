@@ -22,3 +22,53 @@ test("stock history lets the server choose a period-specific data budget", async
 
   assert.equal(requestedPath, "/api/dashboard/stocks/600519.SH?period=monthly");
 });
+
+test("company intelligence API safely encodes stock, frequency, and cursor", async () => {
+  const requestedPaths = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (path) => {
+    requestedPaths.push(path);
+    return new Response(JSON.stringify({ items: [], nextCursor: null }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+
+  try {
+    await dashboardApi.company("60/0519.SH");
+    await dashboardApi.financials("600519.SH", "quarterly", "end/date+next=");
+    await dashboardApi.dividends("600519.SH", "cash/action?next=1");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.deepEqual(requestedPaths, [
+    "/api/dashboard/stocks/60%2F0519.SH/company",
+    "/api/dashboard/stocks/600519.SH/financials?frequency=quarterly&cursor=end%2Fdate%2Bnext%3D",
+    "/api/dashboard/stocks/600519.SH/dividends?cursor=cash%2Faction%3Fnext%3D1",
+  ]);
+});
+
+test("company intelligence API omits absent cursors", async () => {
+  const requestedPaths = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (path) => {
+    requestedPaths.push(path);
+    return new Response(JSON.stringify({ items: [], nextCursor: null }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+
+  try {
+    await dashboardApi.financials("600519.SH", "annual");
+    await dashboardApi.dividends("600519.SH");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.deepEqual(requestedPaths, [
+    "/api/dashboard/stocks/600519.SH/financials?frequency=annual",
+    "/api/dashboard/stocks/600519.SH/dividends",
+  ]);
+});

@@ -5,6 +5,7 @@ const required = [
   "css/dashboard.css",
   "js/app.js",
   "js/api.js",
+  "js/company-panels.js",
   "js/state.js",
   "js/chart.js",
   "vendor/lightweight-charts.js",

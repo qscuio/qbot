@@ -1,5 +1,6 @@
-import { dashboardApi, ApiError } from "./api.js?v=20260719.2";
-import { activitySeries, mountChart } from "./chart.js?v=20260719.2";
+import { dashboardApi, ApiError } from "./api.js?v=20260719.3";
+import { activitySeries, mountChart } from "./chart.js?v=20260719.3";
+import { companyPanel, dividendPanel, financialPanel } from "./company-panels.js?v=20260719.3";
 import {
   activeFilterCount,
   applyFilters,
@@ -15,7 +16,7 @@ import {
   saveInspectorPreferences,
   sortRows,
   updateTab,
-} from "./state.js?v=20260719.2";
+} from "./state.js?v=20260719.3";
 
 const app = document.querySelector("#app");
 let bootstrap = null;
@@ -24,6 +25,10 @@ let workspace = createWorkspaceState();
 let filters = { search: "", group: "", signal: "", rankedOnly: false, sort: "ranked", direction: "desc" };
 const details = new Map();
 const stockRequestSequences = new Map();
+const companyPanelStates = new Map();
+const optionalRequestCache = new Map();
+const optionalRequestSequences = new Map();
+const financialFrequencies = new Map();
 let chartHandle = null;
 let inspectorCleanup = null;
 let closeInspectorOverlay = null;
@@ -60,6 +65,10 @@ function enterAuthenticationBoundary() {
   workspace = createWorkspaceState();
   details.clear();
   stockRequestSequences.clear();
+  companyPanelStates.clear();
+  optionalRequestCache.clear();
+  optionalRequestSequences.clear();
+  financialFrequencies.clear();
   return invalidateProtectedView();
 }
 
@@ -237,8 +246,202 @@ function stockLoadingTemplate(tab) {
   return `<div class="loading-panel"><span class="spinner"></span><span>Loading ${escapeHtml(tab.code)} market history…</span></div>`;
 }
 
+function panelStateKey(kind, code, frequency = "") {
+  return `${protectedViewGeneration}:${kind}:${code}:${frequency}`;
+}
+
+function currentFinancialFrequency(code) {
+  return financialFrequencies.get(code) || "annual";
+}
+
+function getPanelState(kind, code, frequency = "") {
+  const key = panelStateKey(kind, code, frequency);
+  if (!companyPanelStates.has(key)) {
+    companyPanelStates.set(key, { status: "idle", items: [], nextCursor: null, error: "", failedCursor: null, windowStart: 0 });
+  }
+  return companyPanelStates.get(key);
+}
+
+function financialControls(frequency) {
+  return `<div class="panel-section-toolbar"><div class="segmented-control" role="group" aria-label="财务周期"><button type="button" data-financial-frequency="annual" aria-pressed="${frequency === "annual"}" class="${frequency === "annual" ? "active" : ""}">年度</button><button type="button" data-financial-frequency="quarterly" aria-pressed="${frequency === "quarterly"}" class="${frequency === "quarterly" ? "active" : ""}">季度</button></div></div>`;
+}
+
+function panelLoading(label, frequency = null) {
+  return `${frequency ? financialControls(frequency) : ""}<div class="panel-local-state" role="status"><span class="spinner"></span><span>Loading ${escapeHtml(label)}…</span></div>`;
+}
+
+function panelError(kind, message, frequency = null) {
+  return `${frequency ? financialControls(frequency) : ""}<div class="panel-local-state panel-error" role="alert"><strong>Unable to load this section</strong><span>${escapeHtml(message)}</span><button type="button" class="outline-button" data-panel-retry="${escapeHtml(kind)}">Retry</button></div>`;
+}
+
+function panelMarkup(kind, code) {
+  if (kind === "overview") {
+    const state = getPanelState("company", code);
+    if (state.status === "loaded") return companyPanel(state.payload);
+    if (state.status === "error") return panelError("company", state.error);
+    return panelLoading("overview");
+  }
+  if (kind === "financials") {
+    const frequency = currentFinancialFrequency(code);
+    const state = getPanelState("financials", code, frequency);
+    if (state.status === "loaded" || state.items.length) {
+      const rendered = financialPanel(
+        { items: state.items, nextCursor: state.nextCursor },
+        { frequency, windowStart: state.windowStart },
+      );
+      return `${rendered}${state.status === "error" ? `<div class="panel-inline-error" role="alert">${escapeHtml(state.error)} <button type="button" data-panel-retry="financials">Retry</button></div>` : ""}`;
+    }
+    if (state.status === "error") return panelError("financials", state.error, frequency);
+    return panelLoading(`${frequency} financials`, frequency);
+  }
+  if (kind === "dividends") {
+    const state = getPanelState("dividends", code);
+    if (state.status === "loaded" || state.items.length) {
+      const rendered = dividendPanel(
+        { items: state.items, nextCursor: state.nextCursor },
+        { windowStart: state.windowStart },
+      );
+      return `${rendered}${state.status === "error" ? `<div class="panel-inline-error" role="alert">${escapeHtml(state.error)} <button type="button" data-panel-retry="dividends">Retry</button></div>` : ""}`;
+    }
+    if (state.status === "error") return panelError("dividends", state.error);
+    return panelLoading("dividends");
+  }
+  return `<div class="inspector-placeholder"><strong>Chips</strong><span>This section is ready for chip intelligence.</span></div>`;
+}
+
+function currentStockTab() {
+  const tab = workspace.tabs.find((item) => item.id === workspace.activeTab);
+  return tab?.type === "stock" ? tab : null;
+}
+
+function renderInspectorPanel(kind, code) {
+  const tab = currentStockTab();
+  if (!tab || tab.code !== code || inspectorTab !== kind) return;
+  const panel = app.querySelector(`[data-inspector-panel="${kind}"]`);
+  if (!panel) return;
+  const scroller = app.querySelector(".inspector-panels");
+  const scrollTop = scroller?.scrollTop || 0;
+  const historyScrollTop = panel.querySelector("[data-history-kind]")?.scrollTop || 0;
+  panel.innerHTML = panelMarkup(kind, code);
+  bindPanelActions(panel, kind, code);
+  if (scroller) scroller.scrollTop = scrollTop;
+  const historyScroller = panel.querySelector("[data-history-kind]");
+  if (historyScroller) historyScroller.scrollTop = historyScrollTop;
+}
+
+function rowIdentity(kind, item) {
+  if (kind === "financials") return [item.source, item.endDate, item.reportType].join("|");
+  return [item.source, item.announcementDate, item.recordDate, item.exDate, item.payDate, item.implementationStatus, item.cashDividend, item.stockRatio].join("|");
+}
+
+function appendUnique(kind, current, incoming) {
+  const seen = new Set(current.map((item) => rowIdentity(kind, item)));
+  return [...current, ...incoming.filter((item) => {
+    const key = rowIdentity(kind, item);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  })];
+}
+
+async function loadPanelPage(kind, code, { frequency = "", cursor = null, retry = false } = {}) {
+  if (!authenticated) return;
+  const generation = protectedViewGeneration;
+  const baseKey = panelStateKey(kind, code, frequency);
+  const state = getPanelState(kind, code, frequency);
+  const requestKey = `${baseKey}:${cursor || "first"}`;
+  if (retry) optionalRequestCache.delete(requestKey);
+  if (optionalRequestCache.has(requestKey)) return optionalRequestCache.get(requestKey);
+  state.status = "loading";
+  state.error = "";
+  state.failedCursor = null;
+  renderInspectorPanel(kind === "company" ? "overview" : kind, code);
+  const sequence = (optionalRequestSequences.get(requestKey) || 0) + 1;
+  optionalRequestSequences.set(requestKey, sequence);
+  const isCurrent = () => authenticated
+    && generation === protectedViewGeneration
+    && optionalRequestSequences.get(requestKey) === sequence;
+  const operation = (async () => {
+    try {
+      const payload = kind === "company"
+        ? await dashboardApi.company(code)
+        : kind === "financials"
+          ? await dashboardApi.financials(code, frequency, cursor)
+          : await dashboardApi.dividends(code, cursor);
+      if (!isCurrent()) return;
+      if (kind === "company") state.payload = payload;
+      else state.items = cursor
+        ? appendUnique(kind, state.items, Array.isArray(payload.items) ? payload.items : [])
+        : (Array.isArray(payload.items) ? payload.items : []);
+      state.nextCursor = payload?.nextCursor || null;
+      state.status = "loaded";
+      state.error = "";
+      optionalRequestCache.set(requestKey, Promise.resolve(payload));
+    } catch (error) {
+      if (!isCurrent()) return;
+      optionalRequestCache.delete(requestKey);
+      if (error instanceof ApiError && error.status === 401) {
+        renderLogin("Your session expired. Please sign in again.");
+        return;
+      }
+      state.status = "error";
+      state.error = error.message;
+      state.failedCursor = cursor;
+    }
+    if (!isCurrent()) return;
+    renderInspectorPanel(kind === "company" ? "overview" : kind, code);
+  })();
+  optionalRequestCache.set(requestKey, operation);
+  return operation;
+}
+
+function ensureInspectorPanel(kind, code) {
+  if (kind === "overview") return loadPanelPage("company", code);
+  if (kind === "financials") return loadPanelPage("financials", code, { frequency: currentFinancialFrequency(code) });
+  if (kind === "dividends") return loadPanelPage("dividends", code);
+  return null;
+}
+
+function bindPanelActions(panel, kind, code) {
+  panel.querySelectorAll("[data-financial-frequency]").forEach((button) => button.addEventListener("click", () => {
+    const frequency = button.dataset.financialFrequency;
+    financialFrequencies.set(code, frequency);
+    renderInspectorPanel("financials", code);
+    loadPanelPage("financials", code, { frequency });
+  }));
+  panel.querySelector("[data-panel-retry]")?.addEventListener("click", () => {
+    const requestKind = kind === "overview" ? "company" : kind;
+    const frequency = requestKind === "financials" ? currentFinancialFrequency(code) : "";
+    const state = getPanelState(requestKind, code, frequency);
+    loadPanelPage(requestKind, code, { frequency, cursor: state.failedCursor, retry: true });
+  });
+  panel.querySelector("[data-load-more]")?.addEventListener("click", () => {
+    const requestKind = panel.querySelector("[data-load-more]").dataset.loadMore;
+    const frequency = requestKind === "financials" ? currentFinancialFrequency(code) : "";
+    const state = getPanelState(requestKind, code, frequency);
+    if (state.nextCursor) loadPanelPage(requestKind, code, { frequency, cursor: state.nextCursor });
+  });
+  const historyScroller = panel.querySelector("[data-history-kind]");
+  if (historyScroller) {
+    let scrollFrame = null;
+    historyScroller.addEventListener("scroll", () => {
+      if (scrollFrame !== null) return;
+      scrollFrame = window.requestAnimationFrame(() => {
+        scrollFrame = null;
+        const requestKind = historyScroller.dataset.historyKind;
+        const frequency = requestKind === "financials" ? currentFinancialFrequency(code) : "";
+        const state = getPanelState(requestKind, code, frequency);
+        const rowHeight = Number(historyScroller.dataset.historyRowHeight) || 42;
+        const nextStart = Math.max(0, Math.floor(historyScroller.scrollTop / rowHeight) - 10);
+        if (Math.abs(nextStart - state.windowStart) < 10) return;
+        state.windowStart = nextStart;
+        renderInspectorPanel(kind, code);
+      });
+    }, { passive: true });
+  }
+}
+
 function inspectorTemplate(detail) {
-  const latest = detail.latest;
   const tabs = [
     ["overview", "Overview"],
     ["financials", "Financials"],
@@ -250,18 +453,7 @@ function inspectorTemplate(detail) {
     <div class="inspector-heading"><strong>Information</strong><span class="mono">${escapeHtml(detail.code)}</span></div>
     <div class="inspector-tabs" role="tablist" aria-label="Stock information sections">${tabButtons}</div>
     <div class="inspector-panels">
-      <section class="inspector-panel" role="tabpanel" data-inspector-panel="overview" id="inspector-panel-overview" aria-labelledby="inspector-tab-overview" ${inspectorTab === "overview" ? "" : "hidden"}>
-        <dl class="overview-grid">
-          <div><dt>Open</dt><dd>${formatNumber(latest?.open)}</dd></div>
-          <div><dt>High</dt><dd>${formatNumber(latest?.high)}</dd></div>
-          <div><dt>Low</dt><dd>${formatNumber(latest?.low)}</dd></div>
-          <div><dt>Close</dt><dd>${formatNumber(latest?.close)}</dd></div>
-          <div><dt>Volume</dt><dd>${formatNumber(latest?.volume, 0)}</dd></div>
-          <div><dt>Amount</dt><dd>${formatNumber(latest?.amount, 0)}</dd></div>
-          <div><dt>Signals</dt><dd>${detail.hits.length}</dd></div>
-        </dl>
-      </section>
-      ${tabs.slice(1).map(([id, label]) => `<section class="inspector-panel inspector-placeholder" role="tabpanel" data-inspector-panel="${id}" id="inspector-panel-${id}" aria-labelledby="inspector-tab-${id}" ${inspectorTab === id ? "" : "hidden"}><strong>${label}</strong><span>This section is ready for company intelligence.</span></section>`).join("")}
+      ${tabs.map(([id]) => `<section class="inspector-panel" role="tabpanel" data-inspector-panel="${id}" id="inspector-panel-${id}" aria-labelledby="inspector-tab-${id}" ${inspectorTab === id ? "" : "hidden"}>${panelMarkup(id, detail.code)}</section>`).join("")}
     </div>
   </aside>`;
 }
@@ -294,7 +486,14 @@ function renderWorkspace() {
   bindShell(tab);
   if (tab.type === "stock") {
     if (!detail) loadStock(tab);
-    else if (!detail.error && detail.bars.length) chartHandle = mountChart(app.querySelector("#stock-chart"), detail.bars, detail.hits);
+    else if (!detail.error && detail.bars.length) {
+      chartHandle = mountChart(app.querySelector("#stock-chart"), detail.bars, detail.hits);
+      queueMicrotask(() => {
+        if (currentStockTab()?.code !== tab.code) return;
+        ensureInspectorPanel("overview", tab.code);
+        if (inspectorTab !== "overview") ensureInspectorPanel(inspectorTab, tab.code);
+      });
+    }
   }
 }
 
@@ -422,6 +621,12 @@ function bindInspector() {
     app.querySelectorAll("[data-inspector-panel]").forEach((panel) => {
       panel.hidden = panel.dataset.inspectorPanel !== inspectorTab;
     });
+    const activeStock = currentStockTab();
+    if (activeStock) {
+      const panel = app.querySelector(`[data-inspector-panel="${inspectorTab}"]`);
+      if (panel) bindPanelActions(panel, inspectorTab, activeStock.code);
+      ensureInspectorPanel(inspectorTab, activeStock.code);
+    }
     if (focus) button.focus();
   };
   tabButtons.forEach((button, index) => {
@@ -437,6 +642,12 @@ function bindInspector() {
       activateTab(tabButtons[nextIndex], { focus: true });
     });
   });
+  const activeStock = currentStockTab();
+  if (activeStock) {
+    app.querySelectorAll("[data-inspector-panel]").forEach((panel) => {
+      bindPanelActions(panel, panel.dataset.inspectorPanel, activeStock.code);
+    });
+  }
 
   if (resizer) {
     let drag = null;

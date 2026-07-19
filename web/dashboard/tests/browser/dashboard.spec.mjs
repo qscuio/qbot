@@ -29,11 +29,33 @@ const bars = Array.from({ length: 90 }, (_, index) => {
   return { time: date, open: close - 3, high: close + 8, low: close - 10, close, volume: 1000000 + index * 1000, amount: 1 };
 });
 
+const company = {
+  code: "600519.SH",
+  name: "贵州茅台",
+  industry: "白酒",
+  market: "主板",
+  exchange: "SSE",
+  listDate: "2001-08-27",
+  quote: { tradeDate: "2026-07-17", close: "1488.50", volume: 123456, amount: "321000000" },
+  valuation: { pe: "22.1", pb: "7.2", ps: "12.4", totalMarketValue: "1862400000000" },
+};
+
+const annualFinancials = {
+  items: [{ endDate: "2025-12-31", announcementDate: "2026-03-31", frequency: "annual", reportType: "1", revenue: "120000000000", netProfitParent: "86240000000", deductedNetProfit: "85000000000", revenueYoy: "12.3", netProfitYoy: "14.2", basicEps: "3.21", roe: "31.2", grossMargin: "91.2", revisionCount: 2 }],
+  nextCursor: null,
+};
+
+const dividendFirstPage = {
+  items: [{ announcementDate: "2026-04-01", recordDate: "2026-06-20", exDate: "2026-06-21", payDate: "2026-06-25", implementationStatus: "implemented", cashDividend: "2.76", stockRatio: "0", revisionCount: 1 }],
+  nextCursor: "older page",
+};
+
 async function mockApi(page, initiallyAuthenticated = true, stockHits = bootstrap.results[0].hits, requestedPeriods = [], gates = {}) {
   let authenticated = initiallyAuthenticated;
   let sessionRequests = 0;
   let bootstrapRequests = 0;
   let stockRequests = 0;
+  const optionalRequests = { company: 0, financials: 0, dividends: 0 };
   await page.route("**/api/dashboard/**", async (route) => {
     const url = new URL(route.request().url());
     if (url.pathname.endsWith("/auth/session")) {
@@ -79,6 +101,27 @@ async function mockApi(page, initiallyAuthenticated = true, stockHits = bootstra
         },
       });
     }
+    const optionalKind = url.pathname.endsWith("/company")
+      ? "company"
+      : url.pathname.endsWith("/financials")
+        ? "financials"
+        : url.pathname.endsWith("/dividends") ? "dividends" : null;
+    if (optionalKind) {
+      optionalRequests[optionalKind] += 1;
+      const configuration = gates[optionalKind];
+      const response = configuration?.responses?.[optionalRequests[optionalKind]];
+      configuration?.requested?.({ request: optionalRequests[optionalKind], url });
+      response?.requested?.({ request: optionalRequests[optionalKind], url });
+      if (response?.release) await response.release;
+      else if (configuration?.release) await configuration.release;
+      if (response?.status && response.status !== 200) {
+        return route.fulfill({ status: response.status, json: response.payload ?? { error: `${optionalKind} request failed` } });
+      }
+      const payload = response?.payload ?? (optionalKind === "company"
+        ? company
+        : optionalKind === "financials" ? annualFinancials : dividendFirstPage);
+      return route.fulfill({ status: 200, json: payload });
+    }
     const period = url.searchParams.get("period") || "daily";
     requestedPeriods.push(period);
     stockRequests += 1;
@@ -109,6 +152,151 @@ async function mockApi(page, initiallyAuthenticated = true, stockHits = bootstra
     } });
   });
 }
+
+test("company overview waits for chart mount while optional data stays local", async ({ page }) => {
+  let releaseCompany;
+  const companyRelease = new Promise((resolve) => { releaseCompany = resolve; });
+  let markCompanyRequested;
+  const companyRequested = new Promise((resolve) => { markCompanyRequested = resolve; });
+  await mockApi(page, true, bootstrap.results[0].hits, [], {
+    company: { release: companyRelease, requested: markCompanyRequested },
+  });
+  await page.goto("/dashboard/");
+  await page.locator("tbody tr").first().click();
+  await companyRequested;
+
+  await expect(page.locator("#stock-chart canvas").first()).toBeVisible();
+  await expect(page.locator('[data-inspector-panel="overview"]')).toContainText("Loading overview");
+  releaseCompany();
+  await expect(page.locator('[data-inspector-panel="overview"]')).toContainText("贵州茅台");
+  await expect(page.locator('[data-inspector-panel="overview"]')).toContainText("市盈率");
+});
+
+test("financials lazy-load once per frequency and ignore stale frequency responses", async ({ page }) => {
+  const requests = [];
+  let releaseAnnual;
+  const annualRelease = new Promise((resolve) => { releaseAnnual = resolve; });
+  await mockApi(page, true, bootstrap.results[0].hits, [], {
+    financials: {
+      requested: ({ url }) => requests.push(url.searchParams.get("frequency")),
+      responses: {
+        1: { release: annualRelease, payload: annualFinancials },
+        2: { payload: { items: [{ ...annualFinancials.items[0], endDate: "2026-03-31", frequency: "quarterly", netProfitParent: "21000000000" }], nextCursor: null } },
+      },
+    },
+  });
+  await page.goto("/dashboard/");
+  await page.locator("tbody tr").first().click();
+  await page.getByRole("tab", { name: "Financials" }).click();
+  await page.getByRole("button", { name: "季度" }).click();
+
+  await expect(page.locator('[data-inspector-panel="financials"]')).toContainText("2026-03-31");
+  releaseAnnual();
+  await page.evaluate(() => new Promise((resolve) => setTimeout(resolve, 20)));
+  await expect(page.locator('[data-inspector-panel="financials"]')).toContainText("2026-03-31");
+  await expect(page.locator('[data-inspector-panel="financials"]')).not.toContainText("2025-12-31");
+  await page.getByRole("button", { name: "年度" }).click();
+  await expect(page.locator('[data-inspector-panel="financials"]')).toContainText("2025-12-31");
+  expect(requests).toEqual(["annual", "quarterly"]);
+});
+
+test("dividend failure retries locally and pagination appends without duplicates", async ({ page }) => {
+  await mockApi(page, true, bootstrap.results[0].hits, [], {
+    dividends: { responses: {
+      1: { status: 500, payload: { error: "dividend source unavailable" } },
+      2: { payload: dividendFirstPage },
+      3: { payload: { items: [dividendFirstPage.items[0], { ...dividendFirstPage.items[0], announcementDate: "2025-04-01", exDate: "2025-06-21", cashDividend: "2.10" }], nextCursor: null } },
+    } },
+  });
+  await page.goto("/dashboard/");
+  await page.locator("tbody tr").first().click();
+  await page.getByRole("tab", { name: "Dividends" }).click();
+
+  await expect(page.locator('[data-inspector-panel="dividends"]')).toContainText("dividend source unavailable");
+  await page.locator('[data-inspector-panel="dividends"] [data-panel-retry]').click();
+  await expect(page.locator('[data-inspector-panel="dividends"]')).toContainText("2.76");
+  await page.locator('[data-inspector-panel="dividends"] [data-load-more="dividends"]').click();
+  await expect(page.locator('[data-inspector-panel="dividends"]')).toContainText("2.10");
+  await expect(page.locator('[data-inspector-panel="dividends"] .dividend-card')).toHaveCount(2);
+});
+
+test("active company tab follows stock navigation without stale panel writes", async ({ page }) => {
+  const requestedCodes = [];
+  await mockApi(page, true, bootstrap.results[0].hits, [], {
+    financials: { requested: ({ url }) => requestedCodes.push(url.pathname.split("/").at(-2)) },
+  });
+  await page.goto("/dashboard/");
+  await page.locator("tbody tr").first().click();
+  await page.getByRole("tab", { name: "Financials" }).click();
+  await expect.poll(() => requestedCodes.length).toBe(1);
+  await page.getByRole("tab", { name: /Latest scan/ }).click();
+  await page.locator("tbody tr").nth(1).click();
+
+  await expect.poll(() => requestedCodes).toEqual(["600519", "000001"]);
+  await expect(page.getByRole("tab", { name: "Financials" })).toHaveAttribute("aria-selected", "true");
+});
+
+test("an optional route 401 uses the protected session lifecycle", async ({ page }) => {
+  await mockApi(page, true, bootstrap.results[0].hits, [], {
+    financials: { responses: { 1: { status: 401, payload: { error: "session expired" } } } },
+  });
+  await page.goto("/dashboard/");
+  await page.locator("tbody tr").first().click();
+  await page.getByRole("tab", { name: "Financials" }).click();
+
+  await expect(page.getByRole("button", { name: "Sign in" })).toBeVisible();
+  await expect(page.locator(".shell, #stock-chart, .stock-inspector")).toHaveCount(0);
+});
+
+test("old company response cannot cross logout and login generations", async ({ page }) => {
+  let releaseOld;
+  const oldRelease = new Promise((resolve) => { releaseOld = resolve; });
+  let oldRequested;
+  const requested = new Promise((resolve) => { oldRequested = resolve; });
+  await mockApi(page, true, bootstrap.results[0].hits, [], {
+    company: { responses: {
+      1: { release: oldRelease, requested: oldRequested, payload: { ...company, name: "Old generation" } },
+      2: { payload: { ...company, name: "Fresh generation" } },
+    } },
+  });
+  await page.goto("/dashboard/");
+  await page.locator("tbody tr").first().click();
+  await requested;
+  await page.getByRole("button", { name: "Settings" }).click();
+  await page.getByRole("button", { name: "Sign out" }).click();
+  await page.getByLabel("Username").fill("analyst");
+  await page.getByLabel("Password").fill("secret");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.locator('[data-inspector-panel="overview"]')).toContainText("Fresh generation");
+
+  releaseOld();
+  await page.evaluate(() => new Promise((resolve) => setTimeout(resolve, 20)));
+  await expect(page.locator('[data-inspector-panel="overview"]')).toContainText("Fresh generation");
+  await expect(page.locator('[data-inspector-panel="overview"]')).not.toContainText("Old generation");
+});
+
+test("loaded company tables remain inside the viewport on desktop and narrow screens", async ({ page }) => {
+  await page.setViewportSize({ width: 960, height: 420 });
+  await mockApi(page);
+  await page.goto("/dashboard/");
+  await page.locator("tbody tr").first().click();
+  await page.getByRole("tab", { name: "Financials" }).click();
+  await expect(page.locator(".financial-table")).toBeVisible();
+
+  const desktop = await page.evaluate(() => ({
+    width: [document.documentElement.clientWidth, document.documentElement.scrollWidth],
+    height: [document.documentElement.clientHeight, document.documentElement.scrollHeight],
+  }));
+  expect(desktop.width[1]).toBe(desktop.width[0]);
+  expect(desktop.height[1]).toBe(desktop.height[0]);
+  await page.setViewportSize({ width: 680, height: 420 });
+  const narrow = await page.evaluate(() => ({
+    width: [document.documentElement.clientWidth, document.documentElement.scrollWidth],
+    height: [document.documentElement.clientHeight, document.documentElement.scrollHeight],
+  }));
+  expect(narrow.width[1]).toBe(narrow.width[0]);
+  expect(narrow.height[1]).toBe(narrow.height[0]);
+});
 
 async function installLifecycleProbe(page) {
   await page.addInitScript(() => {
@@ -546,7 +734,7 @@ test("resizable stock information sidebar persists its desktop layout", async ({
   const resizer = page.locator(".inspector-resizer");
   await expect(inspector).toHaveCSS("width", "380px");
   await expect(page.locator("[data-inspector-tab]")).toHaveCount(4);
-  await expect(page.locator('[data-inspector-panel="overview"]')).toContainText("1,489.00");
+  await expect(page.locator('[data-inspector-panel="overview"]')).toContainText("1,488.50");
 
   const chartSurface = page.locator("#stock-chart > div").first();
   const initialChartWidth = (await chartSurface.boundingBox()).width;

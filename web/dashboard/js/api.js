@@ -29,4 +29,16 @@ export const dashboardApi = {
   stock: (code, period = "daily") => request(
     `/api/dashboard/stocks/${encodeURIComponent(code)}?period=${encodeURIComponent(period)}`,
   ),
+  company: (code) => request(`/api/dashboard/stocks/${encodeURIComponent(code)}/company`),
+  financials: (code, frequency = "annual", cursor = null) => {
+    const query = new URLSearchParams({ frequency });
+    if (cursor) query.set("cursor", cursor);
+    return request(`/api/dashboard/stocks/${encodeURIComponent(code)}/financials?${query}`);
+  },
+  dividends: (code, cursor = null) => {
+    const query = new URLSearchParams();
+    if (cursor) query.set("cursor", cursor);
+    const suffix = query.size ? `?${query}` : "";
+    return request(`/api/dashboard/stocks/${encodeURIComponent(code)}/dividends${suffix}`);
+  },
 };
