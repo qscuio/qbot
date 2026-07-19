@@ -1,6 +1,7 @@
 use chrono::{Datelike, NaiveDate, Timelike};
 use serde::{Deserialize, Serialize};
-use sqlx::types::Json;
+use serde_json::Value;
+use sqlx::PgPool;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -22,6 +23,125 @@ struct BarPoint {
     close: f64,
     volume: f64,
     turnover_rate: f64, // decimal, e.g. 0.03
+}
+
+#[cfg(test)]
+mod coexistence_tests {
+    use chrono::NaiveDate;
+    use sqlx::PgPool;
+
+    use super::{
+        load_cached_from_pool, save_chip_distribution_to_pool, ChipBucket, ChipDistributionResult,
+    };
+    use crate::data::chip::{ChipBucket as CanonicalBucket, ChipSnapshot};
+    use crate::storage::chip_repository::ChipRepository;
+
+    fn date() -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 7, 17).unwrap()
+    }
+
+    fn legacy_result() -> ChipDistributionResult {
+        ChipDistributionResult {
+            code: "600519.SH".to_string(),
+            date: date().to_string(),
+            current_price: 1_550.0,
+            distribution: vec![ChipBucket {
+                price: 1_500.0,
+                percentage: 100.0,
+                is_profit: true,
+            }],
+            avg_cost: 1_500.0,
+            profit_ratio: 100.0,
+            concentration: 100.0,
+        }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn legacy_dashboard_reads_normalized_canonical_rows(
+        pool: PgPool,
+    ) -> crate::error::Result<()> {
+        let repo = ChipRepository::new(pool.clone());
+        repo.upsert_snapshot(&ChipSnapshot {
+            code: "600519.SH".to_string(),
+            trade_date: date(),
+            distribution: vec![
+                CanonicalBucket {
+                    price: 1_500.0,
+                    weight: 0.25,
+                },
+                CanonicalBucket {
+                    price: 1_600.0,
+                    weight: 0.75,
+                },
+            ],
+            average_cost: 1_575.0,
+            winner_rate: 25.0,
+            concentration: 75.0,
+            dominant_peak_price: 1_600.0,
+            source: "qbot_estimate".to_string(),
+            model_version: Some("qbot-chip-v2".to_string()),
+            validated: false,
+            source_updated_at: chrono::Utc::now(),
+        })
+        .await?;
+
+        let loaded = load_cached_from_pool(&pool, "600519.SH", date(), 1_550.0)
+            .await?
+            .expect("normalized row remains dashboard-readable");
+        assert_eq!(loaded.distribution.len(), 2);
+        assert!((loaded.distribution[0].percentage - 100.0 / 3.0).abs() < 1e-9);
+        assert!(loaded.distribution[0].is_profit);
+        assert_eq!(loaded.distribution[1].percentage, 100.0);
+        assert!(!loaded.distribution[1].is_profit);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn legacy_updater_cannot_overwrite_normalized_rows_and_marks_legacy_inserts(
+        pool: PgPool,
+    ) -> crate::error::Result<()> {
+        let repo = ChipRepository::new(pool.clone());
+        let canonical = ChipSnapshot {
+            code: "600519.SH".to_string(),
+            trade_date: date(),
+            distribution: vec![CanonicalBucket {
+                price: 1_500.0,
+                weight: 1.0,
+            }],
+            average_cost: 1_500.0,
+            winner_rate: 50.0,
+            concentration: 50.0,
+            dominant_peak_price: 1_500.0,
+            source: "qbot_estimate".to_string(),
+            model_version: Some("qbot-chip-v2".to_string()),
+            validated: true,
+            source_updated_at: chrono::Utc::now(),
+        };
+        repo.upsert_snapshot(&canonical).await?;
+        let before = repo.latest_snapshot("600519.SH").await?.unwrap();
+        assert!(!save_chip_distribution_to_pool(&pool, &legacy_result(), date()).await?);
+        assert_eq!(repo.latest_snapshot("600519.SH").await?.unwrap(), before);
+
+        let mut other = legacy_result();
+        other.code = "000001.SZ".to_string();
+        assert!(save_chip_distribution_to_pool(&pool, &other, date()).await?);
+        let provenance: (String, Option<String>, bool, String) = sqlx::query_as(
+            "SELECT source, model_version, validated, distribution_format FROM chip_distribution WHERE code = '000001.SZ' AND trade_date = $1",
+        )
+        .bind(date())
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            provenance,
+            (
+                "legacy".to_string(),
+                None,
+                false,
+                "legacy_peak_relative".to_string()
+            )
+        );
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,34 +212,8 @@ impl ChipDistService {
         code: &str,
         target_date: NaiveDate,
     ) -> Result<Option<ChipDistributionResult>> {
-        let row: Option<(Json<Vec<ChipBucket>>, Option<f64>, Option<f64>, Option<f64>)> =
-            sqlx::query_as(
-                r#"SELECT distribution,
-                          avg_cost::float8,
-                          profit_ratio::float8,
-                          concentration::float8
-                   FROM chip_distribution
-                   WHERE code = $1 AND trade_date = $2"#,
-            )
-            .bind(code)
-            .bind(target_date)
-            .fetch_optional(&self.state.db)
-            .await?;
-
-        let Some((distribution, avg_cost, profit_ratio, concentration)) = row else {
-            return Ok(None);
-        };
-
         let current_price = self.latest_close(code, target_date).await?.unwrap_or(0.0);
-        Ok(Some(ChipDistributionResult {
-            code: code.to_string(),
-            date: target_date.to_string(),
-            current_price,
-            distribution: distribution.0,
-            avg_cost: avg_cost.unwrap_or(0.0),
-            profit_ratio: profit_ratio.unwrap_or(0.0),
-            concentration: concentration.unwrap_or(0.0),
-        }))
+        load_cached_from_pool(&self.state.db, code, target_date, current_price).await
     }
 
     async fn save_chip_distribution(
@@ -127,26 +221,7 @@ impl ChipDistService {
         data: &ChipDistributionResult,
         target_date: NaiveDate,
     ) -> Result<()> {
-        sqlx::query(
-            r#"INSERT INTO chip_distribution
-               (code, trade_date, distribution, avg_cost, profit_ratio, concentration, updated_at)
-               VALUES ($1, $2, $3, $4, $5, $6, NOW())
-               ON CONFLICT (code, trade_date) DO UPDATE SET
-                 distribution = EXCLUDED.distribution,
-                 avg_cost = EXCLUDED.avg_cost,
-                 profit_ratio = EXCLUDED.profit_ratio,
-                 concentration = EXCLUDED.concentration,
-                 updated_at = NOW()"#,
-        )
-        .bind(&data.code)
-        .bind(target_date)
-        .bind(Json(data.distribution.clone()))
-        .bind(data.avg_cost)
-        .bind(data.profit_ratio)
-        .bind(data.concentration)
-        .execute(&self.state.db)
-        .await?;
-
+        save_chip_distribution_to_pool(&self.state.db, data, target_date).await?;
         Ok(())
     }
 
@@ -422,4 +497,107 @@ impl ChipDistService {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         }
     }
+}
+
+async fn load_cached_from_pool(
+    pool: &PgPool,
+    code: &str,
+    target_date: NaiveDate,
+    current_price: f64,
+) -> Result<Option<ChipDistributionResult>> {
+    let row: Option<(Value, String, Option<f64>, Option<f64>, Option<f64>)> = sqlx::query_as(
+        r#"SELECT distribution, distribution_format,
+                  avg_cost::float8, profit_ratio::float8, concentration::float8
+           FROM chip_distribution
+           WHERE code = $1 AND trade_date = $2"#,
+    )
+    .bind(code)
+    .bind(target_date)
+    .fetch_optional(pool)
+    .await?;
+    let Some((distribution, format, avg_cost, profit_ratio, concentration)) = row else {
+        return Ok(None);
+    };
+
+    let distribution = match format.as_str() {
+        "legacy_peak_relative" => serde_json::from_value::<Vec<ChipBucket>>(distribution)?
+            .into_iter()
+            .map(|bucket| ChipBucket {
+                is_profit: bucket.price <= current_price,
+                ..bucket
+            })
+            .collect(),
+        "normalized_probability" => {
+            let buckets =
+                serde_json::from_value::<Vec<crate::data::chip::ChipBucket>>(distribution)?;
+            let max_weight = buckets
+                .iter()
+                .map(|bucket| bucket.weight)
+                .fold(0.0_f64, f64::max);
+            buckets
+                .into_iter()
+                .map(|bucket| ChipBucket {
+                    price: bucket.price,
+                    percentage: if max_weight > 0.0 {
+                        bucket.weight / max_weight * 100.0
+                    } else {
+                        0.0
+                    },
+                    is_profit: bucket.price <= current_price,
+                })
+                .collect()
+        }
+        other => {
+            return Err(crate::error::AppError::Internal(format!(
+                "unknown chip distribution format: {other}"
+            )))
+        }
+    };
+
+    Ok(Some(ChipDistributionResult {
+        code: code.to_string(),
+        date: target_date.to_string(),
+        current_price,
+        distribution,
+        avg_cost: avg_cost.unwrap_or(0.0),
+        profit_ratio: profit_ratio.unwrap_or(0.0),
+        concentration: concentration.unwrap_or(0.0),
+    }))
+}
+
+async fn save_chip_distribution_to_pool(
+    pool: &PgPool,
+    data: &ChipDistributionResult,
+    target_date: NaiveDate,
+) -> Result<bool> {
+    let result = sqlx::query(
+        r#"INSERT INTO chip_distribution
+               (code, trade_date, distribution, avg_cost, profit_ratio, concentration,
+                source, model_version, validated, distribution_format,
+                source_updated_at, updated_at)
+               VALUES ($1, $2, $3, $4, $5, $6,
+                       'legacy', NULL, FALSE, 'legacy_peak_relative', NOW(), NOW())
+               ON CONFLICT (code, trade_date) DO UPDATE SET
+                 distribution = EXCLUDED.distribution,
+                 avg_cost = EXCLUDED.avg_cost,
+                 profit_ratio = EXCLUDED.profit_ratio,
+                 concentration = EXCLUDED.concentration,
+                 dominant_peak_price = NULL,
+                 source = 'legacy',
+                 model_version = NULL,
+                 validated = FALSE,
+                 distribution_format = 'legacy_peak_relative',
+                 source_updated_at = NOW(),
+                 updated_at = NOW()
+               WHERE chip_distribution.distribution_format = 'legacy_peak_relative'"#,
+    )
+    .bind(&data.code)
+    .bind(target_date)
+    .bind(serde_json::to_value(&data.distribution)?)
+    .bind(data.avg_cost)
+    .bind(data.profit_ratio)
+    .bind(data.concentration)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
 }

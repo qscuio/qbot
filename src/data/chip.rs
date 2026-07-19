@@ -43,6 +43,7 @@ pub struct ChipModelState {
     pub model_version: String,
     pub through_date: NaiveDate,
     pub distribution: Vec<ChipBucket>,
+    pub last_adjustment_factor: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

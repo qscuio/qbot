@@ -138,14 +138,31 @@ impl ChipRepository {
     }
 
     pub async fn save_model_state(&self, state: &ChipModelState) -> Result<bool> {
+        if state.code.trim().is_empty() {
+            return Err(AppError::BadRequest(
+                "chip model state code is empty".to_string(),
+            ));
+        }
+        if state.model_version.trim().is_empty() {
+            return Err(AppError::BadRequest(
+                "chip model state version is empty".to_string(),
+            ));
+        }
+        if !state.last_adjustment_factor.is_finite() || state.last_adjustment_factor <= 0.0 {
+            return Err(AppError::BadRequest(
+                "chip model state adjustment factor must be finite and positive".to_string(),
+            ));
+        }
         validate_buckets(&state.distribution, true)?;
         let result = sqlx::query(
             r#"INSERT INTO chip_model_states
-               (code, model_version, through_date, distribution, updated_at)
-               VALUES ($1, $2, $3, $4, NOW())
+               (code, model_version, through_date, distribution,
+                last_adjustment_factor, updated_at)
+               VALUES ($1, $2, $3, $4, $5, NOW())
                ON CONFLICT (code, model_version) DO UPDATE SET
                  through_date = EXCLUDED.through_date,
                  distribution = EXCLUDED.distribution,
+                 last_adjustment_factor = EXCLUDED.last_adjustment_factor,
                  updated_at = NOW()
                WHERE chip_model_states.through_date < EXCLUDED.through_date"#,
         )
@@ -153,6 +170,7 @@ impl ChipRepository {
         .bind(&state.model_version)
         .bind(state.through_date)
         .bind(serde_json::to_value(&state.distribution)?)
+        .bind(state.last_adjustment_factor)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
@@ -192,7 +210,7 @@ impl ChipRepository {
                  AND completed_at IS NOT NULL
                  AND decision IS NOT NULL
                  AND error_summary IS NULL
-               ORDER BY completed_at DESC, run_id DESC
+               ORDER BY recorded_at DESC, run_id DESC
                LIMIT 1"#,
         )
         .bind(model_version)
@@ -220,25 +238,41 @@ fn validate_snapshot(snapshot: &ChipSnapshot) -> Result<()> {
             snapshot.source
         )));
     }
-    if snapshot.source == "qbot_estimate"
-        && snapshot
-            .model_version
-            .as_deref()
-            .is_none_or(|version| version.trim().is_empty())
-    {
-        return Err(AppError::BadRequest(
-            "estimated chip snapshot requires a model version".to_string(),
-        ));
+    match snapshot.source.as_str() {
+        "qbot_estimate"
+            if snapshot
+                .model_version
+                .as_deref()
+                .is_none_or(|version| version.trim().is_empty()) =>
+        {
+            return Err(AppError::BadRequest(
+                "estimated chip snapshot requires a model version".to_string(),
+            ));
+        }
+        "tushare" if snapshot.model_version.is_some() => {
+            return Err(AppError::BadRequest(
+                "official chip snapshot cannot carry an estimator model version".to_string(),
+            ));
+        }
+        _ => {}
     }
     for (name, value) in [
         ("average cost", snapshot.average_cost),
-        ("winner rate", snapshot.winner_rate),
-        ("concentration", snapshot.concentration),
         ("dominant peak price", snapshot.dominant_peak_price),
     ] {
-        if !value.is_finite() {
+        if !value.is_finite() || value <= 0.0 {
             return Err(AppError::BadRequest(format!(
-                "chip snapshot {name} must be finite"
+                "chip snapshot {name} must be finite and positive"
+            )));
+        }
+    }
+    for (name, value) in [
+        ("winner rate", snapshot.winner_rate),
+        ("concentration", snapshot.concentration),
+    ] {
+        if !value.is_finite() || !(0.0..=100.0).contains(&value) {
+            return Err(AppError::BadRequest(format!(
+                "chip snapshot {name} must be between 0 and 100"
             )));
         }
     }
@@ -253,9 +287,9 @@ fn validate_buckets(buckets: &[ChipBucket], require_normalized: bool) -> Result<
     }
     let mut sum = 0.0;
     for bucket in buckets {
-        if !bucket.price.is_finite() || bucket.price < 0.0 {
+        if !bucket.price.is_finite() || bucket.price <= 0.0 {
             return Err(AppError::BadRequest(
-                "chip bucket price must be finite and non-negative".to_string(),
+                "chip bucket price must be finite and positive".to_string(),
             ));
         }
         if !bucket.weight.is_finite() || bucket.weight < 0.0 {
@@ -515,10 +549,12 @@ mod tests {
             model_version: "qbot-chip-v2".to_string(),
             through_date: date(2026, 7, 18),
             distribution: snapshot(date(2026, 7, 18), 0.2).distribution,
+            last_adjustment_factor: 2.5,
         };
         let stale = ChipModelState {
             through_date: date(2026, 7, 17),
             distribution: snapshot(date(2026, 7, 17), 0.8).distribution,
+            last_adjustment_factor: 1.5,
             ..newer.clone()
         };
 
@@ -536,6 +572,14 @@ mod tests {
         .await?;
         assert_eq!(through_date, date(2026, 7, 18));
         assert_eq!(distribution, serde_json::to_value(&newer.distribution)?);
+        let factor: f64 = sqlx::query_scalar(
+            "SELECT last_adjustment_factor::float8 FROM chip_model_states WHERE code = $1 AND model_version = $2",
+        )
+        .bind("600519.SH")
+        .bind("qbot-chip-v2")
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(factor, 2.5);
         Ok(())
     }
 
@@ -549,10 +593,12 @@ mod tests {
             model_version: "qbot-chip-v2".to_string(),
             through_date: date(2026, 7, 18),
             distribution: snapshot(date(2026, 7, 18), 0.2).distribution,
+            last_adjustment_factor: 2.5,
         };
         let stale = ChipModelState {
             through_date: date(2026, 7, 17),
             distribution: snapshot(date(2026, 7, 17), 0.8).distribution,
+            last_adjustment_factor: 1.5,
             ..newer.clone()
         };
 
@@ -573,6 +619,281 @@ mod tests {
         .fetch_one(&pool)
         .await?;
         assert_eq!(stored_date, date(2026, 7, 18));
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn app_boundary_enforces_metric_provenance_and_model_state_invariants(
+        pool: PgPool,
+    ) -> crate::error::Result<()> {
+        let repo = ChipRepository::new(pool);
+        let day = date(2026, 7, 17);
+        let mut invalid_snapshots = Vec::new();
+
+        let mut zero_price = snapshot(day, 0.5);
+        zero_price.distribution[0].price = 0.0;
+        invalid_snapshots.push(zero_price);
+        let mut non_finite_price = snapshot(day, 0.5);
+        non_finite_price.distribution[0].price = f64::NAN;
+        invalid_snapshots.push(non_finite_price);
+        let mut zero_cost = snapshot(day, 0.5);
+        zero_cost.average_cost = 0.0;
+        invalid_snapshots.push(zero_cost);
+        let mut non_finite_cost = snapshot(day, 0.5);
+        non_finite_cost.average_cost = f64::INFINITY;
+        invalid_snapshots.push(non_finite_cost);
+        let mut zero_peak = snapshot(day, 0.5);
+        zero_peak.dominant_peak_price = 0.0;
+        invalid_snapshots.push(zero_peak);
+        let mut non_finite_peak = snapshot(day, 0.5);
+        non_finite_peak.dominant_peak_price = f64::NAN;
+        invalid_snapshots.push(non_finite_peak);
+        let mut bad_winner = snapshot(day, 0.5);
+        bad_winner.winner_rate = 100.01;
+        invalid_snapshots.push(bad_winner);
+        let mut bad_concentration = snapshot(day, 0.5);
+        bad_concentration.concentration = -0.01;
+        invalid_snapshots.push(bad_concentration);
+        let mut official_with_model = snapshot(day, 0.5);
+        official_with_model.source = "tushare".to_string();
+        invalid_snapshots.push(official_with_model);
+
+        for invalid in invalid_snapshots {
+            assert!(repo.upsert_snapshot(&invalid).await.is_err());
+        }
+
+        let buckets = snapshot(day, 0.5).distribution;
+        for state in [
+            ChipModelState {
+                code: "".to_string(),
+                model_version: "qbot-chip-v2".to_string(),
+                through_date: day,
+                distribution: buckets.clone(),
+                last_adjustment_factor: 1.0,
+            },
+            ChipModelState {
+                code: "600519.SH".to_string(),
+                model_version: "".to_string(),
+                through_date: day,
+                distribution: buckets.clone(),
+                last_adjustment_factor: 1.0,
+            },
+            ChipModelState {
+                code: "600519.SH".to_string(),
+                model_version: "qbot-chip-v2".to_string(),
+                through_date: day,
+                distribution: buckets.clone(),
+                last_adjustment_factor: 0.0,
+            },
+            ChipModelState {
+                code: "600519.SH".to_string(),
+                model_version: "qbot-chip-v2".to_string(),
+                through_date: day,
+                distribution: buckets,
+                last_adjustment_factor: f64::NAN,
+            },
+        ] {
+            assert!(repo.save_model_state(&state).await.is_err());
+        }
+        let state_distribution = serde_json::to_value(snapshot(day, 0.5).distribution)?;
+        assert!(sqlx::query(
+            r#"INSERT INTO chip_model_states
+               (code, model_version, through_date, distribution, last_adjustment_factor)
+               VALUES ('600519.SH', 'direct-sql-nan', DATE '2026-07-17', $1,
+                       'NaN'::numeric)"#,
+        )
+        .bind(state_distribution)
+        .execute(&repo.pool)
+        .await
+        .is_err());
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn exact_zero_and_hundred_percent_metrics_round_trip(
+        pool: PgPool,
+    ) -> crate::error::Result<()> {
+        let repo = ChipRepository::new(pool);
+        let mut lower = snapshot(date(2026, 7, 17), 0.5);
+        lower.winner_rate = 0.0;
+        lower.concentration = 0.0;
+        repo.upsert_snapshot(&lower).await?;
+        let mut upper = snapshot(date(2026, 7, 18), 0.5);
+        upper.winner_rate = 100.0;
+        upper.concentration = 100.0;
+        repo.upsert_snapshot(&upper).await?;
+
+        let stored = repo.latest_snapshot("600519.SH").await?.unwrap();
+        assert_eq!(stored.winner_rate, 100.0);
+        assert_eq!(stored.concentration, 100.0);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn database_constraints_reject_invalid_metrics_and_provenance(
+        pool: PgPool,
+    ) -> crate::error::Result<()> {
+        let normalized = serde_json::to_value(snapshot(date(2026, 7, 17), 0.5).distribution)?;
+        let insert = |code: &'static str,
+                      avg_cost: f64,
+                      winner_rate: f64,
+                      concentration: f64,
+                      peak: f64,
+                      source: &'static str,
+                      model: Option<&'static str>,
+                      validated: bool,
+                      format: &'static str| {
+            let pool = pool.clone();
+            let normalized = normalized.clone();
+            async move {
+                sqlx::query(
+                    r#"INSERT INTO chip_distribution
+                       (code, trade_date, distribution, avg_cost, profit_ratio, concentration,
+                        dominant_peak_price, source, model_version, validated, distribution_format)
+                       VALUES ($1, DATE '2026-07-17', $2, $3, $4, $5, $6, $7, $8, $9, $10)"#,
+                )
+                .bind(code)
+                .bind(normalized)
+                .bind(avg_cost)
+                .bind(winner_rate)
+                .bind(concentration)
+                .bind(peak)
+                .bind(source)
+                .bind(model)
+                .bind(validated)
+                .bind(format)
+                .execute(&pool)
+                .await
+            }
+        };
+
+        assert!(insert(
+            "BAD001",
+            0.0,
+            50.0,
+            50.0,
+            10.0,
+            "qbot_estimate",
+            Some("v2"),
+            false,
+            "normalized_probability"
+        )
+        .await
+        .is_err());
+        assert!(insert(
+            "BAD002",
+            10.0,
+            101.0,
+            50.0,
+            10.0,
+            "qbot_estimate",
+            Some("v2"),
+            false,
+            "normalized_probability"
+        )
+        .await
+        .is_err());
+        assert!(insert(
+            "BAD003",
+            10.0,
+            50.0,
+            -1.0,
+            10.0,
+            "qbot_estimate",
+            Some("v2"),
+            false,
+            "normalized_probability"
+        )
+        .await
+        .is_err());
+        assert!(insert(
+            "BAD004",
+            10.0,
+            50.0,
+            50.0,
+            0.0,
+            "qbot_estimate",
+            Some("v2"),
+            false,
+            "normalized_probability"
+        )
+        .await
+        .is_err());
+        assert!(insert(
+            "BAD005",
+            10.0,
+            50.0,
+            50.0,
+            10.0,
+            "legacy",
+            Some("v2"),
+            false,
+            "legacy_peak_relative"
+        )
+        .await
+        .is_err());
+        assert!(insert(
+            "BAD006",
+            10.0,
+            50.0,
+            50.0,
+            10.0,
+            "legacy",
+            None,
+            true,
+            "legacy_peak_relative"
+        )
+        .await
+        .is_err());
+        assert!(insert(
+            "BAD007",
+            10.0,
+            50.0,
+            50.0,
+            10.0,
+            "qbot_estimate",
+            None,
+            false,
+            "normalized_probability"
+        )
+        .await
+        .is_err());
+        assert!(insert(
+            "BAD008",
+            10.0,
+            50.0,
+            50.0,
+            10.0,
+            "tushare",
+            Some("v2"),
+            true,
+            "normalized_probability"
+        )
+        .await
+        .is_err());
+        assert!(insert(
+            "BAD009",
+            10.0,
+            50.0,
+            50.0,
+            10.0,
+            "tushare",
+            None,
+            true,
+            "legacy_peak_relative"
+        )
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            r#"INSERT INTO chip_distribution
+               (code, trade_date, distribution, avg_cost, profit_ratio, concentration,
+                dominant_peak_price, source, model_version, validated, distribution_format)
+               VALUES ('BAD010', DATE '2026-07-17', '[]', 'NaN'::numeric, 50, 50,
+                       10, 'qbot_estimate', 'v2', FALSE, 'normalized_probability')"#,
+        )
+        .execute(&pool)
+        .await
+        .is_err());
         Ok(())
     }
 
@@ -614,6 +935,19 @@ mod tests {
         for run in [&older, &failed, &incomplete, &tie_low, &tie_high] {
             repo.save_validation_run(run).await?;
         }
+        sqlx::query(
+            "UPDATE chip_model_validation_runs SET recorded_at = TIMESTAMPTZ '2026-07-18 02:00:00Z' WHERE run_id = $1",
+        )
+        .bind(older.run_id)
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "UPDATE chip_model_validation_runs SET recorded_at = TIMESTAMPTZ '2026-07-18 03:00:00Z' WHERE run_id IN ($1, $2)",
+        )
+        .bind(tie_low.run_id)
+        .bind(tie_high.run_id)
+        .execute(&pool)
+        .await?;
 
         assert_eq!(
             repo.latest_validation_decision("qbot-chip-v2").await?,
@@ -634,6 +968,35 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn validation_decision_recency_uses_database_recording_time_not_caller_clock(
+        pool: PgPool,
+    ) -> crate::error::Result<()> {
+        let repo = ChipRepository::new(pool.clone());
+        let future_completed = validation_run(
+            Uuid::parse_str("10000000-0000-0000-0000-000000000001").unwrap(),
+            Some(23),
+            Some(ChipSourceDecision::Official),
+            None,
+        );
+        repo.save_validation_run(&future_completed).await?;
+        sqlx::query("SELECT pg_sleep(0.01)").execute(&pool).await?;
+        let mut later_recorded = validation_run(
+            Uuid::parse_str("10000000-0000-0000-0000-000000000002").unwrap(),
+            Some(2),
+            Some(ChipSourceDecision::Estimate),
+            None,
+        );
+        later_recorded.started_at = Utc.with_ymd_and_hms(2026, 7, 18, 0, 0, 0).unwrap();
+        repo.save_validation_run(&later_recorded).await?;
+
+        assert_eq!(
+            repo.latest_validation_decision("qbot-chip-v2").await?,
+            Some(ChipSourceDecision::Estimate)
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn migration_preserves_legacy_chip_rows_with_honest_provenance(
         pool: PgPool,
     ) -> crate::error::Result<()> {
@@ -642,6 +1005,11 @@ mod tests {
             .await?;
         sqlx::query(
             "ALTER TABLE chip_distribution DROP COLUMN source, DROP COLUMN model_version, DROP COLUMN dominant_peak_price, DROP COLUMN validated, DROP COLUMN source_updated_at, DROP COLUMN distribution_format",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE chip_distribution ALTER COLUMN profit_ratio TYPE NUMERIC(6,4), ALTER COLUMN concentration TYPE NUMERIC(6,4)",
         )
         .execute(&pool)
         .await?;
