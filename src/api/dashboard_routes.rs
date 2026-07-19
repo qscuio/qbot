@@ -15,6 +15,7 @@ use crate::services::dashboard::{DashboardPeriod, DashboardService};
 use crate::services::dashboard_auth::{
     session_token_from_cookie, DashboardAuth, SESSION_COOKIE_NAME, SESSION_TTL_SECONDS,
 };
+use crate::services::dashboard_company::DashboardCompanyService;
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -35,6 +36,53 @@ impl DashboardDetailQuery {
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub(crate) struct DashboardFinancialQuery {
+    frequency: Option<String>,
+    limit: Option<String>,
+    cursor: Option<String>,
+}
+
+impl DashboardFinancialQuery {
+    fn parsed_frequency(&self) -> crate::error::Result<crate::data::company::FinancialFrequency> {
+        crate::data::company::FinancialFrequency::from_storage(
+            self.frequency.as_deref().unwrap_or("annual"),
+        )
+        .ok_or_else(|| {
+            crate::error::AppError::BadRequest("frequency must be annual or quarterly".to_string())
+        })
+    }
+
+    fn parsed_limit(&self) -> crate::error::Result<usize> {
+        parsed_company_page_limit(self.limit.as_deref())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct DashboardDividendQuery {
+    limit: Option<String>,
+    cursor: Option<String>,
+}
+
+impl DashboardDividendQuery {
+    fn parsed_limit(&self) -> crate::error::Result<usize> {
+        parsed_company_page_limit(self.limit.as_deref())
+    }
+}
+
+fn parsed_company_page_limit(value: Option<&str>) -> crate::error::Result<usize> {
+    match value {
+        None => Ok(50),
+        Some(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|limit| (1..=100).contains(limit))
+            .ok_or_else(|| {
+                crate::error::AppError::BadRequest("limit must be between 1 and 100".to_string())
+            }),
+    }
+}
+
 pub fn dashboard_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/dashboard/auth/login", post(login))
@@ -42,6 +90,15 @@ pub fn dashboard_router(state: Arc<AppState>) -> Router {
         .route("/api/dashboard/auth/session", get(session))
         .route("/api/dashboard/bootstrap", get(bootstrap))
         .route("/api/dashboard/stocks/:code", get(stock_detail))
+        .route("/api/dashboard/stocks/:code/company", get(stock_company))
+        .route(
+            "/api/dashboard/stocks/:code/financials",
+            get(stock_financials),
+        )
+        .route(
+            "/api/dashboard/stocks/:code/dividends",
+            get(stock_dividends),
+        )
         .nest_service(
             "/dashboard",
             ServeDir::new("web/dashboard").append_index_html_on_directories(true),
@@ -211,6 +268,103 @@ async fn stock_detail(
     }
 }
 
+fn company_service(state: &AppState) -> Result<DashboardCompanyService, Response> {
+    let secret = state
+        .config
+        .dashboard_session_secret
+        .clone()
+        .ok_or_else(|| internal_error("dashboard cursor secret is not configured"))?;
+    Ok(DashboardCompanyService::new(state.db.clone(), secret))
+}
+
+async fn stock_company(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(code): Path<String>,
+) -> Response {
+    if let Err(response) = authorized(&state, &headers).await {
+        return response;
+    }
+    let service = match company_service(&state) {
+        Ok(service) => service,
+        Err(response) => return response,
+    };
+    match service.company(&code).await {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => dashboard_company_error(error),
+    }
+}
+
+async fn stock_financials(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(code): Path<String>,
+    Query(query): Query<DashboardFinancialQuery>,
+) -> Response {
+    if let Err(response) = authorized(&state, &headers).await {
+        return response;
+    }
+    let frequency = match query.parsed_frequency() {
+        Ok(frequency) => frequency,
+        Err(error) => return dashboard_company_error(error),
+    };
+    let limit = match query.parsed_limit() {
+        Ok(limit) => limit,
+        Err(error) => return dashboard_company_error(error),
+    };
+    let service = match company_service(&state) {
+        Ok(service) => service,
+        Err(response) => return response,
+    };
+    match service
+        .financials(&code, frequency, limit, query.cursor.as_deref())
+        .await
+    {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => dashboard_company_error(error),
+    }
+}
+
+async fn stock_dividends(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(code): Path<String>,
+    Query(query): Query<DashboardDividendQuery>,
+) -> Response {
+    if let Err(response) = authorized(&state, &headers).await {
+        return response;
+    }
+    let service = match company_service(&state) {
+        Ok(service) => service,
+        Err(response) => return response,
+    };
+    let limit = match query.parsed_limit() {
+        Ok(limit) => limit,
+        Err(error) => return dashboard_company_error(error),
+    };
+    match service
+        .dividends(&code, limit, query.cursor.as_deref())
+        .await
+    {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => dashboard_company_error(error),
+    }
+}
+
+fn dashboard_company_error(error: crate::error::AppError) -> Response {
+    match error {
+        crate::error::AppError::BadRequest(message) => {
+            (StatusCode::BAD_REQUEST, Json(json!({"error": message}))).into_response()
+        }
+        crate::error::AppError::NotFound(_) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "stock not found"})),
+        )
+            .into_response(),
+        error => internal_error(&error.to_string()),
+    }
+}
+
 fn valid_origin(state: &AppState, headers: &HeaderMap) -> bool {
     let Some(expected) = state.config.dashboard_public_url.as_deref() else {
         return false;
@@ -253,6 +407,13 @@ fn internal_error(message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::PgPool;
+    use tokio::sync::Mutex;
+    use uuid::Uuid;
+
+    use crate::config::Config;
+    use crate::data::tushare::TushareClient;
+    use crate::telegram::pusher::TelegramPusher;
 
     #[test]
     fn detail_query_rejects_unknown_period() {
@@ -272,5 +433,182 @@ mod tests {
         };
 
         assert_eq!(query.parsed_period().unwrap(), DashboardPeriod::Daily);
+    }
+
+    async fn test_state(pool: PgPool) -> Arc<AppState> {
+        let redis_url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        let redis_client = redis::Client::open(redis_url.clone()).unwrap();
+        let redis = redis::aio::ConnectionManager::new(redis_client)
+            .await
+            .unwrap();
+        let session_secret = format!("dashboard-route-test-secret-{}", Uuid::new_v4());
+        let provider = Arc::new(TushareClient::new("test".to_string(), None));
+        Arc::new(AppState {
+            config: Arc::new(Config {
+                tushare_token: "test".to_string(),
+                database_url: "postgresql://qbot:qbot@127.0.0.1/qbot".to_string(),
+                redis_url,
+                telegram_bot_token: "test".to_string(),
+                telegram_webhook_secret: None,
+                webhook_url: None,
+                stock_alert_channel: None,
+                report_channel: None,
+                daban_channel: None,
+                api_port: 8080,
+                api_key: Some("test-key".to_string()),
+                dashboard_public_url: Some("https://dash.example.test".to_string()),
+                dashboard_username: Some("analyst".to_string()),
+                dashboard_password_hash: Some("$argon2-test".to_string()),
+                dashboard_session_secret: Some(session_secret),
+                ai_api_key: None,
+                ai_base_url: "https://api.openai.com/v1".to_string(),
+                ai_model: "gpt-4o-mini".to_string(),
+                data_proxy: None,
+                official_event_feed_url: None,
+                official_event_feed_api_key: None,
+                official_event_source_id: "official:market_event".to_string(),
+                official_event_store_full_content: false,
+                enable_gdelt_events: false,
+                gdelt_event_query: String::new(),
+                gdelt_max_records: 250,
+                enable_burst_monitor: false,
+                enable_daban_live: false,
+                enable_ai_analysis: false,
+                enable_chip_dist: false,
+                enable_event_score_adjustment: false,
+                max_event_score_adjustment: 0.0,
+                enable_signal_auto_trading: false,
+            }),
+            db: pool,
+            redis,
+            provider: provider.clone(),
+            point_in_time_provider: provider,
+            pusher: Arc::new(TelegramPusher::new("test".to_string())),
+            fetch_job_lock: Arc::new(Mutex::new(())),
+            analysis_job_lock: Arc::new(Mutex::new(())),
+            scan_job_lock: Arc::new(Mutex::new(())),
+            daily_report_job_lock: Arc::new(Mutex::new(())),
+            weekly_report_job_lock: Arc::new(Mutex::new(())),
+        })
+    }
+
+    async fn authenticated_cookie(state: &AppState) -> String {
+        let auth = DashboardAuth::from_config(&state.config, state.redis.clone()).unwrap();
+        let token = auth.create_session().await.unwrap();
+        format!("{SESSION_COOKIE_NAME}={token}")
+    }
+
+    fn headers(cookie: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Some(cookie) = cookie {
+            headers.insert(header::COOKIE, HeaderValue::from_str(cookie).unwrap());
+        }
+        headers
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn company_routes_authenticate_before_lookup_and_map_validation_and_existence(
+        pool: PgPool,
+    ) -> crate::error::Result<()> {
+        sqlx::query(
+            r#"INSERT INTO stock_info (code, name, market, industry)
+               VALUES ('600519.SH', '贵州茅台', 'SH', '白酒')"#,
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            r#"INSERT INTO security_master_versions
+               (code, name, market, exchange, list_status, list_date, available_at,
+                availability_quality, source)
+               VALUES ('600519.SH', '贵州茅台', '主板', 'SSE', 'L', '2001-08-27',
+                       '2026-01-01T00:00:00Z', 'observed', 'tushare')"#,
+        )
+        .execute(&pool)
+        .await?;
+        let state = test_state(pool).await;
+
+        let unauthenticated = stock_financials(
+            State(state.clone()),
+            headers(None),
+            Path("999999.SH".to_string()),
+            Query(DashboardFinancialQuery {
+                frequency: Some("monthly".to_string()),
+                limit: None,
+                cursor: None,
+            }),
+        )
+        .await;
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+        let cookie = authenticated_cookie(&state).await;
+        for query in [
+            DashboardFinancialQuery {
+                frequency: Some("monthly".to_string()),
+                limit: None,
+                cursor: None,
+            },
+            DashboardFinancialQuery {
+                frequency: None,
+                limit: Some("0".to_string()),
+                cursor: None,
+            },
+            DashboardFinancialQuery {
+                frequency: None,
+                limit: Some("not-a-number".to_string()),
+                cursor: None,
+            },
+            DashboardFinancialQuery {
+                frequency: None,
+                limit: None,
+                cursor: Some("invalid".to_string()),
+            },
+        ] {
+            let response = stock_financials(
+                State(state.clone()),
+                headers(Some(&cookie)),
+                Path("600519.SH".to_string()),
+                Query(query),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let missing = stock_company(
+            State(state.clone()),
+            headers(Some(&cookie)),
+            Path("999999.SH".to_string()),
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let company = stock_company(
+            State(state.clone()),
+            headers(Some(&cookie)),
+            Path("600519.SH".to_string()),
+        )
+        .await;
+        assert_eq!(company.status(), StatusCode::OK);
+        let financials = stock_financials(
+            State(state.clone()),
+            headers(Some(&cookie)),
+            Path("600519.SH".to_string()),
+            Query(DashboardFinancialQuery {
+                frequency: Some("annual".to_string()),
+                limit: Some("10".to_string()),
+                cursor: None,
+            }),
+        )
+        .await;
+        assert_eq!(financials.status(), StatusCode::OK);
+        let dividends = stock_dividends(
+            State(state),
+            headers(Some(&cookie)),
+            Path("600519.SH".to_string()),
+            Query(DashboardDividendQuery {
+                limit: Some("10".to_string()),
+                cursor: None,
+            }),
+        )
+        .await;
+        assert_eq!(dividends.status(), StatusCode::OK);
+        Ok(())
     }
 }
