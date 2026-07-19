@@ -31,6 +31,28 @@ fn repair_company_intelligence_requested(args: impl IntoIterator<Item = String>)
         .any(|arg| arg == "--repair-company-intelligence")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepairMode {
+    None,
+    DailyBars,
+    CompanyIntelligence,
+}
+
+fn repair_mode(args: impl IntoIterator<Item = String>) -> Result<RepairMode> {
+    let args = args.into_iter().collect::<Vec<_>>();
+    let daily_bars = repair_daily_bars_requested(args.iter().cloned());
+    let company_intelligence = repair_company_intelligence_requested(args.iter().cloned());
+
+    match (daily_bars, company_intelligence) {
+        (true, true) => anyhow::bail!(
+            "--repair-daily-bars and --repair-company-intelligence are mutually exclusive"
+        ),
+        (true, false) => Ok(RepairMode::DailyBars),
+        (false, true) => Ok(RepairMode::CompanyIntelligence),
+        (false, false) => Ok(RepairMode::None),
+    }
+}
+
 async fn run_company_intelligence_repair<Financials, FinancialFuture, Dividends, DividendFuture>(
     financials: Financials,
     dividends: Dividends,
@@ -99,6 +121,8 @@ where
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let repair_mode = repair_mode(std::env::args())?;
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -106,9 +130,8 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let args = std::env::args().collect::<Vec<_>>();
-    let repair_daily_bars = repair_daily_bars_requested(args.iter().cloned());
-    let repair_company_intelligence = repair_company_intelligence_requested(args.iter().cloned());
+    let repair_daily_bars = repair_mode == RepairMode::DailyBars;
+    let repair_company_intelligence = repair_mode == RepairMode::CompanyIntelligence;
     info!("qbot starting...");
 
     let config = config::Config::from_env()?;
@@ -416,7 +439,7 @@ async fn main() -> Result<()> {
 mod tests {
     use super::{
         api_bind_addr, repair_company_intelligence_requested, repair_daily_bars_requested,
-        run_company_intelligence_repair,
+        repair_mode, run_company_intelligence_repair,
     };
     use crate::error::AppError;
     use crate::services::company_intelligence::CompanySyncReport;
@@ -452,29 +475,148 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn company_repair_attempts_dividends_after_financial_failure() {
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let financial_calls = calls.clone();
-        let dividend_calls = calls.clone();
+    #[test]
+    fn repair_modes_are_mutually_exclusive_before_startup() {
+        let error = repair_mode(
+            [
+                "qbot",
+                "--repair-daily-bars",
+                "--repair-company-intelligence",
+            ]
+            .map(str::to_string),
+        )
+        .unwrap_err();
 
-        let result = run_company_intelligence_repair(
-            move || async move {
-                financial_calls.lock().unwrap().push("financials");
-                Err(AppError::DataProvider("financial failure".to_string()))
+        assert!(error.to_string().contains("mutually exclusive"));
+    }
+
+    #[derive(Clone, Copy)]
+    enum RepairOutcome {
+        Report {
+            completed: usize,
+            failed: usize,
+            pending: usize,
+        },
+        Error(&'static str),
+    }
+
+    impl RepairOutcome {
+        fn result(self) -> crate::error::Result<CompanySyncReport> {
+            match self {
+                Self::Report {
+                    completed,
+                    failed,
+                    pending,
+                } => Ok(CompanySyncReport {
+                    completed,
+                    failed,
+                    pending,
+                }),
+                Self::Error(message) => Err(AppError::DataProvider(message.to_string())),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn company_repair_attempts_both_phases_and_reports_every_outcome() {
+        struct Case {
+            name: &'static str,
+            financials: RepairOutcome,
+            dividends: RepairOutcome,
+            succeeds: bool,
+            expected_errors: &'static [&'static str],
+        }
+
+        let success = RepairOutcome::Report {
+            completed: 2,
+            failed: 0,
+            pending: 0,
+        };
+        let cases = [
+            Case {
+                name: "both phases succeed",
+                financials: success,
+                dividends: success,
+                succeeds: true,
+                expected_errors: &[],
             },
-            move || async move {
-                dividend_calls.lock().unwrap().push("dividends");
-                Ok(CompanySyncReport {
+            Case {
+                name: "pending report is incomplete",
+                financials: RepairOutcome::Report {
                     completed: 1,
                     failed: 0,
-                    pending: 0,
-                })
+                    pending: 1,
+                },
+                dividends: success,
+                succeeds: false,
+                expected_errors: &["financial repair incomplete", "pending=1"],
             },
-        )
-        .await;
+            Case {
+                name: "failed report is incomplete",
+                financials: RepairOutcome::Report {
+                    completed: 1,
+                    failed: 1,
+                    pending: 0,
+                },
+                dividends: success,
+                succeeds: false,
+                expected_errors: &["financial repair incomplete", "failed=1"],
+            },
+            Case {
+                name: "dividend failure follows financial success",
+                financials: success,
+                dividends: RepairOutcome::Error("dividend failure"),
+                succeeds: false,
+                expected_errors: &["dividend failure"],
+            },
+            Case {
+                name: "both failures are retained",
+                financials: RepairOutcome::Error("financial failure"),
+                dividends: RepairOutcome::Error("dividend failure"),
+                succeeds: false,
+                expected_errors: &["financial failure", "dividend failure"],
+            },
+        ];
 
-        assert!(result.is_err());
-        assert_eq!(*calls.lock().unwrap(), vec!["financials", "dividends"]);
+        for case in cases {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let financial_calls = calls.clone();
+            let dividend_calls = calls.clone();
+            let financials = case.financials;
+            let dividends = case.dividends;
+
+            let result = run_company_intelligence_repair(
+                move || async move {
+                    financial_calls.lock().unwrap().push("financials");
+                    financials.result()
+                },
+                move || async move {
+                    dividend_calls.lock().unwrap().push("dividends");
+                    dividends.result()
+                },
+            )
+            .await;
+            let error = result
+                .as_ref()
+                .err()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+
+            assert_eq!(result.is_ok(), case.succeeds, "{}: {error}", case.name);
+            assert_eq!(
+                *calls.lock().unwrap(),
+                vec!["financials", "dividends"],
+                "{}",
+                case.name
+            );
+            let mut previous_position = 0;
+            for expected in case.expected_errors {
+                let position = error[previous_position..]
+                    .find(expected)
+                    .map(|offset| previous_position + offset)
+                    .unwrap_or_else(|| panic!("{}: missing {expected:?} in {error:?}", case.name));
+                previous_position = position + expected.len();
+            }
+        }
     }
 }
