@@ -182,6 +182,8 @@ test("resizable stock information sidebar persists its desktop layout", async ({
   await page.mouse.up();
   await expect(inspector).toHaveCSS("width", "600px");
   expect((await chartSurface.boundingBox()).width).toBeLessThan(initialChartWidth);
+  await page.reload();
+  await expect(inspector).toHaveCSS("width", "600px");
 
   const maxDivider = await resizer.boundingBox();
   await page.mouse.move(maxDivider.x + maxDivider.width / 2, maxDivider.y + 40);
@@ -192,6 +194,23 @@ test("resizable stock information sidebar persists its desktop layout", async ({
 
   await resizer.dblclick();
   await expect(inspector).toHaveCSS("width", "380px");
+  await expect(resizer).toHaveAttribute("role", "separator");
+  await resizer.focus();
+  await page.keyboard.press("ArrowLeft");
+  await expect(inspector).toHaveCSS("width", "400px");
+  await page.keyboard.press("ArrowRight");
+  await expect(inspector).toHaveCSS("width", "380px");
+
+  const overviewTab = page.locator('[data-inspector-tab="overview"]');
+  const financialsTab = page.locator('[data-inspector-tab="financials"]');
+  await expect(overviewTab).toHaveAttribute("tabindex", "0");
+  await expect(financialsTab).toHaveAttribute("tabindex", "-1");
+  await overviewTab.focus();
+  await page.keyboard.press("ArrowRight");
+  await expect(financialsTab).toBeFocused();
+  await expect(financialsTab).toHaveAttribute("aria-selected", "true");
+  await expect(page.locator('[data-inspector-panel="financials"]')).toBeVisible();
+
   await page.locator(".inspector-toggle").click();
   await expect(workspace).toHaveClass(/inspector-collapsed/);
   await page.reload();
@@ -210,8 +229,74 @@ test("resizable stock information sidebar persists its desktop layout", async ({
   expect(overflow.height[1]).toBe(overflow.height[0]);
 });
 
+test("resizable stock information sidebar reclamps and resizes its chart on live viewport changes", async ({ page }) => {
+  await page.setViewportSize({ width: 1200, height: 800 });
+  await page.addInitScript(() => localStorage.setItem("qbot.dashboard.inspector.v1", JSON.stringify({ width: 600, collapsed: false })));
+  await mockApi(page);
+  await page.goto("/dashboard/");
+  await page.locator("tbody tr").first().click();
+
+  const inspector = page.locator(".stock-inspector");
+  await expect(inspector).toHaveCSS("width", "600px");
+  const initialSurfaceWidth = (await page.locator("#stock-chart > div").boundingBox()).width;
+  await page.setViewportSize({ width: 900, height: 700 });
+  await expect.soft(inspector).toHaveCSS("width", "450px");
+  await expect.poll(() => page.evaluate(() => ({
+    host: document.querySelector("#stock-chart").getBoundingClientRect().width,
+    surface: document.querySelector("#stock-chart > div").getBoundingClientRect().width,
+  })).then(({ host, surface }) => ({ matches: Math.abs(host - surface) <= 1, shrank: surface < initialSurfaceWidth }))).toEqual({ matches: true, shrank: true });
+  expect(await page.evaluate(() => JSON.parse(localStorage.getItem("qbot.dashboard.inspector.v1")).width)).toBe(600);
+
+  await page.setViewportSize({ width: 1400, height: 800 });
+  await expect(inspector).toHaveCSS("width", "600px");
+  await expect.poll(() => page.evaluate(() => {
+    const host = document.querySelector("#stock-chart").getBoundingClientRect().width;
+    const surface = document.querySelector("#stock-chart > div").getBoundingClientRect().width;
+    return Math.abs(host - surface);
+  })).toBeLessThanOrEqual(1);
+});
+
+test("mobile inspector actions preserve the preferred desktop width", async ({ page }) => {
+  await page.setViewportSize({ width: 680, height: 420 });
+  await page.addInitScript(() => {
+    if (!localStorage.getItem("qbot.dashboard.inspector.v1")) {
+      localStorage.setItem("qbot.dashboard.inspector.v1", JSON.stringify({ width: 520, collapsed: false }));
+    }
+  });
+  await mockApi(page);
+  await page.goto("/dashboard/");
+  await page.locator("tbody tr").first().click();
+
+  await expect(page.locator(".stock-inspector")).toHaveCSS("width", "340px");
+  await page.locator(".inspector-toggle").click();
+  await page.locator(".inspector-toggle").click();
+  await page.keyboard.press("Escape");
+  await expect(page.locator(".stock-workspace")).toHaveClass(/inspector-collapsed/);
+  await page.setViewportSize({ width: 1200, height: 800 });
+  await page.reload();
+  await expect(page.locator(".stock-inspector")).toHaveCSS("width", "520px");
+});
+
+test("resizable stock information sidebar cleans up lost pointer capture", async ({ page }) => {
+  await page.setViewportSize({ width: 1200, height: 800 });
+  await mockApi(page);
+  await page.goto("/dashboard/");
+  await page.locator("tbody tr").first().click();
+
+  const resizer = page.locator(".inspector-resizer");
+  const divider = await resizer.boundingBox();
+  await page.mouse.move(divider.x + divider.width / 2, divider.y + 40);
+  await page.mouse.down();
+  await expect(resizer).toHaveClass(/dragging/);
+  await resizer.dispatchEvent("pointerup", { pointerId: 999 });
+  await expect(resizer).toHaveClass(/dragging/);
+  await resizer.dispatchEvent("lostpointercapture", { pointerId: 1 });
+  await expect(resizer).not.toHaveClass(/dragging/);
+  await page.mouse.up();
+});
+
 test("resizable stock information sidebar becomes a narrow overlay drawer", async ({ page }) => {
-  await page.setViewportSize({ width: 680, height: 800 });
+  await page.setViewportSize({ width: 680, height: 420 });
   await mockApi(page);
   await page.goto("/dashboard/");
   await page.locator("tbody tr").first().click();
@@ -220,6 +305,19 @@ test("resizable stock information sidebar becomes a narrow overlay drawer", asyn
   const inspector = page.locator(".stock-inspector");
   const chartPane = page.locator(".chart-pane");
   const openChartWidth = (await chartPane.boundingBox()).width;
+  expect((await chartPane.boundingBox()).height).toBeLessThanOrEqual((await workspace.boundingBox()).height);
+  expect((await page.locator("#stock-chart").boundingBox()).height).toBeLessThanOrEqual((await chartPane.boundingBox()).height - 28);
+  const verticalLayout = await page.evaluate(() => {
+    const editor = document.querySelector(".editor-body");
+    const stockWorkspace = document.querySelector(".stock-workspace");
+    return {
+      editor: { client: editor.clientHeight, scroll: editor.scrollHeight },
+      workspaceBottom: stockWorkspace.getBoundingClientRect().bottom,
+      editorBottom: editor.getBoundingClientRect().bottom,
+    };
+  });
+  expect(verticalLayout.editor.scroll).toBe(verticalLayout.editor.client);
+  expect(verticalLayout.workspaceBottom).toBeLessThanOrEqual(verticalLayout.editorBottom);
   await expect(inspector).toBeVisible();
   await expect(inspector).toHaveCSS("position", "absolute");
   await expect(page.locator(".inspector-resizer")).toBeHidden();

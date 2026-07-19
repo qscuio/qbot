@@ -21,12 +21,22 @@ let workspace = createWorkspaceState();
 let filters = { search: "", group: "", signal: "", rankedOnly: false, sort: "ranked", direction: "desc" };
 const details = new Map();
 let chartHandle = null;
+let inspectorCleanup = null;
 let refreshTimer = null;
 let filterMenuOpen = false;
 let inspectorTab = "overview";
-let inspectorPreferences = loadInspectorPreferences(window.localStorage, window.innerWidth);
+let inspectorPreferences = loadInspectorPreferences(window.localStorage, Number.POSITIVE_INFINITY);
 
 const defaultInspectorWidth = 380;
+const minimumInspectorWidth = 300;
+
+function effectiveInspectorWidth() {
+  return clampInspectorWidth(inspectorPreferences.width, window.innerWidth);
+}
+
+function maximumInspectorWidth() {
+  return Math.max(minimumInspectorWidth, Math.floor(window.innerWidth * 0.5));
+}
 
 function scheduleRefresh() {
   clearInterval(refreshTimer);
@@ -182,7 +192,7 @@ function inspectorTemplate(detail) {
     ["dividends", "Dividends"],
     ["chips", "Chips"],
   ];
-  const tabButtons = tabs.map(([id, label]) => `<button type="button" role="tab" data-inspector-tab="${id}" id="inspector-tab-${id}" aria-controls="inspector-panel-${id}" aria-selected="${inspectorTab === id}" class="inspector-tab ${inspectorTab === id ? "active" : ""}">${label}</button>`).join("");
+  const tabButtons = tabs.map(([id, label]) => `<button type="button" role="tab" data-inspector-tab="${id}" id="inspector-tab-${id}" aria-controls="inspector-panel-${id}" aria-selected="${inspectorTab === id}" tabindex="${inspectorTab === id ? "0" : "-1"}" class="inspector-tab ${inspectorTab === id ? "active" : ""}">${label}</button>`).join("");
   return `<aside class="stock-inspector" id="stock-inspector" aria-label="Stock information">
     <div class="inspector-heading"><strong>Information</strong><span class="mono">${escapeHtml(detail.code)}</span></div>
     <div class="inspector-tabs" role="tablist" aria-label="Stock information sections">${tabButtons}</div>
@@ -213,13 +223,16 @@ function stockTemplate(tab, detail) {
   const periods = [["daily", "D", "Daily"], ["weekly", "W", "Weekly"], ["monthly", "M", "Monthly"]];
   const periodName = periods.find(([period]) => period === detail.period)?.[2] || "Daily";
   const activity = activitySeries(detail.bars);
+  const inspectorWidth = effectiveInspectorWidth();
   return `<section class="stock-view">
     <header class="stock-toolbar"><div class="stock-identity"><h1>${escapeHtml(detail.name)}<span>${escapeHtml(detail.code)}</span></h1><div class="muted mono">${latest ? escapeHtml(latest.time) : "No market history"}${detail.partial ? " · partial data" : ""}</div></div><div class="stock-quote"><span class="stock-price">${formatNumber(latest?.close)}</span><span class="number ${changeClass(change)}">${change == null ? "—" : `${change > 0 ? "+" : ""}${formatNumber(change)}%`}</span></div><div class="periods" aria-label="Chart period">${periods.map(([period, label, name]) => `<button class="period-button ${tab.period === period ? "active" : ""}" data-period="${period}" aria-label="${name}" title="${name}">${label}</button>`).join("")}</div><div class="nav-buttons"><button class="ghost-button" data-neighbor="${escapeHtml(activeRows[index - 1]?.code || "")}" ${index <= 0 ? "disabled" : ""}>← Prev</button><button class="ghost-button" data-neighbor="${escapeHtml(activeRows[index + 1]?.code || "")}" ${index < 0 || index >= activeRows.length - 1 ? "disabled" : ""}>Next →</button></div><button class="ghost-button inspector-toggle" type="button" aria-controls="stock-inspector" aria-expanded="${!inspectorPreferences.collapsed}" aria-label="${inspectorPreferences.collapsed ? "Show" : "Hide"} stock information">ⓘ</button></header>
-    <div class="stock-workspace ${inspectorPreferences.collapsed ? "inspector-collapsed" : ""}" style="--inspector-width:${inspectorPreferences.width}px"><div class="stock-content">${detail.bars.length ? `<div class="chart-pane"><div class="chart-legend"><strong class="chart-period">${periodName} · ${detail.bars.length} bars · ${detail.hits.length} signals</strong><span class="chart-activity">${escapeHtml(activity.label)}</span><span class="ma5">MA5</span><span class="ma10">MA10</span><span class="ma20">MA20</span><span class="ma60">MA60</span></div><div class="chart" id="stock-chart"></div><a class="chart-watermark" href="https://www.tradingview.com/" target="_blank" rel="noopener">Charts by TradingView</a></div>` : `<div class="empty-state"><strong>No usable chart history</strong><span>No historical bars are available for this period.</span></div>`}</div><button class="inspector-resizer" type="button" aria-label="Resize stock information panel" title="Drag to resize · Double-click or press Enter to reset"></button>${inspectorTemplate(detail)}</div>
+    <div class="stock-workspace ${inspectorPreferences.collapsed ? "inspector-collapsed" : ""}" style="--inspector-width:${inspectorWidth}px"><div class="stock-content">${detail.bars.length ? `<div class="chart-pane"><div class="chart-legend"><strong class="chart-period">${periodName} · ${detail.bars.length} bars · ${detail.hits.length} signals</strong><span class="chart-activity">${escapeHtml(activity.label)}</span><span class="ma5">MA5</span><span class="ma10">MA10</span><span class="ma20">MA20</span><span class="ma60">MA60</span></div><div class="chart" id="stock-chart"></div><a class="chart-watermark" href="https://www.tradingview.com/" target="_blank" rel="noopener">Charts by TradingView</a></div>` : `<div class="empty-state"><strong>No usable chart history</strong><span>No historical bars are available for this period.</span></div>`}</div><div class="inspector-resizer" role="separator" tabindex="0" aria-controls="stock-inspector" aria-label="Resize stock information panel" aria-orientation="vertical" aria-valuemin="${minimumInspectorWidth}" aria-valuemax="${maximumInspectorWidth()}" aria-valuenow="${inspectorWidth}" title="Drag or use arrow keys to resize · Press Enter to reset"></div>${inspectorTemplate(detail)}</div>
   </section>`;
 }
 
 function renderWorkspace() {
+  inspectorCleanup?.();
+  inspectorCleanup = null;
   chartHandle?.destroy();
   chartHandle = null;
   const tab = workspace.tabs.find((item) => item.id === workspace.activeTab) || workspace.tabs[0];
@@ -288,16 +301,25 @@ function bindShell(activeTab) {
     details.delete(`${activeTab.code}:${activeTab.period}`);
     renderWorkspace();
   });
-  bindInspector();
+  inspectorCleanup = bindInspector();
 }
 
 function bindInspector() {
   const stockWorkspace = app.querySelector(".stock-workspace");
   const inspector = app.querySelector(".stock-inspector");
   const toggle = app.querySelector(".inspector-toggle");
-  if (!stockWorkspace || !inspector || !toggle) return;
+  if (!stockWorkspace || !inspector || !toggle) return null;
 
   const resizeChart = () => window.requestAnimationFrame(() => chartHandle?.resize?.());
+  const resizer = app.querySelector(".inspector-resizer");
+  const applyEffectiveWidth = () => {
+    const width = effectiveInspectorWidth();
+    stockWorkspace.style.setProperty("--inspector-width", `${width}px`);
+    resizer?.setAttribute("aria-valuemax", String(maximumInspectorWidth()));
+    resizer?.setAttribute("aria-valuenow", String(width));
+    chartHandle?.resize?.();
+    resizeChart();
+  };
   const setCollapsed = (collapsed, { restoreFocus = false } = {}) => {
     inspectorPreferences = { ...inspectorPreferences, collapsed };
     saveInspectorPreferences(window.localStorage, inspectorPreferences);
@@ -312,30 +334,43 @@ function bindInspector() {
       ...inspectorPreferences,
       width: clampInspectorWidth(width, window.innerWidth),
     };
-    stockWorkspace.style.setProperty("--inspector-width", `${inspectorPreferences.width}px`);
     if (persist) saveInspectorPreferences(window.localStorage, inspectorPreferences);
-    chartHandle?.resize?.();
-    resizeChart();
+    applyEffectiveWidth();
   };
 
   toggle.addEventListener("click", () => setCollapsed(!inspectorPreferences.collapsed));
-  app.querySelectorAll("[data-inspector-tab]").forEach((button) => button.addEventListener("click", () => {
+  const tabButtons = [...app.querySelectorAll("[data-inspector-tab]")];
+  const activateTab = (button, { focus = false } = {}) => {
     inspectorTab = button.dataset.inspectorTab;
-    app.querySelectorAll("[data-inspector-tab]").forEach((candidate) => {
+    tabButtons.forEach((candidate) => {
       const active = candidate === button;
       candidate.classList.toggle("active", active);
       candidate.setAttribute("aria-selected", String(active));
+      candidate.tabIndex = active ? 0 : -1;
     });
     app.querySelectorAll("[data-inspector-panel]").forEach((panel) => {
       panel.hidden = panel.dataset.inspectorPanel !== inspectorTab;
     });
-  }));
+    if (focus) button.focus();
+  };
+  tabButtons.forEach((button, index) => {
+    button.addEventListener("click", () => activateTab(button));
+    button.addEventListener("keydown", (event) => {
+      let nextIndex = null;
+      if (event.key === "ArrowRight") nextIndex = (index + 1) % tabButtons.length;
+      else if (event.key === "ArrowLeft") nextIndex = (index - 1 + tabButtons.length) % tabButtons.length;
+      else if (event.key === "Home") nextIndex = 0;
+      else if (event.key === "End") nextIndex = tabButtons.length - 1;
+      if (nextIndex === null) return;
+      event.preventDefault();
+      activateTab(tabButtons[nextIndex], { focus: true });
+    });
+  });
 
-  const resizer = app.querySelector(".inspector-resizer");
   if (resizer) {
     let drag = null;
-    const finishDrag = () => {
-      if (!drag) return;
+    const finishDrag = (event) => {
+      if (!drag || event.pointerId !== drag.pointerId) return;
       drag = null;
       resizer.classList.remove("dragging");
       saveInspectorPreferences(window.localStorage, inspectorPreferences);
@@ -343,9 +378,9 @@ function bindInspector() {
     };
     const resetWidth = () => setWidth(defaultInspectorWidth, { persist: true });
     resizer.addEventListener("pointerdown", (event) => {
-      if (event.button !== 0) return;
+      if (event.button !== 0 || drag) return;
       event.preventDefault();
-      drag = { pointerId: event.pointerId, startX: event.clientX, startWidth: inspectorPreferences.width };
+      drag = { pointerId: event.pointerId, startX: event.clientX, startWidth: effectiveInspectorWidth() };
       resizer.setPointerCapture(event.pointerId);
       resizer.classList.add("dragging");
     });
@@ -355,16 +390,27 @@ function bindInspector() {
     });
     resizer.addEventListener("pointerup", finishDrag);
     resizer.addEventListener("pointercancel", finishDrag);
+    resizer.addEventListener("lostpointercapture", finishDrag);
     resizer.addEventListener("dblclick", (event) => {
       event.preventDefault();
       resetWidth();
     });
     resizer.addEventListener("keydown", (event) => {
-      if (event.key !== "Enter" && event.key !== " ") return;
+      const width = effectiveInspectorWidth();
+      let nextWidth = null;
+      if (event.key === "ArrowLeft") nextWidth = width + 20;
+      else if (event.key === "ArrowRight") nextWidth = width - 20;
+      else if (event.key === "Home") nextWidth = maximumInspectorWidth();
+      else if (event.key === "End") nextWidth = minimumInspectorWidth;
+      else if (event.key === "Enter" || event.key === " ") nextWidth = defaultInspectorWidth;
+      if (nextWidth === null) return;
       event.preventDefault();
-      resetWidth();
+      setWidth(nextWidth, { persist: true });
     });
   }
+  const handleViewportResize = () => applyEffectiveWidth();
+  window.addEventListener("resize", handleViewportResize);
+  return () => window.removeEventListener("resize", handleViewportResize);
 }
 
 function setFilterMenuOpen(open) {

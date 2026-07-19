@@ -196,8 +196,8 @@ button { cursor: pointer; }
   .stock-inspector { position: absolute; z-index: 12; top: 0; right: 0; height: 100%; width: min(var(--inspector-width), calc(100% - 36px)); border-left: 1px solid #454545; box-shadow: -14px 0 32px rgba(0,0,0,.42); }
   .stock-workspace.inspector-collapsed .stock-inspector { display: none; }
   .inspector-resizer { display: none; }
-  .chart-pane { grid-template-rows: 28px 430px; }
-  .chart { min-height: 430px; }
+  .chart-pane { grid-template-rows: 28px minmax(0,1fr); }
+  .chart { height: 100%; min-height: 0; }
   .statusbar > span:nth-child(2) { display: none; }
 }
 

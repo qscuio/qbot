@@ -144,9 +144,22 @@ export function mountChart(container, bars, hits = []) {
     }
   }
   const cancelInitialFit = fitChartAfterLayout(chart.timeScale(), undefined, bars.length);
+  let active = true;
+  const resize = () => {
+    if (!active || !container.clientWidth || !container.clientHeight) return;
+    chart.resize(container.clientWidth, container.clientHeight);
+  };
+  const resizeObserver = typeof window.ResizeObserver === "function"
+    ? new window.ResizeObserver(resize)
+    : null;
+  if (resizeObserver) resizeObserver.observe(container);
+  else window.addEventListener("resize", resize);
   return {
-    resize: () => chart.resize(container.clientWidth, container.clientHeight),
+    resize,
     destroy: () => {
+      active = false;
+      resizeObserver?.disconnect();
+      if (!resizeObserver) window.removeEventListener("resize", resize);
       cancelInitialFit();
       chart.remove();
     },
