@@ -1,5 +1,5 @@
-import { dashboardApi, ApiError } from "./api.js?v=20260719.1";
-import { activitySeries, mountChart } from "./chart.js?v=20260719.1";
+import { dashboardApi, ApiError } from "./api.js?v=20260719.2";
+import { activitySeries, mountChart } from "./chart.js?v=20260719.2";
 import {
   activeFilterCount,
   applyFilters,
@@ -15,7 +15,7 @@ import {
   saveInspectorPreferences,
   sortRows,
   updateTab,
-} from "./state.js?v=20260719.1";
+} from "./state.js?v=20260719.2";
 
 const app = document.querySelector("#app");
 let bootstrap = null;
