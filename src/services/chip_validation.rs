@@ -391,18 +391,20 @@ pub fn aggregate_chip_comparisons(
         if !expected.contains_key(&pair) {
             return Err(invalid("comparison is outside the expected sample"));
         }
+        let expects_distribution = expected_distributions.contains(&pair);
+        if comparison.dominant_peak_relative_error.is_some() != expects_distribution
+            || comparison.normalized_wasserstein_distance.is_some() != expects_distribution
+        {
+            return Err(invalid(
+                "comparison metric shape does not match the sampled pair type",
+            ));
+        }
         if actual.insert(pair, comparison).is_some() {
             return Err(invalid("duplicate comparison for a sampled stock date"));
         }
     }
 
-    let complete = actual.len() == expected.len()
-        && expected_distributions.iter().all(|pair| {
-            actual.get(pair).is_some_and(|comparison| {
-                comparison.normalized_wasserstein_distance.is_some()
-                    && comparison.dominant_peak_relative_error.is_some()
-            })
-        });
+    let complete = actual.len() == expected.len();
 
     let mut expected_subgroup_counts = BTreeMap::<String, usize>::new();
     for subgroup_keys in expected.values() {
@@ -443,9 +445,17 @@ pub fn aggregate_chip_comparisons(
         );
     }
 
-    let wasserstein = comparisons
+    let distribution_comparisons = expected_distributions
         .iter()
-        .filter_map(|comparison| comparison.normalized_wasserstein_distance)
+        .filter_map(|pair| actual.get(pair).copied())
+        .collect::<Vec<_>>();
+    let wasserstein = distribution_comparisons
+        .iter()
+        .map(|comparison| {
+            comparison
+                .normalized_wasserstein_distance
+                .expect("distribution metric shape was validated")
+        })
         .collect::<Vec<_>>();
     let aggregate = if comparisons.is_empty() || wasserstein.is_empty() {
         None
@@ -459,9 +469,13 @@ pub fn aggregate_chip_comparisons(
             distribution_sample_count: wasserstein.len(),
             median_average_cost_relative_error: checked_median(&average_errors)?,
             median_dominant_peak_relative_error: checked_median(
-                &comparisons
+                &distribution_comparisons
                     .iter()
-                    .filter_map(|comparison| comparison.dominant_peak_relative_error)
+                    .map(|comparison| {
+                        comparison
+                            .dominant_peak_relative_error
+                            .expect("distribution metric shape was validated")
+                    })
                     .collect::<Vec<_>>(),
             )?,
             mean_winner_rate_absolute_error: checked_mean(
@@ -515,7 +529,11 @@ pub fn decide_chip_source(report: &ChipValidationReport) -> ChipSourceDecision {
         .cloned()
         .collect::<BTreeSet<_>>();
     let actual = report.subgroups.keys().cloned().collect::<BTreeSet<_>>();
-    if expected.is_empty() || expected != actual {
+    if expected.is_empty()
+        || expected.len() != report.expected_subgroups.len()
+        || expected != actual
+        || !subgroup_counts_reconcile(report)
+    {
         return ChipSourceDecision::Official;
     }
     for subgroup in report.subgroups.values() {
@@ -530,6 +548,51 @@ pub fn decide_chip_source(report: &ChipValidationReport) -> ChipSourceDecision {
         }
     }
     ChipSourceDecision::Estimate
+}
+
+fn subgroup_counts_reconcile(report: &ChipValidationReport) -> bool {
+    const DIMENSIONS: [&str; 5] = [
+        "exchange",
+        "market_value",
+        "turnover",
+        "volatility",
+        "corporate_action",
+    ];
+
+    let mut expected_totals = BTreeMap::<&str, usize>::new();
+    let mut sample_totals = BTreeMap::<&str, usize>::new();
+    for key in &report.expected_subgroups {
+        let Some((dimension, value)) = key.split_once(':') else {
+            return false;
+        };
+        if !DIMENSIONS.contains(&dimension) || value.is_empty() || value.contains(':') {
+            return false;
+        }
+        let Some(metrics) = report.subgroups.get(key) else {
+            return false;
+        };
+        let Some(expected_total) = expected_totals
+            .entry(dimension)
+            .or_default()
+            .checked_add(metrics.expected_sample_count)
+        else {
+            return false;
+        };
+        expected_totals.insert(dimension, expected_total);
+        let Some(sample_total) = sample_totals
+            .entry(dimension)
+            .or_default()
+            .checked_add(metrics.sample_count)
+        else {
+            return false;
+        };
+        sample_totals.insert(dimension, sample_total);
+    }
+
+    DIMENSIONS.iter().all(|dimension| {
+        expected_totals.get(dimension) == Some(&report.expected_performance_count)
+            && sample_totals.get(dimension) == Some(&report.expected_performance_count)
+    })
 }
 
 pub fn checked_mean(values: &[f64]) -> Result<f64> {
@@ -856,9 +919,9 @@ fn invalid(message: &str) -> AppError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
 
-    use chrono::{NaiveDate, TimeZone, Utc};
+    use chrono::{Datelike, NaiveDate, TimeZone, Utc};
 
     use super::*;
     use crate::data::chip::{ChipBucket, ChipSnapshot, ChipSourceDecision};
@@ -1284,9 +1347,9 @@ mod tests {
         assert!((report.aggregate.as_ref().unwrap().wasserstein.median - 0.05).abs() < 1e-12);
         assert_eq!(report.subgroups.len(), 5);
 
-        let incomplete =
-            aggregate_chip_comparisons(&sample, &[comparison("600001.SH", 1, 0.01, 0.01, 1.0)])
-                .unwrap();
+        let mut only_first = comparison("600001.SH", 1, 0.01, 0.01, 1.0);
+        only_first.normalized_wasserstein_distance = Some(0.01);
+        let incomplete = aggregate_chip_comparisons(&sample, &[only_first]).unwrap();
         assert!(!incomplete.complete);
         assert_eq!(
             decide_chip_source(&incomplete),
@@ -1294,13 +1357,70 @@ mod tests {
         );
     }
 
+    #[test]
+    fn aggregation_rejects_distribution_metrics_on_performance_only_dates() {
+        let observations = (1..=13)
+            .map(|day| observation("600001.SH", day, 1.0, 0.02))
+            .collect::<Vec<_>>();
+        let sample = build_validation_sample(
+            "model-v1",
+            &[stock("600001.SH", "SH", 5_000_000_000.0)],
+            &observations,
+            &[],
+        )
+        .unwrap();
+        let sample_stock = &sample.stocks[0];
+        let distribution_dates = sample_stock
+            .distribution_dates
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(sample_stock.performance_dates.len(), 13);
+        assert_eq!(distribution_dates.len(), 12);
+
+        let comparisons = sample_stock
+            .performance_dates
+            .iter()
+            .map(|trade_date| {
+                let mut value = comparison("600001.SH", trade_date.day(), 0.01, 0.01, 1.0);
+                if distribution_dates.contains(trade_date) {
+                    value.normalized_wasserstein_distance = Some(0.01);
+                } else {
+                    value.dominant_peak_relative_error = Some(999.0);
+                }
+                value
+            })
+            .collect::<Vec<_>>();
+
+        assert!(aggregate_chip_comparisons(&sample, &comparisons).is_err());
+    }
+
+    #[test]
+    fn aggregation_rejects_incomplete_distribution_metric_pairs() {
+        let sample = small_sample();
+        let mut missing_peak = comparison("600001.SH", 1, 0.01, 0.01, 1.0);
+        missing_peak.dominant_peak_relative_error = None;
+        missing_peak.normalized_wasserstein_distance = Some(0.01);
+        assert!(aggregate_chip_comparisons(&sample, &[missing_peak]).is_err());
+
+        let missing_wasserstein = comparison("600001.SH", 1, 0.01, 0.01, 1.0);
+        assert!(aggregate_chip_comparisons(&sample, &[missing_wasserstein]).is_err());
+    }
+
     fn report_at(average: f64, peak: f64, winner: f64, p90: f64) -> ChipValidationReport {
-        let subgroup = ChipSubgroupMetrics {
+        let subgroup = || ChipSubgroupMetrics {
             expected_sample_count: 10,
             sample_count: 10,
             median_average_cost_relative_error: 0.01,
             median_winner_rate_absolute_error: 1.0,
         };
+        let expected_subgroups = vec![
+            "exchange:SH".to_string(),
+            "market_value:small".to_string(),
+            "turnover:low".to_string(),
+            "volatility:low".to_string(),
+            "corporate_action:no".to_string(),
+        ];
         ChipValidationReport {
             model_version: "model-v1".to_string(),
             expected_performance_count: 10,
@@ -1319,8 +1439,11 @@ mod tests {
                     p90: 0.03,
                 },
             }),
-            expected_subgroups: vec!["exchange:SH".to_string()],
-            subgroups: BTreeMap::from([("exchange:SH".to_string(), subgroup)]),
+            expected_subgroups: expected_subgroups.clone(),
+            subgroups: expected_subgroups
+                .into_iter()
+                .map(|key| (key, subgroup()))
+                .collect(),
         }
     }
 
@@ -1401,5 +1524,71 @@ mod tests {
         report = report_at(0.01, 0.01, 1.0, 0.02);
         report.subgroups.clear();
         assert_eq!(decide_chip_source(&report), ChipSourceDecision::Official);
+    }
+
+    #[test]
+    fn decision_rejects_omitted_dimension_and_understated_dimension_counts() {
+        let mut report = report_at(0.01, 0.01, 1.0, 0.02);
+        report
+            .expected_subgroups
+            .retain(|key| !key.starts_with("volatility:"));
+        report
+            .subgroups
+            .retain(|key, _| !key.starts_with("volatility:"));
+        assert_eq!(decide_chip_source(&report), ChipSourceDecision::Official);
+
+        let mut report = report_at(0.01, 0.01, 1.0, 0.02);
+        let exchange = report.subgroups.get_mut("exchange:SH").unwrap();
+        exchange.expected_sample_count = 9;
+        exchange.sample_count = 9;
+        assert_eq!(decide_chip_source(&report), ChipSourceDecision::Official);
+    }
+
+    #[test]
+    fn decision_accepts_multiple_values_when_each_dimension_reconciles() {
+        let mut report = report_at(0.01, 0.01, 1.0, 0.02);
+        let sh = report.subgroups.get_mut("exchange:SH").unwrap();
+        sh.expected_sample_count = 6;
+        sh.sample_count = 6;
+        report.expected_subgroups.push("exchange:SZ".to_string());
+        report.subgroups.insert(
+            "exchange:SZ".to_string(),
+            ChipSubgroupMetrics {
+                expected_sample_count: 4,
+                sample_count: 4,
+                median_average_cost_relative_error: 0.01,
+                median_winner_rate_absolute_error: 1.0,
+            },
+        );
+        assert_eq!(decide_chip_source(&report), ChipSourceDecision::Estimate);
+    }
+
+    #[test]
+    fn decision_rejects_unknown_malformed_and_duplicate_subgroup_keys() {
+        let mut unknown = report_at(0.01, 0.01, 1.0, 0.02);
+        let metrics = unknown.subgroups.remove("turnover:low").unwrap();
+        unknown
+            .expected_subgroups
+            .retain(|key| key != "turnover:low");
+        unknown
+            .expected_subgroups
+            .push("sector:technology".to_string());
+        unknown
+            .subgroups
+            .insert("sector:technology".to_string(), metrics);
+        assert_eq!(decide_chip_source(&unknown), ChipSourceDecision::Official);
+
+        let mut malformed = report_at(0.01, 0.01, 1.0, 0.02);
+        let metrics = malformed.subgroups.remove("turnover:low").unwrap();
+        malformed
+            .expected_subgroups
+            .retain(|key| key != "turnover:low");
+        malformed.expected_subgroups.push("turnover:".to_string());
+        malformed.subgroups.insert("turnover:".to_string(), metrics);
+        assert_eq!(decide_chip_source(&malformed), ChipSourceDecision::Official);
+
+        let mut duplicate = report_at(0.01, 0.01, 1.0, 0.02);
+        duplicate.expected_subgroups.push("exchange:SH".to_string());
+        assert_eq!(decide_chip_source(&duplicate), ChipSourceDecision::Official);
     }
 }
