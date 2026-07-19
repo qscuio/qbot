@@ -23,6 +23,7 @@ let rows = [];
 let workspace = createWorkspaceState();
 let filters = { search: "", group: "", signal: "", rankedOnly: false, sort: "ranked", direction: "desc" };
 const details = new Map();
+const stockRequestSequences = new Map();
 let chartHandle = null;
 let inspectorCleanup = null;
 let closeInspectorOverlay = null;
@@ -58,6 +59,7 @@ function enterAuthenticationBoundary() {
   rows = [];
   workspace = createWorkspaceState();
   details.clear();
+  stockRequestSequences.clear();
   return invalidateProtectedView();
 }
 
@@ -534,16 +536,21 @@ async function loadStock(tab) {
   if (!authenticated) return;
   const key = `${tab.code}:${tab.period}`;
   const generation = protectedViewGeneration;
+  const requestSequence = (stockRequestSequences.get(key) ?? 0) + 1;
+  stockRequestSequences.set(key, requestSequence);
+  const isCurrentRequest = () => authenticated
+    && generation === protectedViewGeneration
+    && stockRequestSequences.get(key) === requestSequence;
   try {
     const detail = await dashboardApi.stock(tab.code, tab.period);
-    if (!authenticated || generation !== protectedViewGeneration) return;
+    if (!isCurrentRequest()) return;
     details.set(key, detail);
   } catch (error) {
-    if (!authenticated || generation !== protectedViewGeneration) return;
+    if (!isCurrentRequest()) return;
     if (error.status === 401) return renderLogin("Your session expired. Please sign in again.");
     details.set(key, { error: error.message });
   }
-  if (!authenticated || generation !== protectedViewGeneration) return;
+  if (!isCurrentRequest()) return;
   if (workspace.activeTab === tab.id && workspace.tabs.find((item) => item.id === tab.id)?.period === tab.period) renderWorkspace();
 }
 

@@ -33,6 +33,7 @@ async function mockApi(page, initiallyAuthenticated = true, stockHits = bootstra
   let authenticated = initiallyAuthenticated;
   let sessionRequests = 0;
   let bootstrapRequests = 0;
+  let stockRequests = 0;
   await page.route("**/api/dashboard/**", async (route) => {
     const url = new URL(route.request().url());
     if (url.pathname.endsWith("/auth/session")) {
@@ -80,9 +81,17 @@ async function mockApi(page, initiallyAuthenticated = true, stockHits = bootstra
     }
     const period = url.searchParams.get("period") || "daily";
     requestedPeriods.push(period);
-    if (gates.stock) {
+    stockRequests += 1;
+    const stockResponse = gates.stock?.responses?.[stockRequests];
+    if (stockResponse) {
+      stockResponse.requested?.();
+      if (stockResponse.release) await stockResponse.release;
+    } else if (gates.stock) {
       gates.stock.requested?.();
       await gates.stock.release;
+    }
+    if (stockResponse?.status && stockResponse.status !== 200) {
+      return route.fulfill({ status: stockResponse.status, json: stockResponse.payload ?? { error: "stock request failed" } });
     }
     const periodBars = period === "daily"
       ? bars
@@ -96,6 +105,7 @@ async function mockApi(page, initiallyAuthenticated = true, stockHits = bootstra
       latest: periodBars.at(-1),
       bars: periodBars,
       hits: stockHits,
+      ...(stockResponse?.payload ?? {}),
     } });
   });
 }
@@ -420,6 +430,82 @@ test("newer quiet bootstrap wins when an earlier refresh resolves last", async (
   await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
 
   await expect(page.locator(".view-heading p")).toHaveText("Run newer-refresh");
+});
+
+test("newer same-key stock success wins when an older success resolves last", async ({ page }) => {
+  let releaseOlder;
+  const olderRelease = new Promise((resolve) => { releaseOlder = resolve; });
+  let markOlderRequested;
+  const olderRequested = new Promise((resolve) => { markOlderRequested = resolve; });
+  let releaseNewer;
+  const newerRelease = new Promise((resolve) => { releaseNewer = resolve; });
+  let markNewerRequested;
+  const newerRequested = new Promise((resolve) => { markNewerRequested = resolve; });
+  await mockApi(page, true, bootstrap.results[0].hits, [], {
+    stock: {
+      responses: {
+        1: { release: olderRelease, requested: markOlderRequested, payload: { name: "Older snapshot" } },
+        2: { release: newerRelease, requested: markNewerRequested, payload: { name: "Newer snapshot" } },
+      },
+    },
+  });
+  await page.goto("/dashboard/");
+
+  await page.locator("tbody tr").first().click();
+  await olderRequested;
+  await page.locator("[data-close]").click();
+  await page.locator("tbody tr").first().click();
+  await newerRequested;
+
+  const newerResponse = page.waitForResponse((response) => response.url().includes("/api/dashboard/stocks/"));
+  releaseNewer();
+  await newerResponse;
+  await expect(page.getByRole("heading", { name: /Newer snapshot/ })).toBeVisible();
+  const olderResponse = page.waitForResponse((response) => response.url().includes("/api/dashboard/stocks/"));
+  releaseOlder();
+  await olderResponse;
+  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+
+  await expect(page.getByRole("heading", { name: /Newer snapshot/ })).toBeVisible();
+  await expect(page.getByRole("heading", { name: /Older snapshot/ })).toHaveCount(0);
+});
+
+test("newer same-key stock success wins when an older error resolves last", async ({ page }) => {
+  let releaseOlder;
+  const olderRelease = new Promise((resolve) => { releaseOlder = resolve; });
+  let markOlderRequested;
+  const olderRequested = new Promise((resolve) => { markOlderRequested = resolve; });
+  let releaseNewer;
+  const newerRelease = new Promise((resolve) => { releaseNewer = resolve; });
+  let markNewerRequested;
+  const newerRequested = new Promise((resolve) => { markNewerRequested = resolve; });
+  await mockApi(page, true, bootstrap.results[0].hits, [], {
+    stock: {
+      responses: {
+        1: { release: olderRelease, requested: markOlderRequested, status: 500, payload: { error: "older request failed" } },
+        2: { release: newerRelease, requested: markNewerRequested, payload: { name: "Current snapshot" } },
+      },
+    },
+  });
+  await page.goto("/dashboard/");
+
+  await page.locator("tbody tr").first().click();
+  await olderRequested;
+  await page.locator("[data-close]").click();
+  await page.locator("tbody tr").first().click();
+  await newerRequested;
+
+  const newerResponse = page.waitForResponse((response) => response.url().includes("/api/dashboard/stocks/") && response.status() === 200);
+  releaseNewer();
+  await newerResponse;
+  await expect(page.getByRole("heading", { name: /Current snapshot/ })).toBeVisible();
+  const olderResponse = page.waitForResponse((response) => response.url().includes("/api/dashboard/stocks/") && response.status() === 500);
+  releaseOlder();
+  await olderResponse;
+  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+
+  await expect(page.getByRole("heading", { name: /Current snapshot/ })).toBeVisible();
+  await expect(page.getByText("Chart unavailable")).toHaveCount(0);
 });
 
 test("stock detail fills the viewport without an evidence sidebar", async ({ page }) => {
