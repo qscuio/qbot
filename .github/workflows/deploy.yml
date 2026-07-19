@@ -194,7 +194,13 @@ jobs:
                 sudo systemctl stop qbot
               fi
             fi
-            cp target/release/qbot /opt/qbot/qbot
+            # Do not overwrite the inode used by a detached repair from an
+            # earlier deployment. Install beside it, then atomically rename.
+            binary_tmp="/opt/qbot/.qbot-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}.tmp"
+            trap 'rm -f "$binary_tmp"' EXIT
+            install -m 0755 target/release/qbot "$binary_tmp"
+            mv -f "$binary_tmp" /opt/qbot/qbot
+            trap - EXIT
 
             # Keep DB/cache containers up for local service dependencies.
             if command -v docker >/dev/null 2>&1; then
@@ -448,38 +454,56 @@ jobs:
               exit 1
             fi
 
-            if sudo systemctl is-active --quiet "$unit"; then
-              echo "$unit is already active; leaving the resumable repair running"
-              exit 0
-            fi
+            unit_property() {
+              sudo systemctl show "$unit" --property="$1" --value 2>/dev/null || true
+            }
 
-            # Clear an inactive or failed transient unit before reusing its
-            # stable name. --collect makes future completed runs unload, while
-            # this cleanup also handles a unit left behind by an older deploy.
-            load_state="$(sudo systemctl show "$unit" --property=LoadState --value 2>/dev/null || true)"
-            if [ -n "$load_state" ] && [ "$load_state" != "not-found" ]; then
+            clear_transient_unit() {
               sudo systemctl stop "$unit"
               sudo systemctl reset-failed "$unit" 2>/dev/null || true
-            fi
 
-            for attempt in 1 2 3 4 5; do
-              load_state="$(sudo systemctl show "$unit" --property=LoadState --value 2>/dev/null || true)"
-              if [ -z "$load_state" ] || [ "$load_state" = "not-found" ]; then
-                break
-              fi
-              sudo systemctl reset-failed "$unit" 2>/dev/null || true
-              sleep 1
-            done
+              for attempt in 1 2 3 4 5; do
+                load_state="$(unit_property LoadState)"
+                if [ -z "$load_state" ] || [ "$load_state" = "not-found" ]; then
+                  return 0
+                fi
+                sudo systemctl reset-failed "$unit" 2>/dev/null || true
+                sleep 1
+              done
 
-            if [ -n "$load_state" ] && [ "$load_state" != "not-found" ]; then
               echo "Unable to clear stale transient unit $unit (load state: $load_state)"
               sudo systemctl status "$unit" --no-pager || true
-              exit 1
+              return 1
+            }
+
+            show_repair_failure() {
+              sudo systemctl status "$unit" --no-pager || true
+              sudo journalctl -u "$unit" -n 80 --no-pager || true
+            }
+
+            # Running/activating means another deployment already launched the
+            # worker. A successful exited unit, failure, or other stale state is
+            # cleaned before the stable name is reused.
+            load_state="$(unit_property LoadState)"
+            if [ -n "$load_state" ] && [ "$load_state" != "not-found" ]; then
+              active_state="$(unit_property ActiveState)"
+              sub_state="$(unit_property SubState)"
+              case "$active_state:$sub_state" in
+                active:running|activating:*|reloading:*)
+                  echo "$unit is already running (state: $active_state/$sub_state)"
+                  exit 0
+                  ;;
+                *)
+                  echo "Clearing stale $unit (state: $active_state/$sub_state)"
+                  clear_transient_unit
+                  ;;
+              esac
             fi
 
-            sudo systemd-run --no-block --collect \
+            sudo systemd-run --no-block \
               --unit="$unit" \
               --property=Type=exec \
+              --property=RemainAfterExit=yes \
               --property=EnvironmentFile=/opt/qbot/.env \
               --property="User=$service_user" \
               --property=UMask=0077 \
@@ -488,19 +512,40 @@ jobs:
               --working-directory=/opt/qbot \
               /opt/qbot/qbot --repair-company-intelligence
 
-            queued_state="$(sudo systemctl is-active "$unit" 2>/dev/null || true)"
-            case "$queued_state" in
-              active|activating)
-                echo "$unit launch accepted (state: $queued_state)"
-                echo "Follow progress with: sudo journalctl -fu $unit"
-                ;;
-              *)
-                echo "$unit did not enter active/activating state (state: $queued_state)"
-                sudo systemctl status "$unit" --no-pager || true
-                sudo journalctl -u "$unit" -n 80 --no-pager || true
-                exit 1
-                ;;
-            esac
+            # RemainAfterExit keeps fast success inspectable as active/exited.
+            # Failures remain loaded for diagnostics and are cleared on the next
+            # deployment before the stable name is reused.
+            for attempt in 1 2 3 4 5 6 7 8 9 10; do
+              active_state="$(unit_property ActiveState)"
+              sub_state="$(unit_property SubState)"
+              result="$(unit_property Result)"
+              exec_status="$(unit_property ExecMainStatus)"
+              observed="$active_state:$sub_state:$result:$exec_status"
+
+              case "$observed" in
+                active:running:*:*|activating:*:*:*)
+                  echo "$unit launch accepted (state: $active_state/$sub_state)"
+                  echo "Follow progress with: sudo journalctl -fu $unit"
+                  exit 0
+                  ;;
+                active:exited:success:0)
+                  echo "$unit completed successfully before deployment observation finished"
+                  clear_transient_unit
+                  exit 0
+                  ;;
+                failed:*:*:*|*:failed:*:*|active:exited:*:*|*:*:*:[!0]*)
+                  echo "$unit failed during launch observation (state: $observed)"
+                  show_repair_failure
+                  exit 1
+                  ;;
+              esac
+
+              sleep 1
+            done
+
+            echo "$unit launch observation timed out"
+            show_repair_failure
+            exit 1
 
       - name: Repair persisted OHLCV data
         if: steps.check.outputs.skip != 'true'
