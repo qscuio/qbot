@@ -138,7 +138,7 @@ struct StoredFinancialRevision {
 }
 
 impl StoredFinancialRevision {
-    fn matches(&self, report: &FinancialReport) -> bool {
+    fn matches(&self, report: &FinancialReport, available_at: DateTime<Utc>) -> bool {
         self.announcement_date == report.announcement_date
             && self.frequency == report.frequency.as_str()
             && self.total_revenue == report.total_revenue
@@ -155,7 +155,7 @@ impl StoredFinancialRevision {
             && self.revenue_yoy == report.revenue_yoy
             && self.net_profit_yoy == report.net_profit_yoy
             && self.raw_payload == report.raw_payload
-            && self.available_at == report.available_at
+            && self.available_at == available_at
     }
 }
 
@@ -175,7 +175,7 @@ struct StoredDividendRevision {
 }
 
 impl StoredDividendRevision {
-    fn matches(&self, record: &DividendRecord) -> bool {
+    fn matches(&self, record: &DividendRecord, available_at: DateTime<Utc>) -> bool {
         self.code == record.code
             && self.announcement_date == record.announcement_date
             && self.record_date == record.record_date
@@ -186,8 +186,13 @@ impl StoredDividendRevision {
             && self.cash_dividend_tax == record.cash_dividend_tax
             && self.stock_ratio == record.stock_ratio
             && self.raw_payload == record.raw_payload
-            && self.available_at == record.available_at
+            && self.available_at == available_at
     }
+}
+
+fn postgres_timestamp(value: DateTime<Utc>) -> DateTime<Utc> {
+    DateTime::from_timestamp_micros(value.timestamp_micros())
+        .expect("a valid UTC timestamp remains valid at PostgreSQL precision")
 }
 
 #[derive(Clone)]
@@ -205,6 +210,8 @@ impl CompanyRepository {
         let mut inserted = 0;
 
         for report in reports {
+            let available_at = postgres_timestamp(report.available_at);
+            let ingested_at = postgres_timestamp(report.ingested_at);
             let rows_affected = sqlx::query(
                 r#"INSERT INTO stock_financial_report_versions
                    (source, code, end_date, announcement_date, report_type, frequency,
@@ -239,8 +246,8 @@ impl CompanyRepository {
             .bind(report.revenue_yoy)
             .bind(report.net_profit_yoy)
             .bind(&report.raw_payload)
-            .bind(report.available_at)
-            .bind(report.ingested_at)
+            .bind(available_at)
+            .bind(ingested_at)
             .execute(&mut *transaction)
             .await?
             .rows_affected();
@@ -268,7 +275,7 @@ impl CompanyRepository {
             .fetch_optional(&mut *transaction)
             .await?;
 
-            if !stored.is_some_and(|row| row.matches(report)) {
+            if !stored.is_some_and(|row| row.matches(report, available_at)) {
                 return Err(AppError::BadRequest(format!(
                     "immutable financial revision conflicts with stored history: {}/{}/{}/{}/{}",
                     report.source,
@@ -289,6 +296,8 @@ impl CompanyRepository {
         let mut inserted = 0;
 
         for record in records {
+            let available_at = postgres_timestamp(record.available_at);
+            let ingested_at = postgres_timestamp(record.ingested_at);
             let rows_affected = sqlx::query(
                 r#"INSERT INTO stock_dividend_versions
                    (source, action_key, code, announcement_date, record_date, ex_date,
@@ -311,8 +320,8 @@ impl CompanyRepository {
             .bind(record.stock_ratio)
             .bind(&record.source_revision)
             .bind(&record.raw_payload)
-            .bind(record.available_at)
-            .bind(record.ingested_at)
+            .bind(available_at)
+            .bind(ingested_at)
             .execute(&mut *transaction)
             .await?
             .rows_affected();
@@ -335,7 +344,7 @@ impl CompanyRepository {
             .fetch_optional(&mut *transaction)
             .await?;
 
-            if !stored.is_some_and(|row| row.matches(record)) {
+            if !stored.is_some_and(|row| row.matches(record, available_at)) {
                 return Err(AppError::BadRequest(format!(
                     "immutable dividend revision conflicts with stored history: {}/{}/{}",
                     record.source, record.action_key, record.source_revision
@@ -667,6 +676,18 @@ mod tests {
         Utc.with_ymd_and_hms(year, month, day, hour, 0, 0).unwrap()
     }
 
+    fn dt_submicro(year: i32, month: u32, day: u32, hour: u32) -> chrono::DateTime<Utc> {
+        dt(year, month, day, hour) + chrono::Duration::nanoseconds(789)
+    }
+
+    fn migration_022_sql() -> String {
+        std::fs::read_to_string(format!(
+            "{}/migrations/022_preserve_company_dividend_versions.sql",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap_or_default()
+    }
+
     fn decimal(value: &str) -> Decimal {
         value.parse().unwrap()
     }
@@ -939,6 +960,83 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn financial_submicrosecond_timestamp_replay_is_a_noop(
+        pool: PgPool,
+    ) -> crate::error::Result<()> {
+        let repo = CompanyRepository::new(pool.clone());
+        let mut original = financial_report("submicro", 20);
+        original.available_at = dt_submicro(2026, 4, 1, 8);
+        original.ingested_at = dt_submicro(2026, 4, 1, 9);
+
+        assert_eq!(repo.upsert_financial_reports(&[original.clone()]).await?, 1);
+        assert_eq!(repo.upsert_financial_reports(&[original.clone()]).await?, 0);
+
+        let stored_ingested_at: chrono::DateTime<Utc> = sqlx::query_scalar(
+            r#"SELECT ingested_at FROM stock_financial_report_versions
+               WHERE source = $1 AND code = $2 AND end_date = $3
+                 AND report_type = $4 AND source_revision = $5"#,
+        )
+        .bind(&original.source)
+        .bind(&original.code)
+        .bind(original.end_date)
+        .bind(&original.report_type)
+        .bind(&original.source_revision)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            stored_ingested_at,
+            chrono::DateTime::from_timestamp_micros(original.ingested_at.timestamp_micros())
+                .unwrap()
+        );
+
+        let mut changed_availability = original;
+        changed_availability.available_at += chrono::Duration::microseconds(1);
+        let error = repo
+            .upsert_financial_reports(&[changed_availability])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("immutable financial revision"));
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn dividend_submicrosecond_timestamp_replay_is_a_noop(
+        pool: PgPool,
+    ) -> crate::error::Result<()> {
+        let repo = CompanyRepository::new(pool.clone());
+        let mut original = dividend("submicro", "2.76000002");
+        original.available_at = dt_submicro(2026, 4, 1, 8);
+        original.ingested_at = dt_submicro(2026, 4, 1, 9);
+
+        assert_eq!(repo.upsert_dividends(&[original.clone()]).await?, 1);
+        assert_eq!(repo.upsert_dividends(&[original.clone()]).await?, 0);
+
+        let stored_ingested_at: chrono::DateTime<Utc> = sqlx::query_scalar(
+            r#"SELECT ingested_at FROM stock_dividend_versions
+               WHERE source = $1 AND action_key = $2 AND source_revision = $3"#,
+        )
+        .bind(&original.source)
+        .bind(&original.action_key)
+        .bind(&original.source_revision)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            stored_ingested_at,
+            chrono::DateTime::from_timestamp_micros(original.ingested_at.timestamp_micros())
+                .unwrap()
+        );
+
+        let mut changed_availability = original;
+        changed_availability.available_at += chrono::Duration::microseconds(1);
+        let error = repo
+            .upsert_dividends(&[changed_availability])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("immutable dividend revision"));
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn immutable_conflict_rolls_back_earlier_inserts_in_the_batch(
         pool: PgPool,
     ) -> crate::error::Result<()> {
@@ -963,6 +1061,182 @@ mod tests {
         .fetch_one(&pool)
         .await?;
         assert_eq!(count, 0);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn dividend_immutable_conflict_rolls_back_earlier_batch_insert(
+        pool: PgPool,
+    ) -> crate::error::Result<()> {
+        let repo = CompanyRepository::new(pool.clone());
+        let original = dividend("existing", "2.76000002");
+        repo.upsert_dividends(&[original.clone()]).await?;
+
+        let mut new_action = dividend("new-before-conflict", "1.00000001");
+        new_action.action_key = "600519.SH-new-action".to_string();
+        let mut conflict = original;
+        conflict.cash_dividend = Some(decimal("9.99999999"));
+
+        let error = repo
+            .upsert_dividends(&[new_action, conflict])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("immutable dividend revision"));
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM stock_dividend_versions WHERE action_key = '600519.SH-new-action'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(count, 0);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn migration_022_preserves_nonlegacy_dividends_from_migration_020(
+        pool: PgPool,
+    ) -> crate::error::Result<()> {
+        let migration_applied: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM _sqlx_migrations WHERE version = 22 AND success)",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert!(
+            migration_applied,
+            "fresh databases must apply migration 022"
+        );
+
+        for (revision, cash, available_hour, ingested_hour) in [
+            ("upgrade-v1", "2.50000001", 8, 9),
+            ("upgrade-v2", "2.76000002", 10, 11),
+        ] {
+            sqlx::query(
+                r#"INSERT INTO corporate_action_versions
+                   (source, action_key, code, action_type, announcement_date, record_date,
+                    ex_date, pay_date, implementation_status, cash_dividend,
+                    cash_dividend_tax, stock_ratio, source_revision, raw_payload,
+                    available_at, ingested_at, availability_quality)
+                   VALUES ('migration020', '600519.SH-upgrade', '600519.SH', 'dividend',
+                           $1, $2, $3, $4, 'implemented', $5, $6, $7, $8, $9, $10,
+                           $11, 'observed')"#,
+            )
+            .bind(date(2026, 3, 30))
+            .bind(date(2026, 6, 25))
+            .bind(date(2026, 6, 26))
+            .bind(date(2026, 6, 27))
+            .bind(decimal(cash))
+            .bind(decimal(cash))
+            .bind(decimal("0.10000000"))
+            .bind(revision)
+            .bind(json!({"sourceRevision": revision, "preserved": true}))
+            .bind(dt(2026, 4, 1, available_hour))
+            .bind(dt(2026, 4, 1, ingested_hour))
+            .execute(&pool)
+            .await?;
+        }
+
+        let migration_sql = migration_022_sql();
+        assert!(!migration_sql.is_empty(), "migration 022 must exist");
+        sqlx::raw_sql(&migration_sql).execute(&pool).await?;
+        sqlx::raw_sql(&migration_sql).execute(&pool).await?;
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM stock_dividend_versions WHERE source = 'migration020'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(count, 2);
+
+        let preserved: (
+            String,
+            Option<NaiveDate>,
+            Option<NaiveDate>,
+            Option<NaiveDate>,
+            Option<NaiveDate>,
+            String,
+            Option<Decimal>,
+            Option<Decimal>,
+            Option<Decimal>,
+            serde_json::Value,
+            chrono::DateTime<Utc>,
+            chrono::DateTime<Utc>,
+        ) = sqlx::query_as(
+            r#"SELECT code, announcement_date, record_date, ex_date, pay_date,
+                      implementation_status, cash_dividend, cash_dividend_tax,
+                      stock_ratio, raw_payload, available_at, ingested_at
+               FROM stock_dividend_versions
+               WHERE source = 'migration020' AND action_key = '600519.SH-upgrade'
+                 AND source_revision = 'upgrade-v1'"#,
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(preserved.0, "600519.SH");
+        assert_eq!(preserved.1, Some(date(2026, 3, 30)));
+        assert_eq!(preserved.2, Some(date(2026, 6, 25)));
+        assert_eq!(preserved.3, Some(date(2026, 6, 26)));
+        assert_eq!(preserved.4, Some(date(2026, 6, 27)));
+        assert_eq!(preserved.5, "implemented");
+        assert_eq!(preserved.6, Some(decimal("2.50000001")));
+        assert_eq!(preserved.7, Some(decimal("2.50000001")));
+        assert_eq!(preserved.8, Some(decimal("0.10000000")));
+        assert_eq!(
+            preserved.9,
+            json!({"sourceRevision": "upgrade-v1", "preserved": true})
+        );
+        assert_eq!(preserved.10, dt(2026, 4, 1, 8));
+        assert_eq!(preserved.11, dt(2026, 4, 1, 9));
+
+        let history = CompanyRepository::new(pool)
+            .dividend_history("600519.SH", 10, None)
+            .await?;
+        assert_eq!(history.items.len(), 1);
+        assert_eq!(history.items[0].record.source_revision, "upgrade-v2");
+        assert_eq!(history.items[0].revision_count, 2);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn migration_022_rejects_changed_destination_conflicts(pool: PgPool) -> sqlx::Result<()> {
+        sqlx::query(
+            r#"INSERT INTO corporate_action_versions
+               (source, action_key, code, action_type, implementation_status,
+                cash_dividend, source_revision, raw_payload, available_at, ingested_at,
+                availability_quality)
+               VALUES ('migration020', 'conflict', '600519.SH', 'dividend', 'implemented',
+                       2.76, 'v1', '{"side":"source"}', $1, $1, 'observed')"#,
+        )
+        .bind(dt(2026, 4, 1, 8))
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            r#"INSERT INTO stock_dividend_versions
+               (source, action_key, code, implementation_status, cash_dividend,
+                source_revision, raw_payload, available_at, ingested_at)
+               VALUES ('migration020', 'conflict', '600519.SH', 'implemented',
+                       9.99, 'v1', '{"side":"destination"}', $1, $1)"#,
+        )
+        .bind(dt(2026, 4, 1, 8))
+        .execute(&pool)
+        .await?;
+
+        let migration_sql = migration_022_sql();
+        assert!(!migration_sql.is_empty(), "migration 022 must exist");
+        let error = sqlx::raw_sql(&migration_sql)
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("immutable dividend migration conflict"));
+
+        let cash: Decimal = sqlx::query_scalar(
+            r#"SELECT cash_dividend FROM stock_dividend_versions
+               WHERE source = 'migration020' AND action_key = 'conflict'
+                 AND source_revision = 'v1'"#,
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(cash, decimal("9.99"));
         Ok(())
     }
 
