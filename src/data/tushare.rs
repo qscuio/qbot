@@ -1,7 +1,6 @@
-use anyhow::Context;
 use async_trait::async_trait;
-use chrono::{DateTime, Duration, NaiveDate, Utc};
-use reqwest::Client;
+use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
+use reqwest::{Client, StatusCode};
 use rust_decimal::Decimal;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -31,6 +30,14 @@ pub struct TushareClient {
     token: String,
     client: Client,
     point_in_time_capabilities: RwLock<Option<PointInTimeCapabilities>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FinancialJoinIdentity {
+    code: String,
+    end_date: NaiveDate,
+    update_flag: Option<String>,
+    announcement_date: Option<NaiveDate>,
 }
 
 impl TushareClient {
@@ -64,11 +71,35 @@ impl TushareClient {
             .json(&body)
             .send()
             .await
-            .context("Tushare HTTP request failed")
-            .map_err(|e| AppError::Internal(e.to_string()))?;
+            .map_err(|error| {
+                AppError::DataProvider(format!("Tushare {api_name} HTTP request failed: {error}"))
+            })?;
 
-        let json: Value = resp.json().await.map_err(AppError::Http)?;
-        Self::response_data(api_name, &json)
+        let status = resp.status();
+        let response_body = resp.text().await.map_err(|error| {
+            AppError::DataProvider(format!(
+                "Tushare {api_name} HTTP {status} body read failed: {error}"
+            ))
+        })?;
+        Self::decode_response_body(api_name, status, &response_body)
+    }
+
+    fn decode_response_body(api_name: &str, status: StatusCode, body: &str) -> Result<Value> {
+        let response: Value = serde_json::from_str(body).map_err(|error| {
+            let excerpt: String = body.chars().take(200).collect();
+            AppError::DataProvider(format!(
+                "Tushare {api_name} HTTP {} returned non-JSON data: {error}; body: {excerpt}",
+                status.as_u16()
+            ))
+        })?;
+
+        if !status.is_success() && response.get("code").and_then(Value::as_i64) == Some(0) {
+            return Err(AppError::DataProvider(format!(
+                "Tushare {api_name} HTTP {} returned an unsuccessful status",
+                status.as_u16()
+            )));
+        }
+        Self::response_data(api_name, &response)
     }
 
     fn response_data(api_name: &str, response: &Value) -> Result<Value> {
@@ -119,6 +150,42 @@ impl TushareClient {
             "start_date": start.format("%Y%m%d").to_string(),
             "end_date": end.format("%Y%m%d").to_string(),
         })
+    }
+
+    fn company_report_periods(start: NaiveDate, end: NaiveDate) -> Result<Vec<NaiveDate>> {
+        if start > end {
+            return Err(AppError::BadRequest(format!(
+                "company financial window starts after it ends: {start} > {end}"
+            )));
+        }
+        if (end - start).num_days() > 366 {
+            return Err(AppError::BadRequest(format!(
+                "company financial report-period window exceeds one year: {start}..{end}"
+            )));
+        }
+
+        let mut periods = Vec::new();
+        for year in start.year()..=end.year() {
+            for (month, day) in [(3, 31), (6, 30), (9, 30), (12, 31)] {
+                let period = NaiveDate::from_ymd_opt(year, month, day)
+                    .expect("supported report-period dates are valid");
+                if period >= start && period <= end {
+                    periods.push(period);
+                }
+            }
+        }
+        Ok(periods)
+    }
+
+    fn income_period_params(code: &str, period: NaiveDate) -> Value {
+        json!({
+            "ts_code": code,
+            "period": period.format("%Y%m%d").to_string(),
+        })
+    }
+
+    fn dividend_params(code: &str) -> Value {
+        json!({ "ts_code": code })
     }
 
     fn company_rows(data: &Value, endpoint: &str) -> Result<Vec<serde_json::Map<String, Value>>> {
@@ -177,6 +244,43 @@ impl TushareClient {
                     .collect())
             })
             .collect()
+    }
+
+    fn company_data_from_rows(rows: Vec<serde_json::Map<String, Value>>) -> Value {
+        let fields: BTreeSet<String> = rows.iter().flat_map(|row| row.keys().cloned()).collect();
+        let fields: Vec<String> = fields.into_iter().collect();
+        let items: Vec<Vec<Value>> = rows
+            .into_iter()
+            .map(|row| {
+                fields
+                    .iter()
+                    .map(|field| row.get(field).cloned().unwrap_or(Value::Null))
+                    .collect()
+            })
+            .collect();
+        json!({ "fields": fields, "items": items })
+    }
+
+    fn ensure_complete_company_history(data: &Value, endpoint: &str) -> Result<()> {
+        let has_more = data
+            .get("has_more")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let item_count = data
+            .get("items")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        let declared_total_exceeds_items = data
+            .get("total")
+            .and_then(Value::as_u64)
+            .is_some_and(|total| total > item_count as u64);
+        if has_more || declared_total_exceeds_items {
+            return Err(AppError::DataProvider(format!(
+                "Tushare {endpoint} history is truncated and the endpoint exposes no documented pagination contract"
+            )));
+        }
+        Ok(())
     }
 
     fn malformed_company_data(endpoint: &str, detail: &str) -> AppError {
@@ -335,14 +439,35 @@ impl TushareClient {
         }
     }
 
-    fn deterministic_available_at(
-        announcement_date: Option<NaiveDate>,
+    fn availability_semantics(
+        source_event: Option<(&'static str, NaiveDate)>,
         fetched_at: DateTime<Utc>,
-    ) -> DateTime<Utc> {
-        announcement_date
-            .and_then(|date| date.and_hms_opt(0, 0, 0))
+    ) -> (DateTime<Utc>, Value) {
+        let (date, metadata) = match source_event {
+            Some((field, date)) => (
+                date,
+                json!({
+                    "kind": "source_event_date",
+                    "source_field": field,
+                    "date": date.to_string(),
+                }),
+            ),
+            None => {
+                let observed_on = fetched_at.date_naive();
+                (
+                    observed_on,
+                    json!({
+                        "kind": "observation_date",
+                        "observed_on": observed_on.to_string(),
+                    }),
+                )
+            }
+        };
+        let available_at = date
+            .and_hms_opt(0, 0, 0)
             .map(|value| DateTime::from_naive_utc_and_offset(value, Utc))
-            .unwrap_or(fetched_at)
+            .expect("a valid date has a UTC midnight");
+        (available_at, metadata)
     }
 
     fn content_revision(payload: &Value) -> String {
@@ -353,13 +478,29 @@ impl TushareClient {
     fn financial_join_identity(
         row: &serde_json::Map<String, Value>,
         endpoint: &str,
-    ) -> Result<(String, NaiveDate, Option<String>, Option<String>)> {
-        Ok((
-            Self::required_company_text(row, endpoint, "ts_code")?,
-            Self::required_company_date(row, endpoint, "end_date")?,
-            Self::optional_company_text(row, endpoint, "report_type")?,
-            Self::optional_company_text(row, endpoint, "update_flag")?,
-        ))
+    ) -> Result<FinancialJoinIdentity> {
+        let announcement_date = if endpoint == "income" {
+            Self::optional_company_date(row, endpoint, "f_ann_date")?
+                .or(Self::optional_company_date(row, endpoint, "ann_date")?)
+        } else {
+            Self::optional_company_date(row, endpoint, "ann_date")?
+        };
+        Ok(FinancialJoinIdentity {
+            code: Self::required_company_text(row, endpoint, "ts_code")?,
+            end_date: Self::required_company_date(row, endpoint, "end_date")?,
+            update_flag: Self::optional_company_text(row, endpoint, "update_flag")?,
+            announcement_date,
+        })
+    }
+
+    fn financial_identities_match(
+        income: &FinancialJoinIdentity,
+        indicator: &FinancialJoinIdentity,
+    ) -> bool {
+        income.code == indicator.code
+            && income.end_date == indicator.end_date
+            && income.update_flag == indicator.update_flag
+            && income.announcement_date == indicator.announcement_date
     }
 
     fn parse_financial_report_row(
@@ -379,23 +520,32 @@ impl TushareClient {
         let frequency = Self::financial_frequency(end_date)?;
 
         let income_announcement = match income {
-            Some(row) => Self::optional_company_date(row, "income", "f_ann_date")?
-                .or(Self::optional_company_date(row, "income", "ann_date")?),
+            Some(row) => match Self::optional_company_date(row, "income", "f_ann_date")? {
+                Some(date) => Some(("income.f_ann_date", date)),
+                None => Self::optional_company_date(row, "income", "ann_date")?
+                    .map(|date| ("income.ann_date", date)),
+            },
             None => None,
         };
         let indicator_announcement = match indicator {
-            Some(row) => Self::optional_company_date(row, "fina_indicator", "ann_date")?,
+            Some(row) => Self::optional_company_date(row, "fina_indicator", "ann_date")?
+                .map(|date| ("fina_indicator.ann_date", date)),
             None => None,
         };
-        let announcement_date = income_announcement.or(indicator_announcement);
-        let available_date = match (income_announcement, indicator_announcement) {
-            (Some(income_date), Some(indicator_date)) => Some(income_date.max(indicator_date)),
-            (income_date, indicator_date) => income_date.or(indicator_date),
+        let announcement_date = income_announcement
+            .map(|(_, date)| date)
+            .or(indicator_announcement.map(|(_, date)| date));
+        let source_event = match (income_announcement, indicator_announcement) {
+            (Some(income), Some(indicator)) if indicator.1 > income.1 => Some(indicator),
+            (Some(income), _) => Some(income),
+            (None, indicator) => indicator,
         };
+        let (available_at, availability) = Self::availability_semantics(source_event, fetched_at);
 
         let raw_payload = json!({
             "income": income.cloned().map(Value::Object).unwrap_or(Value::Null),
             "indicator": indicator.cloned().map(Value::Object).unwrap_or(Value::Null),
+            "availability": availability,
         });
         let source_revision = Self::content_revision(&raw_payload);
 
@@ -430,7 +580,7 @@ impl TushareClient {
             revenue_yoy: indicator_decimal("tr_yoy")?,
             net_profit_yoy: indicator_decimal("netprofit_yoy")?,
             raw_payload,
-            available_at: Self::deterministic_available_at(available_date, fetched_at),
+            available_at,
             ingested_at: fetched_at,
         })
     }
@@ -450,99 +600,56 @@ impl TushareClient {
             .iter()
             .map(|row| Self::financial_join_identity(row, "fina_indicator"))
             .collect::<Result<Vec<_>>>()?;
-        let mut used_indicators = vec![false; indicator_rows.len()];
-        let mut reports = Vec::with_capacity(income_rows.len() + indicator_rows.len());
-
-        for (income_index, income) in income_rows.iter().enumerate() {
-            let (code, end_date, report_type, update_flag) = &income_identities[income_index];
-            let mut candidates: Vec<usize> = indicator_identities
+        let mut indicator_for_income = vec![None; income_rows.len()];
+        for (indicator_index, indicator_identity) in indicator_identities.iter().enumerate() {
+            let candidates: Vec<usize> = income_identities
                 .iter()
                 .enumerate()
-                .filter(
-                    |(index, (indicator_code, indicator_end, indicator_type, _))| {
-                        !used_indicators[*index]
-                            && indicator_code == code
-                            && indicator_end == end_date
-                            && indicator_type == report_type
-                    },
-                )
+                .filter(|(_, income_identity)| {
+                    Self::financial_identities_match(income_identity, indicator_identity)
+                })
                 .map(|(index, _)| index)
                 .collect();
 
-            if candidates.is_empty() {
-                candidates = indicator_identities
-                    .iter()
-                    .enumerate()
-                    .filter(
-                        |(index, (indicator_code, indicator_end, indicator_type, _))| {
-                            !used_indicators[*index]
-                                && indicator_code == code
-                                && indicator_end == end_date
-                                && indicator_type.is_none()
-                        },
-                    )
-                    .map(|(index, _)| index)
-                    .collect();
+            if candidates.len() != 1 {
+                return Err(Self::malformed_company_data(
+                    "financial",
+                    &format!(
+                        "ambiguous fina_indicator identity for {}/{}: matched {} income rows",
+                        indicator_identity.code,
+                        indicator_identity.end_date,
+                        candidates.len()
+                    ),
+                ));
             }
 
-            if candidates.len() > 1 {
-                if let Some(update_flag) = update_flag {
-                    let matching: Vec<usize> = candidates
-                        .iter()
-                        .copied()
-                        .filter(|index| {
-                            indicator_identities[*index].3.as_ref() == Some(update_flag)
-                        })
-                        .collect();
-                    if !matching.is_empty() {
-                        candidates = matching;
-                    }
-                }
+            let income_index = candidates[0];
+            if indicator_for_income[income_index]
+                .replace(indicator_index)
+                .is_some()
+            {
+                let identity = &income_identities[income_index];
+                return Err(Self::malformed_company_data(
+                    "financial",
+                    &format!(
+                        "ambiguous income identity for {}/{}: matched multiple fina_indicator rows",
+                        identity.code, identity.end_date
+                    ),
+                ));
             }
-            if candidates.len() > 1 {
-                let income_announcement =
-                    Self::optional_company_date(income, "income", "f_ann_date")?
-                        .or(Self::optional_company_date(income, "income", "ann_date")?);
-                if let Some(income_announcement) = income_announcement {
-                    let mut matching = Vec::new();
-                    for index in candidates.iter().copied() {
-                        if Self::optional_company_date(
-                            &indicator_rows[index],
-                            "fina_indicator",
-                            "ann_date",
-                        )? == Some(income_announcement)
-                        {
-                            matching.push(index);
-                        }
-                    }
-                    if !matching.is_empty() {
-                        candidates = matching;
-                    }
-                }
-            }
-
-            let indicator_index = candidates.first().copied();
-            if let Some(index) = indicator_index {
-                used_indicators[index] = true;
-            }
-            reports.push(Self::parse_financial_report_row(
-                Some(income),
-                indicator_index.map(|index| &indicator_rows[index]),
-                fetched_at,
-            )?);
         }
 
-        for (index, indicator) in indicator_rows.iter().enumerate() {
-            if !used_indicators[index] {
-                reports.push(Self::parse_financial_report_row(
-                    None,
-                    Some(indicator),
+        income_rows
+            .iter()
+            .enumerate()
+            .map(|(index, income)| {
+                Self::parse_financial_report_row(
+                    Some(income),
+                    indicator_for_income[index].map(|indicator| &indicator_rows[indicator]),
                     fetched_at,
-                )?);
-            }
-        }
-
-        Ok(reports)
+                )
+            })
+            .collect()
     }
 
     fn normalize_dividend_status(value: Option<&str>) -> &'static str {
@@ -608,12 +715,20 @@ impl TushareClient {
                     ),
                     None => format!("{}:{}", code, end_date.format("%Y%m%d")),
                 };
-                let available_date = if implementation_status == "implemented" {
-                    implementation_announcement.or(announcement_date)
-                } else {
-                    announcement_date
+                let source_event = match implementation_status {
+                    "implemented" => {
+                        implementation_announcement.map(|date| ("dividend.imp_ann_date", date))
+                    }
+                    "proposed" => announcement_date.map(|date| ("dividend.ann_date", date)),
+                    "approved" | "unknown" => None,
+                    _ => unreachable!("dividend statuses are normalized"),
                 };
-                let raw_payload = Value::Object(row);
+                let (available_at, availability) =
+                    Self::availability_semantics(source_event, fetched_at);
+                let raw_payload = json!({
+                    "dividend": Value::Object(row),
+                    "availability": availability,
+                });
                 let source_revision = Self::content_revision(&raw_payload);
 
                 Ok(DividendRecord {
@@ -630,11 +745,74 @@ impl TushareClient {
                     stock_ratio,
                     source_revision,
                     raw_payload,
-                    available_at: Self::deterministic_available_at(available_date, fetched_at),
+                    available_at,
                     ingested_at: fetched_at,
                 })
             })
             .collect()
+    }
+
+    async fn financial_reports_with<C, Fut>(
+        code: &str,
+        start: NaiveDate,
+        end: NaiveDate,
+        fetched_at: DateTime<Utc>,
+        mut call: C,
+    ) -> Result<Vec<FinancialReport>>
+    where
+        C: FnMut(&'static str, Value, &'static str) -> Fut,
+        Fut: Future<Output = Result<Value>>,
+    {
+        let periods = Self::company_report_periods(start, end)?;
+        let mut income_rows = Vec::new();
+        for period in periods {
+            let data = call(
+                "income",
+                Self::income_period_params(code, period),
+                Self::income_fields(),
+            )
+            .await?;
+            income_rows.extend(Self::company_rows(&data, "income")?);
+        }
+        let indicator = call(
+            "fina_indicator",
+            Self::company_window_params(code, start, end),
+            Self::indicator_fields(),
+        )
+        .await?;
+        let income = Self::company_data_from_rows(income_rows);
+        Self::parse_financial_reports(&income, &indicator, fetched_at)
+    }
+
+    async fn dividends_with<C, Fut>(
+        code: &str,
+        start: NaiveDate,
+        end: NaiveDate,
+        fetched_at: DateTime<Utc>,
+        mut call: C,
+    ) -> Result<Vec<DividendRecord>>
+    where
+        C: FnMut(&'static str, Value, &'static str) -> Fut,
+        Fut: Future<Output = Result<Value>>,
+    {
+        if start > end {
+            return Err(AppError::BadRequest(format!(
+                "company dividend window starts after it ends: {start} > {end}"
+            )));
+        }
+        let data = call(
+            "dividend",
+            Self::dividend_params(code),
+            Self::dividend_fields(),
+        )
+        .await?;
+        Self::ensure_complete_company_history(&data, "dividend")?;
+        let mut records = Self::parse_dividend_records(&data, fetched_at)?;
+        records.retain(|record| {
+            let effective_source_date = record.available_at.date_naive();
+            effective_source_date >= start && effective_source_date <= end
+        });
+        Ok(records)
     }
 
     async fn get_sector_name_map(&self) -> Result<HashMap<String, String>> {
@@ -1648,17 +1826,10 @@ impl CompanyDataProvider for TushareClient {
         start: NaiveDate,
         end: NaiveDate,
     ) -> Result<Vec<FinancialReport>> {
-        if start > end {
-            return Err(AppError::BadRequest(format!(
-                "company financial window starts after it ends: {start} > {end}"
-            )));
-        }
-        let params = Self::company_window_params(code, start, end);
-        let (income, indicator) = tokio::try_join!(
-            self.call("income", params.clone(), Self::income_fields()),
-            self.call("fina_indicator", params, Self::indicator_fields()),
-        )?;
-        Self::parse_financial_reports(&income, &indicator, Utc::now())
+        Self::financial_reports_with(code, start, end, Utc::now(), |api_name, params, fields| {
+            self.call(api_name, params, fields)
+        })
+        .await
     }
 
     async fn dividends(
@@ -1667,19 +1838,10 @@ impl CompanyDataProvider for TushareClient {
         start: NaiveDate,
         end: NaiveDate,
     ) -> Result<Vec<DividendRecord>> {
-        if start > end {
-            return Err(AppError::BadRequest(format!(
-                "company dividend window starts after it ends: {start} > {end}"
-            )));
-        }
-        let data = self
-            .call(
-                "dividend",
-                Self::company_window_params(code, start, end),
-                Self::dividend_fields(),
-            )
-            .await?;
-        Self::parse_dividend_records(&data, Utc::now())
+        Self::dividends_with(code, start, end, Utc::now(), |api_name, params, fields| {
+            self.call(api_name, params, fields)
+        })
+        .await
     }
 }
 
@@ -2079,9 +2241,11 @@ mod tests {
     use super::*;
     use crate::analysis::market_snapshot::AvailabilityQuality;
     use crate::data::company::{CompanyDataProvider, FinancialFrequency};
+    use crate::storage::company_repository::CompanyRepository;
     use chrono::{TimeZone, Utc};
     use rust_decimal::Decimal;
     use std::str::FromStr;
+    use std::sync::{Arc, Mutex};
 
     fn decimal(value: &str) -> Decimal {
         Decimal::from_str(value).unwrap()
@@ -2115,9 +2279,7 @@ mod tests {
             ],
             "items": [
                 ["52.345678", "600519.SH", "83000000000.4567", "31.200001", "20241231",
-                 null, "91.234567", "12.345678", "15.765432", "20250330", "1"],
-                [null, "000001.SZ", null, null, "20240630", "1", null, null, null,
-                 "20240801", "0"]
+                 null, "91.234567", "12.345678", "15.765432", "20250330", "1"]
             ]
         })
     }
@@ -2223,14 +2385,6 @@ mod tests {
         assert_eq!(adjusted.frequency, FinancialFrequency::Annual);
         assert_eq!(adjusted.deducted_net_profit, None);
 
-        let indicator_only = rows
-            .iter()
-            .find(|row| row.code == "000001.SZ" && row.end_date.to_string() == "2024-06-30")
-            .unwrap();
-        assert_eq!(indicator_only.frequency, FinancialFrequency::Quarterly);
-        assert_eq!(indicator_only.total_revenue, None);
-        assert_eq!(indicator_only.raw_payload["income"], Value::Null);
-
         let dividends =
             TushareClient::parse_dividend_records(&dividend_fixture(), fetched_at).unwrap();
         assert_eq!(dividends.len(), 4);
@@ -2251,8 +2405,8 @@ mod tests {
             dividends[2].available_at.to_rfc3339(),
             "2025-06-18T00:00:00+00:00"
         );
-        assert_eq!(dividends[2].raw_payload["stk_bo_rate"], "0.20");
-        assert_eq!(dividends[2].raw_payload["stk_co_rate"], "0.10");
+        assert_eq!(dividends[2].raw_payload["dividend"]["stk_bo_rate"], "0.20");
+        assert_eq!(dividends[2].raw_payload["dividend"]["stk_co_rate"], "0.10");
     }
 
     #[test]
@@ -2294,8 +2448,30 @@ mod tests {
             TushareClient::parse_dividend_records(&reorder_table(&dividend_fixture()), later_fetch)
                 .unwrap();
         assert_eq!(original_dividends.len(), reordered_dividends.len());
-        for row in &original_dividends {
+        for row in original_dividends.iter().filter(|row| {
+            matches!(
+                row.implementation_status.as_str(),
+                "proposed" | "implemented"
+            )
+        }) {
             let other = reordered_dividends
+                .iter()
+                .find(|candidate| candidate.source_revision == row.source_revision)
+                .unwrap();
+            assert_eq!(other.action_key, row.action_key);
+            assert_eq!(other.available_at, row.available_at);
+            assert_eq!(other.raw_payload, row.raw_payload);
+        }
+        let same_day_reordered = TushareClient::parse_dividend_records(
+            &reorder_table(&dividend_fixture()),
+            Utc.with_ymd_and_hms(2026, 7, 19, 22, 0, 0).unwrap(),
+        )
+        .unwrap();
+        for row in original_dividends
+            .iter()
+            .filter(|row| matches!(row.implementation_status.as_str(), "approved" | "unknown"))
+        {
+            let other = same_day_reordered
                 .iter()
                 .find(|candidate| candidate.source_revision == row.source_revision)
                 .unwrap();
@@ -2319,7 +2495,10 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].frequency, FinancialFrequency::Quarterly);
         assert_eq!(rows[0].announcement_date, None);
-        assert_eq!(rows[0].available_at, fetched_at);
+        assert_eq!(
+            rows[0].available_at,
+            Utc.with_ymd_and_hms(2026, 7, 19, 0, 0, 0).unwrap()
+        );
         assert_eq!(rows[0].total_revenue, None);
 
         let malformed_decimal = serde_json::json!({
@@ -2355,6 +2534,144 @@ mod tests {
     }
 
     #[test]
+    fn missing_source_events_use_replay_safe_observation_day_versions() {
+        let first = Utc.with_ymd_and_hms(2026, 7, 19, 8, 15, 0).unwrap();
+        let same_day = Utc.with_ymd_and_hms(2026, 7, 19, 20, 45, 0).unwrap();
+        let next_day = Utc.with_ymd_and_hms(2026, 7, 20, 1, 5, 0).unwrap();
+        let income = serde_json::json!({
+            "fields": ["ts_code", "end_date", "report_type", "update_flag"],
+            "items": [["600000.SH", "20241231", "1", "1"]]
+        });
+        let indicators = serde_json::json!({ "fields": [], "items": [] });
+
+        let financial_first =
+            TushareClient::parse_financial_reports(&income, &indicators, first).unwrap();
+        let financial_same =
+            TushareClient::parse_financial_reports(&income, &indicators, same_day).unwrap();
+        let financial_next =
+            TushareClient::parse_financial_reports(&income, &indicators, next_day).unwrap();
+        assert_eq!(
+            financial_first[0].source_revision,
+            financial_same[0].source_revision
+        );
+        assert_eq!(
+            financial_first[0].available_at,
+            financial_same[0].available_at
+        );
+        assert_ne!(
+            financial_first[0].source_revision,
+            financial_next[0].source_revision
+        );
+        assert_eq!(
+            financial_first[0].available_at,
+            first.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc()
+        );
+        assert_eq!(
+            financial_next[0].available_at,
+            next_day
+                .date_naive()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+        );
+        assert_eq!(
+            financial_first[0].raw_payload["availability"],
+            serde_json::json!({
+                "kind": "observation_date",
+                "observed_on": "2026-07-19"
+            })
+        );
+
+        let approved = serde_json::json!({
+            "fields": ["ts_code", "end_date", "ann_date", "div_proc"],
+            "items": [["600000.SH", "20241231", "20250329", "股东大会通过"]]
+        });
+        let dividend_first = TushareClient::parse_dividend_records(&approved, first).unwrap();
+        let dividend_same = TushareClient::parse_dividend_records(&approved, same_day).unwrap();
+        let dividend_next = TushareClient::parse_dividend_records(&approved, next_day).unwrap();
+        assert_eq!(
+            dividend_first[0].source_revision,
+            dividend_same[0].source_revision
+        );
+        assert_eq!(
+            dividend_first[0].available_at,
+            dividend_same[0].available_at
+        );
+        assert_ne!(
+            dividend_first[0].source_revision,
+            dividend_next[0].source_revision
+        );
+        assert_eq!(
+            dividend_first[0].available_at.date_naive(),
+            first.date_naive()
+        );
+        assert_eq!(
+            dividend_first[0].raw_payload["availability"],
+            serde_json::json!({
+                "kind": "observation_date",
+                "observed_on": "2026-07-19"
+            })
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn financial_observation_versions_replay_cleanly_in_company_repository(
+        pool: sqlx::PgPool,
+    ) -> anyhow::Result<()> {
+        let repo = CompanyRepository::new(pool);
+        let income = serde_json::json!({
+            "fields": ["ts_code", "end_date", "report_type", "update_flag"],
+            "items": [["600000.SH", "20241231", "1", "1"]]
+        });
+        let indicators = serde_json::json!({ "fields": [], "items": [] });
+        let times = [
+            Utc.with_ymd_and_hms(2026, 7, 19, 8, 15, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 7, 19, 20, 45, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 7, 20, 1, 5, 0).unwrap(),
+        ];
+        let versions = times
+            .iter()
+            .map(|time| TushareClient::parse_financial_reports(&income, &indicators, *time))
+            .collect::<Result<Vec<_>>>()?;
+
+        assert_eq!(repo.upsert_financial_reports(&versions[0]).await?, 1);
+        assert_eq!(repo.upsert_financial_reports(&versions[1]).await?, 0);
+        assert_eq!(repo.upsert_financial_reports(&versions[2]).await?, 1);
+        let history = repo
+            .financial_history("600000.SH", FinancialFrequency::Annual, 10, None)
+            .await?;
+        assert_eq!(history.items[0].revision_count, 2);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn dividend_observation_versions_replay_cleanly_in_company_repository(
+        pool: sqlx::PgPool,
+    ) -> anyhow::Result<()> {
+        let repo = CompanyRepository::new(pool);
+        let approved = serde_json::json!({
+            "fields": ["ts_code", "end_date", "ann_date", "div_proc"],
+            "items": [["600000.SH", "20241231", "20250329", "股东大会通过"]]
+        });
+        let times = [
+            Utc.with_ymd_and_hms(2026, 7, 19, 8, 15, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 7, 19, 20, 45, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 7, 20, 1, 5, 0).unwrap(),
+        ];
+        let versions = times
+            .iter()
+            .map(|time| TushareClient::parse_dividend_records(&approved, *time))
+            .collect::<Result<Vec<_>>>()?;
+
+        assert_eq!(repo.upsert_dividends(&versions[0]).await?, 1);
+        assert_eq!(repo.upsert_dividends(&versions[1]).await?, 0);
+        assert_eq!(repo.upsert_dividends(&versions[2]).await?, 1);
+        let history = repo.dividend_history("600000.SH", 10, None).await?;
+        assert_eq!(history.items[0].revision_count, 2);
+        Ok(())
+    }
+
+    #[test]
     fn company_parser_preserves_exact_json_numeric_tokens() {
         let fetched_at = Utc.with_ymd_and_hms(2026, 7, 19, 12, 30, 0).unwrap();
         let income: Value = serde_json::from_str(
@@ -2385,6 +2702,45 @@ mod tests {
             TushareClient::parse_financial_reports(&oversized_scientific, &indicators, fetched_at)
                 .unwrap_err();
         assert!(error.to_string().contains("income.total_revenue"));
+
+        let representable_scientific: Value = serde_json::from_str(
+            r#"{
+                "fields":["ts_code","end_date","report_type","total_revenue","revenue"],
+                "items":[["600000.SH","20241231","1",1.2345e+3,-4.321e-2]]
+            }"#,
+        )
+        .unwrap();
+        let rows = TushareClient::parse_financial_reports(
+            &representable_scientific,
+            &indicators,
+            fetched_at,
+        )
+        .unwrap();
+        assert_eq!(rows[0].total_revenue, Some(decimal("1234.5")));
+        assert_eq!(rows[0].revenue, Some(decimal("-0.04321")));
+    }
+
+    #[test]
+    fn company_http_response_errors_include_endpoint_and_status_context() {
+        let rate_limit = TushareClient::decode_response_body(
+            "income",
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            "rate limit exceeded",
+        )
+        .unwrap_err();
+        assert!(rate_limit.to_string().contains("income"));
+        assert!(rate_limit.to_string().contains("429"));
+        assert!(rate_limit.to_string().contains("rate limit exceeded"));
+
+        let non_json = TushareClient::decode_response_body(
+            "dividend",
+            reqwest::StatusCode::BAD_GATEWAY,
+            "<html>upstream unavailable</html>",
+        )
+        .unwrap_err();
+        assert!(non_json.to_string().contains("dividend"));
+        assert!(non_json.to_string().contains("502"));
+        assert!(non_json.to_string().contains("non-JSON"));
     }
 
     #[test]
@@ -2402,11 +2758,11 @@ mod tests {
         });
         let indicators = serde_json::json!({
             "fields": [
-                "roe", "ann_date", "update_flag", "report_type", "end_date", "ts_code"
+                "roe", "ann_date", "update_flag", "end_date", "ts_code"
             ],
             "items": [
-                ["20.20", "20250330", "0", "1", "20241231", "600000.SH"],
-                ["21.21", "20250401", "1", "1", "20241231", "600000.SH"]
+                ["20.20", "20250330", "0", "20241231", "600000.SH"],
+                ["21.21", "20250401", "1", "20241231", "600000.SH"]
             ]
         });
 
@@ -2427,6 +2783,173 @@ mod tests {
     }
 
     #[test]
+    fn company_financial_parser_rejects_ambiguous_official_indicator_identity() {
+        let fetched_at = Utc.with_ymd_and_hms(2026, 7, 19, 12, 30, 0).unwrap();
+        let income = serde_json::json!({
+            "fields": [
+                "ts_code", "end_date", "report_type", "update_flag", "f_ann_date"
+            ],
+            "items": [
+                ["600000.SH", "20241231", "1", "1", "20250401"],
+                ["600000.SH", "20241231", "5", "1", "20250401"]
+            ]
+        });
+        let indicators = serde_json::json!({
+            "fields": ["ts_code", "end_date", "update_flag", "ann_date", "roe"],
+            "items": [["600000.SH", "20241231", "1", "20250401", "21.21"]]
+        });
+
+        let error =
+            TushareClient::parse_financial_reports(&income, &indicators, fetched_at).unwrap_err();
+
+        assert!(error.to_string().contains("ambiguous"));
+        assert!(error.to_string().contains("600000.SH"));
+        assert!(error.to_string().contains("2024-12-31"));
+    }
+
+    #[tokio::test]
+    async fn financial_provider_uses_period_income_requests_and_returns_later_announced_fy() {
+        let start = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+        let end = NaiveDate::from_ymd_opt(2024, 12, 31).unwrap();
+        let fetched_at = Utc.with_ymd_and_hms(2025, 4, 2, 8, 0, 0).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+
+        let reports = TushareClient::financial_reports_with(
+            "600519.SH",
+            start,
+            end,
+            fetched_at,
+            move |api_name, params, fields| {
+                let recorded = recorded.clone();
+                async move {
+                    recorded.lock().unwrap().push((
+                        api_name.to_string(),
+                        params.clone(),
+                        fields.to_string(),
+                    ));
+                    match api_name {
+                        "income" if params["period"] == "20241231" => Ok(serde_json::json!({
+                            "fields": [
+                                "ts_code", "end_date", "report_type", "update_flag",
+                                "f_ann_date", "total_revenue"
+                            ],
+                            "items": [[
+                                "600519.SH", "20241231", "1", "1", "20250330", "100.01"
+                            ]]
+                        })),
+                        "income" => Ok(serde_json::json!({ "fields": [], "items": [] })),
+                        "fina_indicator" => Ok(serde_json::json!({
+                            "fields": [
+                                "ts_code", "end_date", "update_flag", "ann_date", "roe"
+                            ],
+                            "items": [["600519.SH", "20241231", "1", "20250330", "20.02"]]
+                        })),
+                        _ => unreachable!(),
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].end_date, end);
+        assert_eq!(
+            reports[0].announcement_date.unwrap().to_string(),
+            "2025-03-30"
+        );
+        assert_eq!(reports[0].total_revenue, Some(decimal("100.01")));
+        assert_eq!(reports[0].roe, Some(decimal("20.02")));
+
+        let calls = calls.lock().unwrap();
+        let income_params: Vec<_> = calls
+            .iter()
+            .filter(|(api_name, _, _)| api_name == "income")
+            .map(|(_, params, _)| params.clone())
+            .collect();
+        assert_eq!(
+            income_params,
+            vec![
+                serde_json::json!({"ts_code": "600519.SH", "period": "20240331"}),
+                serde_json::json!({"ts_code": "600519.SH", "period": "20240630"}),
+                serde_json::json!({"ts_code": "600519.SH", "period": "20240930"}),
+                serde_json::json!({"ts_code": "600519.SH", "period": "20241231"}),
+            ]
+        );
+        assert!(income_params
+            .iter()
+            .all(|params| params.get("start_date").is_none() && params.get("end_date").is_none()));
+        let indicator_params = calls
+            .iter()
+            .find(|(api_name, _, _)| api_name == "fina_indicator")
+            .map(|(_, params, _)| params)
+            .unwrap();
+        assert_eq!(
+            indicator_params,
+            &serde_json::json!({
+                "ts_code": "600519.SH",
+                "start_date": "20240101",
+                "end_date": "20241231"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn dividend_provider_requests_documented_stock_history_and_filters_locally() {
+        let start = NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
+        let end = NaiveDate::from_ymd_opt(2025, 12, 31).unwrap();
+        let fetched_at = Utc.with_ymd_and_hms(2026, 7, 19, 12, 30, 0).unwrap();
+        let captured = Arc::new(Mutex::new(None));
+        let recorded = captured.clone();
+
+        let records = TushareClient::dividends_with(
+            "600519.SH",
+            start,
+            end,
+            fetched_at,
+            move |api_name, params, fields| {
+                *recorded.lock().unwrap() =
+                    Some((api_name.to_string(), params, fields.to_string()));
+                async { Ok(dividend_fixture()) }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            captured.lock().unwrap().as_ref().unwrap().1,
+            serde_json::json!({"ts_code": "600519.SH"})
+        );
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|record| record.code == "600519.SH"));
+        assert!(records.iter().all(|record| {
+            let effective_date = record.available_at.date_naive();
+            effective_date >= start && effective_date <= end
+        }));
+    }
+
+    #[tokio::test]
+    async fn dividend_provider_rejects_explicitly_truncated_history() {
+        let start = NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
+        let end = NaiveDate::from_ymd_opt(2025, 12, 31).unwrap();
+        let fetched_at = Utc.with_ymd_and_hms(2026, 7, 19, 12, 30, 0).unwrap();
+        let error =
+            TushareClient::dividends_with("600519.SH", start, end, fetched_at, |_, _, _| async {
+                Ok(serde_json::json!({
+                    "fields": [],
+                    "items": [],
+                    "has_more": true
+                }))
+            })
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("truncated"));
+        assert!(error.to_string().contains("dividend"));
+    }
+
+    #[test]
     fn company_request_and_provider_error_shapes_are_explicit() {
         let start = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
         let end = NaiveDate::from_ymd_opt(2024, 12, 31).unwrap();
@@ -2438,6 +2961,12 @@ mod tests {
                 "end_date": "20241231"
             })
         );
+        let oversized_window = TushareClient::company_report_periods(
+            NaiveDate::from_ymd_opt(2023, 1, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 12, 31).unwrap(),
+        )
+        .unwrap_err();
+        assert!(oversized_window.to_string().contains("exceeds one year"));
         for field in [
             "total_revenue",
             "revenue",
