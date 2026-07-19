@@ -211,9 +211,9 @@ button { cursor: pointer; }
 .panel-empty span { max-width: 245px; font-size: 10px; }
 .panel-load-more { width: 100%; height: 30px; margin-top: 9px; border: 1px solid #414141; background: #252526; color: #bbb; font-size: 10px; }
 .panel-load-more:hover { border-color: #666; background: var(--hover); color: #fff; }
-.dividend-list { max-height: 430px; display: grid; gap: 8px; overflow: auto; scrollbar-color: #555 #202020; }
+.dividend-list { max-height: 430px; display: block; overflow: auto; scrollbar-color: #555 #202020; }
 .history-spacer { min-height: 0; pointer-events: none; }
-.dividend-card { padding: 9px; border: 1px solid #373737; border-left: 2px solid #3e8bba; background: #202020; }
+.dividend-card { box-sizing: border-box; height: 93px; margin: 0 0 8px; overflow: hidden; padding: 9px; border: 1px solid #373737; border-left: 2px solid #3e8bba; background: #202020; }
 .dividend-card header { display: flex; align-items: center; gap: 5px; }
 .dividend-card header strong { margin-right: auto; color: #ddd; font: 11px var(--font-mono); }
 .status-badge { padding: 1px 5px; border: 1px solid #465244; color: #a9c6a5; background: #222a21; font-size: 8px; }

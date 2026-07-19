@@ -1,6 +1,6 @@
-import { dashboardApi, ApiError } from "./api.js?v=20260719.3";
-import { activitySeries, mountChart } from "./chart.js?v=20260719.3";
-import { companyPanel, dividendPanel, financialPanel } from "./company-panels.js?v=20260719.3";
+import { dashboardApi, ApiError } from "./api.js?v=20260719.4";
+import { activitySeries, mountChart } from "./chart.js?v=20260719.4";
+import { companyPanel, dividendPanel, financialPanel } from "./company-panels.js?v=20260719.4";
 import {
   activeFilterCount,
   applyFilters,
@@ -16,7 +16,7 @@ import {
   saveInspectorPreferences,
   sortRows,
   updateTab,
-} from "./state.js?v=20260719.3";
+} from "./state.js?v=20260719.4";
 
 const app = document.querySelector("#app");
 let bootstrap = null;
@@ -321,12 +321,17 @@ function renderInspectorPanel(kind, code) {
   if (!panel) return;
   const scroller = app.querySelector(".inspector-panels");
   const scrollTop = scroller?.scrollTop || 0;
-  const historyScrollTop = panel.querySelector("[data-history-kind]")?.scrollTop || 0;
+  const previousHistoryScroller = panel.querySelector("[data-history-kind]");
+  const historyScrollTop = previousHistoryScroller?.scrollTop || 0;
+  const restoreHistoryFocus = document.activeElement === previousHistoryScroller;
   panel.innerHTML = panelMarkup(kind, code);
   bindPanelActions(panel, kind, code);
   if (scroller) scroller.scrollTop = scrollTop;
   const historyScroller = panel.querySelector("[data-history-kind]");
-  if (historyScroller) historyScroller.scrollTop = historyScrollTop;
+  if (historyScroller) {
+    if (restoreHistoryFocus) historyScroller.focus({ preventScroll: true });
+    historyScroller.scrollTop = historyScrollTop;
+  }
 }
 
 function rowIdentity(kind, item) {
@@ -432,7 +437,9 @@ function bindPanelActions(panel, kind, code) {
         const frequency = requestKind === "financials" ? currentFinancialFrequency(code) : "";
         const state = getPanelState(requestKind, code, frequency);
         const rowHeight = Number(historyScroller.dataset.historyRowHeight) || 42;
-        const nextStart = Math.max(0, Math.floor(historyScroller.scrollTop / rowHeight) - 10);
+        const total = Number(historyScroller.dataset.historyTotal) || 0;
+        const maximumStart = Math.max(0, total - 60);
+        const nextStart = Math.min(maximumStart, Math.max(0, Math.floor(historyScroller.scrollTop / rowHeight) - 10));
         if (Math.abs(nextStart - state.windowStart) < 10) return;
         state.windowStart = nextStart;
         renderInspectorPanel(kind, code);
@@ -486,8 +493,8 @@ function renderWorkspace() {
   bindShell(tab);
   if (tab.type === "stock") {
     if (!detail) loadStock(tab);
-    else if (!detail.error && detail.bars.length) {
-      chartHandle = mountChart(app.querySelector("#stock-chart"), detail.bars, detail.hits);
+    else if (!detail.error) {
+      if (detail.bars.length) chartHandle = mountChart(app.querySelector("#stock-chart"), detail.bars, detail.hits);
       queueMicrotask(() => {
         if (currentStockTab()?.code !== tab.code) return;
         ensureInspectorPanel("overview", tab.code);
@@ -623,8 +630,6 @@ function bindInspector() {
     });
     const activeStock = currentStockTab();
     if (activeStock) {
-      const panel = app.querySelector(`[data-inspector-panel="${inspectorTab}"]`);
-      if (panel) bindPanelActions(panel, inspectorTab, activeStock.code);
       ensureInspectorPanel(inspectorTab, activeStock.code);
     }
     if (focus) button.focus();

@@ -298,6 +298,124 @@ test("loaded company tables remain inside the viewport on desktop and narrow scr
   expect(narrow.height[1]).toBe(narrow.height[0]);
 });
 
+test("empty stock history still loads overview and the active optional tab", async ({ page }) => {
+  const companyCodes = [];
+  const financialCodes = [];
+  await mockApi(page, true, bootstrap.results[0].hits, [], {
+    stock: { responses: { 2: { payload: { bars: [], latest: null } } } },
+    company: { requested: ({ url }) => companyCodes.push(url.pathname.split("/").at(-2)) },
+    financials: { requested: ({ url }) => financialCodes.push(url.pathname.split("/").at(-2)) },
+  });
+  await page.goto("/dashboard/");
+  await page.locator("tbody tr").first().click();
+  await page.getByRole("tab", { name: "Financials" }).click();
+  await page.getByRole("tab", { name: /Latest scan/ }).click();
+  await page.locator("tbody tr").nth(1).click();
+
+  await expect(page.locator("#stock-chart")).toHaveCount(0);
+  await expect(page.getByText("No usable chart history")).toBeVisible();
+  await expect.poll(() => companyCodes).toEqual(["600519", "000001"]);
+  await expect.poll(() => financialCodes).toEqual(["600519", "000001"]);
+  await expect(page.locator('[data-inspector-panel="financials"]')).toContainText("2025-12-31");
+});
+
+test("virtual history shifts retain keyboard focus and clamp the last window", async ({ page }) => {
+  const financialItems = Array.from({ length: 180 }, (_, index) => ({
+    ...annualFinancials.items[0], endDate: `financial-${index}`, reportType: String(index),
+  }));
+  const dividendItems = Array.from({ length: 180 }, (_, index) => ({
+    ...dividendFirstPage.items[0], announcementDate: `dividend-${index}`, exDate: `dividend-${index}`,
+  }));
+  await mockApi(page, true, bootstrap.results[0].hits, [], {
+    financials: { responses: { 1: { payload: { items: financialItems, nextCursor: null } } } },
+    dividends: { responses: { 1: { payload: { items: dividendItems, nextCursor: null } } } },
+  });
+  await page.goto("/dashboard/");
+  await page.locator("tbody tr").first().click();
+  await page.getByRole("tab", { name: "Financials" }).click();
+  const financialScroller = page.locator('[data-history-kind="financials"]');
+  await expect(financialScroller).toHaveAttribute("data-history-start", "0");
+  await expect(financialScroller).toContainText("financial-0");
+  await expect(financialScroller).not.toContainText("financial-60");
+  await financialScroller.focus();
+  await financialScroller.evaluate((element) => {
+    element.scrollTop = 90 * 42;
+    element.dispatchEvent(new Event("scroll"));
+  });
+  await expect(financialScroller).toHaveAttribute("data-history-start", "80");
+  await expect(financialScroller.locator("[data-history-row]").first()).toContainText("financial-80");
+  const financialGeometry = await financialScroller.evaluate((element) => ({
+    spacer: element.querySelector(".history-spacer td").getBoundingClientRect().height,
+    stride: element.querySelectorAll("[data-history-row]")[1].getBoundingClientRect().top - element.querySelectorAll("[data-history-row]")[0].getBoundingClientRect().top,
+  }));
+  expect(financialGeometry.spacer).toBe(3360);
+  expect(financialGeometry.stride).toBeCloseTo(42, 1);
+  await expect(financialScroller).toBeFocused();
+  await financialScroller.evaluate((element) => {
+    element.scrollTop = element.scrollHeight;
+    element.dispatchEvent(new Event("scroll"));
+  });
+  await expect(financialScroller).toHaveAttribute("data-history-start", "120");
+  await expect(financialScroller).toBeFocused();
+  await expect(financialScroller.locator("[data-history-row]")).toHaveCount(60);
+  await expect(financialScroller).toContainText("financial-179");
+
+  await page.getByRole("tab", { name: "Dividends" }).click();
+  const dividendScroller = page.locator('[data-history-kind="dividends"]');
+  await expect(dividendScroller).toHaveAttribute("data-history-start", "0");
+  await expect(dividendScroller).toContainText("dividend-0");
+  await expect(dividendScroller).not.toContainText("dividend-60");
+  await dividendScroller.focus();
+  await dividendScroller.evaluate((element) => {
+    element.scrollTop = 90 * 101;
+    element.dispatchEvent(new Event("scroll"));
+  });
+  await expect(dividendScroller).toHaveAttribute("data-history-start", "80");
+  await expect(dividendScroller.locator(".dividend-card").first()).toContainText("dividend-80");
+  expect(await dividendScroller.evaluate((element) => ({
+    spacer: element.querySelector(".history-spacer").getBoundingClientRect().height,
+    stride: element.querySelectorAll(".dividend-card")[1].getBoundingClientRect().top - element.querySelectorAll(".dividend-card")[0].getBoundingClientRect().top,
+  }))).toEqual({ spacer: 8080, stride: 101 });
+  await expect(dividendScroller).toBeFocused();
+  await dividendScroller.evaluate((element) => {
+    element.scrollTop = element.scrollHeight;
+    element.dispatchEvent(new Event("scroll"));
+  });
+  await expect(dividendScroller).toHaveAttribute("data-history-start", "120");
+  await expect(dividendScroller).toBeFocused();
+  await expect(dividendScroller.locator(".dividend-card")).toHaveCount(60);
+  await expect(dividendScroller).toContainText("dividend-179");
+});
+
+test("repeated tab activation does not accumulate panel action handlers", async ({ page }) => {
+  await page.addInitScript(() => {
+    const native = EventTarget.prototype.addEventListener;
+    window.__panelBindings = new WeakMap();
+    EventTarget.prototype.addEventListener = function dashboardBindingProbe(type, listener, options) {
+      if (this instanceof Element && ((type === "scroll" && this.matches("[data-history-kind]")) || (type === "click" && this.matches("[data-financial-frequency]")))) {
+        window.__panelBindings.set(this, (window.__panelBindings.get(this) || 0) + 1);
+      }
+      return native.call(this, type, listener, options);
+    };
+  });
+  await mockApi(page);
+  await page.goto("/dashboard/");
+  await page.locator("tbody tr").first().click();
+  await page.getByRole("tab", { name: "Financials" }).click();
+  await expect(page.locator('[data-history-kind="financials"]')).toBeVisible();
+  for (let index = 0; index < 8; index += 1) {
+    await page.getByRole("tab", { name: "Overview" }).click();
+    await page.getByRole("tab", { name: "Financials" }).click();
+  }
+
+  const bindings = await page.evaluate(() => ({
+    scroll: window.__panelBindings.get(document.querySelector('[data-history-kind="financials"]')),
+    annual: window.__panelBindings.get(document.querySelector('[data-financial-frequency="annual"]')),
+    quarterly: window.__panelBindings.get(document.querySelector('[data-financial-frequency="quarterly"]')),
+  }));
+  expect(bindings).toEqual({ scroll: 1, annual: 1, quarterly: 1 });
+});
+
 async function installLifecycleProbe(page) {
   await page.addInitScript(() => {
     const NativeResizeObserver = window.ResizeObserver;

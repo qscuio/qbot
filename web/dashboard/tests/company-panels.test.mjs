@@ -111,3 +111,38 @@ test("long financial and dividend histories render bounded DOM windows", () => {
   assert.match(dividends, /data-history-total="180"/);
   assert.match(dividends, /row-80/);
 });
+
+test("history windows expose exact first, middle, and end spacer geometry", () => {
+  const financialItems = Array.from({ length: 180 }, (_, index) => ({
+    endDate: `financial-${index}`,
+    reportType: String(index),
+  }));
+  const dividendItems = Array.from({ length: 180 }, (_, index) => ({
+    announcementDate: `dividend-${index}`,
+    exDate: `dividend-${index}`,
+    implementationStatus: "implemented",
+  }));
+
+  const financialFirst = financialPanel({ items: financialItems }, { windowStart: 0 });
+  const financialMiddle = financialPanel({ items: financialItems }, { windowStart: 80 });
+  const financialEnd = financialPanel({ items: financialItems }, { windowStart: 999 });
+  assert.match(financialFirst, /financial-0/);
+  assert.doesNotMatch(financialFirst, /financial-60/);
+  assert.match(financialMiddle, /data-history-start="80"/);
+  assert.match(financialMiddle, /height:3360px/);
+  assert.match(financialMiddle, /height:1680px/);
+  assert.match(financialEnd, /data-history-start="120"/);
+  assert.match(financialEnd, /financial-179/);
+
+  const dividendFirst = dividendPanel({ items: dividendItems }, { windowStart: 0 });
+  const dividendMiddle = dividendPanel({ items: dividendItems }, { windowStart: 80 });
+  const dividendEnd = dividendPanel({ items: dividendItems }, { windowStart: 999 });
+  assert.match(dividendFirst, /dividend-0/);
+  assert.doesNotMatch(dividendFirst, /dividend-60/);
+  assert.match(dividendMiddle, /data-history-start="80"/);
+  assert.match(dividendMiddle, /height:8080px/);
+  assert.match(dividendMiddle, /height:4040px/);
+  assert.match(dividendEnd, /data-history-start="120"/);
+  assert.match(dividendEnd, /dividend-179/);
+  assert.doesNotMatch(dividendMiddle, /display: grid/);
+});
