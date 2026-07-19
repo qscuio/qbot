@@ -1682,6 +1682,13 @@ mod tests {
         )
         .execute(&pool)
         .await?;
+        sqlx::query(
+            r#"INSERT INTO company_data_repair_checkpoints
+               (phase, code, status, attempts, completed_at)
+               VALUES ('dividends', '000004.SZ', 'completed', 4, NOW())"#,
+        )
+        .execute(&pool)
+        .await?;
 
         let migration_sql = migration_023_sql();
         assert!(!migration_sql.is_empty(), "migration 023 must exist");
@@ -1726,6 +1733,17 @@ mod tests {
         assert_eq!(failed.1, date(9999, 12, 31));
         assert_eq!(failed.2, "failed");
 
+        let open_completed: (NaiveDate, NaiveDate, String) = sqlx::query_as(
+            r#"SELECT start_date, end_date, status
+               FROM company_data_repair_checkpoints
+               WHERE phase = 'dividends' AND code = '000004.SZ'"#,
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(open_completed.0, date(1, 1, 1));
+        assert_eq!(open_completed.1, date(9999, 12, 31));
+        assert_eq!(open_completed.2, "completed");
+
         sqlx::query(
             r#"INSERT INTO company_data_repair_checkpoints
                (phase, code, start_date, end_date, status, attempts, completed_at)
@@ -1759,6 +1777,37 @@ mod tests {
             exact_completed_years, 7,
             "023 broad coverage expands in 024"
         );
+        let open_completed_rows: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM company_data_repair_checkpoints
+               WHERE phase = 'dividends' AND code = '000004.SZ'"#,
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            open_completed_rows, 1,
+            "024 retains only the sentinel audit row and generates no years"
+        );
+        let retained_audit: bool = sqlx::query_scalar(
+            r#"SELECT EXISTS (
+                 SELECT 1 FROM company_data_repair_checkpoints
+                 WHERE phase = 'dividends' AND code = '000004.SZ'
+                   AND start_date = DATE '0001-01-01'
+                   AND end_date = DATE '9999-12-31'
+                   AND status = 'completed'
+               )"#,
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert!(retained_audit);
+
+        sqlx::raw_sql(&migration_024).execute(&pool).await?;
+        let rows_after_reexecution: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM company_data_repair_checkpoints
+               WHERE phase = 'dividends' AND code = '000004.SZ'"#,
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(rows_after_reexecution, 1, "024 re-execution stays bounded");
         Ok(())
     }
 

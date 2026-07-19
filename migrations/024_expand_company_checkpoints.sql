@@ -6,6 +6,10 @@ WITH completed_ranges AS MATERIALIZED (
     FROM company_data_repair_checkpoints
     WHERE status = 'completed'
       AND phase IN ('financials', 'dividends')
+      -- Migration 023 uses these sentinels for legacy open bounds. They are
+      -- audit coverage, not real dates, and must be refetched per exact year.
+      AND start_date <> DATE '0001-01-01'
+      AND end_date <> DATE '9999-12-31'
 ), yearly_windows AS (
     SELECT phase,
            code,

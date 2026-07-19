@@ -748,6 +748,41 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn sentinel_open_coverage_refetches_the_exact_service_window(pool: PgPool) {
+        seed_current_stock(&pool, "000001.SZ", date(2026, 1, 1)).await;
+        sqlx::query(
+            r#"INSERT INTO company_data_repair_checkpoints
+               (phase, code, start_date, end_date, status, attempts, completed_at)
+               VALUES ('financials', '000001.SZ', '0001-01-01', '9999-12-31',
+                       'completed', 4, NOW())"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let provider = Arc::new(RecordingProvider::default());
+        let service =
+            CompanyIntelligenceService::new_at(pool.clone(), provider.clone(), date(2026, 7, 19));
+
+        assert_eq!(service.backfill_financials().await.unwrap().completed, 1);
+        assert_eq!(
+            provider.calls(),
+            vec![ProviderCall {
+                kind: CallKind::Financials,
+                code: "000001.SZ".into(),
+                start: date(2026, 1, 1),
+                end: date(2026, 7, 19),
+            }]
+        );
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM company_data_repair_checkpoints WHERE phase = 'financials' AND code = '000001.SZ'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, 2, "sentinel audit and exact completion coexist");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn late_year_failure_keeps_completed_windows_and_retry_fetches_only_failed_window(
         pool: PgPool,
     ) {
