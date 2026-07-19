@@ -133,6 +133,65 @@ test("top chrome is consolidated into the left settings menu", async ({ page }) 
   await expect(page.getByRole("button", { name: "Sign out" })).toBeVisible();
 });
 
+test("stock workspace teardown disconnects chart and inspector resize resources on logout", async ({ page }) => {
+  await page.addInitScript(() => {
+    const NativeResizeObserver = window.ResizeObserver;
+    const nativeAddEventListener = window.addEventListener;
+    const nativeRemoveEventListener = window.removeEventListener;
+    const resizeListeners = new Set();
+    window.__dashboardLifecycleProbe = { callbacks: 0, disconnects: 0, observes: 0, resizeListeners };
+    window.ResizeObserver = class extends NativeResizeObserver {
+      constructor(callback) {
+        super((...args) => {
+          window.__dashboardLifecycleProbe.callbacks += 1;
+          callback(...args);
+        });
+      }
+      observe(...args) {
+        window.__dashboardLifecycleProbe.observes += 1;
+        return super.observe(...args);
+      }
+      disconnect() {
+        window.__dashboardLifecycleProbe.disconnects += 1;
+        return super.disconnect();
+      }
+    };
+    window.addEventListener = function addEventListener(type, listener, options) {
+      if (type === "resize") resizeListeners.add(listener);
+      return nativeAddEventListener.call(this, type, listener, options);
+    };
+    window.removeEventListener = function removeEventListener(type, listener, options) {
+      if (type === "resize") resizeListeners.delete(listener);
+      return nativeRemoveEventListener.call(this, type, listener, options);
+    };
+  });
+  await mockApi(page);
+  await page.goto("/dashboard/");
+  const baselineListeners = await page.evaluate(() => window.__dashboardLifecycleProbe.resizeListeners.size);
+  await page.locator("tbody tr").first().click();
+  await expect(page.locator("#stock-chart canvas").first()).toBeVisible();
+  const mounted = await page.evaluate(() => ({
+    listeners: window.__dashboardLifecycleProbe.resizeListeners.size,
+    observes: window.__dashboardLifecycleProbe.observes,
+  }));
+  expect(mounted.listeners).toBeGreaterThan(baselineListeners);
+  expect(mounted.observes).toBeGreaterThan(0);
+
+  await page.getByRole("button", { name: "Settings" }).click();
+  await page.getByRole("button", { name: "Sign out" }).click();
+  await expect(page.getByRole("button", { name: "Sign in" })).toBeVisible();
+  const afterLogout = await page.evaluate(() => ({
+    callbacks: window.__dashboardLifecycleProbe.callbacks,
+    disconnects: window.__dashboardLifecycleProbe.disconnects,
+    listeners: window.__dashboardLifecycleProbe.resizeListeners.size,
+  }));
+  expect(afterLogout.disconnects).toBeGreaterThan(0);
+  expect(afterLogout.listeners).toBe(baselineListeners);
+  await page.setViewportSize({ width: 900, height: 500 });
+  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  expect(await page.evaluate(() => window.__dashboardLifecycleProbe.callbacks)).toBe(afterLogout.callbacks);
+});
+
 test("stock detail fills the viewport without an evidence sidebar", async ({ page }) => {
   await page.setViewportSize({ width: 1883, height: 937 });
   const denseHits = Array.from({ length: 10 }, (_, index) => ({
@@ -340,6 +399,36 @@ test("resizable stock information sidebar becomes a narrow overlay drawer", asyn
   }));
   expect(overflow.width[1]).toBe(overflow.width[0]);
   expect(overflow.height[1]).toBe(overflow.height[0]);
+});
+
+test("stock chart fits a short non-mobile landscape workspace", async ({ page }) => {
+  await page.setViewportSize({ width: 800, height: 420 });
+  await mockApi(page);
+  await page.goto("/dashboard/");
+  await page.locator("tbody tr").first().click();
+
+  await expect(page.locator(".inspector-resizer")).toBeVisible();
+  await expect(page.locator(".stock-inspector")).toHaveCSS("position", "static");
+  const layout = await page.evaluate(() => {
+    const root = document.scrollingElement;
+    const editor = document.querySelector(".editor-body");
+    const workspace = document.querySelector(".stock-workspace");
+    const pane = document.querySelector(".chart-pane");
+    const chart = document.querySelector("#stock-chart");
+    return {
+      document: { client: root.clientHeight, scroll: root.scrollHeight },
+      editor: { client: editor.clientHeight, scroll: editor.scrollHeight },
+      heights: {
+        workspace: workspace.getBoundingClientRect().height,
+        pane: pane.getBoundingClientRect().height,
+        chart: chart.getBoundingClientRect().height,
+      },
+    };
+  });
+  expect(layout.heights.pane).toBeLessThanOrEqual(layout.heights.workspace);
+  expect(layout.heights.chart).toBeLessThanOrEqual(layout.heights.pane - 28);
+  expect(layout.document.scroll).toBe(layout.document.client);
+  expect(layout.editor.scroll).toBe(layout.editor.client);
 });
 
 test("browser back and forward restore scan and stock pages", async ({ page }) => {

@@ -22,6 +22,7 @@ let filters = { search: "", group: "", signal: "", rankedOnly: false, sort: "ran
 const details = new Map();
 let chartHandle = null;
 let inspectorCleanup = null;
+let closeInspectorOverlay = null;
 let refreshTimer = null;
 let filterMenuOpen = false;
 let inspectorTab = "overview";
@@ -36,6 +37,14 @@ function effectiveInspectorWidth() {
 
 function maximumInspectorWidth() {
   return Math.max(minimumInspectorWidth, Math.floor(window.innerWidth * 0.5));
+}
+
+function teardownWorkspaceView() {
+  inspectorCleanup?.();
+  inspectorCleanup = null;
+  closeInspectorOverlay = null;
+  chartHandle?.destroy();
+  chartHandle = null;
 }
 
 function scheduleRefresh() {
@@ -74,6 +83,7 @@ function visibleRows() {
 
 function renderLogin(error = "") {
   clearInterval(refreshTimer);
+  teardownWorkspaceView();
   app.innerHTML = `
     <main class="login-screen">
       <form class="login-card" id="login-form">
@@ -106,7 +116,10 @@ function renderLogin(error = "") {
 }
 
 async function loadBootstrap({ quiet = false } = {}) {
-  if (!quiet) app.innerHTML = `<div class="boot-screen"><span class="spinner"></span><span>Loading latest scan…</span></div>`;
+  if (!quiet) {
+    teardownWorkspaceView();
+    app.innerHTML = `<div class="boot-screen"><span class="spinner"></span><span>Loading latest scan…</span></div>`;
+  }
   try {
     bootstrap = await dashboardApi.bootstrap();
     rows = normalizeRows(bootstrap.results);
@@ -119,6 +132,7 @@ async function loadBootstrap({ quiet = false } = {}) {
 }
 
 function renderFailure(message) {
+  teardownWorkspaceView();
   app.innerHTML = `<div class="boot-screen"><strong>QBot is unavailable</strong><span>${escapeHtml(message)}</span><button class="outline-button" id="retry">Retry</button></div>`;
   app.querySelector("#retry").addEventListener("click", () => loadBootstrap());
 }
@@ -231,10 +245,7 @@ function stockTemplate(tab, detail) {
 }
 
 function renderWorkspace() {
-  inspectorCleanup?.();
-  inspectorCleanup = null;
-  chartHandle?.destroy();
-  chartHandle = null;
+  teardownWorkspaceView();
   const tab = workspace.tabs.find((item) => item.id === workspace.activeTab) || workspace.tabs[0];
   workspace = { ...workspace, activeTab: tab.id };
   const detail = tab.type === "stock" ? details.get(`${tab.code}:${tab.period}`) : null;
@@ -310,14 +321,20 @@ function bindInspector() {
   const toggle = app.querySelector(".inspector-toggle");
   if (!stockWorkspace || !inspector || !toggle) return null;
 
-  const resizeChart = () => window.requestAnimationFrame(() => chartHandle?.resize?.());
+  let resizeFrame = null;
+  const resizeChart = () => {
+    if (resizeFrame !== null) return;
+    resizeFrame = window.requestAnimationFrame(() => {
+      resizeFrame = null;
+      chartHandle?.resize?.();
+    });
+  };
   const resizer = app.querySelector(".inspector-resizer");
   const applyEffectiveWidth = () => {
     const width = effectiveInspectorWidth();
     stockWorkspace.style.setProperty("--inspector-width", `${width}px`);
     resizer?.setAttribute("aria-valuemax", String(maximumInspectorWidth()));
     resizer?.setAttribute("aria-valuenow", String(width));
-    chartHandle?.resize?.();
     resizeChart();
   };
   const setCollapsed = (collapsed, { restoreFocus = false } = {}) => {
@@ -339,6 +356,12 @@ function bindInspector() {
   };
 
   toggle.addEventListener("click", () => setCollapsed(!inspectorPreferences.collapsed));
+  const closeOverlay = () => {
+    if (!stockWorkspace.classList.contains("inspector-collapsed")) {
+      setCollapsed(true, { restoreFocus: true });
+    }
+  };
+  closeInspectorOverlay = closeOverlay;
   const tabButtons = [...app.querySelectorAll("[data-inspector-tab]")];
   const activateTab = (button, { focus = false } = {}) => {
     inspectorTab = button.dataset.inspectorTab;
@@ -410,7 +433,11 @@ function bindInspector() {
   }
   const handleViewportResize = () => applyEffectiveWidth();
   window.addEventListener("resize", handleViewportResize);
-  return () => window.removeEventListener("resize", handleViewportResize);
+  return () => {
+    window.removeEventListener("resize", handleViewportResize);
+    if (resizeFrame !== null) window.cancelAnimationFrame(resizeFrame);
+    if (closeInspectorOverlay === closeOverlay) closeInspectorOverlay = null;
+  };
 }
 
 function setFilterMenuOpen(open) {
@@ -426,17 +453,7 @@ document.addEventListener("keydown", (event) => {
     app.querySelector("#filter-toggle")?.focus();
     return;
   }
-  const stockWorkspace = app.querySelector(".stock-workspace");
-  if (window.matchMedia("(max-width: 700px)").matches && stockWorkspace && !stockWorkspace.classList.contains("inspector-collapsed")) {
-    inspectorPreferences = { ...inspectorPreferences, collapsed: true };
-    saveInspectorPreferences(window.localStorage, inspectorPreferences);
-    stockWorkspace.classList.add("inspector-collapsed");
-    const toggle = app.querySelector(".inspector-toggle");
-    toggle?.setAttribute("aria-expanded", "false");
-    toggle?.setAttribute("aria-label", "Show stock information");
-    toggle?.focus();
-    window.requestAnimationFrame(() => chartHandle?.resize?.());
-  }
+  if (window.matchMedia("(max-width: 700px)").matches) closeInspectorOverlay?.();
 });
 
 document.addEventListener("click", (event) => {
