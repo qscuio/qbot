@@ -36,6 +36,7 @@ pub struct TushareClient {
 struct FinancialJoinIdentity {
     code: String,
     end_date: NaiveDate,
+    report_type: Option<String>,
     update_flag: Option<String>,
     announcement_date: Option<NaiveDate>,
 }
@@ -86,20 +87,40 @@ impl TushareClient {
 
     fn decode_response_body(api_name: &str, status: StatusCode, body: &str) -> Result<Value> {
         let response: Value = serde_json::from_str(body).map_err(|error| {
-            let excerpt: String = body.chars().take(200).collect();
+            let excerpt = Self::bounded_response_excerpt(body);
             AppError::DataProvider(format!(
                 "Tushare {api_name} HTTP {} returned non-JSON data: {error}; body: {excerpt}",
                 status.as_u16()
             ))
         })?;
 
-        if !status.is_success() && response.get("code").and_then(Value::as_i64) == Some(0) {
+        if !status.is_success() {
+            let code = response
+                .get("code")
+                .and_then(Value::as_i64)
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "unavailable".to_string());
+            let message = response
+                .get("msg")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error");
+            let excerpt = Self::bounded_response_excerpt(body);
             return Err(AppError::DataProvider(format!(
-                "Tushare {api_name} HTTP {} returned an unsuccessful status",
-                status.as_u16()
+                "Tushare {api_name} HTTP {}; provider code {code}: {message}; body: {excerpt}",
+                status.as_u16(),
             )));
         }
         Self::response_data(api_name, &response)
+    }
+
+    fn bounded_response_excerpt(body: &str) -> String {
+        let mut characters = body.chars();
+        let excerpt: String = characters.by_ref().take(200).collect();
+        if characters.next().is_some() {
+            format!("{excerpt}…")
+        } else {
+            excerpt
+        }
     }
 
     fn response_data(api_name: &str, response: &Value) -> Result<Value> {
@@ -453,7 +474,9 @@ impl TushareClient {
                 }),
             ),
             None => {
-                let observed_on = fetched_at.date_naive();
+                let observed_on = fetched_at
+                    .with_timezone(&crate::market_time::beijing_tz())
+                    .date_naive();
                 (
                     observed_on,
                     json!({
@@ -465,9 +488,18 @@ impl TushareClient {
         };
         let available_at = date
             .and_hms_opt(0, 0, 0)
-            .map(|value| DateTime::from_naive_utc_and_offset(value, Utc))
-            .expect("a valid date has a UTC midnight");
+            .expect("a valid date has a midnight")
+            .and_local_timezone(crate::market_time::beijing_tz())
+            .single()
+            .expect("a fixed UTC+08:00 midnight is unambiguous")
+            .with_timezone(&Utc);
         (available_at, metadata)
+    }
+
+    fn beijing_date(timestamp: DateTime<Utc>) -> NaiveDate {
+        timestamp
+            .with_timezone(&crate::market_time::beijing_tz())
+            .date_naive()
     }
 
     fn content_revision(payload: &Value) -> String {
@@ -488,6 +520,7 @@ impl TushareClient {
         Ok(FinancialJoinIdentity {
             code: Self::required_company_text(row, endpoint, "ts_code")?,
             end_date: Self::required_company_date(row, endpoint, "end_date")?,
+            report_type: Self::optional_company_text(row, endpoint, "report_type")?,
             update_flag: Self::optional_company_text(row, endpoint, "update_flag")?,
             announcement_date,
         })
@@ -499,6 +532,10 @@ impl TushareClient {
     ) -> bool {
         income.code == indicator.code
             && income.end_date == indicator.end_date
+            && indicator
+                .report_type
+                .as_ref()
+                .is_none_or(|report_type| income.report_type.as_ref() == Some(report_type))
             && income.update_flag == indicator.update_flag
             && income.announcement_date == indicator.announcement_date
     }
@@ -601,6 +638,7 @@ impl TushareClient {
             .map(|row| Self::financial_join_identity(row, "fina_indicator"))
             .collect::<Result<Vec<_>>>()?;
         let mut indicator_for_income = vec![None; income_rows.len()];
+        let mut typed_indicator_only = Vec::new();
         for (indicator_index, indicator_identity) in indicator_identities.iter().enumerate() {
             let candidates: Vec<usize> = income_identities
                 .iter()
@@ -611,6 +649,10 @@ impl TushareClient {
                 .map(|(index, _)| index)
                 .collect();
 
+            if candidates.is_empty() && indicator_identity.report_type.is_some() {
+                typed_indicator_only.push(indicator_index);
+                continue;
+            }
             if candidates.len() != 1 {
                 return Err(Self::malformed_company_data(
                     "financial",
@@ -639,7 +681,7 @@ impl TushareClient {
             }
         }
 
-        income_rows
+        let mut reports = income_rows
             .iter()
             .enumerate()
             .map(|(index, income)| {
@@ -649,7 +691,15 @@ impl TushareClient {
                     fetched_at,
                 )
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        for indicator_index in typed_indicator_only {
+            reports.push(Self::parse_financial_report_row(
+                None,
+                Some(&indicator_rows[indicator_index]),
+                fetched_at,
+            )?);
+        }
+        Ok(reports)
     }
 
     fn normalize_dividend_status(value: Option<&str>) -> &'static str {
@@ -809,7 +859,7 @@ impl TushareClient {
         Self::ensure_complete_company_history(&data, "dividend")?;
         let mut records = Self::parse_dividend_records(&data, fetched_at)?;
         records.retain(|record| {
-            let effective_source_date = record.available_at.date_naive();
+            let effective_source_date = Self::beijing_date(record.available_at);
             effective_source_date >= start && effective_source_date <= end
         });
         Ok(records)
@@ -2359,7 +2409,7 @@ mod tests {
         assert_eq!(annual.net_profit_yoy, Some(decimal("15.765432")));
         assert_eq!(
             annual.available_at.to_rfc3339(),
-            "2025-03-30T00:00:00+00:00"
+            "2025-03-29T16:00:00+00:00"
         );
         assert_eq!(annual.ingested_at, fetched_at);
         assert_eq!(annual.source_revision.len(), 64);
@@ -2399,11 +2449,11 @@ mod tests {
         assert_ne!(dividends[0].source_revision, dividends[2].source_revision);
         assert_eq!(
             dividends[0].available_at.to_rfc3339(),
-            "2025-03-29T00:00:00+00:00"
+            "2025-03-28T16:00:00+00:00"
         );
         assert_eq!(
             dividends[2].available_at.to_rfc3339(),
-            "2025-06-18T00:00:00+00:00"
+            "2025-06-17T16:00:00+00:00"
         );
         assert_eq!(dividends[2].raw_payload["dividend"]["stk_bo_rate"], "0.20");
         assert_eq!(dividends[2].raw_payload["dividend"]["stk_co_rate"], "0.10");
@@ -2464,7 +2514,7 @@ mod tests {
         }
         let same_day_reordered = TushareClient::parse_dividend_records(
             &reorder_table(&dividend_fixture()),
-            Utc.with_ymd_and_hms(2026, 7, 19, 22, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 7, 19, 15, 0, 0).unwrap(),
         )
         .unwrap();
         for row in original_dividends
@@ -2497,7 +2547,7 @@ mod tests {
         assert_eq!(rows[0].announcement_date, None);
         assert_eq!(
             rows[0].available_at,
-            Utc.with_ymd_and_hms(2026, 7, 19, 0, 0, 0).unwrap()
+            Utc.with_ymd_and_hms(2026, 7, 18, 16, 0, 0).unwrap()
         );
         assert_eq!(rows[0].total_revenue, None);
 
@@ -2535,9 +2585,9 @@ mod tests {
 
     #[test]
     fn missing_source_events_use_replay_safe_observation_day_versions() {
-        let first = Utc.with_ymd_and_hms(2026, 7, 19, 8, 15, 0).unwrap();
-        let same_day = Utc.with_ymd_and_hms(2026, 7, 19, 20, 45, 0).unwrap();
-        let next_day = Utc.with_ymd_and_hms(2026, 7, 20, 1, 5, 0).unwrap();
+        let first = Utc.with_ymd_and_hms(2026, 7, 19, 0, 15, 0).unwrap();
+        let same_day = Utc.with_ymd_and_hms(2026, 7, 19, 15, 45, 0).unwrap();
+        let next_day = Utc.with_ymd_and_hms(2026, 7, 19, 16, 5, 0).unwrap();
         let income = serde_json::json!({
             "fields": ["ts_code", "end_date", "report_type", "update_flag"],
             "items": [["600000.SH", "20241231", "1", "1"]]
@@ -2564,15 +2614,11 @@ mod tests {
         );
         assert_eq!(
             financial_first[0].available_at,
-            first.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc()
+            Utc.with_ymd_and_hms(2026, 7, 18, 16, 0, 0).unwrap()
         );
         assert_eq!(
             financial_next[0].available_at,
-            next_day
-                .date_naive()
-                .and_hms_opt(0, 0, 0)
-                .unwrap()
-                .and_utc()
+            Utc.with_ymd_and_hms(2026, 7, 19, 16, 0, 0).unwrap()
         );
         assert_eq!(
             financial_first[0].raw_payload["availability"],
@@ -2602,8 +2648,8 @@ mod tests {
             dividend_next[0].source_revision
         );
         assert_eq!(
-            dividend_first[0].available_at.date_naive(),
-            first.date_naive()
+            TushareClient::beijing_date(dividend_first[0].available_at),
+            NaiveDate::from_ymd_opt(2026, 7, 19).unwrap()
         );
         assert_eq!(
             dividend_first[0].raw_payload["availability"],
@@ -2611,6 +2657,87 @@ mod tests {
                 "kind": "observation_date",
                 "observed_on": "2026-07-19"
             })
+        );
+    }
+
+    #[test]
+    fn observation_versions_follow_beijing_day_across_utc_boundaries() {
+        let income = serde_json::json!({
+            "fields": ["ts_code", "end_date", "report_type", "update_flag"],
+            "items": [["600000.SH", "20241231", "1", "1"]]
+        });
+        let indicators = serde_json::json!({ "fields": [], "items": [] });
+        let before_utc_midnight = Utc.with_ymd_and_hms(2026, 7, 19, 23, 59, 0).unwrap();
+        let after_utc_midnight = Utc.with_ymd_and_hms(2026, 7, 20, 0, 1, 0).unwrap();
+        let before_beijing_midnight = Utc.with_ymd_and_hms(2026, 7, 19, 15, 59, 0).unwrap();
+        let after_beijing_midnight = Utc.with_ymd_and_hms(2026, 7, 19, 16, 1, 0).unwrap();
+
+        let before_utc =
+            TushareClient::parse_financial_reports(&income, &indicators, before_utc_midnight)
+                .unwrap();
+        let after_utc =
+            TushareClient::parse_financial_reports(&income, &indicators, after_utc_midnight)
+                .unwrap();
+        assert_eq!(before_utc[0].source_revision, after_utc[0].source_revision);
+        assert_eq!(
+            before_utc[0].available_at,
+            Utc.with_ymd_and_hms(2026, 7, 19, 16, 0, 0).unwrap()
+        );
+        assert_eq!(
+            before_utc[0].raw_payload["availability"]["observed_on"],
+            "2026-07-20"
+        );
+
+        let before_beijing =
+            TushareClient::parse_financial_reports(&income, &indicators, before_beijing_midnight)
+                .unwrap();
+        let after_beijing =
+            TushareClient::parse_financial_reports(&income, &indicators, after_beijing_midnight)
+                .unwrap();
+        assert_ne!(
+            before_beijing[0].source_revision,
+            after_beijing[0].source_revision
+        );
+        assert_eq!(
+            before_beijing[0].raw_payload["availability"]["observed_on"],
+            "2026-07-19"
+        );
+        assert_eq!(
+            after_beijing[0].raw_payload["availability"]["observed_on"],
+            "2026-07-20"
+        );
+    }
+
+    #[tokio::test]
+    async fn dividend_provider_filters_observations_by_beijing_day() {
+        let beijing_day = NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
+        let fetched_at = Utc.with_ymd_and_hms(2026, 7, 19, 23, 59, 0).unwrap();
+        let approved = serde_json::json!({
+            "fields": ["ts_code", "end_date", "ann_date", "div_proc"],
+            "items": [["600000.SH", "20241231", "20250329", "股东大会通过"]]
+        });
+
+        let records = TushareClient::dividends_with(
+            "600000.SH",
+            beijing_day,
+            beijing_day,
+            fetched_at,
+            move |_, _, _| {
+                let approved = approved.clone();
+                async move { Ok(approved) }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].available_at,
+            Utc.with_ymd_and_hms(2026, 7, 19, 16, 0, 0).unwrap()
+        );
+        assert_eq!(
+            records[0].raw_payload["availability"]["observed_on"],
+            "2026-07-20"
         );
     }
 
@@ -2625,9 +2752,9 @@ mod tests {
         });
         let indicators = serde_json::json!({ "fields": [], "items": [] });
         let times = [
-            Utc.with_ymd_and_hms(2026, 7, 19, 8, 15, 0).unwrap(),
-            Utc.with_ymd_and_hms(2026, 7, 19, 20, 45, 0).unwrap(),
-            Utc.with_ymd_and_hms(2026, 7, 20, 1, 5, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 7, 19, 0, 15, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 7, 19, 15, 45, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 7, 19, 16, 5, 0).unwrap(),
         ];
         let versions = times
             .iter()
@@ -2654,9 +2781,9 @@ mod tests {
             "items": [["600000.SH", "20241231", "20250329", "股东大会通过"]]
         });
         let times = [
-            Utc.with_ymd_and_hms(2026, 7, 19, 8, 15, 0).unwrap(),
-            Utc.with_ymd_and_hms(2026, 7, 19, 20, 45, 0).unwrap(),
-            Utc.with_ymd_and_hms(2026, 7, 20, 1, 5, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 7, 19, 0, 15, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 7, 19, 15, 45, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 7, 19, 16, 5, 0).unwrap(),
         ];
         let versions = times
             .iter()
@@ -2741,6 +2868,37 @@ mod tests {
         assert!(non_json.to_string().contains("dividend"));
         assert!(non_json.to_string().contains("502"));
         assert!(non_json.to_string().contains("non-JSON"));
+
+        let json_rate_limit = TushareClient::decode_response_body(
+            "fina_indicator",
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            r#"{"code":-2002,"msg":"每分钟最多访问60次","data":null}"#,
+        )
+        .unwrap_err();
+        let json_rate_limit = json_rate_limit.to_string();
+        assert!(json_rate_limit.contains("fina_indicator"));
+        assert!(json_rate_limit.contains("429"));
+        assert!(json_rate_limit.contains("-2002"));
+        assert!(json_rate_limit.contains("每分钟最多访问60次"));
+        assert!(json_rate_limit.contains("\"code\":-2002"));
+
+        let unsuccessful_zero = TushareClient::decode_response_body(
+            "dividend",
+            reqwest::StatusCode::BAD_GATEWAY,
+            r#"{"code":0,"msg":"upstream rejected request","data":{"fields":[],"items":[]}}"#,
+        )
+        .unwrap_err();
+        let unsuccessful_zero = unsuccessful_zero.to_string();
+        assert!(unsuccessful_zero.contains("dividend"));
+        assert!(unsuccessful_zero.contains("502"));
+        assert!(unsuccessful_zero.contains("code 0"));
+        assert!(unsuccessful_zero.contains("upstream rejected request"));
+        assert!(unsuccessful_zero.contains("\"items\":[]"));
+
+        let long_body = "x".repeat(300);
+        let excerpt = TushareClient::bounded_response_excerpt(&long_body);
+        assert_eq!(excerpt.chars().count(), 201);
+        assert!(excerpt.ends_with('…'));
     }
 
     #[test]
@@ -2805,6 +2963,116 @@ mod tests {
         assert!(error.to_string().contains("ambiguous"));
         assert!(error.to_string().contains("600000.SH"));
         assert!(error.to_string().contains("2024-12-31"));
+    }
+
+    #[test]
+    fn typed_indicator_never_crosses_an_income_report_type() {
+        let fetched_at = Utc.with_ymd_and_hms(2026, 7, 19, 12, 30, 0).unwrap();
+        let income = serde_json::json!({
+            "fields": [
+                "ts_code", "end_date", "report_type", "update_flag", "f_ann_date",
+                "total_revenue"
+            ],
+            "items": [["600000.SH", "20241231", "1", "1", "20250401", "100.01"]]
+        });
+        let indicators = serde_json::json!({
+            "fields": [
+                "ts_code", "end_date", "report_type", "update_flag", "ann_date", "roe"
+            ],
+            "items": [["600000.SH", "20241231", "5", "1", "20250401", "21.21"]]
+        });
+
+        let rows =
+            TushareClient::parse_financial_reports(&income, &indicators, fetched_at).unwrap();
+
+        assert_eq!(rows.len(), 2);
+        let income_only = rows.iter().find(|row| row.report_type == "1").unwrap();
+        assert_eq!(income_only.total_revenue, Some(decimal("100.01")));
+        assert_eq!(income_only.roe, None);
+        assert!(income_only.raw_payload["indicator"].is_null());
+        let indicator_only = rows.iter().find(|row| row.report_type == "5").unwrap();
+        assert_eq!(indicator_only.total_revenue, None);
+        assert_eq!(indicator_only.roe, Some(decimal("21.21")));
+        assert!(indicator_only.raw_payload["income"].is_null());
+    }
+
+    #[test]
+    fn typed_indicator_only_row_preserves_its_source_identity() {
+        let fetched_at = Utc.with_ymd_and_hms(2026, 7, 19, 12, 30, 0).unwrap();
+        let income = serde_json::json!({ "fields": [], "items": [] });
+        let indicators = serde_json::json!({
+            "fields": [
+                "ts_code", "end_date", "report_type", "update_flag", "ann_date", "roe"
+            ],
+            "items": [["000001.SZ", "20240630", "1", "0", "20240801", "10.10"]]
+        });
+
+        let rows =
+            TushareClient::parse_financial_reports(&income, &indicators, fetched_at).unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].code, "000001.SZ");
+        assert_eq!(rows[0].report_type, "1");
+        assert_eq!(rows[0].frequency, FinancialFrequency::Quarterly);
+        assert_eq!(rows[0].total_revenue, None);
+        assert_eq!(rows[0].roe, Some(decimal("10.10")));
+        assert!(rows[0].raw_payload["income"].is_null());
+        assert_eq!(rows[0].raw_payload["indicator"]["report_type"], "1");
+        assert_eq!(
+            rows[0].available_at,
+            Utc.with_ymd_and_hms(2024, 7, 31, 16, 0, 0).unwrap()
+        );
+        assert_eq!(
+            rows[0].source_revision,
+            TushareClient::content_revision(&rows[0].raw_payload)
+        );
+    }
+
+    #[test]
+    fn mixed_typed_and_untyped_indicators_join_only_unique_revision_identities() {
+        let fetched_at = Utc.with_ymd_and_hms(2026, 7, 19, 12, 30, 0).unwrap();
+        let income = serde_json::json!({
+            "fields": [
+                "ts_code", "end_date", "report_type", "update_flag", "f_ann_date",
+                "n_income_attr_p"
+            ],
+            "items": [
+                ["600000.SH", "20241231", "1", "1", "20250401", "101.01"],
+                ["600000.SH", "20241231", "5", "1", "20250401", "105.05"],
+                ["600000.SH", "20241231", "1", "0", "20250330", "99.99"]
+            ]
+        });
+        let indicators = serde_json::json!({
+            "fields": [
+                "ts_code", "end_date", "report_type", "update_flag", "ann_date", "roe"
+            ],
+            "items": [
+                ["600000.SH", "20241231", "5", "1", "20250401", "25.25"],
+                ["600000.SH", "20241231", null, "0", "20250330", "20.20"]
+            ]
+        });
+
+        let rows =
+            TushareClient::parse_financial_reports(&income, &indicators, fetched_at).unwrap();
+
+        assert_eq!(rows.len(), 3);
+        let typed = rows
+            .iter()
+            .find(|row| row.net_profit_parent == Some(decimal("105.05")))
+            .unwrap();
+        assert_eq!(typed.report_type, "5");
+        assert_eq!(typed.roe, Some(decimal("25.25")));
+        let untyped = rows
+            .iter()
+            .find(|row| row.net_profit_parent == Some(decimal("99.99")))
+            .unwrap();
+        assert_eq!(untyped.report_type, "1");
+        assert_eq!(untyped.roe, Some(decimal("20.20")));
+        let unmatched_income = rows
+            .iter()
+            .find(|row| row.net_profit_parent == Some(decimal("101.01")))
+            .unwrap();
+        assert_eq!(unmatched_income.roe, None);
     }
 
     #[tokio::test]
@@ -2924,7 +3192,7 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert!(records.iter().all(|record| record.code == "600519.SH"));
         assert!(records.iter().all(|record| {
-            let effective_date = record.available_at.date_naive();
+            let effective_date = TushareClient::beijing_date(record.available_at);
             effective_date >= start && effective_date <= end
         }));
     }
