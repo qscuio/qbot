@@ -4,7 +4,7 @@ const defaultInspectorWidth = 380;
 const minimumInspectorWidth = 300;
 
 export function activeFilterCount(filters = {}) {
-  return [filters.search, filters.group, filters.signal, filters.rankedOnly]
+  return [String(filters.search ?? "").trim(), filters.group, filters.signal, filters.rankedOnly]
     .filter(Boolean)
     .length;
 }

@@ -71,6 +71,7 @@ test("counts only active scan filters", () => {
     direction: "desc",
   }), 2);
   assert.equal(activeFilterCount({ signal: "top20", rankedOnly: true }), 2);
+  assert.equal(activeFilterCount({ search: "   " }), 0);
 });
 
 test("clamps and persists inspector preferences", () => {

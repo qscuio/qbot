@@ -1,6 +1,7 @@
 import { dashboardApi, ApiError } from "./api.js?v=20260719.1";
 import { activitySeries, mountChart } from "./chart.js?v=20260719.1";
 import {
+  activeFilterCount,
   applyFilters,
   closeTab,
   createWorkspaceState,
@@ -18,6 +19,7 @@ let filters = { search: "", group: "", signal: "", rankedOnly: false, sort: "ran
 const details = new Map();
 let chartHandle = null;
 let refreshTimer = null;
+let filterMenuOpen = false;
 
 function scheduleRefresh() {
   clearInterval(refreshTimer);
@@ -118,8 +120,7 @@ function shellTemplate(body) {
       <div class="workspace">
         <nav class="activitybar" aria-label="Workspace"><button class="activity-button active" title="Scan explorer">⌁</button><span class="activity-spacer"></span><button class="activity-button" id="settings" aria-label="Settings" aria-expanded="false">⚙</button></nav>
         <div class="settings-popover hidden" id="settings-menu"><strong>QBot</strong><span>Market intelligence · read only</span><button class="outline-button" id="logout">Sign out</button></div>
-        ${sidebarTemplate()}
-        <main class="editor"><div class="tabs" role="tablist"><button class="ghost-button mobile-filter" id="mobile-filter">Filters</button><button class="ghost-button mobile-settings" id="mobile-settings" aria-label="Settings">⚙</button>${tabsTemplate()}</div><div class="editor-body">${body}</div></main>
+        <main class="editor"><div class="tabs" role="tablist"><button class="ghost-button mobile-settings" id="mobile-settings" aria-label="Settings">⚙</button>${tabsTemplate()}</div><div class="editor-body">${body}</div></main>
       </div>
       <footer class="statusbar">
         <span><i class="status-dot"></i>API connected</span>
@@ -129,12 +130,9 @@ function shellTemplate(body) {
     </div>`;
 }
 
-function sidebarTemplate() {
+function filterFormTemplate() {
   const groups = [...new Set(bootstrap.catalog.map((item) => item.group))].sort();
-  return `<aside class="sidebar" id="sidebar">
-    <div class="sidebar-title">Scan explorer</div>
-    <div class="section-title">Filters</div>
-    <form class="filter-form" id="filters">
+  return `<form class="filter-form" id="filters">
       <label>Stock search<input class="control" name="search" value="${escapeHtml(filters.search)}" placeholder="Code or name"></label>
       <label>Signal group<select class="control" name="group"><option value="">All groups</option>${groups.map((group) => `<option value="${escapeHtml(group)}" ${filters.group === group ? "selected" : ""}>${escapeHtml(group)}</option>`).join("")}</select></label>
       <label>Signal<select class="control" name="signal"><option value="">All signals</option>${bootstrap.catalog.map((signal) => `<option value="${escapeHtml(signal.id)}" ${filters.signal === signal.id ? "selected" : ""}>${escapeHtml(signal.name)}</option>`).join("")}</select></label>
@@ -142,15 +140,7 @@ function sidebarTemplate() {
       <label>Direction<select class="control" name="direction"><option value="desc">Descending</option><option value="asc">Ascending</option></select></label>
       <label class="checkbox"><input type="checkbox" name="rankedOnly" ${filters.rankedOnly ? "checked" : ""}> Ranked pools only</label>
       <button class="outline-button" type="button" id="clear-filters">Clear filters</button>
-    </form>
-    <div class="section-title">Latest run</div>
-    <div class="metrics-list">
-      <div class="metric-row"><span>Unique stocks</span><strong>${bootstrap.summary.uniqueStocks}</strong></div>
-      <div class="metric-row"><span>Total hits</span><strong>${bootstrap.summary.totalHits}</strong></div>
-      <div class="metric-row"><span>Active signals</span><strong>${bootstrap.summary.activeSignals}</strong></div>
-      <div class="metric-row"><span>Ranked candidates</span><strong>${bootstrap.summary.rankedCandidates}</strong></div>
-    </div>
-  </aside>`;
+    </form>`;
 }
 
 function tabsTemplate() {
@@ -159,9 +149,16 @@ function tabsTemplate() {
 
 function scanTemplate() {
   const visible = visibleRows();
+  const filterCount = activeFilterCount(filters);
   return `<section class="scan-view">
-    <div class="view-heading"><div><h1>Latest scan</h1><p>${escapeHtml(bootstrap.runId ? `Run ${bootstrap.runId}` : "Awaiting the first scan")}</p></div><div class="view-heading-actions"><button class="outline-button" id="refresh">↻ Refresh</button></div></div>
+    <div class="view-heading"><div><h1>Latest scan</h1><p>${escapeHtml(bootstrap.runId ? `Run ${bootstrap.runId}` : "Awaiting the first scan")}</p></div><div class="view-heading-actions"><div class="filter-anchor"><button class="outline-button" id="filter-toggle" type="button" aria-controls="filter-menu" aria-expanded="${filterMenuOpen}">Filters${filterCount ? ` (${filterCount})` : ""}</button><div class="filter-popover ${filterMenuOpen ? "" : "hidden"}" id="filter-menu"><div class="filter-popover-title">Scan filters</div>${filterFormTemplate()}</div></div><button class="outline-button" id="refresh">↻ Refresh</button></div></div>
     ${freshnessBanner()}
+    <section class="summary-strip" aria-label="Latest run summary">
+      <div class="summary-metric"><span>Unique stocks</span><strong>${bootstrap.summary.uniqueStocks}</strong></div>
+      <div class="summary-metric"><span>Total hits</span><strong>${bootstrap.summary.totalHits}</strong></div>
+      <div class="summary-metric"><span>Active signals</span><strong>${bootstrap.summary.activeSignals}</strong></div>
+      <div class="summary-metric"><span>Ranked candidates</span><strong>${bootstrap.summary.rankedCandidates}</strong></div>
+    </section>
     ${visible.length ? `<table class="data-grid"><thead><tr><th>Security</th><th>Close</th><th>Change</th><th>Signals</th><th>Hits</th></tr></thead><tbody>${visible.map((row) => `<tr data-stock="${escapeHtml(row.code)}"><td><div class="stock-cell"><span class="stock-code mono">${escapeHtml(row.code)}</span><span class="stock-name">${escapeHtml(row.name)}</span></div></td><td class="number">${formatNumber(row.close)}</td><td class="number ${changeClass(row.changePct)}">${row.changePct == null ? "—" : `${row.changePct > 0 ? "+" : ""}${formatNumber(row.changePct)}%`}</td><td><div class="badges">${row.hits.map((hit) => `<span class="badge ${hit.isRankedPool ? "ranked" : ""}" title="${escapeHtml(hit.name)}">${escapeHtml(hit.icon)} ${escapeHtml(hit.name)}</span>`).join("")}</div></td><td class="number">${row.hitCount}</td></tr>`).join("")}</tbody></table>` : `<div class="empty-state"><strong>${rows.length ? "No results match these filters" : "The latest scan contains no hits"}</strong><span>${rows.length ? "Clear or adjust the explorer filters." : "A successful zero-hit scan is valid."}</span></div>`}
   </section>`;
 }
@@ -212,8 +209,8 @@ function bindShell(activeTab) {
   };
   app.querySelector("#settings").addEventListener("click", toggleSettings);
   app.querySelector("#mobile-settings")?.addEventListener("click", toggleSettings);
-  app.querySelector("#mobile-filter")?.addEventListener("click", () => app.querySelector("#sidebar").classList.toggle("open"));
-  app.querySelector("#filters").addEventListener("input", (event) => {
+  app.querySelector("#filter-toggle")?.addEventListener("click", () => setFilterMenuOpen(!filterMenuOpen));
+  app.querySelector("#filters")?.addEventListener("input", (event) => {
     const form = event.currentTarget;
     const changedField = event.target.name;
     filters = { ...filters, search: form.search.value, group: form.group.value, signal: form.signal.value, sort: form.sort.value, direction: form.direction.value, rankedOnly: form.rankedOnly.checked };
@@ -224,9 +221,12 @@ function bindShell(activeTab) {
       search.setSelectionRange(search.value.length, search.value.length);
     }
   });
-  app.querySelector("#filters select[name=sort]").value = filters.sort;
-  app.querySelector("#filters select[name=direction]").value = filters.direction;
-  app.querySelector("#clear-filters").addEventListener("click", () => { filters = { search: "", group: "", signal: "", rankedOnly: false, sort: "ranked", direction: "desc" }; renderWorkspace(); });
+  const filterForm = app.querySelector("#filters");
+  if (filterForm) {
+    filterForm.elements.sort.value = filters.sort;
+    filterForm.elements.direction.value = filters.direction;
+  }
+  app.querySelector("#clear-filters")?.addEventListener("click", () => { filters = { search: "", group: "", signal: "", rankedOnly: false, sort: "ranked", direction: "desc" }; renderWorkspace(); });
   app.querySelectorAll("[data-tab]").forEach((button) => button.addEventListener("click", (event) => {
     if (event.target.closest("[data-close]")) return;
     workspace = { ...workspace, activeTab: button.dataset.tab };
@@ -253,6 +253,22 @@ function bindShell(activeTab) {
     renderWorkspace();
   });
 }
+
+function setFilterMenuOpen(open) {
+  filterMenuOpen = open;
+  app.querySelector("#filter-menu")?.classList.toggle("hidden", !open);
+  app.querySelector("#filter-toggle")?.setAttribute("aria-expanded", String(open));
+}
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && filterMenuOpen) setFilterMenuOpen(false);
+});
+
+document.addEventListener("click", (event) => {
+  if (filterMenuOpen && event.target instanceof Element && !event.target.closest(".filter-anchor")) {
+    setFilterMenuOpen(false);
+  }
+});
 
 function stockRoute(code) {
   return `#stock/${encodeURIComponent(code)}`;

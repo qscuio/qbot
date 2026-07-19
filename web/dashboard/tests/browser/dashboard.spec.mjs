@@ -78,6 +78,7 @@ test("login, filter, stock chart, periods, and logout", async ({ page }) => {
 
   await expect(page.getByRole("heading", { name: "Latest scan" })).toBeVisible();
   await expect(page.locator("tbody tr")).toHaveCount(2);
+  await page.getByRole("button", { name: /^Filters/ }).click();
   await page.getByLabel("Stock search").fill("茅台");
   await expect(page.locator("tbody tr")).toHaveCount(1);
   await page.locator("tbody tr").click();
@@ -93,13 +94,33 @@ test("login, filter, stock chart, periods, and logout", async ({ page }) => {
   await expect(page.getByRole("button", { name: "Sign in" })).toBeVisible();
 });
 
-test("narrow layout exposes the filter drawer", async ({ page }) => {
-  await page.setViewportSize({ width: 390, height: 844 });
+test("filter dropdown replaces the fixed sidebar", async ({ page }) => {
   await mockApi(page);
   await page.goto("/dashboard/");
-  await page.getByRole("button", { name: "Filters", exact: true }).click();
-  await expect(page.locator("#sidebar")).toHaveClass(/open/);
-  await expect(page.getByLabel("Stock search")).toBeVisible();
+
+  await expect(page.locator(".sidebar")).toHaveCount(0);
+  await page.getByRole("button", { name: /^Filters/ }).click();
+  await expect(page.locator("#filter-menu")).toBeVisible();
+  await page.getByLabel("Stock search").fill("茅台");
+  await page.getByLabel("Signal group").selectOption("trend");
+  await expect(page.getByRole("button", { name: "Filters (2)" })).toBeVisible();
+
+  await page.keyboard.press("Escape");
+  await expect(page.locator("#filter-menu")).toBeHidden();
+  await page.getByRole("button", { name: "Filters (2)" }).click();
+  await expect(page.getByLabel("Stock search")).toHaveValue("茅台");
+  await expect(page.getByLabel("Signal group")).toHaveValue("trend");
+  await page.getByRole("heading", { name: "Latest scan" }).click();
+  await expect(page.locator("#filter-menu")).toBeHidden();
+  await page.getByRole("button", { name: "Filters (2)" }).click();
+  await expect(page.getByLabel("Stock search")).toHaveValue("茅台");
+  await expect(page.getByLabel("Signal group")).toHaveValue("trend");
+
+  const summary = page.locator(".summary-strip");
+  await expect(summary.getByText("Unique stocks")).toBeVisible();
+  await expect(summary.getByText("Total hits")).toBeVisible();
+  await expect(summary.getByText("Active signals")).toBeVisible();
+  await expect(summary.getByText("Ranked candidates")).toBeVisible();
 });
 
 test("top chrome is consolidated into the left settings menu", async ({ page }) => {
