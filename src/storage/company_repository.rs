@@ -289,6 +289,7 @@ impl CompanyRepository {
                           ) AS revision_rank
                    FROM stock_financial_report_versions
                    WHERE code = $1 AND frequency = $2
+                     AND available_at <= NOW()
                )
                SELECT source, code, end_date, announcement_date, report_type, frequency,
                       source_revision, total_revenue, revenue, operating_profit,
@@ -348,7 +349,7 @@ impl CompanyRepository {
                             ORDER BY available_at DESC, source, source_revision DESC
                           ) AS revision_rank
                    FROM stock_dividend_versions
-                   WHERE code = $1
+                   WHERE code = $1 AND available_at <= NOW()
                ), latest AS (
                    SELECT *, COALESCE(ex_date, record_date, announcement_date,
                                       DATE '0001-01-01') AS dividend_date
@@ -1078,6 +1079,37 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn financial_history_excludes_future_revisions_from_winner_count_and_pages(
+        pool: PgPool,
+    ) -> crate::error::Result<()> {
+        let repo = CompanyRepository::new(pool);
+        let visible = financial_report("visible", 20);
+        let mut future = financial_report("future", 25);
+        future.available_at = dt(2099, 3, 25, 8);
+        future.ingested_at = dt(2099, 3, 25, 9);
+        let mut older = financial_report("older", 20);
+        older.end_date = date(2024, 12, 31);
+        repo.upsert_financial_reports(&[visible, future, older])
+            .await?;
+
+        let first = repo
+            .financial_history("600519.SH", FinancialFrequency::Annual, 1, None)
+            .await?;
+        assert_eq!(first.items.len(), 1);
+        assert_eq!(first.items[0].report.source_revision, "visible");
+        assert_eq!(first.items[0].revision_count, 1);
+        let cursor = first.next_cursor.expect("visible older period remains");
+
+        let second = repo
+            .financial_history("600519.SH", FinancialFrequency::Annual, 1, Some(cursor))
+            .await?;
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(second.items[0].report.source_revision, "older");
+        assert!(second.next_cursor.is_none());
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn dividend_upserts_are_revision_idempotent_and_history_is_latest_first(
         pool: PgPool,
     ) -> crate::error::Result<()> {
@@ -1123,6 +1155,38 @@ mod tests {
             Some(decimal("2.76000002"))
         );
         assert_eq!(page.items[0].revision_count, 2);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn dividend_history_excludes_future_revisions_from_winner_count_and_pages(
+        pool: PgPool,
+    ) -> crate::error::Result<()> {
+        let repo = CompanyRepository::new(pool);
+        let visible = dividend("visible", "2.76000000");
+        let mut future = dividend("future", "9.99000000");
+        future.available_at = dt(2099, 3, 30, 8);
+        future.ingested_at = dt(2099, 3, 30, 9);
+        let mut older = dividend("older", "1.50000000");
+        older.action_key = "600519.SH-2024-final".to_string();
+        older.announcement_date = Some(date(2025, 3, 30));
+        older.record_date = Some(date(2025, 6, 25));
+        older.ex_date = Some(date(2025, 6, 26));
+        older.pay_date = Some(date(2025, 6, 26));
+        older.available_at = dt(2025, 3, 30, 8);
+        older.ingested_at = dt(2025, 3, 30, 9);
+        repo.upsert_dividends(&[visible, future, older]).await?;
+
+        let first = repo.dividend_history("600519.SH", 1, None).await?;
+        assert_eq!(first.items.len(), 1);
+        assert_eq!(first.items[0].record.source_revision, "visible");
+        assert_eq!(first.items[0].revision_count, 1);
+        let cursor = first.next_cursor.expect("visible older dividend remains");
+
+        let second = repo.dividend_history("600519.SH", 1, Some(cursor)).await?;
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(second.items[0].record.source_revision, "older");
+        assert!(second.next_cursor.is_none());
         Ok(())
     }
 

@@ -283,16 +283,16 @@ async fn stock_company(
     Path(code): Path<String>,
 ) -> Response {
     if let Err(response) = authorized(&state, &headers).await {
-        return response;
+        return private_no_store(response);
     }
     let service = match company_service(&state) {
         Ok(service) => service,
-        Err(response) => return response,
+        Err(response) => return private_no_store(response),
     };
-    match service.company(&code).await {
+    private_no_store(match service.company(&code).await {
         Ok(payload) => Json(payload).into_response(),
         Err(error) => dashboard_company_error(error),
-    }
+    })
 }
 
 async fn stock_financials(
@@ -302,27 +302,29 @@ async fn stock_financials(
     Query(query): Query<DashboardFinancialQuery>,
 ) -> Response {
     if let Err(response) = authorized(&state, &headers).await {
-        return response;
+        return private_no_store(response);
     }
     let frequency = match query.parsed_frequency() {
         Ok(frequency) => frequency,
-        Err(error) => return dashboard_company_error(error),
+        Err(error) => return private_no_store(dashboard_company_error(error)),
     };
     let limit = match query.parsed_limit() {
         Ok(limit) => limit,
-        Err(error) => return dashboard_company_error(error),
+        Err(error) => return private_no_store(dashboard_company_error(error)),
     };
     let service = match company_service(&state) {
         Ok(service) => service,
-        Err(response) => return response,
+        Err(response) => return private_no_store(response),
     };
-    match service
-        .financials(&code, frequency, limit, query.cursor.as_deref())
-        .await
-    {
-        Ok(payload) => Json(payload).into_response(),
-        Err(error) => dashboard_company_error(error),
-    }
+    private_no_store(
+        match service
+            .financials(&code, frequency, limit, query.cursor.as_deref())
+            .await
+        {
+            Ok(payload) => Json(payload).into_response(),
+            Err(error) => dashboard_company_error(error),
+        },
+    )
 }
 
 async fn stock_dividends(
@@ -332,23 +334,33 @@ async fn stock_dividends(
     Query(query): Query<DashboardDividendQuery>,
 ) -> Response {
     if let Err(response) = authorized(&state, &headers).await {
-        return response;
+        return private_no_store(response);
     }
     let service = match company_service(&state) {
         Ok(service) => service,
-        Err(response) => return response,
+        Err(response) => return private_no_store(response),
     };
     let limit = match query.parsed_limit() {
         Ok(limit) => limit,
-        Err(error) => return dashboard_company_error(error),
+        Err(error) => return private_no_store(dashboard_company_error(error)),
     };
-    match service
-        .dividends(&code, limit, query.cursor.as_deref())
-        .await
-    {
-        Ok(payload) => Json(payload).into_response(),
-        Err(error) => dashboard_company_error(error),
-    }
+    private_no_store(
+        match service
+            .dividends(&code, limit, query.cursor.as_deref())
+            .await
+        {
+            Ok(payload) => Json(payload).into_response(),
+            Err(error) => dashboard_company_error(error),
+        },
+    )
+}
+
+fn private_no_store(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response
 }
 
 fn dashboard_company_error(error: crate::error::AppError) -> Response {
@@ -507,6 +519,13 @@ mod tests {
         headers
     }
 
+    fn assert_private_no_store(response: &Response) {
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("private, no-store"))
+        );
+    }
+
     #[sqlx::test(migrations = "./migrations")]
     async fn company_routes_authenticate_before_lookup_and_map_validation_and_existence(
         pool: PgPool,
@@ -540,6 +559,7 @@ mod tests {
         )
         .await;
         assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+        assert_private_no_store(&unauthenticated);
         let cookie = authenticated_cookie(&state).await;
         for query in [
             DashboardFinancialQuery {
@@ -571,6 +591,7 @@ mod tests {
             )
             .await;
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_private_no_store(&response);
         }
         let missing = stock_company(
             State(state.clone()),
@@ -579,6 +600,7 @@ mod tests {
         )
         .await;
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_private_no_store(&missing);
         let company = stock_company(
             State(state.clone()),
             headers(Some(&cookie)),
@@ -586,6 +608,7 @@ mod tests {
         )
         .await;
         assert_eq!(company.status(), StatusCode::OK);
+        assert_private_no_store(&company);
         let financials = stock_financials(
             State(state.clone()),
             headers(Some(&cookie)),
@@ -598,6 +621,7 @@ mod tests {
         )
         .await;
         assert_eq!(financials.status(), StatusCode::OK);
+        assert_private_no_store(&financials);
         let dividends = stock_dividends(
             State(state),
             headers(Some(&cookie)),
@@ -609,6 +633,7 @@ mod tests {
         )
         .await;
         assert_eq!(dividends.status(), StatusCode::OK);
+        assert_private_no_store(&dividends);
         Ok(())
     }
 }

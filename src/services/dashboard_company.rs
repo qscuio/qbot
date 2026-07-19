@@ -13,6 +13,7 @@ use crate::storage::company_repository::{
 };
 
 const MAX_PAGE_SIZE: usize = 100;
+const CURSOR_HMAC_DOMAIN: &[u8] = b"qbot-dashboard-cursor-v1\0";
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -442,6 +443,7 @@ impl DashboardCompanyService {
         let body = URL_SAFE_NO_PAD.encode(body);
         let mut mac = HmacSha256::new_from_slice(self.cursor_secret.as_bytes())
             .map_err(|_| AppError::Internal("invalid dashboard cursor secret".to_string()))?;
+        mac.update(CURSOR_HMAC_DOMAIN);
         mac.update(body.as_bytes());
         let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
         Ok(format!("{body}.{signature}"))
@@ -457,6 +459,7 @@ impl DashboardCompanyService {
             .map_err(|_| invalid_cursor())?;
         let mut mac = HmacSha256::new_from_slice(self.cursor_secret.as_bytes())
             .map_err(|_| AppError::Internal("invalid dashboard cursor secret".to_string()))?;
+        mac.update(CURSOR_HMAC_DOMAIN);
         mac.update(body.as_bytes());
         mac.verify_slice(&signature).map_err(|_| invalid_cursor())?;
         let payload = URL_SAFE_NO_PAD.decode(body).map_err(|_| invalid_cursor())?;
@@ -729,6 +732,23 @@ mod tests {
             .financials("600519.SH", FinancialFrequency::Quarterly, 1, Some(&cursor))
             .await;
         assert!(matches!(mismatch, Err(AppError::BadRequest(_))));
+
+        let (body, _) = cursor.split_once('.').expect("signed cursor");
+        let mut legacy_mac = HmacSha256::new_from_slice(b"cursor-test-secret").unwrap();
+        legacy_mac.update(body.as_bytes());
+        let legacy_signature = URL_SAFE_NO_PAD.encode(legacy_mac.finalize().into_bytes());
+        let legacy_cursor = format!("{body}.{legacy_signature}");
+        assert!(matches!(
+            service
+                .financials(
+                    "600519.SH",
+                    FinancialFrequency::Annual,
+                    1,
+                    Some(&legacy_cursor)
+                )
+                .await,
+            Err(AppError::BadRequest(_))
+        ));
 
         let mut tampered = cursor;
         tampered.replace_range(0..1, if tampered.starts_with('a') { "b" } else { "a" });
