@@ -1227,6 +1227,7 @@ impl TushareClient {
     {
         let periods = Self::company_report_periods(start, end)?;
         let mut income_rows = Vec::new();
+        let mut indicator_rows = Vec::new();
         for period in periods {
             let data = call(
                 "income",
@@ -1235,14 +1236,17 @@ impl TushareClient {
             )
             .await?;
             income_rows.extend(Self::company_rows(&data, "income")?);
+
+            let data = call(
+                "fina_indicator",
+                Self::income_period_params(code, period),
+                Self::indicator_fields(),
+            )
+            .await?;
+            indicator_rows.extend(Self::company_rows(&data, "fina_indicator")?);
         }
-        let indicator = call(
-            "fina_indicator",
-            Self::company_window_params(code, start, end),
-            Self::indicator_fields(),
-        )
-        .await?;
         let income = Self::company_data_from_rows(income_rows);
+        let indicator = Self::company_data_from_rows(indicator_rows);
         Self::parse_financial_reports(&income, &indicator, fetched_at)
     }
 
@@ -4016,12 +4020,15 @@ mod tests {
                             ]]
                         })),
                         "income" => Ok(serde_json::json!({ "fields": [], "items": [] })),
-                        "fina_indicator" => Ok(serde_json::json!({
-                            "fields": [
-                                "ts_code", "end_date", "update_flag", "ann_date", "roe"
-                            ],
-                            "items": [["600519.SH", "20241231", "1", "20250330", "20.02"]]
-                        })),
+                        "fina_indicator" if params["period"] == "20241231" => {
+                            Ok(serde_json::json!({
+                                "fields": [
+                                    "ts_code", "end_date", "update_flag", "ann_date", "roe"
+                                ],
+                                "items": [["600519.SH", "20241231", "1", "20250330", "20.02"]]
+                            }))
+                        }
+                        "fina_indicator" => Ok(serde_json::json!({ "fields": [], "items": [] })),
                         _ => unreachable!(),
                     }
                 }
@@ -4057,19 +4064,23 @@ mod tests {
         assert!(income_params
             .iter()
             .all(|params| params.get("start_date").is_none() && params.get("end_date").is_none()));
-        let indicator_params = calls
+        let indicator_params: Vec<_> = calls
             .iter()
-            .find(|(api_name, _, _)| api_name == "fina_indicator")
-            .map(|(_, params, _)| params)
-            .unwrap();
+            .filter(|(api_name, _, _)| api_name == "fina_indicator")
+            .map(|(_, params, _)| params.clone())
+            .collect();
         assert_eq!(
             indicator_params,
-            &serde_json::json!({
-                "ts_code": "600519.SH",
-                "start_date": "20240101",
-                "end_date": "20241231"
-            })
+            vec![
+                serde_json::json!({"ts_code": "600519.SH", "period": "20240331"}),
+                serde_json::json!({"ts_code": "600519.SH", "period": "20240630"}),
+                serde_json::json!({"ts_code": "600519.SH", "period": "20240930"}),
+                serde_json::json!({"ts_code": "600519.SH", "period": "20241231"}),
+            ]
         );
+        assert!(indicator_params
+            .iter()
+            .all(|params| params.get("start_date").is_none() && params.get("end_date").is_none()));
     }
 
     #[tokio::test]
