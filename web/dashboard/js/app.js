@@ -6,7 +6,10 @@ import {
   closeTab,
   clampInspectorWidth,
   createWorkspaceState,
+  DEFAULT_INSPECTOR_WIDTH,
   loadInspectorPreferences,
+  maximumInspectorWidth,
+  MINIMUM_INSPECTOR_WIDTH,
   normalizeRows,
   openStockTab,
   saveInspectorPreferences,
@@ -23,20 +26,14 @@ const details = new Map();
 let chartHandle = null;
 let inspectorCleanup = null;
 let closeInspectorOverlay = null;
+let protectedViewGeneration = 0;
 let refreshTimer = null;
 let filterMenuOpen = false;
 let inspectorTab = "overview";
 let inspectorPreferences = loadInspectorPreferences(window.localStorage, Number.POSITIVE_INFINITY);
 
-const defaultInspectorWidth = 380;
-const minimumInspectorWidth = 300;
-
 function effectiveInspectorWidth() {
   return clampInspectorWidth(inspectorPreferences.width, window.innerWidth);
-}
-
-function maximumInspectorWidth() {
-  return Math.max(minimumInspectorWidth, Math.floor(window.innerWidth * 0.5));
 }
 
 function teardownWorkspaceView() {
@@ -45,6 +42,12 @@ function teardownWorkspaceView() {
   closeInspectorOverlay = null;
   chartHandle?.destroy();
   chartHandle = null;
+}
+
+function invalidateProtectedView() {
+  protectedViewGeneration += 1;
+  teardownWorkspaceView();
+  return protectedViewGeneration;
 }
 
 function scheduleRefresh() {
@@ -83,7 +86,7 @@ function visibleRows() {
 
 function renderLogin(error = "") {
   clearInterval(refreshTimer);
-  teardownWorkspaceView();
+  invalidateProtectedView();
   app.innerHTML = `
     <main class="login-screen">
       <form class="login-card" id="login-form">
@@ -103,11 +106,13 @@ function renderLogin(error = "") {
     button.disabled = true;
     button.textContent = "Signing in…";
     errorNode.textContent = "";
+    const generation = protectedViewGeneration;
     try {
       await dashboardApi.login(event.currentTarget.username.value, event.currentTarget.password.value);
-      await loadBootstrap();
-      scheduleRefresh();
+      if (generation !== protectedViewGeneration) return;
+      if (await loadBootstrap()) scheduleRefresh();
     } catch (error) {
+      if (generation !== protectedViewGeneration) return;
       errorNode.textContent = error.status === 429 ? "Too many attempts. Try again later." : "Invalid username or password.";
       button.disabled = false;
       button.textContent = "Sign in";
@@ -116,23 +121,28 @@ function renderLogin(error = "") {
 }
 
 async function loadBootstrap({ quiet = false } = {}) {
+  const generation = quiet ? protectedViewGeneration : invalidateProtectedView();
   if (!quiet) {
-    teardownWorkspaceView();
     app.innerHTML = `<div class="boot-screen"><span class="spinner"></span><span>Loading latest scan…</span></div>`;
   }
   try {
-    bootstrap = await dashboardApi.bootstrap();
+    const payload = await dashboardApi.bootstrap();
+    if (generation !== protectedViewGeneration) return false;
+    bootstrap = payload;
     rows = normalizeRows(bootstrap.results);
     restoreLocation();
+    return true;
   } catch (error) {
+    if (generation !== protectedViewGeneration) return false;
     if (error instanceof ApiError && error.status === 401) return renderLogin();
     if (quiet) return showTransientError("Refresh failed. Existing results are unchanged.");
     renderFailure(error.message);
+    return false;
   }
 }
 
 function renderFailure(message) {
-  teardownWorkspaceView();
+  invalidateProtectedView();
   app.innerHTML = `<div class="boot-screen"><strong>QBot is unavailable</strong><span>${escapeHtml(message)}</span><button class="outline-button" id="retry">Retry</button></div>`;
   app.querySelector("#retry").addEventListener("click", () => loadBootstrap());
 }
@@ -240,7 +250,7 @@ function stockTemplate(tab, detail) {
   const inspectorWidth = effectiveInspectorWidth();
   return `<section class="stock-view">
     <header class="stock-toolbar"><div class="stock-identity"><h1>${escapeHtml(detail.name)}<span>${escapeHtml(detail.code)}</span></h1><div class="muted mono">${latest ? escapeHtml(latest.time) : "No market history"}${detail.partial ? " · partial data" : ""}</div></div><div class="stock-quote"><span class="stock-price">${formatNumber(latest?.close)}</span><span class="number ${changeClass(change)}">${change == null ? "—" : `${change > 0 ? "+" : ""}${formatNumber(change)}%`}</span></div><div class="periods" aria-label="Chart period">${periods.map(([period, label, name]) => `<button class="period-button ${tab.period === period ? "active" : ""}" data-period="${period}" aria-label="${name}" title="${name}">${label}</button>`).join("")}</div><div class="nav-buttons"><button class="ghost-button" data-neighbor="${escapeHtml(activeRows[index - 1]?.code || "")}" ${index <= 0 ? "disabled" : ""}>← Prev</button><button class="ghost-button" data-neighbor="${escapeHtml(activeRows[index + 1]?.code || "")}" ${index < 0 || index >= activeRows.length - 1 ? "disabled" : ""}>Next →</button></div><button class="ghost-button inspector-toggle" type="button" aria-controls="stock-inspector" aria-expanded="${!inspectorPreferences.collapsed}" aria-label="${inspectorPreferences.collapsed ? "Show" : "Hide"} stock information">ⓘ</button></header>
-    <div class="stock-workspace ${inspectorPreferences.collapsed ? "inspector-collapsed" : ""}" style="--inspector-width:${inspectorWidth}px"><div class="stock-content">${detail.bars.length ? `<div class="chart-pane"><div class="chart-legend"><strong class="chart-period">${periodName} · ${detail.bars.length} bars · ${detail.hits.length} signals</strong><span class="chart-activity">${escapeHtml(activity.label)}</span><span class="ma5">MA5</span><span class="ma10">MA10</span><span class="ma20">MA20</span><span class="ma60">MA60</span></div><div class="chart" id="stock-chart"></div><a class="chart-watermark" href="https://www.tradingview.com/" target="_blank" rel="noopener">Charts by TradingView</a></div>` : `<div class="empty-state"><strong>No usable chart history</strong><span>No historical bars are available for this period.</span></div>`}</div><div class="inspector-resizer" role="separator" tabindex="0" aria-controls="stock-inspector" aria-label="Resize stock information panel" aria-orientation="vertical" aria-valuemin="${minimumInspectorWidth}" aria-valuemax="${maximumInspectorWidth()}" aria-valuenow="${inspectorWidth}" title="Drag or use arrow keys to resize · Press Enter to reset"></div>${inspectorTemplate(detail)}</div>
+    <div class="stock-workspace ${inspectorPreferences.collapsed ? "inspector-collapsed" : ""}" style="--inspector-width:${inspectorWidth}px"><div class="stock-content">${detail.bars.length ? `<div class="chart-pane"><div class="chart-legend"><strong class="chart-period">${periodName} · ${detail.bars.length} bars · ${detail.hits.length} signals</strong><span class="chart-activity">${escapeHtml(activity.label)}</span><span class="ma5">MA5</span><span class="ma10">MA10</span><span class="ma20">MA20</span><span class="ma60">MA60</span></div><div class="chart" id="stock-chart"></div><a class="chart-watermark" href="https://www.tradingview.com/" target="_blank" rel="noopener">Charts by TradingView</a></div>` : `<div class="empty-state"><strong>No usable chart history</strong><span>No historical bars are available for this period.</span></div>`}</div><div class="inspector-resizer" role="separator" tabindex="0" aria-controls="stock-inspector" aria-label="Resize stock information panel" aria-orientation="vertical" aria-valuemin="${MINIMUM_INSPECTOR_WIDTH}" aria-valuemax="${maximumInspectorWidth(window.innerWidth)}" aria-valuenow="${inspectorWidth}" title="Drag or use arrow keys to resize · Press Enter to reset"></div>${inspectorTemplate(detail)}</div>
   </section>`;
 }
 
@@ -260,6 +270,7 @@ function renderWorkspace() {
 
 function bindShell(activeTab) {
   app.querySelector("#logout").addEventListener("click", async () => {
+    invalidateProtectedView();
     try { await dashboardApi.logout(); } finally { renderLogin(); }
   });
   const settingsMenu = app.querySelector("#settings-menu");
@@ -333,7 +344,7 @@ function bindInspector() {
   const applyEffectiveWidth = () => {
     const width = effectiveInspectorWidth();
     stockWorkspace.style.setProperty("--inspector-width", `${width}px`);
-    resizer?.setAttribute("aria-valuemax", String(maximumInspectorWidth()));
+    resizer?.setAttribute("aria-valuemax", String(maximumInspectorWidth(window.innerWidth)));
     resizer?.setAttribute("aria-valuenow", String(width));
     resizeChart();
   };
@@ -399,7 +410,7 @@ function bindInspector() {
       saveInspectorPreferences(window.localStorage, inspectorPreferences);
       resizeChart();
     };
-    const resetWidth = () => setWidth(defaultInspectorWidth, { persist: true });
+    const resetWidth = () => setWidth(DEFAULT_INSPECTOR_WIDTH, { persist: true });
     resizer.addEventListener("pointerdown", (event) => {
       if (event.button !== 0 || drag) return;
       event.preventDefault();
@@ -423,9 +434,9 @@ function bindInspector() {
       let nextWidth = null;
       if (event.key === "ArrowLeft") nextWidth = width + 20;
       else if (event.key === "ArrowRight") nextWidth = width - 20;
-      else if (event.key === "Home") nextWidth = maximumInspectorWidth();
-      else if (event.key === "End") nextWidth = minimumInspectorWidth;
-      else if (event.key === "Enter" || event.key === " ") nextWidth = defaultInspectorWidth;
+      else if (event.key === "Home") nextWidth = maximumInspectorWidth(window.innerWidth);
+      else if (event.key === "End") nextWidth = MINIMUM_INSPECTOR_WIDTH;
+      else if (event.key === "Enter" || event.key === " ") nextWidth = DEFAULT_INSPECTOR_WIDTH;
       if (nextWidth === null) return;
       event.preventDefault();
       setWidth(nextWidth, { persist: true });
@@ -485,12 +496,17 @@ function openStock(code, { updateHistory = true } = {}) {
 
 async function loadStock(tab) {
   const key = `${tab.code}:${tab.period}`;
+  const generation = protectedViewGeneration;
   try {
-    details.set(key, await dashboardApi.stock(tab.code, tab.period));
+    const detail = await dashboardApi.stock(tab.code, tab.period);
+    if (generation !== protectedViewGeneration) return;
+    details.set(key, detail);
   } catch (error) {
+    if (generation !== protectedViewGeneration) return;
     if (error.status === 401) return renderLogin("Your session expired. Please sign in again.");
     details.set(key, { error: error.message });
   }
+  if (generation !== protectedViewGeneration) return;
   if (workspace.activeTab === tab.id && workspace.tabs.find((item) => item.id === tab.id)?.period === tab.period) renderWorkspace();
 }
 
@@ -518,8 +534,7 @@ function showTransientError(message) {
 async function start() {
   try {
     await dashboardApi.session();
-    await loadBootstrap();
-    scheduleRefresh();
+    if (await loadBootstrap()) scheduleRefresh();
   } catch (error) {
     if (error.status === 401 || error.status === 503) renderLogin(error.status === 503 ? "Dashboard authentication is not configured." : "");
     else renderFailure(error.message);

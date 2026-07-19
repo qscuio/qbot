@@ -1,7 +1,11 @@
 const collator = new Intl.Collator("zh-CN", { numeric: true, sensitivity: "base" });
 const inspectorPreferencesKey = "qbot.dashboard.inspector.v1";
-const defaultInspectorWidth = 380;
-const minimumInspectorWidth = 300;
+export const DEFAULT_INSPECTOR_WIDTH = 380;
+export const MINIMUM_INSPECTOR_WIDTH = 300;
+
+export function maximumInspectorWidth(viewportWidth) {
+  return Math.max(MINIMUM_INSPECTOR_WIDTH, Math.floor(viewportWidth * 0.5));
+}
 
 export function activeFilterCount(filters = {}) {
   return [String(filters.search ?? "").trim(), filters.group, filters.signal, filters.rankedOnly]
@@ -10,9 +14,8 @@ export function activeFilterCount(filters = {}) {
 }
 
 export function clampInspectorWidth(width, viewportWidth) {
-  const maximumWidth = Math.max(minimumInspectorWidth, Math.floor(viewportWidth * 0.5));
-  const preferredWidth = Number.isFinite(width) ? width : defaultInspectorWidth;
-  return Math.min(Math.max(preferredWidth, minimumInspectorWidth), maximumWidth);
+  const preferredWidth = Number.isFinite(width) ? width : DEFAULT_INSPECTOR_WIDTH;
+  return Math.min(Math.max(preferredWidth, MINIMUM_INSPECTOR_WIDTH), maximumInspectorWidth(viewportWidth));
 }
 
 export function loadInspectorPreferences(storage, viewportWidth) {
@@ -24,7 +27,7 @@ export function loadInspectorPreferences(storage, viewportWidth) {
     };
   } catch {
     return {
-      width: clampInspectorWidth(defaultInspectorWidth, viewportWidth),
+      width: clampInspectorWidth(DEFAULT_INSPECTOR_WIDTH, viewportWidth),
       collapsed: false,
     };
   }

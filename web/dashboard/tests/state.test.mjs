@@ -6,7 +6,10 @@ import {
   applyFilters,
   clampInspectorWidth,
   createWorkspaceState,
+  DEFAULT_INSPECTOR_WIDTH,
   loadInspectorPreferences,
+  maximumInspectorWidth,
+  MINIMUM_INSPECTOR_WIDTH,
   normalizeRows,
   openStockTab,
   saveInspectorPreferences,
@@ -75,6 +78,9 @@ test("counts only active scan filters", () => {
 });
 
 test("clamps and persists inspector preferences", () => {
+  assert.equal(DEFAULT_INSPECTOR_WIDTH, 380);
+  assert.equal(MINIMUM_INSPECTOR_WIDTH, 300);
+  assert.equal(maximumInspectorWidth(1600), 800);
   assert.equal(clampInspectorWidth(120, 1600), 300);
   assert.equal(clampInspectorWidth(1200, 1600), 800);
   const storage = memoryStorage();

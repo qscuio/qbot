@@ -29,8 +29,9 @@ const bars = Array.from({ length: 90 }, (_, index) => {
   return { time: date, open: close - 3, high: close + 8, low: close - 10, close, volume: 1000000 + index * 1000, amount: 1 };
 });
 
-async function mockApi(page, initiallyAuthenticated = true, stockHits = bootstrap.results[0].hits, requestedPeriods = []) {
+async function mockApi(page, initiallyAuthenticated = true, stockHits = bootstrap.results[0].hits, requestedPeriods = [], gates = {}) {
   let authenticated = initiallyAuthenticated;
+  let bootstrapRequests = 0;
   await page.route("**/api/dashboard/**", async (route) => {
     const url = new URL(route.request().url());
     if (url.pathname.endsWith("/auth/session")) {
@@ -42,15 +43,26 @@ async function mockApi(page, initiallyAuthenticated = true, stockHits = bootstra
     }
     if (url.pathname.endsWith("/auth/logout")) return route.fulfill({ status: 204, body: "" });
     if (!authenticated) return route.fulfill({ status: 401, json: { error: "unauthorized" } });
-    if (url.pathname.endsWith("/bootstrap")) return route.fulfill({
-      status: 200,
-      json: {
-        ...bootstrap,
-        results: bootstrap.results.map((row) => row.code === "600519" ? { ...row, hits: stockHits } : row),
-      },
-    });
+    if (url.pathname.endsWith("/bootstrap")) {
+      bootstrapRequests += 1;
+      if (gates.bootstrap && bootstrapRequests > (gates.bootstrap.afterRequests ?? 0)) {
+        gates.bootstrap.requested?.();
+        await gates.bootstrap.release;
+      }
+      return route.fulfill({
+        status: 200,
+        json: {
+          ...bootstrap,
+          results: bootstrap.results.map((row) => row.code === "600519" ? { ...row, hits: stockHits } : row),
+        },
+      });
+    }
     const period = url.searchParams.get("period") || "daily";
     requestedPeriods.push(period);
+    if (gates.stock) {
+      gates.stock.requested?.();
+      await gates.stock.release;
+    }
     const periodBars = period === "daily"
       ? bars
       : bars.filter((_, index) => (index + 1) % (period === "weekly" ? 5 : 20) === 0);
@@ -64,6 +76,40 @@ async function mockApi(page, initiallyAuthenticated = true, stockHits = bootstra
       bars: periodBars,
       hits: stockHits,
     } });
+  });
+}
+
+async function installLifecycleProbe(page) {
+  await page.addInitScript(() => {
+    const NativeResizeObserver = window.ResizeObserver;
+    const nativeAddEventListener = window.addEventListener;
+    const nativeRemoveEventListener = window.removeEventListener;
+    const resizeListeners = new Set();
+    window.__dashboardLifecycleProbe = { callbacks: 0, disconnects: 0, observes: 0, resizeListeners };
+    window.ResizeObserver = class extends NativeResizeObserver {
+      constructor(callback) {
+        super((...args) => {
+          window.__dashboardLifecycleProbe.callbacks += 1;
+          callback(...args);
+        });
+      }
+      observe(...args) {
+        window.__dashboardLifecycleProbe.observes += 1;
+        return super.observe(...args);
+      }
+      disconnect() {
+        window.__dashboardLifecycleProbe.disconnects += 1;
+        return super.disconnect();
+      }
+    };
+    window.addEventListener = function addEventListener(type, listener, options) {
+      if (type === "resize") resizeListeners.add(listener);
+      return nativeAddEventListener.call(this, type, listener, options);
+    };
+    window.removeEventListener = function removeEventListener(type, listener, options) {
+      if (type === "resize") resizeListeners.delete(listener);
+      return nativeRemoveEventListener.call(this, type, listener, options);
+    };
   });
 }
 
@@ -134,37 +180,7 @@ test("top chrome is consolidated into the left settings menu", async ({ page }) 
 });
 
 test("stock workspace teardown disconnects chart and inspector resize resources on logout", async ({ page }) => {
-  await page.addInitScript(() => {
-    const NativeResizeObserver = window.ResizeObserver;
-    const nativeAddEventListener = window.addEventListener;
-    const nativeRemoveEventListener = window.removeEventListener;
-    const resizeListeners = new Set();
-    window.__dashboardLifecycleProbe = { callbacks: 0, disconnects: 0, observes: 0, resizeListeners };
-    window.ResizeObserver = class extends NativeResizeObserver {
-      constructor(callback) {
-        super((...args) => {
-          window.__dashboardLifecycleProbe.callbacks += 1;
-          callback(...args);
-        });
-      }
-      observe(...args) {
-        window.__dashboardLifecycleProbe.observes += 1;
-        return super.observe(...args);
-      }
-      disconnect() {
-        window.__dashboardLifecycleProbe.disconnects += 1;
-        return super.disconnect();
-      }
-    };
-    window.addEventListener = function addEventListener(type, listener, options) {
-      if (type === "resize") resizeListeners.add(listener);
-      return nativeAddEventListener.call(this, type, listener, options);
-    };
-    window.removeEventListener = function removeEventListener(type, listener, options) {
-      if (type === "resize") resizeListeners.delete(listener);
-      return nativeRemoveEventListener.call(this, type, listener, options);
-    };
-  });
+  await installLifecycleProbe(page);
   await mockApi(page);
   await page.goto("/dashboard/");
   const baselineListeners = await page.evaluate(() => window.__dashboardLifecycleProbe.resizeListeners.size);
@@ -190,6 +206,73 @@ test("stock workspace teardown disconnects chart and inspector resize resources 
   await page.setViewportSize({ width: 900, height: 500 });
   await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
   expect(await page.evaluate(() => window.__dashboardLifecycleProbe.callbacks)).toBe(afterLogout.callbacks);
+});
+
+test("delayed stock response cannot remount a protected workspace after logout", async ({ page }) => {
+  await installLifecycleProbe(page);
+  let releaseStock;
+  const stockRelease = new Promise((resolve) => { releaseStock = resolve; });
+  let markStockRequested;
+  const stockRequested = new Promise((resolve) => { markStockRequested = resolve; });
+  await mockApi(page, true, bootstrap.results[0].hits, [], {
+    stock: { release: stockRelease, requested: markStockRequested },
+  });
+  await page.goto("/dashboard/");
+  await page.locator("tbody tr").first().click();
+  await stockRequested;
+
+  await page.getByRole("button", { name: "Settings" }).click();
+  await page.getByRole("button", { name: "Sign out" }).click();
+  await expect(page.getByRole("button", { name: "Sign in" })).toBeVisible();
+  const authLifecycle = await page.evaluate(() => ({
+    listeners: window.__dashboardLifecycleProbe.resizeListeners.size,
+    observes: window.__dashboardLifecycleProbe.observes,
+  }));
+  const stockResponse = page.waitForResponse((response) => response.url().includes("/api/dashboard/stocks/"));
+  releaseStock();
+  await stockResponse;
+  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+
+  await expect(page.getByRole("button", { name: "Sign in" })).toBeVisible();
+  await expect(page.locator(".stock-inspector")).toHaveCount(0);
+  await expect(page.locator("#stock-chart")).toHaveCount(0);
+  expect(await page.evaluate(() => ({
+    listeners: window.__dashboardLifecycleProbe.resizeListeners.size,
+    observes: window.__dashboardLifecycleProbe.observes,
+  }))).toEqual(authLifecycle);
+});
+
+test("delayed quiet bootstrap cannot replace the auth root after logout", async ({ page }) => {
+  await installLifecycleProbe(page);
+  let releaseBootstrap;
+  const bootstrapRelease = new Promise((resolve) => { releaseBootstrap = resolve; });
+  let markBootstrapRequested;
+  const bootstrapRequested = new Promise((resolve) => { markBootstrapRequested = resolve; });
+  await mockApi(page, true, bootstrap.results[0].hits, [], {
+    bootstrap: { afterRequests: 1, release: bootstrapRelease, requested: markBootstrapRequested },
+  });
+  await page.goto("/dashboard/");
+  await page.getByRole("button", { name: "Refresh" }).click();
+  await bootstrapRequested;
+
+  await page.getByRole("button", { name: "Settings" }).click();
+  await page.getByRole("button", { name: "Sign out" }).click();
+  await expect(page.getByRole("button", { name: "Sign in" })).toBeVisible();
+  const authLifecycle = await page.evaluate(() => ({
+    listeners: window.__dashboardLifecycleProbe.resizeListeners.size,
+    observes: window.__dashboardLifecycleProbe.observes,
+  }));
+  const bootstrapResponse = page.waitForResponse((response) => response.url().endsWith("/api/dashboard/bootstrap"));
+  releaseBootstrap();
+  await bootstrapResponse;
+  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+
+  await expect(page.getByRole("button", { name: "Sign in" })).toBeVisible();
+  await expect(page.locator(".shell")).toHaveCount(0);
+  expect(await page.evaluate(() => ({
+    listeners: window.__dashboardLifecycleProbe.resizeListeners.size,
+    observes: window.__dashboardLifecycleProbe.observes,
+  }))).toEqual(authLifecycle);
 });
 
 test("stock detail fills the viewport without an evidence sidebar", async ({ page }) => {
