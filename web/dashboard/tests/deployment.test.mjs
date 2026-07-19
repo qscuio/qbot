@@ -132,6 +132,7 @@ case "$MOCK_SCENARIO" in
   fast-failure) echo fast-failure > "$MOCK_STATE" ;;
   activating-failure) echo activating-failed > "$MOCK_STATE" ;;
   activating-running) echo activating-running > "$MOCK_STATE" ;;
+  running-restart) echo running > "$MOCK_STATE" ;;
   stale-relaunch) echo running > "$MOCK_STATE" ;;
   *) echo "unexpected launch in scenario $MOCK_SCENARIO" >&2; exit 64 ;;
 esac
@@ -321,12 +322,15 @@ test("deployment launches one detached resumable company repair after health", a
   assert.match(main, /chip_backfill:/);
 });
 
-test("an already-running company repair is skipped without a duplicate launch", async () => {
-  const result = await runRepairScenario("running-skip", "running");
+test("an already-running company repair is restarted onto the deployed binary", async () => {
+  const result = await runRepairScenario("running-restart", "running");
 
   assert.equal(result.status, 0, result.stderr);
-  assert.doesNotMatch(result.log, /systemd-run/);
-  assert.match(result.stdout, /already running/);
+  const cleanup = result.log.indexOf("systemctl stop qbot-company-intelligence-repair");
+  const launch = result.log.indexOf("systemd-run --no-block");
+  assert.ok(cleanup >= 0);
+  assert.ok(launch > cleanup);
+  assert.equal(result.log.match(/systemd-run/g)?.length, 1);
 });
 
 test("a fast successful company repair is observed and cleaned up", async () => {

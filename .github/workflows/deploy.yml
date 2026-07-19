@@ -481,23 +481,15 @@ jobs:
               sudo journalctl -u "$unit" -n 80 --no-pager || true
             }
 
-            # Running/activating means another deployment already launched the
-            # worker. A successful exited unit, failure, or other stale state is
-            # cleaned before the stable name is reused.
+            # The worker is resumable from database checkpoints. Always replace
+            # an existing transient unit so a deployment cannot leave the old
+            # binary running after repair code changes.
             load_state="$(unit_property LoadState)"
             if [ -n "$load_state" ] && [ "$load_state" != "not-found" ]; then
               active_state="$(unit_property ActiveState)"
               sub_state="$(unit_property SubState)"
-              case "$active_state:$sub_state" in
-                active:running|activating:*|reloading:*)
-                  echo "$unit is already running (state: $active_state/$sub_state)"
-                  exit 0
-                  ;;
-                *)
-                  echo "Clearing stale $unit (state: $active_state/$sub_state)"
-                  clear_transient_unit
-                  ;;
-              esac
+              echo "Replacing $unit (state: $active_state/$sub_state)"
+              clear_transient_unit
             fi
 
             sudo systemd-run --no-block \
