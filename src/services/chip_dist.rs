@@ -55,10 +55,7 @@ pub fn next_chip_update_attempt(
 
 pub fn should_poll_chip_readiness(now: DateTime<FixedOffset>, attempts: usize) -> bool {
     let minutes = now.hour() * 60 + now.minute();
-    if !(18 * 60..=20 * 60).contains(&minutes) || attempts >= 5 {
-        return false;
-    }
-    attempts == 0 || matches!(minutes, 1110 | 1140 | 1170 | 1200)
+    attempts < 5 && matches!(minutes, 1080 | 1110 | 1140 | 1170 | 1200)
 }
 
 #[derive(Debug, Default)]
@@ -66,6 +63,7 @@ pub struct ChipUpdateController {
     beijing_date: Option<NaiveDate>,
     attempts: usize,
     executed_slots: HashSet<u32>,
+    readiness_slots: HashSet<u32>,
 }
 
 impl ChipUpdateController {
@@ -93,6 +91,12 @@ impl ChipUpdateController {
         self.attempts += 1;
     }
 
+    pub fn claim_readiness_slot(&mut self, now: DateTime<FixedOffset>) -> bool {
+        self.reset_for(now.date_naive());
+        let slot = now.hour() * 60 + now.minute();
+        should_poll_chip_readiness(now, self.attempts) && self.readiness_slots.insert(slot)
+    }
+
     pub fn attempts(&self) -> usize {
         self.attempts
     }
@@ -102,6 +106,7 @@ impl ChipUpdateController {
             self.beijing_date = Some(date);
             self.attempts = 0;
             self.executed_slots.clear();
+            self.readiness_slots.clear();
         }
     }
 }
@@ -388,13 +393,38 @@ mod schedule_tests {
     #[test]
     fn should_poll_chip_readiness_only_at_eligible_attempt_slots() {
         assert!(!should_poll_chip_readiness(bj(20, 17, 59), 0));
-        assert!(should_poll_chip_readiness(bj(20, 18, 7), 0));
+        assert!(should_poll_chip_readiness(bj(20, 18, 0), 0));
+        assert!(!should_poll_chip_readiness(bj(20, 18, 7), 0));
         assert!(!should_poll_chip_readiness(bj(20, 18, 8), 1));
         assert!(should_poll_chip_readiness(bj(20, 18, 30), 1));
         assert!(should_poll_chip_readiness(bj(20, 19, 0), 2));
         assert!(!should_poll_chip_readiness(bj(20, 19, 1), 2));
         assert!(!should_poll_chip_readiness(bj(20, 20, 1), 4));
         assert!(!should_poll_chip_readiness(bj(20, 18, 30), 5));
+    }
+
+    #[test]
+    fn controller_claims_each_readiness_slot_once_without_counting_an_update_attempt() {
+        let mut controller = ChipUpdateController::default();
+
+        assert!(controller.claim_readiness_slot(bj(20, 18, 0)));
+        assert!(!controller.claim_readiness_slot(bj(20, 18, 0)));
+        assert_eq!(controller.attempts(), 0);
+        assert!(controller.claim_readiness_slot(bj(20, 18, 30)));
+    }
+
+    #[test]
+    fn stop_for_prior_trade_date_does_not_hide_a_later_current_date() {
+        let mut controller = ChipUpdateController::default();
+
+        assert_eq!(
+            controller.decision(bj(20, 18, 0), date(19), Some(date(19))),
+            UpdateDecision::StopForDay
+        );
+        assert_eq!(
+            controller.decision(bj(20, 18, 30), date(20), Some(date(19))),
+            UpdateDecision::Run
+        );
     }
 
     #[test]
@@ -752,17 +782,10 @@ where
     P: CompanyDataProvider + OfficialChipProvider + 'static,
 {
     let mut controller = ChipUpdateController::default();
-    let mut stopped_date = None;
 
     loop {
         let now = beijing_now();
-        controller.reset_for(now.date_naive());
-        if stopped_date.is_some_and(|date| date != now.date_naive()) {
-            stopped_date = None;
-        }
-        if stopped_date == Some(now.date_naive())
-            || !should_poll_chip_readiness(now, controller.attempts())
-        {
+        if !controller.claim_readiness_slot(now) {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             continue;
         }
@@ -823,8 +846,7 @@ where
                     warn!("18:00 canonical chip update failed: {error}");
                 }
             }
-            UpdateDecision::StopForDay => stopped_date = Some(now.date_naive()),
-            UpdateDecision::Wait => {}
+            UpdateDecision::Wait | UpdateDecision::StopForDay => {}
         }
 
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;

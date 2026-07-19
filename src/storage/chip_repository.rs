@@ -230,7 +230,11 @@ impl ChipRepository {
             changed += usize::from(upsert_snapshot_in_tx(transaction, snapshot, false).await?);
         }
         if let Some(state) = model_state {
-            save_model_state_in_tx(transaction, state).await?;
+            if !save_model_state_in_tx(transaction, state).await? {
+                return Err(AppError::BadRequest(
+                    "chip model state is older than the stored state".to_string(),
+                ));
+            }
         }
         let completed = sqlx::query(
             r#"UPDATE company_data_repair_checkpoints
@@ -593,7 +597,7 @@ async fn save_model_state_in_tx(
              distribution = EXCLUDED.distribution,
              last_adjustment_factor = EXCLUDED.last_adjustment_factor,
              updated_at = NOW()
-           WHERE chip_model_states.through_date < EXCLUDED.through_date"#,
+           WHERE chip_model_states.through_date <= EXCLUDED.through_date"#,
     )
     .bind(&state.code)
     .bind(&state.model_version)
@@ -1288,6 +1292,88 @@ mod tests {
         .fetch_one(&pool)
         .await?;
         assert_eq!(factor, 2.5);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn equal_date_recomputation_atomically_replaces_snapshot_and_model_state(
+        pool: PgPool,
+    ) -> crate::error::Result<()> {
+        let day = date(2026, 7, 18);
+        let checkpoints = CompanyRepository::new(pool.clone());
+        let repo = ChipRepository::new(pool.clone());
+        let initial_snapshot = snapshot(day, 0.2);
+        let initial_state = ChipModelState {
+            code: "600519.SH".into(),
+            model_version: "qbot-chip-v2".into(),
+            through_date: day,
+            distribution: initial_snapshot.distribution.clone(),
+            last_adjustment_factor: 1.0,
+        };
+        let CheckpointClaimOutcome::Claimed(initial_lease) = checkpoints
+            .claim_checkpoint_window(
+                "chip_backfill",
+                "600519.SH",
+                day,
+                day,
+                Duration::from_secs(300),
+            )
+            .await?
+        else {
+            panic!("initial checkpoint must be claimed")
+        };
+        repo.persist_snapshot_batch_and_complete(
+            &initial_lease,
+            std::slice::from_ref(&initial_snapshot),
+            Some(&initial_state),
+        )
+        .await?;
+
+        let revised_snapshot = snapshot(day, 0.35);
+        let revised_state = ChipModelState {
+            distribution: revised_snapshot.distribution.clone(),
+            last_adjustment_factor: 2.0,
+            ..initial_state
+        };
+        let CheckpointClaimOutcome::Claimed(revised_lease) = checkpoints
+            .claim_checkpoint_window(
+                "chip_daily",
+                "600519.SH",
+                day,
+                day,
+                Duration::from_secs(300),
+            )
+            .await?
+        else {
+            panic!("recomputation checkpoint must be claimed")
+        };
+        repo.persist_snapshot_batch_and_complete(
+            &revised_lease,
+            std::slice::from_ref(&revised_snapshot),
+            Some(&revised_state),
+        )
+        .await?;
+
+        let snapshot_distribution: serde_json::Value = sqlx::query_scalar(
+            "SELECT distribution FROM chip_distribution WHERE code = $1 AND trade_date = $2",
+        )
+        .bind("600519.SH")
+        .bind(day)
+        .fetch_one(&pool)
+        .await?;
+        let (state_distribution, factor): (serde_json::Value, f64) = sqlx::query_as(
+            "SELECT distribution, last_adjustment_factor::float8 FROM chip_model_states WHERE code = $1 AND model_version = $2",
+        )
+        .bind("600519.SH")
+        .bind("qbot-chip-v2")
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            snapshot_distribution,
+            serde_json::to_value(&revised_snapshot.distribution)?
+        );
+        assert_eq!(state_distribution, snapshot_distribution);
+        assert_eq!(factor, 2.0);
         Ok(())
     }
 

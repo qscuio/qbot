@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, NaiveDate, TimeZone, Utc};
@@ -36,6 +36,42 @@ const CHIP_DAILY_PHASE: &str = "chip_daily";
 const OFFICIAL_CHIP_FIRST_DATE: NaiveDate =
     NaiveDate::from_ymd_opt(2018, 1, 1).expect("valid official chip first date");
 const CHIP_BUCKET_COUNT: usize = 30;
+
+static ACTIVE_CHIP_MUTATIONS: LazyLock<StdMutex<BTreeSet<String>>> =
+    LazyLock::new(|| StdMutex::new(BTreeSet::new()));
+
+struct ChipMutationGuard {
+    code: String,
+}
+
+impl Drop for ChipMutationGuard {
+    fn drop(&mut self) {
+        ACTIVE_CHIP_MUTATIONS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.code);
+    }
+}
+
+fn try_acquire_local_chip_mutation(scope: &str, code: &str) -> Option<ChipMutationGuard> {
+    let key = format!("{scope}:{code}");
+    let mut active = ACTIVE_CHIP_MUTATIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    active
+        .insert(key.clone())
+        .then(|| ChipMutationGuard { code: key })
+}
+
+fn active_chip_mutation_count(scope: &str) -> usize {
+    let prefix = format!("{scope}:");
+    ACTIVE_CHIP_MUTATIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .filter(|key| key.starts_with(&prefix))
+        .count()
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CompanySyncReport {
@@ -195,6 +231,7 @@ pub struct CompanyIntelligenceService<P: CompanyDataProvider> {
     provider: Arc<P>,
     today: NaiveDate,
     lease_ttl: Duration,
+    mutation_scope: String,
 }
 
 impl<P: CompanyDataProvider> CompanyIntelligenceService<P> {
@@ -203,12 +240,18 @@ impl<P: CompanyDataProvider> CompanyIntelligenceService<P> {
     }
 
     pub fn new_at(pool: PgPool, provider: Arc<P>, today: NaiveDate) -> Self {
+        let mutation_scope = pool
+            .connect_options()
+            .get_database()
+            .unwrap_or_default()
+            .to_string();
         Self {
             repository: CompanyRepository::new(pool.clone()),
             pool,
             provider,
             today,
             lease_ttl: DEFAULT_LEASE_TTL,
+            mutation_scope,
         }
     }
 
@@ -701,9 +744,12 @@ where
                      AND list_date <= $1
                      AND (delist_date IS NULL OR delist_date > $1)
                ), candidate_dates AS (
-                   SELECT DISTINCT trade_date
+                   SELECT trade_date
                    FROM security_daily_status
-                   WHERE trade_date <= $1
+                   WHERE trade_date BETWEEN $1::date - 14 AND $1
+                   GROUP BY trade_date
+                   ORDER BY trade_date DESC
+                   LIMIT 10
                )
                SELECT (
                    SELECT candidate.trade_date
@@ -780,6 +826,14 @@ where
     }
 
     pub async fn update_daily_chips(&self) -> Result<DailyChipUpdateReport> {
+        let active_mutations = active_chip_mutation_count(&self.mutation_scope);
+        if active_mutations > 0 {
+            return Ok(DailyChipUpdateReport {
+                pending: active_mutations,
+                errors: vec!["an in-process chip writer is already active".to_string()],
+                ..Default::default()
+            });
+        }
         let current_stocks = self.current_stocks().await?;
         let expected_date = self.expected_chip_trade_date().await?;
         let mut report = DailyChipUpdateReport {
@@ -894,6 +948,11 @@ where
         code: &str,
         expected_date: NaiveDate,
     ) -> Result<DailyStockChipOutcome> {
+        let Some(_local_guard) = try_acquire_local_chip_mutation(&self.mutation_scope, code) else {
+            return Ok(DailyStockChipOutcome::Pending(
+                "another in-process chip writer owns the mutation guard".to_string(),
+            ));
+        };
         let claim = company_repository
             .claim_checkpoint_window(
                 CHIP_DAILY_PHASE,
@@ -940,20 +999,20 @@ where
                 Ok(outcome)
             }
             Err(error) => {
-                let failure = error.to_string();
+                let rollback_suffix = transaction
+                    .rollback()
+                    .await
+                    .err()
+                    .map(|rollback| format!("; fence rollback failed: {rollback}"))
+                    .unwrap_or_default();
+                let failure = format!("{error}{rollback_suffix}");
                 let failure = match lease.as_ref() {
                     Some(lease) => {
-                        self.fail_daily_checkpoint_in_transaction(
-                            company_repository,
-                            &mut transaction,
-                            lease,
-                            &failure,
-                        )
-                        .await
+                        self.fail_daily_checkpoint(company_repository, lease, &failure)
+                            .await
                     }
                     None => failure,
                 };
-                transaction.commit().await?;
                 Ok(DailyStockChipOutcome::Failed(failure))
             }
         }
@@ -969,26 +1028,9 @@ where
         expected_date: NaiveDate,
         lease: Option<CheckpointLease>,
     ) -> Result<DailyStockChipOutcome> {
-        let state = match self
+        let state = self
             .load_chip_model_state_in_transaction(transaction, code)
-            .await
-        {
-            Ok(state) => state,
-            Err(error) => {
-                return Ok(match lease.as_ref() {
-                    Some(lease) => DailyStockChipOutcome::Failed(
-                        self.fail_daily_checkpoint_in_transaction(
-                            company_repository,
-                            transaction,
-                            lease,
-                            &format!("model state read failed: {error}"),
-                        )
-                        .await,
-                    ),
-                    None => DailyStockChipOutcome::Failed(error.to_string()),
-                })
-            }
-        };
+            .await?;
         let Some(state) = state else {
             let failure = format!(
                 "missing {CHIP_MODEL_VERSION} state; historical backfill must complete first"
@@ -1025,26 +1067,9 @@ where
             });
         }
         if state.through_date == expected_date {
-            let canonical = match chip_repository
+            let canonical = chip_repository
                 .canonical_snapshot_at_or_before_in_transaction(transaction, code, expected_date)
-                .await
-            {
-                Ok(canonical) => canonical,
-                Err(error) => {
-                    return Ok(match lease.as_ref() {
-                        Some(lease) => DailyStockChipOutcome::Failed(
-                            self.fail_daily_checkpoint_in_transaction(
-                                company_repository,
-                                transaction,
-                                lease,
-                                &format!("canonical snapshot read failed: {error}"),
-                            )
-                            .await,
-                        ),
-                        None => DailyStockChipOutcome::Failed(error.to_string()),
-                    })
-                }
-            };
+                .await?;
             let ready = canonical
                 .as_ref()
                 .is_some_and(|snapshot| snapshot.trade_date == expected_date && snapshot.validated);
@@ -1077,7 +1102,7 @@ where
             ));
         };
 
-        let next_date: Option<NaiveDate> = match sqlx::query_scalar(
+        let next_date: Option<NaiveDate> = sqlx::query_scalar(
             r#"SELECT MIN(trade_date) FROM stock_daily_bars
                WHERE code = $1 AND trade_date > $2 AND trade_date <= $3"#,
         )
@@ -1085,21 +1110,7 @@ where
         .bind(state.through_date)
         .bind(expected_date)
         .fetch_one(&mut **transaction)
-        .await
-        {
-            Ok(next_date) => next_date,
-            Err(error) => {
-                return Ok(DailyStockChipOutcome::Failed(
-                    self.fail_daily_checkpoint_in_transaction(
-                        company_repository,
-                        transaction,
-                        &lease,
-                        &format!("chronology check failed: {error}"),
-                    )
-                    .await,
-                ))
-            }
-        };
+        .await?;
         if next_date != Some(expected_date) {
             let failure = format!(
                 "next chronological bar is {:?}; target {expected_date} cannot skip history",
@@ -1116,23 +1127,9 @@ where
             ));
         }
 
-        let raw = match self
+        let raw = self
             .load_exact_daily_chip_input_in_transaction(transaction, code, expected_date)
-            .await
-        {
-            Ok(raw) => raw,
-            Err(error) => {
-                return Ok(DailyStockChipOutcome::Failed(
-                    self.fail_daily_checkpoint_in_transaction(
-                        company_repository,
-                        transaction,
-                        &lease,
-                        &format!("daily prerequisite read failed: {error}"),
-                    )
-                    .await,
-                ))
-            }
-        };
+            .await?;
         let Some(raw) = raw else {
             let failure = "daily bar prerequisite is missing";
             return Ok(DailyStockChipOutcome::Pending(
@@ -1570,6 +1567,12 @@ where
         decision: ChipSourceDecision,
         code: &str,
     ) -> Result<ChipBackfillReport> {
+        let Some(_local_guard) = try_acquire_local_chip_mutation(&self.mutation_scope, code) else {
+            return Ok(ChipBackfillReport {
+                pending: 1,
+                ..Default::default()
+            });
+        };
         let history = self.load_raw_chip_history(code).await?;
         if history.is_empty() {
             return Err(AppError::DataProvider(format!(
@@ -2495,7 +2498,7 @@ mod tests {
 
     use super::{
         bounded_date_windows, estimate_history_at_dates, official_snapshot,
-        CompanyIntelligenceService,
+        CompanyIntelligenceService, DailyStockChipOutcome, CHIP_DAILY_PHASE,
     };
     use crate::data::chip::{
         ChipDayInput, ChipSourceDecision, OfficialChipBucket, OfficialChipPerformance,
@@ -2505,6 +2508,7 @@ mod tests {
         CompanyDataProvider, DividendRecord, FinancialFrequency, FinancialReport,
     };
     use crate::error::{AppError, Result};
+    use crate::storage::chip_repository::ChipRepository;
     use crate::storage::company_repository::{CheckpointClaimOutcome, CompanyRepository};
 
     #[derive(Default)]
@@ -3470,6 +3474,38 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn daily_target_ignores_status_dates_outside_the_recent_horizon(pool: PgPool) {
+        let code = "000001.SZ";
+        let stale = date(2026, 6, 19);
+        let today = date(2026, 7, 20);
+        seed_current_stock(&pool, code, date(2020, 1, 1)).await;
+        seed_security_status(&pool, code, stale, false).await;
+        seed_chip_bars(&pool, code, stale, 1).await;
+        seed_adjustment_factor(&pool, code, stale).await;
+        let service = CompanyIntelligenceService::new_at(
+            pool,
+            Arc::new(RecordingChipProvider::default()),
+            today,
+        );
+
+        assert_eq!(service.expected_chip_trade_date().await.unwrap(), None);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn readiness_migration_adds_a_trade_date_leading_status_index(pool: PgPool) {
+        let definition: Option<String> = sqlx::query_scalar(
+            "SELECT indexdef FROM pg_indexes WHERE schemaname = current_schema() AND indexname = 'idx_security_status_trade_date_code'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap()
+        .flatten();
+
+        let definition = definition.expect("trade-date readiness index must exist");
+        assert!(definition.contains("(trade_date DESC, code"));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn daily_observed_date_is_none_when_any_current_stock_is_pending(pool: PgPool) {
         let first = "000001.SZ";
         let second = "000002.SZ";
@@ -3621,9 +3657,18 @@ mod tests {
             official_delay: Duration::from_millis(200),
             ..Default::default()
         });
-        let backfill_service =
-            CompanyIntelligenceService::new_at(pool.clone(), provider.clone(), expected);
-        let daily_service = CompanyIntelligenceService::new_at(pool.clone(), provider, expected);
+        let constrained_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(pool.connect_options().as_ref().clone())
+            .await
+            .unwrap();
+        let backfill_service = CompanyIntelligenceService::new_at(
+            constrained_pool.clone(),
+            provider.clone(),
+            expected,
+        );
+        let daily_service =
+            CompanyIntelligenceService::new_at(constrained_pool, provider, expected);
         let backfill = tokio::spawn(async move { backfill_service.backfill_chips().await });
         let checkpoints = CompanyRepository::new(pool.clone());
 
@@ -3711,6 +3756,43 @@ mod tests {
 
         assert_eq!(report.completed, 1);
         assert_eq!(report.observed_date, Some(expected));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn daily_sql_error_rolls_back_fence_before_fresh_checkpoint_cleanup(pool: PgPool) {
+        let code = "000001.SZ";
+        let expected = date(2026, 7, 20);
+        let service = CompanyIntelligenceService::new_at(
+            pool.clone(),
+            Arc::new(RecordingChipProvider::default()),
+            expected,
+        );
+        sqlx::query("DROP TABLE chip_model_states")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let company_repository = CompanyRepository::new(pool.clone());
+        let chip_repository = ChipRepository::new(pool.clone());
+
+        let outcome = service
+            .update_daily_chip_stock(
+                &company_repository,
+                &chip_repository,
+                ChipSourceDecision::Estimate,
+                code,
+                expected,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, DailyStockChipOutcome::Failed(_)));
+        let checkpoint = company_repository
+            .checkpoint_window(CHIP_DAILY_PHASE, code, expected, expected)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.status, "failed");
+        assert!(checkpoint.lease_token.is_none());
     }
 
     #[sqlx::test(migrations = "./migrations")]
