@@ -1,3 +1,4 @@
+pub mod chip_repository;
 pub mod company_repository;
 pub mod dashboard_repository;
 pub mod decision_support_repository;

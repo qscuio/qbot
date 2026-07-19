@@ -1,3 +1,4 @@
+pub mod chip;
 pub mod company;
 pub mod db;
 pub mod eastmoney;
