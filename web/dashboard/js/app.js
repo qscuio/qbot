@@ -4,9 +4,12 @@ import {
   activeFilterCount,
   applyFilters,
   closeTab,
+  clampInspectorWidth,
   createWorkspaceState,
+  loadInspectorPreferences,
   normalizeRows,
   openStockTab,
+  saveInspectorPreferences,
   sortRows,
   updateTab,
 } from "./state.js?v=20260719.1";
@@ -20,6 +23,10 @@ const details = new Map();
 let chartHandle = null;
 let refreshTimer = null;
 let filterMenuOpen = false;
+let inspectorTab = "overview";
+let inspectorPreferences = loadInspectorPreferences(window.localStorage, window.innerWidth);
+
+const defaultInspectorWidth = 380;
 
 function scheduleRefresh() {
   clearInterval(refreshTimer);
@@ -167,6 +174,35 @@ function stockLoadingTemplate(tab) {
   return `<div class="loading-panel"><span class="spinner"></span><span>Loading ${escapeHtml(tab.code)} market history…</span></div>`;
 }
 
+function inspectorTemplate(detail) {
+  const latest = detail.latest;
+  const tabs = [
+    ["overview", "Overview"],
+    ["financials", "Financials"],
+    ["dividends", "Dividends"],
+    ["chips", "Chips"],
+  ];
+  const tabButtons = tabs.map(([id, label]) => `<button type="button" role="tab" data-inspector-tab="${id}" id="inspector-tab-${id}" aria-controls="inspector-panel-${id}" aria-selected="${inspectorTab === id}" class="inspector-tab ${inspectorTab === id ? "active" : ""}">${label}</button>`).join("");
+  return `<aside class="stock-inspector" id="stock-inspector" aria-label="Stock information">
+    <div class="inspector-heading"><strong>Information</strong><span class="mono">${escapeHtml(detail.code)}</span></div>
+    <div class="inspector-tabs" role="tablist" aria-label="Stock information sections">${tabButtons}</div>
+    <div class="inspector-panels">
+      <section class="inspector-panel" role="tabpanel" data-inspector-panel="overview" id="inspector-panel-overview" aria-labelledby="inspector-tab-overview" ${inspectorTab === "overview" ? "" : "hidden"}>
+        <dl class="overview-grid">
+          <div><dt>Open</dt><dd>${formatNumber(latest?.open)}</dd></div>
+          <div><dt>High</dt><dd>${formatNumber(latest?.high)}</dd></div>
+          <div><dt>Low</dt><dd>${formatNumber(latest?.low)}</dd></div>
+          <div><dt>Close</dt><dd>${formatNumber(latest?.close)}</dd></div>
+          <div><dt>Volume</dt><dd>${formatNumber(latest?.volume, 0)}</dd></div>
+          <div><dt>Amount</dt><dd>${formatNumber(latest?.amount, 0)}</dd></div>
+          <div><dt>Signals</dt><dd>${detail.hits.length}</dd></div>
+        </dl>
+      </section>
+      ${tabs.slice(1).map(([id, label]) => `<section class="inspector-panel inspector-placeholder" role="tabpanel" data-inspector-panel="${id}" id="inspector-panel-${id}" aria-labelledby="inspector-tab-${id}" ${inspectorTab === id ? "" : "hidden"}><strong>${label}</strong><span>This section is ready for company intelligence.</span></section>`).join("")}
+    </div>
+  </aside>`;
+}
+
 function stockTemplate(tab, detail) {
   if (detail.error) return `<div class="loading-panel"><strong>Chart unavailable</strong><span>${escapeHtml(detail.error)}</span><button class="outline-button" id="retry-stock">Retry</button></div>`;
   const latest = detail.latest;
@@ -178,8 +214,8 @@ function stockTemplate(tab, detail) {
   const periodName = periods.find(([period]) => period === detail.period)?.[2] || "Daily";
   const activity = activitySeries(detail.bars);
   return `<section class="stock-view">
-    <header class="stock-toolbar"><div class="stock-identity"><h1>${escapeHtml(detail.name)}<span>${escapeHtml(detail.code)}</span></h1><div class="muted mono">${latest ? escapeHtml(latest.time) : "No market history"}${detail.partial ? " · partial data" : ""}</div></div><div class="stock-quote"><span class="stock-price">${formatNumber(latest?.close)}</span><span class="number ${changeClass(change)}">${change == null ? "—" : `${change > 0 ? "+" : ""}${formatNumber(change)}%`}</span></div><div class="periods" aria-label="Chart period">${periods.map(([period, label, name]) => `<button class="period-button ${tab.period === period ? "active" : ""}" data-period="${period}" aria-label="${name}" title="${name}">${label}</button>`).join("")}</div><div class="nav-buttons"><button class="ghost-button" data-neighbor="${escapeHtml(activeRows[index - 1]?.code || "")}" ${index <= 0 ? "disabled" : ""}>← Prev</button><button class="ghost-button" data-neighbor="${escapeHtml(activeRows[index + 1]?.code || "")}" ${index < 0 || index >= activeRows.length - 1 ? "disabled" : ""}>Next →</button></div></header>
-    ${detail.bars.length ? `<div class="stock-content"><div class="chart-pane"><div class="chart-legend"><strong class="chart-period">${periodName} · ${detail.bars.length} bars · ${detail.hits.length} signals</strong><span class="chart-activity">${escapeHtml(activity.label)}</span><span class="ma5">MA5</span><span class="ma10">MA10</span><span class="ma20">MA20</span><span class="ma60">MA60</span></div><div class="chart" id="stock-chart"></div><a class="chart-watermark" href="https://www.tradingview.com/" target="_blank" rel="noopener">Charts by TradingView</a></div></div>` : `<div class="empty-state"><strong>No usable chart history</strong><span>No historical bars are available for this period.</span></div>`}
+    <header class="stock-toolbar"><div class="stock-identity"><h1>${escapeHtml(detail.name)}<span>${escapeHtml(detail.code)}</span></h1><div class="muted mono">${latest ? escapeHtml(latest.time) : "No market history"}${detail.partial ? " · partial data" : ""}</div></div><div class="stock-quote"><span class="stock-price">${formatNumber(latest?.close)}</span><span class="number ${changeClass(change)}">${change == null ? "—" : `${change > 0 ? "+" : ""}${formatNumber(change)}%`}</span></div><div class="periods" aria-label="Chart period">${periods.map(([period, label, name]) => `<button class="period-button ${tab.period === period ? "active" : ""}" data-period="${period}" aria-label="${name}" title="${name}">${label}</button>`).join("")}</div><div class="nav-buttons"><button class="ghost-button" data-neighbor="${escapeHtml(activeRows[index - 1]?.code || "")}" ${index <= 0 ? "disabled" : ""}>← Prev</button><button class="ghost-button" data-neighbor="${escapeHtml(activeRows[index + 1]?.code || "")}" ${index < 0 || index >= activeRows.length - 1 ? "disabled" : ""}>Next →</button></div><button class="ghost-button inspector-toggle" type="button" aria-controls="stock-inspector" aria-expanded="${!inspectorPreferences.collapsed}" aria-label="${inspectorPreferences.collapsed ? "Show" : "Hide"} stock information">ⓘ</button></header>
+    <div class="stock-workspace ${inspectorPreferences.collapsed ? "inspector-collapsed" : ""}" style="--inspector-width:${inspectorPreferences.width}px"><div class="stock-content">${detail.bars.length ? `<div class="chart-pane"><div class="chart-legend"><strong class="chart-period">${periodName} · ${detail.bars.length} bars · ${detail.hits.length} signals</strong><span class="chart-activity">${escapeHtml(activity.label)}</span><span class="ma5">MA5</span><span class="ma10">MA10</span><span class="ma20">MA20</span><span class="ma60">MA60</span></div><div class="chart" id="stock-chart"></div><a class="chart-watermark" href="https://www.tradingview.com/" target="_blank" rel="noopener">Charts by TradingView</a></div>` : `<div class="empty-state"><strong>No usable chart history</strong><span>No historical bars are available for this period.</span></div>`}</div><button class="inspector-resizer" type="button" aria-label="Resize stock information panel" title="Drag to resize · Double-click or press Enter to reset"></button>${inspectorTemplate(detail)}</div>
   </section>`;
 }
 
@@ -252,6 +288,83 @@ function bindShell(activeTab) {
     details.delete(`${activeTab.code}:${activeTab.period}`);
     renderWorkspace();
   });
+  bindInspector();
+}
+
+function bindInspector() {
+  const stockWorkspace = app.querySelector(".stock-workspace");
+  const inspector = app.querySelector(".stock-inspector");
+  const toggle = app.querySelector(".inspector-toggle");
+  if (!stockWorkspace || !inspector || !toggle) return;
+
+  const resizeChart = () => window.requestAnimationFrame(() => chartHandle?.resize?.());
+  const setCollapsed = (collapsed, { restoreFocus = false } = {}) => {
+    inspectorPreferences = { ...inspectorPreferences, collapsed };
+    saveInspectorPreferences(window.localStorage, inspectorPreferences);
+    stockWorkspace.classList.toggle("inspector-collapsed", collapsed);
+    toggle.setAttribute("aria-expanded", String(!collapsed));
+    toggle.setAttribute("aria-label", `${collapsed ? "Show" : "Hide"} stock information`);
+    if (restoreFocus) toggle.focus();
+    resizeChart();
+  };
+  const setWidth = (width, { persist = false } = {}) => {
+    inspectorPreferences = {
+      ...inspectorPreferences,
+      width: clampInspectorWidth(width, window.innerWidth),
+    };
+    stockWorkspace.style.setProperty("--inspector-width", `${inspectorPreferences.width}px`);
+    if (persist) saveInspectorPreferences(window.localStorage, inspectorPreferences);
+    chartHandle?.resize?.();
+    resizeChart();
+  };
+
+  toggle.addEventListener("click", () => setCollapsed(!inspectorPreferences.collapsed));
+  app.querySelectorAll("[data-inspector-tab]").forEach((button) => button.addEventListener("click", () => {
+    inspectorTab = button.dataset.inspectorTab;
+    app.querySelectorAll("[data-inspector-tab]").forEach((candidate) => {
+      const active = candidate === button;
+      candidate.classList.toggle("active", active);
+      candidate.setAttribute("aria-selected", String(active));
+    });
+    app.querySelectorAll("[data-inspector-panel]").forEach((panel) => {
+      panel.hidden = panel.dataset.inspectorPanel !== inspectorTab;
+    });
+  }));
+
+  const resizer = app.querySelector(".inspector-resizer");
+  if (resizer) {
+    let drag = null;
+    const finishDrag = () => {
+      if (!drag) return;
+      drag = null;
+      resizer.classList.remove("dragging");
+      saveInspectorPreferences(window.localStorage, inspectorPreferences);
+      resizeChart();
+    };
+    const resetWidth = () => setWidth(defaultInspectorWidth, { persist: true });
+    resizer.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      drag = { pointerId: event.pointerId, startX: event.clientX, startWidth: inspectorPreferences.width };
+      resizer.setPointerCapture(event.pointerId);
+      resizer.classList.add("dragging");
+    });
+    resizer.addEventListener("pointermove", (event) => {
+      if (!drag || event.pointerId !== drag.pointerId) return;
+      setWidth(drag.startWidth + drag.startX - event.clientX);
+    });
+    resizer.addEventListener("pointerup", finishDrag);
+    resizer.addEventListener("pointercancel", finishDrag);
+    resizer.addEventListener("dblclick", (event) => {
+      event.preventDefault();
+      resetWidth();
+    });
+    resizer.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      resetWidth();
+    });
+  }
 }
 
 function setFilterMenuOpen(open) {
@@ -261,7 +374,23 @@ function setFilterMenuOpen(open) {
 }
 
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && filterMenuOpen) setFilterMenuOpen(false);
+  if (event.key !== "Escape") return;
+  if (filterMenuOpen) {
+    setFilterMenuOpen(false);
+    app.querySelector("#filter-toggle")?.focus();
+    return;
+  }
+  const stockWorkspace = app.querySelector(".stock-workspace");
+  if (window.matchMedia("(max-width: 700px)").matches && stockWorkspace && !stockWorkspace.classList.contains("inspector-collapsed")) {
+    inspectorPreferences = { ...inspectorPreferences, collapsed: true };
+    saveInspectorPreferences(window.localStorage, inspectorPreferences);
+    stockWorkspace.classList.add("inspector-collapsed");
+    const toggle = app.querySelector(".inspector-toggle");
+    toggle?.setAttribute("aria-expanded", "false");
+    toggle?.setAttribute("aria-label", "Show stock information");
+    toggle?.focus();
+    window.requestAnimationFrame(() => chartHandle?.resize?.());
+  }
 });
 
 document.addEventListener("click", (event) => {

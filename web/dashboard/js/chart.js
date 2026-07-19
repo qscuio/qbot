@@ -87,10 +87,9 @@ export function fitChartAfterLayout(
 }
 
 export function mountChart(container, bars, hits = []) {
-  if (!window.LightweightCharts || !container) return { destroy() {} };
+  if (!window.LightweightCharts || !container) return { resize() {}, destroy() {} };
   container.replaceChildren();
   const chart = window.LightweightCharts.createChart(container, {
-    autoSize: true,
     ...CHART_INTERACTION_OPTIONS,
     layout: { background: { color: "#1e1e1e" }, textColor: COLORS.text },
     grid: {
@@ -146,6 +145,7 @@ export function mountChart(container, bars, hits = []) {
   }
   const cancelInitialFit = fitChartAfterLayout(chart.timeScale(), undefined, bars.length);
   return {
+    resize: () => chart.resize(container.clientWidth, container.clientHeight),
     destroy: () => {
       cancelInitialFit();
       chart.remove();

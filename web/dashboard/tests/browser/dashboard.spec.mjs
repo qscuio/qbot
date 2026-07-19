@@ -160,6 +160,90 @@ test("stock detail fills the viewport without an evidence sidebar", async ({ pag
   await expect(page.locator(".statusbar")).toHaveCSS("background-color", "rgb(24, 24, 24)");
 });
 
+test("resizable stock information sidebar persists its desktop layout", async ({ page }) => {
+  await page.setViewportSize({ width: 1200, height: 800 });
+  await mockApi(page);
+  await page.goto("/dashboard/");
+  await page.locator("tbody tr").first().click();
+
+  const inspector = page.locator(".stock-inspector");
+  const workspace = page.locator(".stock-workspace");
+  const resizer = page.locator(".inspector-resizer");
+  await expect(inspector).toHaveCSS("width", "380px");
+  await expect(page.locator("[data-inspector-tab]")).toHaveCount(4);
+  await expect(page.locator('[data-inspector-panel="overview"]')).toContainText("1,489.00");
+
+  const chartSurface = page.locator("#stock-chart > div").first();
+  const initialChartWidth = (await chartSurface.boundingBox()).width;
+  const divider = await resizer.boundingBox();
+  await page.mouse.move(divider.x + divider.width / 2, divider.y + 40);
+  await page.mouse.down();
+  await page.mouse.move(-100, divider.y + 40, { steps: 3 });
+  await page.mouse.up();
+  await expect(inspector).toHaveCSS("width", "600px");
+  expect((await chartSurface.boundingBox()).width).toBeLessThan(initialChartWidth);
+
+  const maxDivider = await resizer.boundingBox();
+  await page.mouse.move(maxDivider.x + maxDivider.width / 2, maxDivider.y + 40);
+  await page.mouse.down();
+  await page.mouse.move(1190, maxDivider.y + 40, { steps: 3 });
+  await page.mouse.up();
+  await expect(inspector).toHaveCSS("width", "300px");
+
+  await resizer.dblclick();
+  await expect(inspector).toHaveCSS("width", "380px");
+  await page.locator(".inspector-toggle").click();
+  await expect(workspace).toHaveClass(/inspector-collapsed/);
+  await page.reload();
+  await expect(workspace).toHaveClass(/inspector-collapsed/);
+  await page.locator(".inspector-toggle").click();
+  await expect(workspace).not.toHaveClass(/inspector-collapsed/);
+  await page.reload();
+  await expect(workspace).not.toHaveClass(/inspector-collapsed/);
+  await expect(inspector).toHaveCSS("width", "380px");
+
+  const overflow = await page.evaluate(() => ({
+    width: [document.documentElement.clientWidth, document.documentElement.scrollWidth],
+    height: [document.documentElement.clientHeight, document.documentElement.scrollHeight],
+  }));
+  expect(overflow.width[1]).toBe(overflow.width[0]);
+  expect(overflow.height[1]).toBe(overflow.height[0]);
+});
+
+test("resizable stock information sidebar becomes a narrow overlay drawer", async ({ page }) => {
+  await page.setViewportSize({ width: 680, height: 800 });
+  await mockApi(page);
+  await page.goto("/dashboard/");
+  await page.locator("tbody tr").first().click();
+
+  const workspace = page.locator(".stock-workspace");
+  const inspector = page.locator(".stock-inspector");
+  const chartPane = page.locator(".chart-pane");
+  const openChartWidth = (await chartPane.boundingBox()).width;
+  await expect(inspector).toBeVisible();
+  await expect(inspector).toHaveCSS("position", "absolute");
+  await expect(page.locator(".inspector-resizer")).toBeHidden();
+
+  const toggle = page.locator(".inspector-toggle");
+  await toggle.click();
+  await expect(workspace).toHaveClass(/inspector-collapsed/);
+  await expect(inspector).toBeHidden();
+  expect((await chartPane.boundingBox()).width).toBe(openChartWidth);
+
+  await toggle.click();
+  await expect(inspector).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(workspace).toHaveClass(/inspector-collapsed/);
+  await expect(toggle).toBeFocused();
+
+  const overflow = await page.evaluate(() => ({
+    width: [document.documentElement.clientWidth, document.documentElement.scrollWidth],
+    height: [document.documentElement.clientHeight, document.documentElement.scrollHeight],
+  }));
+  expect(overflow.width[1]).toBe(overflow.width[0]);
+  expect(overflow.height[1]).toBe(overflow.height[0]);
+});
+
 test("browser back and forward restore scan and stock pages", async ({ page }) => {
   await mockApi(page);
   await page.goto("/dashboard/");
