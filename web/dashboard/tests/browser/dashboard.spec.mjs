@@ -31,10 +31,16 @@ const bars = Array.from({ length: 90 }, (_, index) => {
 
 async function mockApi(page, initiallyAuthenticated = true, stockHits = bootstrap.results[0].hits, requestedPeriods = [], gates = {}) {
   let authenticated = initiallyAuthenticated;
+  let sessionRequests = 0;
   let bootstrapRequests = 0;
   await page.route("**/api/dashboard/**", async (route) => {
     const url = new URL(route.request().url());
     if (url.pathname.endsWith("/auth/session")) {
+      sessionRequests += 1;
+      gates.session?.requested?.(sessionRequests);
+      if (sessionRequests <= (gates.session?.failRequests ?? 0)) {
+        return route.fulfill({ status: 500, json: { error: "temporary session failure" } });
+      }
       return route.fulfill({ status: authenticated ? 200 : 401, json: authenticated ? { authenticated: true } : { error: "unauthorized" } });
     }
     if (url.pathname.endsWith("/auth/login")) {
@@ -46,6 +52,7 @@ async function mockApi(page, initiallyAuthenticated = true, stockHits = bootstra
         gates.logout.requested?.();
         await gates.logout.release;
       }
+      authenticated = false;
       return route.fulfill({ status: 204, body: "" });
     }
     if (!authenticated) return route.fulfill({ status: 401, json: { error: "unauthorized" } });
@@ -58,6 +65,9 @@ async function mockApi(page, initiallyAuthenticated = true, stockHits = bootstra
       } else if (gates.bootstrap && bootstrapRequests > (gates.bootstrap.afterRequests ?? 0)) {
         gates.bootstrap.requested?.();
         await gates.bootstrap.release;
+      }
+      if (response?.status && response.status !== 200) {
+        return route.fulfill({ status: response.status, json: response.payload ?? { error: "request failed" } });
       }
       const responseBootstrap = response?.payload ?? bootstrap;
       return route.fulfill({
@@ -313,7 +323,7 @@ test("history navigation cannot restore cached protected views after logout", as
   }))).toEqual(authLifecycle);
 });
 
-test("late logout response cannot replace a newer authenticated workspace", async ({ page }) => {
+test("held logout hides login until session cookie expiry settles", async ({ page }) => {
   let releaseLogout;
   const logoutRelease = new Promise((resolve) => { releaseLogout = resolve; });
   let markLogoutRequested;
@@ -326,19 +336,59 @@ test("late logout response cannot replace a newer authenticated workspace", asyn
   await page.getByRole("button", { name: "Settings" }).click();
   await page.getByRole("button", { name: "Sign out" }).click();
   await logoutRequested;
+  await expect(page.getByText("Signing out…", { exact: true })).toBeVisible();
+  await expect(page.locator("#login-form")).toHaveCount(0);
+  await expect(page.locator(".shell, .stock-inspector, #stock-chart")).toHaveCount(0);
+
+  const logoutResponse = page.waitForResponse((response) => response.url().endsWith("/api/dashboard/auth/logout"));
+  releaseLogout();
+  await logoutResponse;
   await expect(page.getByRole("button", { name: "Sign in" })).toBeVisible();
   await page.getByLabel("Username").fill("analyst");
   await page.getByLabel("Password").fill("secret");
   await page.getByRole("button", { name: "Sign in" }).click();
   await expect(page.getByRole("heading", { name: "Latest scan" })).toBeVisible();
-
-  const logoutResponse = page.waitForResponse((response) => response.url().endsWith("/api/dashboard/auth/logout"));
-  releaseLogout();
-  await logoutResponse;
   await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
 
   await expect(page.getByRole("heading", { name: "Latest scan" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Sign in" })).toHaveCount(0);
+});
+
+test("startup session failure retry reruns session initialization", async ({ page }) => {
+  const sessionRequests = [];
+  await mockApi(page, true, bootstrap.results[0].hits, [], {
+    session: { failRequests: 1, requested: (request) => sessionRequests.push(request) },
+  });
+  await page.goto("/dashboard/");
+
+  await expect(page.getByText("QBot is unavailable")).toBeVisible();
+  await page.getByRole("button", { name: "Retry" }).click();
+
+  await expect(page.getByRole("heading", { name: "Latest scan" })).toBeVisible();
+  expect(sessionRequests).toEqual([1, 2]);
+});
+
+test("bootstrap 401 returns to login without scheduling refresh", async ({ page }) => {
+  await page.addInitScript(() => {
+    const nativeSetInterval = window.setInterval.bind(window);
+    window.__dashboardRefreshIntervals = 0;
+    window.setInterval = (handler, timeout, ...args) => {
+      if (timeout === 5 * 60 * 1000) window.__dashboardRefreshIntervals += 1;
+      return nativeSetInterval(handler, timeout, ...args);
+    };
+  });
+  await mockApi(page, false, bootstrap.results[0].hits, [], {
+    bootstrap: { responses: { 1: { status: 401, payload: { error: "unauthorized" } } } },
+  });
+  await page.goto("/dashboard/");
+  await page.getByLabel("Username").fill("analyst");
+  await page.getByLabel("Password").fill("secret");
+  const bootstrapResponse = page.waitForResponse((response) => response.url().endsWith("/api/dashboard/bootstrap"));
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await bootstrapResponse;
+
+  await expect(page.getByRole("button", { name: "Sign in" })).toBeVisible();
+  expect(await page.evaluate(() => window.__dashboardRefreshIntervals)).toBe(0);
 });
 
 test("newer quiet bootstrap wins when an earlier refresh resolves last", async ({ page }) => {

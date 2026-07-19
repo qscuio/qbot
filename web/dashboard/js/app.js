@@ -122,7 +122,7 @@ function renderLogin(error = "") {
       await dashboardApi.login(event.currentTarget.username.value, event.currentTarget.password.value);
       if (generation !== protectedViewGeneration) return;
       authenticated = true;
-      if (await loadBootstrap()) scheduleRefresh();
+      if ((await loadBootstrap()) === true) scheduleRefresh();
     } catch (error) {
       if (generation !== protectedViewGeneration) return;
       errorNode.textContent = error.status === 429 ? "Too many attempts. Try again later." : "Invalid username or password.";
@@ -130,6 +130,12 @@ function renderLogin(error = "") {
       button.textContent = "Sign in";
     }
   });
+}
+
+function renderSigningOut() {
+  clearInterval(refreshTimer);
+  const generation = enterAuthenticationBoundary();
+  app.innerHTML = `<div class="boot-screen"><span class="spinner"></span><span>Signing out…</span></div>`;
   return generation;
 }
 
@@ -149,17 +155,23 @@ async function loadBootstrap({ quiet = false } = {}) {
     return true;
   } catch (error) {
     if (!authenticated || generation !== protectedViewGeneration || requestSequence !== bootstrapRequestSequence) return false;
-    if (error instanceof ApiError && error.status === 401) return renderLogin();
-    if (quiet) return showTransientError("Refresh failed. Existing results are unchanged.");
+    if (error instanceof ApiError && error.status === 401) {
+      renderLogin();
+      return false;
+    }
+    if (quiet) {
+      showTransientError("Refresh failed. Existing results are unchanged.");
+      return false;
+    }
     renderFailure(error.message);
     return false;
   }
 }
 
-function renderFailure(message) {
+function renderFailure(message, retry = () => loadBootstrap()) {
   invalidateProtectedView();
   app.innerHTML = `<div class="boot-screen"><strong>QBot is unavailable</strong><span>${escapeHtml(message)}</span><button class="outline-button" id="retry">Retry</button></div>`;
-  app.querySelector("#retry").addEventListener("click", () => loadBootstrap());
+  app.querySelector("#retry").addEventListener("click", () => retry());
 }
 
 function freshnessBanner() {
@@ -286,10 +298,11 @@ function renderWorkspace() {
 
 function bindShell(activeTab) {
   app.querySelector("#logout").addEventListener("click", async () => {
-    const logoutGeneration = renderLogin();
+    const logoutGeneration = renderSigningOut();
     try {
       await dashboardApi.logout();
       if (logoutGeneration !== protectedViewGeneration || authenticated) return;
+      renderLogin();
     } catch {
       if (logoutGeneration !== protectedViewGeneration || authenticated) return;
       renderLogin("Sign out could not be confirmed. Please sign in again.");
@@ -560,10 +573,10 @@ async function start() {
   try {
     await dashboardApi.session();
     authenticated = true;
-    if (await loadBootstrap()) scheduleRefresh();
+    if ((await loadBootstrap()) === true) scheduleRefresh();
   } catch (error) {
     if (error.status === 401 || error.status === 503) renderLogin(error.status === 503 ? "Dashboard authentication is not configured." : "");
-    else renderFailure(error.message);
+    else renderFailure(error.message, start);
   }
 }
 
