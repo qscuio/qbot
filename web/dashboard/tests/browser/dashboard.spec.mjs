@@ -50,12 +50,33 @@ const dividendFirstPage = {
   nextCursor: "older page",
 };
 
+const chipSnapshot = {
+  code: "600519.SH",
+  requestedDate: "2026-02-15",
+  resolvedDate: "2026-02-13",
+  currentPrice: 1488.5,
+  distribution: [
+    { price: 1500, weight: 0.6, percentage: 60 },
+    { price: 1400, weight: 0.4, percentage: 40 },
+  ],
+  averageCost: 1460,
+  winnerRate: 70,
+  concentration: 82,
+  dominantPeakPrice: 1500,
+  source: "qbot_estimate",
+  sourceLabel: "QBot 估算",
+  modelVersion: "qbot-chip-v2",
+  validated: true,
+  validationLabel: "已验证",
+  sourceUpdatedAt: "2026-07-18T10:00:00Z",
+};
+
 async function mockApi(page, initiallyAuthenticated = true, stockHits = bootstrap.results[0].hits, requestedPeriods = [], gates = {}) {
   let authenticated = initiallyAuthenticated;
   let sessionRequests = 0;
   let bootstrapRequests = 0;
   let stockRequests = 0;
-  const optionalRequests = { company: 0, financials: 0, dividends: 0 };
+  const optionalRequests = { company: 0, financials: 0, dividends: 0, chips: 0 };
   await page.route("**/api/dashboard/**", async (route) => {
     const url = new URL(route.request().url());
     if (url.pathname.endsWith("/auth/session")) {
@@ -105,7 +126,9 @@ async function mockApi(page, initiallyAuthenticated = true, stockHits = bootstra
       ? "company"
       : url.pathname.endsWith("/financials")
         ? "financials"
-        : url.pathname.endsWith("/dividends") ? "dividends" : null;
+        : url.pathname.endsWith("/dividends")
+          ? "dividends"
+          : url.pathname.endsWith("/chips") ? "chips" : null;
     if (optionalKind) {
       optionalRequests[optionalKind] += 1;
       const configuration = gates[optionalKind];
@@ -119,7 +142,9 @@ async function mockApi(page, initiallyAuthenticated = true, stockHits = bootstra
       }
       const payload = response?.payload ?? (optionalKind === "company"
         ? company
-        : optionalKind === "financials" ? annualFinancials : dividendFirstPage);
+        : optionalKind === "financials"
+          ? annualFinancials
+          : optionalKind === "dividends" ? dividendFirstPage : chipSnapshot);
       return route.fulfill({ status: 200, json: payload });
     }
     const period = url.searchParams.get("period") || "daily";
@@ -152,6 +177,114 @@ async function mockApi(page, initiallyAuthenticated = true, stockHits = bootstra
     } });
   });
 }
+
+test("chips stay lazy, crosshair movement is silent, and Latest loads without a date", async ({ page }) => {
+  const requests = [];
+  await mockApi(page, true, bootstrap.results[0].hits, [], {
+    chips: { requested: ({ url }) => requests.push(url.search) },
+  });
+  await page.goto("/dashboard/");
+  await page.locator("tbody tr").first().click();
+  await expect(page.locator("#stock-chart canvas").first()).toBeVisible();
+
+  await page.locator("#stock-chart").hover({ position: { x: 300, y: 180 } });
+  await page.mouse.move(500, 240, { steps: 8 });
+  expect(requests).toEqual([]);
+
+  await page.getByRole("tab", { name: "Chips" }).click();
+  await expect(page.locator('[data-inspector-panel="chips"]')).toContainText("QBot 估算");
+  expect(requests).toEqual([""]);
+  await page.locator("[data-chip-latest]").click();
+  await page.waitForTimeout(20);
+  expect(requests).toEqual([""]);
+});
+
+test("candle click selects Chips once, resolves fallback, and Latest requests the newest snapshot", async ({ page }) => {
+  const requests = [];
+  await mockApi(page, true, bootstrap.results[0].hits, [], {
+    chips: { requested: ({ url }) => requests.push(url.searchParams.get("date")) },
+  });
+  await page.goto("/dashboard/");
+  await page.locator("tbody tr").first().click();
+  const chart = page.locator("#stock-chart");
+  await expect(chart.locator("canvas").first()).toBeVisible();
+  await chart.click({ position: { x: 380, y: 180 } });
+
+  await expect(page.getByRole("tab", { name: "Chips" })).toHaveAttribute("aria-selected", "true");
+  await expect(page.locator('[data-inspector-panel="chips"]')).toContainText("请求 2026-02-15");
+  await expect(page.locator('[data-inspector-panel="chips"]')).toContainText("实际 2026-02-13");
+  expect(requests).toHaveLength(1);
+  expect(requests[0]).toMatch(/^2026-\d{2}-\d{2}$/);
+
+  await page.locator("[data-chip-latest]").click();
+  await expect.poll(() => requests.length).toBe(2);
+  expect(requests[1]).toBeNull();
+});
+
+test("rapid chip selections keep the newest response and use weekly/monthly final candle dates", async ({ page }) => {
+  const requests = [];
+  let releaseFirst;
+  const firstRelease = new Promise((resolve) => { releaseFirst = resolve; });
+  await mockApi(page, true, bootstrap.results[0].hits, [], {
+    chips: {
+      requested: ({ url }) => requests.push(url.searchParams.get("date")),
+      responses: {
+        1: { release: firstRelease, payload: { ...chipSnapshot, requestedDate: "older", resolvedDate: "older-response" } },
+        2: { payload: { ...chipSnapshot, requestedDate: "newer", resolvedDate: "newer-response" } },
+      },
+    },
+  });
+  await page.goto("/dashboard/");
+  await page.locator("tbody tr").first().click();
+  const chart = page.locator("#stock-chart");
+  await chart.click({ position: { x: 280, y: 180 } });
+  await expect.poll(() => requests.length).toBe(1);
+  await page.getByRole("button", { name: "Weekly" }).click();
+  await expect(page.locator("#stock-chart canvas").first()).toBeVisible();
+  await page.locator("#stock-chart").click({ position: { x: 200, y: 180 } });
+  await expect.poll(() => requests.length).toBe(2);
+  expect(bars.filter((_, index) => (index + 1) % 5 === 0).map((bar) => bar.time)).toContain(requests[1]);
+  await expect(page.locator('[data-inspector-panel="chips"]')).toContainText("newer-response");
+  releaseFirst();
+  await page.waitForTimeout(30);
+  await expect(page.locator('[data-inspector-panel="chips"]')).toContainText("newer-response");
+  await expect(page.locator('[data-inspector-panel="chips"]')).not.toContainText("older-response");
+
+  await page.getByRole("button", { name: "Monthly" }).click();
+  await expect(page.locator("#stock-chart canvas").first()).toBeVisible();
+  const before = requests.length;
+  await page.locator("#stock-chart").click({ position: { x: 500, y: 180 } });
+  await expect.poll(() => requests.length).toBe(before + 1);
+  expect(bars.filter((_, index) => (index + 1) % 20 === 0).map((bar) => bar.time)).toContain(requests.at(-1));
+});
+
+test("a chip response from a signed-out generation cannot overwrite the next session", async ({ page }) => {
+  let releaseOld;
+  const oldRelease = new Promise((resolve) => { releaseOld = resolve; });
+  await mockApi(page, true, bootstrap.results[0].hits, [], {
+    chips: { responses: {
+      1: { release: oldRelease, payload: { ...chipSnapshot, resolvedDate: "old-session" } },
+      2: { payload: { ...chipSnapshot, resolvedDate: "fresh-session" } },
+    } },
+  });
+  await page.goto("/dashboard/");
+  await page.locator("tbody tr").first().click();
+  await expect(page.locator("#stock-chart canvas").first()).toBeVisible();
+  await page.getByRole("tab", { name: "Chips" }).click();
+  await page.locator("#settings").click();
+  await page.locator("#logout").click();
+  await expect(page.locator("#login-form")).toBeVisible();
+  releaseOld();
+  await page.waitForTimeout(30);
+  await expect(page.locator("#login-form")).toBeVisible();
+  await page.locator("#username").fill("analyst");
+  await page.locator("#password").fill("secret");
+  await page.locator("#login-form button").click();
+  await expect(page.locator("#stock-chart canvas").first()).toBeVisible();
+  await page.getByRole("tab", { name: "Chips" }).click();
+  await expect(page.locator('[data-inspector-panel="chips"]')).toContainText("fresh-session");
+  await expect(page.locator('[data-inspector-panel="chips"]')).not.toContainText("old-session");
+});
 
 test("company overview waits for chart mount while optional data stays local", async ({ page }) => {
   let releaseCompany;

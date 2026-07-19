@@ -1,6 +1,6 @@
 import { dashboardApi, ApiError } from "./api.js?v=20260719.5";
 import { activitySeries, mountChart } from "./chart.js?v=20260719.5";
-import { companyPanel, dividendPanel, financialPanel } from "./company-panels.js?v=20260719.5";
+import { chipPanel, companyPanel, dividendPanel, financialPanel } from "./company-panels.js?v=20260719.5";
 import {
   activeFilterCount,
   applyFilters,
@@ -29,6 +29,7 @@ const companyPanelStates = new Map();
 const optionalRequestCache = new Map();
 const optionalRequestSequences = new Map();
 const financialFrequencies = new Map();
+const chipRequestedDates = new Map();
 let chartHandle = null;
 let inspectorCleanup = null;
 let closeInspectorOverlay = null;
@@ -69,6 +70,7 @@ function enterAuthenticationBoundary() {
   optionalRequestCache.clear();
   optionalRequestSequences.clear();
   financialFrequencies.clear();
+  chipRequestedDates.clear();
   return invalidateProtectedView();
 }
 
@@ -254,6 +256,18 @@ function currentFinancialFrequency(code) {
   return financialFrequencies.get(code) || "annual";
 }
 
+function chipSelectionKey(code) {
+  return `${protectedViewGeneration}:${code}`;
+}
+
+function currentChipRequest(code) {
+  return chipRequestedDates.get(chipSelectionKey(code)) ?? "latest";
+}
+
+function chipControls() {
+  return `<div class="panel-section-toolbar chip-toolbar"><strong>筹码分布</strong><button type="button" class="outline-button" data-chip-latest>Latest</button></div>`;
+}
+
 function getPanelState(kind, code, frequency = "") {
   const key = panelStateKey(kind, code, frequency);
   if (!companyPanelStates.has(key)) {
@@ -306,7 +320,14 @@ function panelMarkup(kind, code) {
     if (state.status === "error") return panelError("dividends", state.error);
     return panelLoading("dividends");
   }
-  return `<div class="inspector-placeholder"><strong>Chips</strong><span>This section is ready for chip intelligence.</span></div>`;
+  if (kind === "chips") {
+    const requestDate = currentChipRequest(code);
+    const state = getPanelState("chips", code, requestDate);
+    if (state.status === "loaded") return chipPanel(state.payload);
+    if (state.status === "error") return `${chipControls()}${panelError("chips", state.error)}`;
+    return `${chipControls()}${panelLoading("chips")}`;
+  }
+  return "";
 }
 
 function currentStockTab() {
@@ -372,9 +393,11 @@ async function loadPanelPage(kind, code, { frequency = "", cursor = null, retry 
         ? await dashboardApi.company(code)
         : kind === "financials"
           ? await dashboardApi.financials(code, frequency, cursor)
-          : await dashboardApi.dividends(code, cursor);
+          : kind === "dividends"
+            ? await dashboardApi.dividends(code, cursor)
+            : await dashboardApi.chips(code, frequency === "latest" ? null : frequency);
       if (!isCurrent()) return;
-      if (kind === "company") state.payload = payload;
+      if (kind === "company" || kind === "chips") state.payload = payload;
       else state.items = cursor
         ? appendUnique(kind, state.items, Array.isArray(payload.items) ? payload.items : [])
         : (Array.isArray(payload.items) ? payload.items : []);
@@ -404,6 +427,7 @@ function ensureInspectorPanel(kind, code) {
   if (kind === "overview") return loadPanelPage("company", code);
   if (kind === "financials") return loadPanelPage("financials", code, { frequency: currentFinancialFrequency(code) });
   if (kind === "dividends") return loadPanelPage("dividends", code);
+  if (kind === "chips") return loadPanelPage("chips", code, { frequency: currentChipRequest(code) });
   return null;
 }
 
@@ -416,9 +440,16 @@ function bindPanelActions(panel, kind, code) {
   }));
   panel.querySelector("[data-panel-retry]")?.addEventListener("click", () => {
     const requestKind = kind === "overview" ? "company" : kind;
-    const frequency = requestKind === "financials" ? currentFinancialFrequency(code) : "";
+    const frequency = requestKind === "financials"
+      ? currentFinancialFrequency(code)
+      : requestKind === "chips" ? currentChipRequest(code) : "";
     const state = getPanelState(requestKind, code, frequency);
     loadPanelPage(requestKind, code, { frequency, cursor: state.failedCursor, retry: true });
+  });
+  panel.querySelector("[data-chip-latest]")?.addEventListener("click", () => {
+    chipRequestedDates.set(chipSelectionKey(code), "latest");
+    renderInspectorPanel("chips", code);
+    loadPanelPage("chips", code, { frequency: "latest" });
   });
   panel.querySelector("[data-load-more]")?.addEventListener("click", () => {
     const requestKind = panel.querySelector("[data-load-more]").dataset.loadMore;
@@ -494,7 +525,17 @@ function renderWorkspace() {
   if (tab.type === "stock") {
     if (!detail) loadStock(tab);
     else if (!detail.error) {
-      if (detail.bars.length) chartHandle = mountChart(app.querySelector("#stock-chart"), detail.bars, detail.hits);
+      if (detail.bars.length) {
+        const chartGeneration = protectedViewGeneration;
+        chartHandle = mountChart(app.querySelector("#stock-chart"), detail.bars, detail.hits, {
+          onCandleSelect: (date) => {
+            const activeStock = currentStockTab();
+            if (!authenticated || chartGeneration !== protectedViewGeneration || activeStock?.code !== tab.code) return;
+            chipRequestedDates.set(chipSelectionKey(tab.code), date);
+            app.querySelector('[data-inspector-tab="chips"]')?.click();
+          },
+        });
+      }
       queueMicrotask(() => {
         if (currentStockTab()?.code !== tab.code) return;
         ensureInspectorPanel("overview", tab.code);

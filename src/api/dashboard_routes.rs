@@ -64,6 +64,11 @@ pub(crate) struct DashboardDividendQuery {
     cursor: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub(crate) struct DashboardChipQuery {
+    date: Option<chrono::NaiveDate>,
+}
+
 impl DashboardDividendQuery {
     fn parsed_limit(&self) -> crate::error::Result<usize> {
         parsed_company_page_limit(self.limit)
@@ -110,6 +115,7 @@ pub fn dashboard_router(state: Arc<AppState>) -> Router {
             "/api/dashboard/stocks/:code/dividends",
             get(stock_dividends),
         )
+        .route("/api/dashboard/stocks/:code/chips", get(stock_chips))
         .nest_service(
             "/dashboard",
             ServeDir::new("web/dashboard").append_index_html_on_directories(true),
@@ -372,6 +378,29 @@ async fn stock_dividends(
             Err(error) => dashboard_company_error(error),
         },
     )
+}
+
+async fn stock_chips(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(code): Path<String>,
+    uri: Uri,
+) -> Response {
+    if let Err(response) = authorized(&state, &headers).await {
+        return private_no_store(response);
+    }
+    let query = match parse_dashboard_query::<DashboardChipQuery>(&uri) {
+        Ok(query) => query,
+        Err(response) => return response,
+    };
+    let service = match company_service(&state) {
+        Ok(service) => service,
+        Err(response) => return private_no_store(response),
+    };
+    private_no_store(match service.chips(&code, query.date).await {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => dashboard_company_error(error),
+    })
 }
 
 fn private_no_store(mut response: Response) -> Response {
@@ -707,6 +736,97 @@ mod tests {
         ] {
             let response = router_get(&mut router, uri, Some(&cookie)).await;
             assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            assert_private_no_store(&response);
+        }
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn dashboard_chip_route_authenticates_before_query_and_returns_private_canonical_data(
+        pool: PgPool,
+    ) -> crate::error::Result<()> {
+        sqlx::query(
+            r#"INSERT INTO stock_info (code, name, market, industry)
+               VALUES ('600519.SH', '贵州茅台', 'SH', '白酒')"#,
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            r#"INSERT INTO security_master_versions
+               (code, name, market, exchange, list_status, list_date, available_at,
+                availability_quality, source)
+               VALUES ('600519.SH', '贵州茅台', '主板', 'SSE', 'L', '2001-08-27',
+                       '2026-01-01T00:00:00Z', 'observed', 'tushare')"#,
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            r#"INSERT INTO chip_distribution
+               (code, trade_date, distribution, avg_cost, profit_ratio, concentration,
+                dominant_peak_price, source, model_version, validated, source_updated_at,
+                distribution_format)
+               VALUES ('600519.SH', '2026-07-17',
+                       '[{"price": 1400.0, "weight": 0.4}, {"price": 1500.0, "weight": 0.6}]',
+                       1460, 70, 82, 1500, 'qbot_estimate', 'qbot-chip-v2', TRUE,
+                       '2026-07-18T10:00:00Z', 'normalized_probability')"#,
+        )
+        .execute(&pool)
+        .await?;
+        let state = test_state(pool).await;
+        let cookie = authenticated_cookie(&state).await;
+        let mut router = dashboard_router(state);
+
+        for uri in [
+            "/api/dashboard/stocks/600519.SH/chips?date=bad",
+            "/api/dashboard/stocks/600519.SH/chips?date=2026-07-17&date=2026-07-18",
+        ] {
+            let response = router_get(&mut router, uri, None).await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+            assert_private_no_store(&response);
+        }
+
+        for uri in [
+            "/api/dashboard/stocks/600519.SH/chips?date=bad",
+            "/api/dashboard/stocks/600519.SH/chips?date=2026-07-17&date=2026-07-18",
+        ] {
+            assert_safe_query_error(router_get(&mut router, uri, Some(&cookie)).await).await;
+        }
+
+        let response = router_get(
+            &mut router,
+            "/api/dashboard/stocks/600519.SH/chips?date=2026-07-18",
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_private_no_store(&response);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: Value = serde_json::from_slice(&body)?;
+        assert_eq!(payload["requestedDate"], "2026-07-18");
+        assert_eq!(payload["resolvedDate"], "2026-07-17");
+        assert_eq!(payload["distribution"][0]["price"], 1500.0);
+        assert_eq!(payload["sourceLabel"], "QBot 估算");
+        assert_eq!(payload["validationLabel"], "已验证");
+        assert!(payload.get("rawPayload").is_none());
+
+        let latest = router_get(
+            &mut router,
+            "/api/dashboard/stocks/600519.SH/chips",
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(latest.status(), StatusCode::OK);
+        assert_private_no_store(&latest);
+
+        for uri in [
+            "/api/dashboard/stocks/600519/chips",
+            "/api/dashboard/stocks/999999.SH/chips",
+            "/api/dashboard/stocks/600519.SH/chips?date=2026-07-16",
+        ] {
+            let response = router_get(&mut router, uri, Some(&cookie)).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
             assert_private_no_store(&response);
         }
         Ok(())

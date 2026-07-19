@@ -8,6 +8,7 @@ use sqlx::{FromRow, PgPool};
 
 use crate::data::company::FinancialFrequency;
 use crate::error::{AppError, Result};
+use crate::storage::chip_repository::ChipRepository;
 use crate::storage::company_repository::{
     CompanyRepository, DividendHistoryCursor, FinancialHistoryCursor,
 };
@@ -109,6 +110,34 @@ pub struct DashboardDividendItem {
     pub revision_count: i64,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DashboardChipSnapshot {
+    pub code: String,
+    pub requested_date: Option<NaiveDate>,
+    pub resolved_date: NaiveDate,
+    pub current_price: Option<Decimal>,
+    pub distribution: Vec<DashboardChipBucket>,
+    pub average_cost: f64,
+    pub winner_rate: f64,
+    pub concentration: f64,
+    pub dominant_peak_price: f64,
+    pub source: String,
+    pub source_label: &'static str,
+    pub model_version: Option<String>,
+    pub validated: bool,
+    pub validation_label: &'static str,
+    pub source_updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DashboardChipBucket {
+    pub price: f64,
+    pub weight: f64,
+    pub percentage: f64,
+}
+
 #[derive(Debug, FromRow)]
 struct CompanyRow {
     code: String,
@@ -159,6 +188,7 @@ enum CursorPayload {
 pub struct DashboardCompanyService {
     pool: PgPool,
     repository: CompanyRepository,
+    chip_repository: ChipRepository,
     cursor_secret: String,
 }
 
@@ -170,6 +200,7 @@ impl DashboardCompanyService {
     fn from_parts(pool: PgPool, cursor_secret: impl Into<String>) -> Self {
         Self {
             repository: CompanyRepository::new(pool.clone()),
+            chip_repository: ChipRepository::new(pool.clone()),
             pool,
             cursor_secret: cursor_secret.into(),
         }
@@ -329,6 +360,71 @@ impl DashboardCompanyService {
             })
             .collect();
         Ok(DashboardDividendPage { items, next_cursor })
+    }
+
+    pub async fn chips(
+        &self,
+        raw_code: &str,
+        requested_date: Option<NaiveDate>,
+    ) -> Result<DashboardChipSnapshot> {
+        let code = self.ensure_current_code(raw_code).await?;
+        let snapshot = match requested_date {
+            Some(date) => {
+                self.chip_repository
+                    .snapshot_at_or_before(code, date)
+                    .await?
+            }
+            None => self.chip_repository.latest_snapshot(code).await?,
+        }
+        .ok_or_else(|| AppError::NotFound(format!("chip snapshot for {code}")))?;
+        let current_price = sqlx::query_scalar::<_, Decimal>(
+            r#"SELECT close
+               FROM stock_daily_bar_versions
+               WHERE code = $1 AND trade_date = $2 AND available_at <= NOW()
+               ORDER BY available_at DESC, ingested_at DESC, source DESC
+               LIMIT 1"#,
+        )
+        .bind(code)
+        .bind(snapshot.trade_date)
+        .fetch_optional(&self.pool)
+        .await?;
+        let mut distribution = snapshot
+            .distribution
+            .iter()
+            .map(|bucket| DashboardChipBucket {
+                price: bucket.price,
+                weight: bucket.weight,
+                percentage: bucket.weight * 100.0,
+            })
+            .collect::<Vec<_>>();
+        distribution.sort_by(|left, right| right.price.total_cmp(&left.price));
+        let source_label = match snapshot.source.as_str() {
+            "qbot_estimate" => "QBot 估算",
+            "tushare" => "Tushare 官方",
+            _ => "未知来源",
+        };
+        let validation_label = if snapshot.validated {
+            "已验证"
+        } else {
+            "未验证"
+        };
+        Ok(DashboardChipSnapshot {
+            code: snapshot.code,
+            requested_date,
+            resolved_date: snapshot.trade_date,
+            current_price,
+            distribution,
+            average_cost: snapshot.average_cost,
+            winner_rate: snapshot.winner_rate,
+            concentration: snapshot.concentration,
+            dominant_peak_price: snapshot.dominant_peak_price,
+            source: snapshot.source,
+            source_label,
+            model_version: snapshot.model_version,
+            validated: snapshot.validated,
+            validation_label,
+            source_updated_at: snapshot.source_updated_at,
+        })
     }
 
     async fn ensure_current_code<'a>(&self, raw_code: &'a str) -> Result<&'a str> {
@@ -545,6 +641,7 @@ mod tests {
     use serde_json::{json, to_value};
     use sqlx::PgPool;
 
+    use crate::data::chip::{ChipBucket, ChipSnapshot};
     use crate::data::company::{DividendRecord, FinancialFrequency, FinancialReport};
     use crate::error::AppError;
     use crate::storage::company_repository::CompanyRepository;
@@ -662,6 +759,93 @@ mod tests {
             available_at,
             ingested_at: available_at,
         }
+    }
+
+    fn chip_snapshot(
+        trade_date: NaiveDate,
+        source: &str,
+        model_version: Option<&str>,
+        validated: bool,
+    ) -> ChipSnapshot {
+        ChipSnapshot {
+            code: "600519.SH".to_string(),
+            trade_date,
+            distribution: vec![
+                ChipBucket {
+                    price: 1_400.0,
+                    weight: 0.25,
+                },
+                ChipBucket {
+                    price: 1_500.0,
+                    weight: 0.75,
+                },
+            ],
+            average_cost: 1_475.0,
+            winner_rate: 72.5,
+            concentration: 80.0,
+            dominant_peak_price: 1_500.0,
+            source: source.to_string(),
+            model_version: model_version.map(str::to_string),
+            validated,
+            source_updated_at: dt(2026, 7, 18, 10),
+        }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn dashboard_chip_resolves_exact_prior_and_latest_canonical_snapshots(
+        pool: PgPool,
+    ) -> crate::error::Result<()> {
+        seed_current_stock(&pool).await?;
+        let repository = crate::storage::chip_repository::ChipRepository::new(pool.clone());
+        repository
+            .upsert_snapshot(&chip_snapshot(
+                date(2026, 7, 17),
+                "qbot_estimate",
+                Some("qbot-chip-v2"),
+                true,
+            ))
+            .await?;
+        repository
+            .upsert_snapshot(&chip_snapshot(date(2026, 7, 21), "tushare", None, false))
+            .await?;
+        let service = DashboardCompanyService::from_parts(pool, "cursor-test-secret");
+
+        let exact = service.chips("600519.SH", Some(date(2026, 7, 17))).await?;
+        assert_eq!(exact.requested_date, Some(date(2026, 7, 17)));
+        assert_eq!(exact.resolved_date, date(2026, 7, 17));
+        assert_eq!(exact.current_price, Some(Decimal::new(1435, 0)));
+        assert_eq!(exact.distribution[0].price, 1_500.0);
+        assert_eq!(exact.distribution[0].percentage, 75.0);
+        assert_eq!(exact.source, "qbot_estimate");
+        assert_eq!(exact.source_label, "QBot 估算");
+        assert_eq!(exact.model_version.as_deref(), Some("qbot-chip-v2"));
+        assert!(exact.validated);
+        assert_eq!(exact.validation_label, "已验证");
+
+        let prior = service.chips("600519.SH", Some(date(2026, 7, 19))).await?;
+        assert_eq!(prior.requested_date, Some(date(2026, 7, 19)));
+        assert_eq!(prior.resolved_date, date(2026, 7, 17));
+
+        let latest = service.chips("600519.SH", None).await?;
+        assert_eq!(latest.requested_date, None);
+        assert_eq!(latest.resolved_date, date(2026, 7, 21));
+        assert_eq!(latest.current_price, None);
+        assert_eq!(latest.source_label, "Tushare 官方");
+        assert_eq!(latest.model_version, None);
+        assert!(!latest.validated);
+        assert_eq!(latest.validation_label, "未验证");
+
+        assert!(matches!(
+            service.chips("600519.SH", Some(date(2026, 7, 16))).await,
+            Err(AppError::NotFound(_))
+        ));
+        for code in ["600519", "600519.sh", "999999.SH"] {
+            assert!(matches!(
+                service.chips(code, None).await,
+                Err(AppError::NotFound(_))
+            ));
+        }
+        Ok(())
     }
 
     #[sqlx::test(migrations = "./migrations")]

@@ -72,3 +72,27 @@ test("company intelligence API omits absent cursors", async () => {
     "/api/dashboard/stocks/600519.SH/dividends",
   ]);
 });
+
+test("historical chips API omits latest query and encodes an exact requested date", async () => {
+  const requestedPaths = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (path) => {
+    requestedPaths.push(path);
+    return new Response(JSON.stringify({ distribution: [] }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+
+  try {
+    await dashboardApi.chips("60/0519.SH");
+    await dashboardApi.chips("600519.SH", "2026-07-17");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.deepEqual(requestedPaths, [
+    "/api/dashboard/stocks/60%2F0519.SH/chips",
+    "/api/dashboard/stocks/600519.SH/chips?date=2026-07-17",
+  ]);
+});

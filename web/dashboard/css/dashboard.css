@@ -211,6 +211,22 @@ button { cursor: pointer; }
 .panel-empty span { max-width: 245px; font-size: 10px; }
 .panel-load-more { width: 100%; height: 30px; margin-top: 9px; border: 1px solid #414141; background: #252526; color: #bbb; font-size: 10px; }
 .panel-load-more:hover { border-color: #666; background: var(--hover); color: #fff; }
+.chip-panel { display: grid; gap: 10px; }
+.chip-toolbar { margin-bottom: 0; }
+.chip-toolbar .outline-button { height: 24px; margin-left: auto; padding: 0 10px; color: #c9e5f7; font-size: 10px; }
+.chip-provenance { min-width: 0; display: flex; align-items: center; gap: 6px; padding: 8px 9px; border: 1px solid #38434c; border-left: 2px solid var(--blue); background: #20252a; font-size: 10px; }
+.chip-provenance strong { color: #dcebf5; font-weight: 500; }
+.chip-provenance span { min-width: 0; overflow: hidden; color: #91a2ad; text-overflow: ellipsis; white-space: nowrap; }
+.chip-provenance span:last-child { margin-left: auto; }
+.chip-date-line { color: var(--muted); font: 10px var(--font-mono); }
+.chip-summary { grid-template-columns: repeat(2,minmax(0,1fr)); }
+.chip-distribution { display: grid; gap: 3px; padding: 7px; border: 1px solid var(--border-soft); background: #1d1d1d; }
+.chip-bucket { min-width: 0; height: 21px; display: grid; grid-template-columns: 64px minmax(40px,1fr) 51px; align-items: center; gap: 7px; }
+.chip-price, .chip-weight { color: #bcbcbc; font-size: 9px; font-variant-numeric: tabular-nums; }
+.chip-weight { color: #8fa7b8; text-align: right; }
+.chip-bar-track { height: 8px; overflow: hidden; background: #292929; }
+.chip-bar { display: block; width: var(--chip-width); height: 100%; background: linear-gradient(90deg, #2676a8, #4ba5d8); }
+.chip-bucket:hover .chip-bar { background: linear-gradient(90deg, #3188bd, #62b8e7); }
 .dividend-list { max-height: 430px; display: block; overflow: auto; scrollbar-color: #555 #202020; }
 .history-spacer { min-height: 0; pointer-events: none; }
 .dividend-card { box-sizing: border-box; height: 93px; margin: 0 0 8px; overflow: hidden; padding: 9px; border: 1px solid #373737; border-left: 2px solid #3e8bba; background: #202020; }

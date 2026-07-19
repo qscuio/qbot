@@ -57,6 +57,19 @@ export function activitySeries(bars) {
   };
 }
 
+export function selectedChipDate(param) {
+  const time = param?.time;
+  let value = null;
+  if (typeof time === "string" && /^\d{4}-\d{2}-\d{2}$/.test(time)) {
+    value = time;
+  } else if (time && Number.isInteger(time.year) && Number.isInteger(time.month) && Number.isInteger(time.day)) {
+    value = `${String(time.year).padStart(4, "0")}-${String(time.month).padStart(2, "0")}-${String(time.day).padStart(2, "0")}`;
+  }
+  if (!value) return null;
+  const parsed = new Date(`${value}T00:00:00Z`);
+  return Number.isNaN(parsed.valueOf()) || parsed.toISOString().slice(0, 10) !== value ? null : value;
+}
+
 function addSeries(chart, type, options) {
   if (typeof chart.addSeries === "function") {
     return chart.addSeries(window.LightweightCharts[type], options);
@@ -86,7 +99,7 @@ export function fitChartAfterLayout(
   return () => { active = false; };
 }
 
-export function mountChart(container, bars, hits = []) {
+export function mountChart(container, bars, hits = [], { onCandleSelect } = {}) {
   if (!window.LightweightCharts || !container) return { resize() {}, destroy() {} };
   container.replaceChildren();
   const chart = window.LightweightCharts.createChart(container, {
@@ -145,6 +158,13 @@ export function mountChart(container, bars, hits = []) {
   }
   const cancelInitialFit = fitChartAfterLayout(chart.timeScale(), undefined, bars.length);
   let active = true;
+  const handleClick = (param) => {
+    if (!active || typeof onCandleSelect !== "function") return;
+    const date = selectedChipDate(param);
+    if (!date || !param?.point || !param.seriesData?.has?.(candleSeries)) return;
+    onCandleSelect(date);
+  };
+  if (typeof chart.subscribeClick === "function") chart.subscribeClick(handleClick);
   const resize = () => {
     if (!active || !container.clientWidth || !container.clientHeight) return;
     chart.resize(container.clientWidth, container.clientHeight);
@@ -158,6 +178,7 @@ export function mountChart(container, bars, hits = []) {
     resize,
     destroy: () => {
       active = false;
+      if (typeof chart.unsubscribeClick === "function") chart.unsubscribeClick(handleClick);
       resizeObserver?.disconnect();
       if (!resizeObserver) window.removeEventListener("resize", resize);
       cancelInitialFit();
