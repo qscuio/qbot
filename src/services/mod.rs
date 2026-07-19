@@ -1,6 +1,7 @@
 pub mod ai_analysis;
 pub mod burst_monitor;
 pub mod chip_dist;
+pub mod chip_model;
 pub mod company_intelligence;
 pub mod daban;
 pub mod daban_sim;
