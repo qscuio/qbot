@@ -18,12 +18,12 @@ test("dashboard HTML is fresh while versioned assets can be cached", async () =>
   const app = await readFile("js/app.js", "utf8");
   const versions = [
     ...html.matchAll(/(?:dashboard\.css|lightweight-charts\.js|app\.js)\?v=([\w.-]+)/g),
-    ...app.matchAll(/(?:api\.js|chart\.js|state\.js)\?v=([\w.-]+)/g),
+    ...app.matchAll(/(?:api\.js|chart\.js|company-panels\.js|state\.js)\?v=([\w.-]+)/g),
   ].map((match) => match[1]);
 
-  assert.equal(versions.length, 6);
+  assert.equal(versions.length, 7);
   assert.equal(new Set(versions).size, 1);
-  assert.notEqual(versions[0], "20260719.1");
+  assert.equal(versions[0], "20260719.5");
   assert.match(config, /set \$dashboard_cache_control "no-store";/);
   assert.match(
     config,
@@ -47,4 +47,37 @@ test("deployment runs the resumable daily-bar repair after the service is health
   assert.ok(repair > healthCheck);
   assert.match(workflow, /command_timeout:\s*6h/);
   assert.match(workflow, /--repair-daily-bars/);
+});
+
+test("deployment launches one detached resumable company repair after health", async () => {
+  const workflow = await readFile("../../.github/workflows/deploy.yml", "utf8");
+  const healthCheck = workflow.indexOf("- name: Health check");
+  const repairStart = workflow.indexOf("- name: Start company intelligence repair");
+  const nextStep = workflow.indexOf("\n      - name:", repairStart + 1);
+  const repair = workflow.slice(repairStart, nextStep);
+
+  assert.ok(healthCheck >= 0);
+  assert.ok(repairStart > healthCheck);
+  assert.match(repair, /set -e/);
+  assert.match(repair, /systemctl is-active --quiet "\$unit"/);
+  assert.match(repair, /systemctl show qbot --property=User --value/);
+  assert.match(repair, /systemctl show "\$unit" --property=LoadState --value/);
+  assert.match(repair, /systemctl stop "\$unit"/);
+  assert.match(repair, /systemctl reset-failed "\$unit"/);
+  assert.match(repair, /systemd-run --no-block --collect/);
+  assert.match(repair, /--unit="\$unit"/);
+  assert.match(repair, /unit="qbot-company-intelligence-repair"/);
+  assert.match(repair, /--property=Type=exec/);
+  assert.match(repair, /--property=EnvironmentFile=\/opt\/qbot\/\.env/);
+  assert.match(repair, /--property="User=\$service_user"/);
+  assert.match(repair, /--property=UMask=0077/);
+  assert.match(repair, /--property=StandardOutput=journal/);
+  assert.match(repair, /--property=StandardError=journal/);
+  assert.match(repair, /--working-directory=\/opt\/qbot/);
+  assert.match(repair, /\/opt\/qbot\/qbot --repair-company-intelligence/);
+  assert.match(repair, /queued_state=.*systemctl is-active "\$unit"/);
+  assert.match(repair, /active\|activating/);
+  assert.match(repair, /journalctl -u "\$unit"/);
+  assert.doesNotMatch(repair, /--wait/);
+  assert.doesNotMatch(repair, /github\.run_(?:id|attempt)/);
 });

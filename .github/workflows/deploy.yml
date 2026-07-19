@@ -431,6 +431,77 @@ jobs:
             echo "Health check failed after retries"
             exit 1
 
+      - name: Start company intelligence repair
+        if: steps.check.outputs.skip != 'true'
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            set -e
+            unit="qbot-company-intelligence-repair"
+            service_user="$(sudo systemctl show qbot --property=User --value)"
+
+            if [ -z "$service_user" ]; then
+              echo "Could not determine the deployed qbot service user"
+              exit 1
+            fi
+
+            if sudo systemctl is-active --quiet "$unit"; then
+              echo "$unit is already active; leaving the resumable repair running"
+              exit 0
+            fi
+
+            # Clear an inactive or failed transient unit before reusing its
+            # stable name. --collect makes future completed runs unload, while
+            # this cleanup also handles a unit left behind by an older deploy.
+            load_state="$(sudo systemctl show "$unit" --property=LoadState --value 2>/dev/null || true)"
+            if [ -n "$load_state" ] && [ "$load_state" != "not-found" ]; then
+              sudo systemctl stop "$unit"
+              sudo systemctl reset-failed "$unit" 2>/dev/null || true
+            fi
+
+            for attempt in 1 2 3 4 5; do
+              load_state="$(sudo systemctl show "$unit" --property=LoadState --value 2>/dev/null || true)"
+              if [ -z "$load_state" ] || [ "$load_state" = "not-found" ]; then
+                break
+              fi
+              sudo systemctl reset-failed "$unit" 2>/dev/null || true
+              sleep 1
+            done
+
+            if [ -n "$load_state" ] && [ "$load_state" != "not-found" ]; then
+              echo "Unable to clear stale transient unit $unit (load state: $load_state)"
+              sudo systemctl status "$unit" --no-pager || true
+              exit 1
+            fi
+
+            sudo systemd-run --no-block --collect \
+              --unit="$unit" \
+              --property=Type=exec \
+              --property=EnvironmentFile=/opt/qbot/.env \
+              --property="User=$service_user" \
+              --property=UMask=0077 \
+              --property=StandardOutput=journal \
+              --property=StandardError=journal \
+              --working-directory=/opt/qbot \
+              /opt/qbot/qbot --repair-company-intelligence
+
+            queued_state="$(sudo systemctl is-active "$unit" 2>/dev/null || true)"
+            case "$queued_state" in
+              active|activating)
+                echo "$unit launch accepted (state: $queued_state)"
+                echo "Follow progress with: sudo journalctl -fu $unit"
+                ;;
+              *)
+                echo "$unit did not enter active/activating state (state: $queued_state)"
+                sudo systemctl status "$unit" --no-pager || true
+                sudo journalctl -u "$unit" -n 80 --no-pager || true
+                exit 1
+                ;;
+            esac
+
       - name: Repair persisted OHLCV data
         if: steps.check.outputs.skip != 'true'
         uses: appleboy/ssh-action@v1.0.3
