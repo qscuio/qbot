@@ -6,6 +6,7 @@ use crate::error::{AppError, Result};
 pub const CHIP_MODEL_VERSION: &str = "qbot-chip-v2";
 
 const NORMALIZATION_TOLERANCE: f64 = 1e-9;
+const MIN_BUCKET_COUNT: usize = 3;
 
 #[derive(Debug, Clone)]
 pub struct ChipModelV2 {
@@ -15,7 +16,10 @@ pub struct ChipModelV2 {
 
 impl ChipModelV2 {
     pub fn new(bucket_count: usize) -> Self {
-        assert!(bucket_count > 0, "chip model requires at least one bucket");
+        assert!(
+            bucket_count >= MIN_BUCKET_COUNT,
+            "chip model requires at least {MIN_BUCKET_COUNT} buckets"
+        );
         Self {
             bucket_count,
             state: None,
@@ -68,7 +72,8 @@ impl ChipModelV2 {
             .unwrap_or_default();
 
         let (grid_low, grid_high) = grid_bounds(&adjusted_old, input.low, input.high);
-        let prices = price_grid(grid_low, grid_high, self.bucket_count);
+        let typical_price = weighted_typical_price(&input);
+        let prices = price_grid(grid_low, grid_high, typical_price, self.bucket_count);
         let mut weights = rebin_point_masses(&adjusted_old, &prices);
         allocate_triangular(
             &mut weights,
@@ -76,7 +81,7 @@ impl ChipModelV2 {
             replacement_fraction,
             input.low,
             input.high,
-            weighted_typical_price(&input),
+            typical_price,
         );
         normalize(&mut weights)?;
 
@@ -189,8 +194,8 @@ fn validate_state(state: &ChipModelState) -> Result<()> {
 }
 
 fn validate_distribution(distribution: &[ChipBucket]) -> Result<()> {
-    if distribution.is_empty() {
-        return Err(bad_state("distribution is empty"));
+    if distribution.len() < MIN_BUCKET_COUNT {
+        return Err(bad_state("distribution has fewer than three buckets"));
     }
     let mut total = 0.0;
     let mut previous = None;
@@ -223,12 +228,12 @@ fn grid_bounds(old: &[ChipBucket], current_low: f64, current_high: f64) -> (f64,
     (low, high)
 }
 
-fn price_grid(low: f64, high: f64, bucket_count: usize) -> Vec<f64> {
-    if bucket_count == 1 || low == high {
+fn price_grid(low: f64, high: f64, anchor: f64, bucket_count: usize) -> Vec<f64> {
+    if low == high {
         return vec![low; bucket_count];
     }
     let step = (high - low) / (bucket_count - 1) as f64;
-    (0..bucket_count)
+    let mut prices = (0..bucket_count)
         .map(|index| {
             if index + 1 == bucket_count {
                 high
@@ -236,7 +241,22 @@ fn price_grid(low: f64, high: f64, bucket_count: usize) -> Vec<f64> {
                 low + step * index as f64
             }
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    let anchor = anchor.clamp(low, high);
+    if !prices.contains(&anchor) {
+        let replace = (1..bucket_count - 1)
+            .min_by(|left, right| {
+                (prices[*left] - anchor)
+                    .abs()
+                    .total_cmp(&(prices[*right] - anchor).abs())
+                    .then_with(|| left.cmp(right))
+            })
+            .expect("minimum bucket count leaves an interior grid point");
+        prices[replace] = anchor;
+        prices.sort_by(f64::total_cmp);
+    }
+    prices
 }
 
 fn rebin_point_masses(old: &[ChipBucket], prices: &[f64]) -> Vec<f64> {
@@ -246,23 +266,27 @@ fn rebin_point_masses(old: &[ChipBucket], prices: &[f64]) -> Vec<f64> {
         return result;
     }
 
-    let low = prices[0];
-    let high = prices[prices.len() - 1];
-    let step = (high - low) / (prices.len() - 1) as f64;
     for bucket in old {
         if bucket.weight == 0.0 {
             continue;
         }
-        let position = ((bucket.price - low) / step).clamp(0.0, (prices.len() - 1) as f64);
-        let left = position.floor() as usize;
-        let right = position.ceil() as usize;
-        if left == right {
-            result[left] += bucket.weight;
-        } else {
-            let right_share = position - left as f64;
-            result[left] += bucket.weight * (1.0 - right_share);
-            result[right] += bucket.weight * right_share;
+        let right = prices.partition_point(|price| *price < bucket.price);
+        if right == 0 {
+            result[0] += bucket.weight;
+            continue;
         }
+        if right == prices.len() {
+            result[prices.len() - 1] += bucket.weight;
+            continue;
+        }
+        if prices[right] == bucket.price {
+            result[right] += bucket.weight;
+            continue;
+        }
+        let left = right - 1;
+        let right_share = (bucket.price - prices[left]) / (prices[right] - prices[left]);
+        result[left] += bucket.weight * (1.0 - right_share);
+        result[right] += bucket.weight * right_share;
     }
     result
 }
@@ -561,6 +585,90 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_grid_represents_a_narrow_current_bar_inside_wide_retained_history() {
+        let state = ChipModelState {
+            code: "600519.SH".to_string(),
+            model_version: CHIP_MODEL_VERSION.to_string(),
+            through_date: date(1),
+            distribution: vec![
+                ChipBucket {
+                    price: 1.0,
+                    weight: 0.5,
+                },
+                ChipBucket {
+                    price: 500.0,
+                    weight: 0.0,
+                },
+                ChipBucket {
+                    price: 1_000.0,
+                    weight: 0.5,
+                },
+            ],
+            last_adjustment_factor: 1.0,
+        };
+        let mut model = ChipModelV2::restore(state).unwrap();
+        let snapshot = model
+            .update(day(
+                "600519.SH",
+                date(2),
+                10.25,
+                11.0,
+                10.0,
+                10.75,
+                50.0,
+                1.0,
+            ))
+            .unwrap();
+
+        assert_valid(&snapshot, 3);
+        let current_bar_mass = snapshot
+            .distribution
+            .iter()
+            .filter(|bucket| (10.0..=11.0).contains(&bucket.price))
+            .map(|bucket| bucket.weight)
+            .sum::<f64>();
+        assert_close(current_bar_mass, 0.5);
+        assert_close(snapshot.average_cost, 255.525);
+        assert_close(
+            snapshot
+                .distribution
+                .iter()
+                .map(|bucket| bucket.weight)
+                .sum(),
+            1.0,
+        );
+    }
+
+    #[test]
+    fn rejects_bucket_counts_below_three_and_accepts_the_minimum() {
+        for unsupported in 0..3 {
+            assert!(
+                std::panic::catch_unwind(|| ChipModelV2::new(unsupported)).is_err(),
+                "bucket count {unsupported} must be rejected"
+            );
+        }
+        assert!(std::panic::catch_unwind(|| ChipModelV2::new(3)).is_ok());
+
+        let undersized_state = ChipModelState {
+            code: "600519.SH".to_string(),
+            model_version: CHIP_MODEL_VERSION.to_string(),
+            through_date: date(1),
+            distribution: vec![
+                ChipBucket {
+                    price: 10.0,
+                    weight: 0.5,
+                },
+                ChipBucket {
+                    price: 11.0,
+                    weight: 0.5,
+                },
+            ],
+            last_adjustment_factor: 1.0,
+        };
+        assert!(ChipModelV2::restore(undersized_state).is_err());
+    }
+
+    #[test]
     fn dominant_peak_ties_choose_the_lowest_price_and_metrics_are_deterministic() {
         let state = ChipModelState {
             code: "600519.SH".to_string(),
@@ -570,6 +678,10 @@ mod tests {
                 ChipBucket {
                     price: 10.0,
                     weight: 0.5,
+                },
+                ChipBucket {
+                    price: 15.0,
+                    weight: 0.0,
                 },
                 ChipBucket {
                     price: 20.0,

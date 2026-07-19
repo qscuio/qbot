@@ -51,3 +51,22 @@ The test build emitted only the repository's existing unused-code and future-inc
 ## Concerns
 
 The estimator intentionally exposes an estimate, not an official chip distribution. Calibration and canonical-source selection remain the responsibility of the later validation task.
+
+## Independent-review fixes
+
+Two Important review findings were fixed in a separate follow-up commit.
+
+### RED
+
+- Added a restored three-bucket `1..1000` history followed by a `10..11` current bar. Before the fix, the expected 50% replacement mass inside the current bar was absent: `expected 0.5, got -0`.
+- Added constructor boundaries for bucket counts `0`, `1`, and `2`, plus acceptance of `3`. Before the fix, the test reached count `1` and failed because it was accepted. A normalized two-bucket restored state is also rejected.
+
+### GREEN
+
+- The adaptive grid now always contains the day's deterministic weighted typical price while preserving the retained-history bounds and exact bucket count. This gives even a narrow current bar an in-range representation instead of collapsing replacement mass onto a distant old grid price.
+- Conservative rebinning now interpolates over adjacent prices on the resulting non-uniform grid, preserving retained mass and its weighted cost.
+- Both constructors and restored state enforce a minimum of three buckets.
+- `cargo test --locked services::chip_model::tests -- --nocapture`: 13 passed, 0 failed, 561 filtered out.
+- `cargo test --locked analysis::market_snapshot::adjustment::tests::adjusts_ohlc_to_latest_factor_preserving_non_price_fields -- --nocapture`: 1 passed, 0 failed, 573 filtered out.
+- `cargo fmt --check`: passed.
+- `git diff --check`: passed.
