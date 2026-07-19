@@ -1,6 +1,8 @@
 use chrono::{DateTime, NaiveDate, Utc};
+use rust_decimal::Decimal;
 use serde_json::Value;
 use sqlx::{FromRow, PgPool};
+use uuid::Uuid;
 
 use crate::data::company::{DividendRecord, FinancialFrequency, FinancialReport};
 use crate::error::{AppError, Result};
@@ -51,9 +53,18 @@ pub struct CompanyRepairCheckpoint {
     pub status: String,
     pub attempts: i32,
     pub last_error: Option<String>,
+    pub lease_token: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointLease {
+    pub phase: String,
+    pub code: String,
+    pub attempt: i32,
+    pub token: Uuid,
 }
 
 #[derive(Debug, FromRow)]
@@ -65,19 +76,19 @@ struct FinancialHistoryRow {
     report_type: String,
     frequency: String,
     source_revision: String,
-    total_revenue: Option<f64>,
-    revenue: Option<f64>,
-    operating_profit: Option<f64>,
-    total_profit: Option<f64>,
-    net_profit_parent: Option<f64>,
-    deducted_net_profit: Option<f64>,
-    basic_eps: Option<f64>,
-    diluted_eps: Option<f64>,
-    roe: Option<f64>,
-    gross_margin: Option<f64>,
-    net_margin: Option<f64>,
-    revenue_yoy: Option<f64>,
-    net_profit_yoy: Option<f64>,
+    total_revenue: Option<Decimal>,
+    revenue: Option<Decimal>,
+    operating_profit: Option<Decimal>,
+    total_profit: Option<Decimal>,
+    net_profit_parent: Option<Decimal>,
+    deducted_net_profit: Option<Decimal>,
+    basic_eps: Option<Decimal>,
+    diluted_eps: Option<Decimal>,
+    roe: Option<Decimal>,
+    gross_margin: Option<Decimal>,
+    net_margin: Option<Decimal>,
+    revenue_yoy: Option<Decimal>,
+    net_profit_yoy: Option<Decimal>,
     raw_payload: Value,
     available_at: DateTime<Utc>,
     ingested_at: DateTime<Utc>,
@@ -93,16 +104,90 @@ struct DividendHistoryRow {
     record_date: Option<NaiveDate>,
     ex_date: Option<NaiveDate>,
     pay_date: Option<NaiveDate>,
-    implementation_status: Option<String>,
-    cash_dividend: Option<f64>,
-    cash_dividend_tax: Option<f64>,
-    stock_ratio: Option<f64>,
+    implementation_status: String,
+    cash_dividend: Option<Decimal>,
+    cash_dividend_tax: Option<Decimal>,
+    stock_ratio: Option<Decimal>,
     source_revision: String,
     raw_payload: Value,
     available_at: DateTime<Utc>,
     ingested_at: DateTime<Utc>,
     revision_count: i64,
     dividend_date: NaiveDate,
+}
+
+#[derive(Debug, FromRow)]
+struct StoredFinancialRevision {
+    announcement_date: Option<NaiveDate>,
+    frequency: String,
+    total_revenue: Option<Decimal>,
+    revenue: Option<Decimal>,
+    operating_profit: Option<Decimal>,
+    total_profit: Option<Decimal>,
+    net_profit_parent: Option<Decimal>,
+    deducted_net_profit: Option<Decimal>,
+    basic_eps: Option<Decimal>,
+    diluted_eps: Option<Decimal>,
+    roe: Option<Decimal>,
+    gross_margin: Option<Decimal>,
+    net_margin: Option<Decimal>,
+    revenue_yoy: Option<Decimal>,
+    net_profit_yoy: Option<Decimal>,
+    raw_payload: Value,
+    available_at: DateTime<Utc>,
+}
+
+impl StoredFinancialRevision {
+    fn matches(&self, report: &FinancialReport) -> bool {
+        self.announcement_date == report.announcement_date
+            && self.frequency == report.frequency.as_str()
+            && self.total_revenue == report.total_revenue
+            && self.revenue == report.revenue
+            && self.operating_profit == report.operating_profit
+            && self.total_profit == report.total_profit
+            && self.net_profit_parent == report.net_profit_parent
+            && self.deducted_net_profit == report.deducted_net_profit
+            && self.basic_eps == report.basic_eps
+            && self.diluted_eps == report.diluted_eps
+            && self.roe == report.roe
+            && self.gross_margin == report.gross_margin
+            && self.net_margin == report.net_margin
+            && self.revenue_yoy == report.revenue_yoy
+            && self.net_profit_yoy == report.net_profit_yoy
+            && self.raw_payload == report.raw_payload
+            && self.available_at == report.available_at
+    }
+}
+
+#[derive(Debug, FromRow)]
+struct StoredDividendRevision {
+    code: String,
+    announcement_date: Option<NaiveDate>,
+    record_date: Option<NaiveDate>,
+    ex_date: Option<NaiveDate>,
+    pay_date: Option<NaiveDate>,
+    implementation_status: String,
+    cash_dividend: Option<Decimal>,
+    cash_dividend_tax: Option<Decimal>,
+    stock_ratio: Option<Decimal>,
+    raw_payload: Value,
+    available_at: DateTime<Utc>,
+}
+
+impl StoredDividendRevision {
+    fn matches(&self, record: &DividendRecord) -> bool {
+        self.code == record.code
+            && self.announcement_date == record.announcement_date
+            && self.record_date == record.record_date
+            && self.ex_date == record.ex_date
+            && self.pay_date == record.pay_date
+            && self.implementation_status == record.implementation_status
+            && self.cash_dividend == record.cash_dividend
+            && self.cash_dividend_tax == record.cash_dividend_tax
+            && self.stock_ratio == record.stock_ratio
+            && self.raw_payload == record.raw_payload
+            && self.available_at == record.available_at
+    }
 }
 
 #[derive(Clone)]
@@ -117,10 +202,10 @@ impl CompanyRepository {
 
     pub async fn upsert_financial_reports(&self, reports: &[FinancialReport]) -> Result<usize> {
         let mut transaction = self.pool.begin().await?;
-        let mut changed = 0;
+        let mut inserted = 0;
 
         for report in reports {
-            changed += sqlx::query(
+            let rows_affected = sqlx::query(
                 r#"INSERT INTO stock_financial_report_versions
                    (source, code, end_date, announcement_date, report_type, frequency,
                     source_revision, total_revenue, revenue, operating_profit, total_profit,
@@ -131,52 +216,7 @@ impl CompanyRepository {
                    ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
                     $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
                    ON CONFLICT (source, code, end_date, report_type, source_revision)
-                   DO UPDATE SET
-                     announcement_date = EXCLUDED.announcement_date,
-                     frequency = EXCLUDED.frequency,
-                     total_revenue = EXCLUDED.total_revenue,
-                     revenue = EXCLUDED.revenue,
-                     operating_profit = EXCLUDED.operating_profit,
-                     total_profit = EXCLUDED.total_profit,
-                     net_profit_parent = EXCLUDED.net_profit_parent,
-                     deducted_net_profit = EXCLUDED.deducted_net_profit,
-                     basic_eps = EXCLUDED.basic_eps,
-                     diluted_eps = EXCLUDED.diluted_eps,
-                     roe = EXCLUDED.roe,
-                     gross_margin = EXCLUDED.gross_margin,
-                     net_margin = EXCLUDED.net_margin,
-                     revenue_yoy = EXCLUDED.revenue_yoy,
-                     net_profit_yoy = EXCLUDED.net_profit_yoy,
-                     raw_payload = EXCLUDED.raw_payload,
-                     available_at = EXCLUDED.available_at,
-                     ingested_at = EXCLUDED.ingested_at
-                   WHERE (stock_financial_report_versions.announcement_date,
-                          stock_financial_report_versions.frequency,
-                          stock_financial_report_versions.total_revenue,
-                          stock_financial_report_versions.revenue,
-                          stock_financial_report_versions.operating_profit,
-                          stock_financial_report_versions.total_profit,
-                          stock_financial_report_versions.net_profit_parent,
-                          stock_financial_report_versions.deducted_net_profit,
-                          stock_financial_report_versions.basic_eps,
-                          stock_financial_report_versions.diluted_eps,
-                          stock_financial_report_versions.roe,
-                          stock_financial_report_versions.gross_margin,
-                          stock_financial_report_versions.net_margin,
-                          stock_financial_report_versions.revenue_yoy,
-                          stock_financial_report_versions.net_profit_yoy,
-                          stock_financial_report_versions.raw_payload,
-                          stock_financial_report_versions.available_at,
-                          stock_financial_report_versions.ingested_at)
-                         IS DISTINCT FROM
-                         (EXCLUDED.announcement_date, EXCLUDED.frequency,
-                          EXCLUDED.total_revenue, EXCLUDED.revenue,
-                          EXCLUDED.operating_profit, EXCLUDED.total_profit,
-                          EXCLUDED.net_profit_parent, EXCLUDED.deducted_net_profit,
-                          EXCLUDED.basic_eps, EXCLUDED.diluted_eps, EXCLUDED.roe,
-                          EXCLUDED.gross_margin, EXCLUDED.net_margin,
-                          EXCLUDED.revenue_yoy, EXCLUDED.net_profit_yoy,
-                          EXCLUDED.raw_payload, EXCLUDED.available_at, EXCLUDED.ingested_at)"#,
+                   DO NOTHING"#,
             )
             .bind(&report.source)
             .bind(&report.code)
@@ -203,115 +243,108 @@ impl CompanyRepository {
             .bind(report.ingested_at)
             .execute(&mut *transaction)
             .await?
-            .rows_affected() as usize;
+            .rows_affected();
+
+            if rows_affected == 1 {
+                inserted += 1;
+                continue;
+            }
+
+            let stored = sqlx::query_as::<_, StoredFinancialRevision>(
+                r#"SELECT announcement_date, frequency, total_revenue, revenue,
+                          operating_profit, total_profit, net_profit_parent,
+                          deducted_net_profit, basic_eps, diluted_eps, roe,
+                          gross_margin, net_margin, revenue_yoy, net_profit_yoy,
+                          raw_payload, available_at
+                   FROM stock_financial_report_versions
+                   WHERE source = $1 AND code = $2 AND end_date = $3
+                     AND report_type = $4 AND source_revision = $5"#,
+            )
+            .bind(&report.source)
+            .bind(&report.code)
+            .bind(report.end_date)
+            .bind(&report.report_type)
+            .bind(&report.source_revision)
+            .fetch_optional(&mut *transaction)
+            .await?;
+
+            if !stored.is_some_and(|row| row.matches(report)) {
+                return Err(AppError::BadRequest(format!(
+                    "immutable financial revision conflicts with stored history: {}/{}/{}/{}/{}",
+                    report.source,
+                    report.code,
+                    report.end_date,
+                    report.report_type,
+                    report.source_revision
+                )));
+            }
         }
 
         transaction.commit().await?;
-        Ok(changed)
+        Ok(inserted)
     }
 
     pub async fn upsert_dividends(&self, records: &[DividendRecord]) -> Result<usize> {
         let mut transaction = self.pool.begin().await?;
-        let mut changed = 0;
+        let mut inserted = 0;
 
         for record in records {
-            let query = if record.source_revision == "legacy" {
-                r#"INSERT INTO corporate_action_versions
-                   (source, action_key, code, action_type, announcement_date, record_date,
-                    ex_date, pay_date, implementation_status, cash_dividend,
-                    cash_dividend_tax, stock_ratio, source_revision, raw_payload,
-                    available_at, ingested_at, availability_quality)
-                   VALUES ($1, $2, $3, 'dividend', $4, $5, $6, $7, $8, $9, $10,
-                           $11, $12, $13, $14, $15, 'observed')
-                   ON CONFLICT (source, action_key, available_at)
-                   DO UPDATE SET
-                     code = EXCLUDED.code, announcement_date = EXCLUDED.announcement_date,
-                     record_date = EXCLUDED.record_date, ex_date = EXCLUDED.ex_date,
-                     pay_date = EXCLUDED.pay_date,
-                     implementation_status = EXCLUDED.implementation_status,
-                     cash_dividend = EXCLUDED.cash_dividend,
-                     cash_dividend_tax = EXCLUDED.cash_dividend_tax,
-                     stock_ratio = EXCLUDED.stock_ratio, raw_payload = EXCLUDED.raw_payload,
-                     ingested_at = EXCLUDED.ingested_at
-                   WHERE (corporate_action_versions.code,
-                          corporate_action_versions.announcement_date,
-                          corporate_action_versions.record_date,
-                          corporate_action_versions.ex_date,
-                          corporate_action_versions.pay_date,
-                          corporate_action_versions.implementation_status,
-                          corporate_action_versions.cash_dividend,
-                          corporate_action_versions.cash_dividend_tax,
-                          corporate_action_versions.stock_ratio,
-                          corporate_action_versions.raw_payload,
-                          corporate_action_versions.ingested_at)
-                         IS DISTINCT FROM
-                         (EXCLUDED.code, EXCLUDED.announcement_date, EXCLUDED.record_date,
-                          EXCLUDED.ex_date, EXCLUDED.pay_date,
-                          EXCLUDED.implementation_status, EXCLUDED.cash_dividend,
-                          EXCLUDED.cash_dividend_tax, EXCLUDED.stock_ratio,
-                          EXCLUDED.raw_payload, EXCLUDED.ingested_at)"#
-            } else {
-                r#"INSERT INTO corporate_action_versions
-                   (source, action_key, code, action_type, announcement_date, record_date,
-                    ex_date, pay_date, implementation_status, cash_dividend,
-                    cash_dividend_tax, stock_ratio, source_revision, raw_payload,
-                    available_at, ingested_at, availability_quality)
-                   VALUES ($1, $2, $3, 'dividend', $4, $5, $6, $7, $8, $9, $10,
-                           $11, $12, $13, $14, $15, 'observed')
-                   ON CONFLICT (source, action_key, source_revision)
-                     WHERE source_revision <> 'legacy'
-                   DO UPDATE SET
-                     code = EXCLUDED.code, announcement_date = EXCLUDED.announcement_date,
-                     record_date = EXCLUDED.record_date, ex_date = EXCLUDED.ex_date,
-                     pay_date = EXCLUDED.pay_date,
-                     implementation_status = EXCLUDED.implementation_status,
-                     cash_dividend = EXCLUDED.cash_dividend,
-                     cash_dividend_tax = EXCLUDED.cash_dividend_tax,
-                     stock_ratio = EXCLUDED.stock_ratio, raw_payload = EXCLUDED.raw_payload,
-                     available_at = EXCLUDED.available_at, ingested_at = EXCLUDED.ingested_at
-                   WHERE (corporate_action_versions.code,
-                          corporate_action_versions.announcement_date,
-                          corporate_action_versions.record_date,
-                          corporate_action_versions.ex_date,
-                          corporate_action_versions.pay_date,
-                          corporate_action_versions.implementation_status,
-                          corporate_action_versions.cash_dividend,
-                          corporate_action_versions.cash_dividend_tax,
-                          corporate_action_versions.stock_ratio,
-                          corporate_action_versions.raw_payload,
-                          corporate_action_versions.available_at,
-                          corporate_action_versions.ingested_at)
-                         IS DISTINCT FROM
-                         (EXCLUDED.code, EXCLUDED.announcement_date, EXCLUDED.record_date,
-                          EXCLUDED.ex_date, EXCLUDED.pay_date,
-                          EXCLUDED.implementation_status, EXCLUDED.cash_dividend,
-                          EXCLUDED.cash_dividend_tax, EXCLUDED.stock_ratio,
-                          EXCLUDED.raw_payload, EXCLUDED.available_at, EXCLUDED.ingested_at)"#
-            };
+            let rows_affected = sqlx::query(
+                r#"INSERT INTO stock_dividend_versions
+                   (source, action_key, code, announcement_date, record_date, ex_date,
+                    pay_date, implementation_status, cash_dividend, cash_dividend_tax,
+                    stock_ratio, source_revision, raw_payload, available_at, ingested_at)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                           $13, $14, $15)
+                   ON CONFLICT (source, action_key, source_revision) DO NOTHING"#,
+            )
+            .bind(&record.source)
+            .bind(&record.action_key)
+            .bind(&record.code)
+            .bind(record.announcement_date)
+            .bind(record.record_date)
+            .bind(record.ex_date)
+            .bind(record.pay_date)
+            .bind(&record.implementation_status)
+            .bind(record.cash_dividend)
+            .bind(record.cash_dividend_tax)
+            .bind(record.stock_ratio)
+            .bind(&record.source_revision)
+            .bind(&record.raw_payload)
+            .bind(record.available_at)
+            .bind(record.ingested_at)
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected();
 
-            changed += sqlx::query(query)
-                .bind(&record.source)
-                .bind(&record.action_key)
-                .bind(&record.code)
-                .bind(record.announcement_date)
-                .bind(record.record_date)
-                .bind(record.ex_date)
-                .bind(record.pay_date)
-                .bind(&record.implementation_status)
-                .bind(record.cash_dividend)
-                .bind(record.cash_dividend_tax)
-                .bind(record.stock_ratio)
-                .bind(&record.source_revision)
-                .bind(&record.raw_payload)
-                .bind(record.available_at)
-                .bind(record.ingested_at)
-                .execute(&mut *transaction)
-                .await?
-                .rows_affected() as usize;
+            if rows_affected == 1 {
+                inserted += 1;
+                continue;
+            }
+
+            let stored = sqlx::query_as::<_, StoredDividendRevision>(
+                r#"SELECT code, announcement_date, record_date, ex_date, pay_date,
+                          implementation_status, cash_dividend, cash_dividend_tax,
+                          stock_ratio, raw_payload, available_at
+                   FROM stock_dividend_versions
+                   WHERE source = $1 AND action_key = $2 AND source_revision = $3"#,
+            )
+            .bind(&record.source)
+            .bind(&record.action_key)
+            .bind(&record.source_revision)
+            .fetch_optional(&mut *transaction)
+            .await?;
+
+            if !stored.is_some_and(|row| row.matches(record)) {
+                return Err(AppError::BadRequest(format!(
+                    "immutable dividend revision conflicts with stored history: {}/{}/{}",
+                    record.source, record.action_key, record.source_revision
+                )));
+            }
         }
 
         transaction.commit().await?;
-        Ok(changed)
+        Ok(inserted)
     }
 
     pub async fn financial_history(
@@ -334,18 +367,16 @@ impl CompanyRepository {
                           COUNT(*) OVER (PARTITION BY end_date, report_type) AS revision_count,
                           ROW_NUMBER() OVER (
                             PARTITION BY end_date, report_type
-                            ORDER BY announcement_date DESC NULLS LAST, available_at DESC
+                            ORDER BY available_at DESC, source, source_revision DESC
                           ) AS revision_rank
                    FROM stock_financial_report_versions
                    WHERE code = $1 AND frequency = $2
                )
                SELECT source, code, end_date, announcement_date, report_type, frequency,
-                      source_revision, total_revenue::float8, revenue::float8,
-                      operating_profit::float8, total_profit::float8,
-                      net_profit_parent::float8, deducted_net_profit::float8,
-                      basic_eps::float8, diluted_eps::float8, roe::float8,
-                      gross_margin::float8, net_margin::float8, revenue_yoy::float8,
-                      net_profit_yoy::float8, raw_payload, available_at, ingested_at,
+                      source_revision, total_revenue, revenue, operating_profit,
+                      total_profit, net_profit_parent, deducted_net_profit, basic_eps,
+                      diluted_eps, roe, gross_margin, net_margin, revenue_yoy,
+                      net_profit_yoy, raw_payload, available_at, ingested_at,
                       revision_count
                FROM ranked
                WHERE revision_rank = 1
@@ -396,11 +427,10 @@ impl CompanyRepository {
                           COUNT(*) OVER (PARTITION BY source, action_key) AS revision_count,
                           ROW_NUMBER() OVER (
                             PARTITION BY source, action_key
-                            ORDER BY announcement_date DESC NULLS LAST, available_at DESC,
-                                     source_revision DESC
+                            ORDER BY available_at DESC, source, source_revision DESC
                           ) AS revision_rank
-                   FROM corporate_action_versions
-                   WHERE code = $1 AND action_type IN ('dividend', 'cash_dividend')
+                   FROM stock_dividend_versions
+                   WHERE code = $1
                ), latest AS (
                    SELECT *, COALESCE(ex_date, record_date, announcement_date,
                                       DATE '0001-01-01') AS dividend_date
@@ -408,8 +438,8 @@ impl CompanyRepository {
                    WHERE revision_rank = 1
                )
                SELECT source, action_key, code, announcement_date, record_date, ex_date,
-                      pay_date, implementation_status, cash_dividend::float8,
-                      cash_dividend_tax::float8, stock_ratio::float8, source_revision,
+                      pay_date, implementation_status, cash_dividend,
+                      cash_dividend_tax, stock_ratio, source_revision,
                       raw_payload, available_at, ingested_at, revision_count, dividend_date
                FROM latest
                WHERE ($2::date IS NULL OR (dividend_date, source, action_key) < ($2, $3, $4))
@@ -453,57 +483,79 @@ impl CompanyRepository {
         code: &str,
         start_date: Option<NaiveDate>,
         end_date: Option<NaiveDate>,
-    ) -> Result<()> {
-        sqlx::query(
+    ) -> Result<CheckpointLease> {
+        let token = Uuid::new_v4();
+        let claimed: Option<(i32, Uuid)> = sqlx::query_as(
             r#"INSERT INTO company_data_repair_checkpoints
-               (phase, code, start_date, end_date, status, attempts)
-               VALUES ($1, $2, $3, $4, 'running', 1)
+               (phase, code, start_date, end_date, status, attempts, lease_token)
+               VALUES ($1, $2, $3, $4, 'running', 1, $5)
                ON CONFLICT (phase, code) DO UPDATE SET
                  start_date = EXCLUDED.start_date,
                  end_date = EXCLUDED.end_date,
                  status = 'running',
                  attempts = company_data_repair_checkpoints.attempts + 1,
                  last_error = NULL,
+                 lease_token = EXCLUDED.lease_token,
                  updated_at = NOW(),
-                 completed_at = NULL"#,
+                 completed_at = NULL
+               WHERE company_data_repair_checkpoints.status <> 'running'
+               RETURNING attempts, lease_token"#,
         )
         .bind(phase)
         .bind(code)
         .bind(start_date)
         .bind(end_date)
-        .execute(&self.pool)
+        .bind(token)
+        .fetch_optional(&self.pool)
         .await?;
-        Ok(())
+
+        let (attempt, token) = claimed.ok_or_else(|| {
+            AppError::BadRequest(format!("checkpoint already running: {phase}/{code}"))
+        })?;
+        Ok(CheckpointLease {
+            phase: phase.to_string(),
+            code: code.to_string(),
+            attempt,
+            token,
+        })
     }
 
-    pub async fn complete_checkpoint(&self, phase: &str, code: &str) -> Result<()> {
-        sqlx::query(
+    pub async fn complete_checkpoint(&self, lease: &CheckpointLease) -> Result<()> {
+        let rows_affected = sqlx::query(
             r#"UPDATE company_data_repair_checkpoints
                SET status = 'completed', last_error = NULL,
-                   updated_at = NOW(), completed_at = NOW()
-               WHERE phase = $1 AND code = $2"#,
+                   lease_token = NULL, updated_at = NOW(), completed_at = NOW()
+               WHERE phase = $1 AND code = $2 AND status = 'running'
+                 AND attempts = $3 AND lease_token = $4"#,
         )
-        .bind(phase)
-        .bind(code)
+        .bind(&lease.phase)
+        .bind(&lease.code)
+        .bind(lease.attempt)
+        .bind(lease.token)
         .execute(&self.pool)
-        .await?;
-        Ok(())
+        .await?
+        .rows_affected();
+        checkpoint_transition_result(rows_affected, lease)
     }
 
-    pub async fn fail_checkpoint(&self, phase: &str, code: &str, error: &str) -> Result<()> {
+    pub async fn fail_checkpoint(&self, lease: &CheckpointLease, error: &str) -> Result<()> {
         let bounded_error: String = error.chars().take(500).collect();
-        sqlx::query(
+        let rows_affected = sqlx::query(
             r#"UPDATE company_data_repair_checkpoints
                SET status = 'failed', last_error = $3,
-                   updated_at = NOW(), completed_at = NULL
-               WHERE phase = $1 AND code = $2"#,
+                   lease_token = NULL, updated_at = NOW(), completed_at = NULL
+               WHERE phase = $1 AND code = $2 AND status = 'running'
+                 AND attempts = $4 AND lease_token = $5"#,
         )
-        .bind(phase)
-        .bind(code)
+        .bind(&lease.phase)
+        .bind(&lease.code)
         .bind(bounded_error)
+        .bind(lease.attempt)
+        .bind(lease.token)
         .execute(&self.pool)
-        .await?;
-        Ok(())
+        .await?
+        .rows_affected();
+        checkpoint_transition_result(rows_affected, lease)
     }
 
     pub async fn checkpoint(
@@ -513,7 +565,7 @@ impl CompanyRepository {
     ) -> Result<Option<CompanyRepairCheckpoint>> {
         Ok(sqlx::query_as::<_, CompanyRepairCheckpoint>(
             r#"SELECT phase, code, start_date, end_date, status, attempts, last_error,
-                      created_at, updated_at, completed_at
+                      lease_token, created_at, updated_at, completed_at
                FROM company_data_repair_checkpoints
                WHERE phase = $1 AND code = $2"#,
         )
@@ -521,6 +573,17 @@ impl CompanyRepository {
         .bind(code)
         .fetch_optional(&self.pool)
         .await?)
+    }
+}
+
+fn checkpoint_transition_result(rows_affected: u64, lease: &CheckpointLease) -> Result<()> {
+    if rows_affected == 1 {
+        Ok(())
+    } else {
+        Err(AppError::BadRequest(format!(
+            "stale or missing checkpoint lease: {}/{} attempt {}",
+            lease.phase, lease.code, lease.attempt
+        )))
     }
 }
 
@@ -573,9 +636,7 @@ fn dividend_history_item(row: DividendHistoryRow) -> DividendHistoryItem {
             record_date: row.record_date,
             ex_date: row.ex_date,
             pay_date: row.pay_date,
-            implementation_status: row
-                .implementation_status
-                .unwrap_or_else(|| "unknown".to_string()),
+            implementation_status: row.implementation_status,
             cash_dividend: row.cash_dividend,
             cash_dividend_tax: row.cash_dividend_tax,
             stock_ratio: row.stock_ratio,
@@ -590,10 +651,12 @@ fn dividend_history_item(row: DividendHistoryRow) -> DividendHistoryItem {
 #[cfg(test)]
 mod tests {
     use chrono::{NaiveDate, TimeZone, Utc};
+    use rust_decimal::Decimal;
     use serde_json::json;
     use sqlx::PgPool;
+    use uuid::Uuid;
 
-    use super::CompanyRepository;
+    use super::{CheckpointLease, CompanyRepository};
     use crate::data::company::{DividendRecord, FinancialFrequency, FinancialReport};
 
     fn date(year: i32, month: u32, day: u32) -> NaiveDate {
@@ -602,6 +665,10 @@ mod tests {
 
     fn dt(year: i32, month: u32, day: u32, hour: u32) -> chrono::DateTime<Utc> {
         Utc.with_ymd_and_hms(year, month, day, hour, 0, 0).unwrap()
+    }
+
+    fn decimal(value: &str) -> Decimal {
+        value.parse().unwrap()
     }
 
     fn financial_report(source_revision: &str, announcement_day: u32) -> FinancialReport {
@@ -613,27 +680,27 @@ mod tests {
             report_type: "1".to_string(),
             frequency: FinancialFrequency::Annual,
             source_revision: source_revision.to_string(),
-            total_revenue: Some(180_000_000_000.0),
-            revenue: Some(178_000_000_000.0),
-            operating_profit: Some(120_000_000_000.0),
-            total_profit: Some(121_000_000_000.0),
-            net_profit_parent: Some(86_240_000_000.0),
-            deducted_net_profit: Some(85_000_000_000.0),
-            basic_eps: Some(68.66),
-            diluted_eps: Some(68.66),
-            roe: Some(31.2),
-            gross_margin: Some(91.4),
-            net_margin: Some(48.0),
-            revenue_yoy: Some(12.0),
-            net_profit_yoy: Some(14.0),
+            total_revenue: Some(decimal("180000000000.0000")),
+            revenue: Some(decimal("178000000000.0000")),
+            operating_profit: Some(decimal("120000000000.0000")),
+            total_profit: Some(decimal("121000000000.0000")),
+            net_profit_parent: Some(decimal("86240000000.0000")),
+            deducted_net_profit: Some(decimal("85000000000.0000")),
+            basic_eps: Some(decimal("68.660000")),
+            diluted_eps: Some(decimal("68.660000")),
+            roe: Some(decimal("31.200000")),
+            gross_margin: Some(decimal("91.400000")),
+            net_margin: Some(decimal("48.000000")),
+            revenue_yoy: Some(decimal("12.000000")),
+            net_profit_yoy: Some(decimal("14.000000")),
             raw_payload: json!({"revision": source_revision}),
             available_at: dt(2026, 3, announcement_day, 8),
             ingested_at: dt(2026, 3, announcement_day, 9),
         }
     }
 
-    fn dividend(source_revision: &str, cash_dividend: f64) -> DividendRecord {
-        let available_hour = if source_revision == "v1" { 8 } else { 9 };
+    fn dividend(source_revision: &str, cash_dividend: &str) -> DividendRecord {
+        let cash_dividend = decimal(cash_dividend);
         DividendRecord {
             source: "tushare".to_string(),
             action_key: "600519.SH-2025-final".to_string(),
@@ -648,8 +715,8 @@ mod tests {
             stock_ratio: None,
             source_revision: source_revision.to_string(),
             raw_payload: json!({"revision": source_revision}),
-            available_at: dt(2026, 3, 30, available_hour),
-            ingested_at: dt(2026, 3, 30, available_hour),
+            available_at: dt(2026, 3, 30, 8),
+            ingested_at: dt(2026, 3, 30, 8),
         }
     }
 
@@ -715,21 +782,294 @@ mod tests {
     async fn dividend_upserts_are_revision_idempotent_and_history_is_latest_first(
         pool: PgPool,
     ) -> crate::error::Result<()> {
-        let repo = CompanyRepository::new(pool);
-        let original = dividend("v1", 2.50);
-        let revision = dividend("v2", 2.76);
+        let repo = CompanyRepository::new(pool.clone());
+        sqlx::query(
+            r#"INSERT INTO corporate_action_versions
+               (source, action_key, code, action_type, available_at, ingested_at,
+                availability_quality)
+               VALUES ('tushare', '600519.SH-2025-final', '600519.SH', 'cash_dividend',
+                       $1, $1, 'observed')"#,
+        )
+        .bind(dt(2026, 3, 30, 8))
+        .execute(&pool)
+        .await?;
+
+        let original = dividend("v1", "2.50000001");
+        let revision = dividend("v2", "2.76000002");
 
         assert_eq!(
-            repo.upsert_dividends(&[original, revision.clone()]).await?,
+            repo.upsert_dividends(&[original.clone(), revision.clone()])
+                .await?,
             2
         );
         assert_eq!(repo.upsert_dividends(&[revision]).await?, 0);
 
+        let legacy_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM corporate_action_versions WHERE source = 'tushare'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        let version_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM stock_dividend_versions WHERE source = 'tushare'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(legacy_count, 1);
+        assert_eq!(version_count, 2);
+
         let page = repo.dividend_history("600519.SH", 100, None).await?;
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].record.source_revision, "v2");
-        assert_eq!(page.items[0].record.cash_dividend, Some(2.76));
+        assert_eq!(
+            page.items[0].record.cash_dividend,
+            Some(decimal("2.76000002"))
+        );
         assert_eq!(page.items[0].revision_count, 2);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn exact_financial_and_dividend_numerics_round_trip_without_float_loss(
+        pool: PgPool,
+    ) -> crate::error::Result<()> {
+        let repo = CompanyRepository::new(pool);
+        let mut report = financial_report("exact", 20);
+        report.total_revenue = Some(decimal("12345678901234567890.1234"));
+        report.roe = Some(decimal("0.123456"));
+        let record = dividend("exact", "1234567890.12345678");
+
+        repo.upsert_financial_reports(&[report]).await?;
+        repo.upsert_dividends(&[record]).await?;
+
+        let financials = repo
+            .financial_history("600519.SH", FinancialFrequency::Annual, 10, None)
+            .await?;
+        assert_eq!(
+            financials.items[0].report.total_revenue,
+            Some(decimal("12345678901234567890.1234"))
+        );
+        assert_eq!(financials.items[0].report.roe, Some(decimal("0.123456")));
+
+        let dividends = repo.dividend_history("600519.SH", 10, None).await?;
+        assert_eq!(
+            dividends.items[0].record.cash_dividend,
+            Some(decimal("1234567890.12345678"))
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn financial_replay_preserves_ingestion_audit_and_conflicts_are_immutable(
+        pool: PgPool,
+    ) -> crate::error::Result<()> {
+        let repo = CompanyRepository::new(pool.clone());
+        let original = financial_report("immutable", 20);
+        repo.upsert_financial_reports(&[original.clone()]).await?;
+
+        let mut replay = original.clone();
+        replay.ingested_at = dt(2026, 4, 1, 12);
+        assert_eq!(repo.upsert_financial_reports(&[replay]).await?, 0);
+
+        let stored_ingested_at: chrono::DateTime<Utc> = sqlx::query_scalar(
+            r#"SELECT ingested_at FROM stock_financial_report_versions
+               WHERE source = $1 AND code = $2 AND end_date = $3
+                 AND report_type = $4 AND source_revision = $5"#,
+        )
+        .bind(&original.source)
+        .bind(&original.code)
+        .bind(original.end_date)
+        .bind(&original.report_type)
+        .bind(&original.source_revision)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(stored_ingested_at, original.ingested_at);
+
+        let mut conflict = original.clone();
+        conflict.revenue = Some(decimal("177999999999.9999"));
+        let error = repo
+            .upsert_financial_reports(&[conflict])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("immutable financial revision"));
+
+        let stored_revenue: Decimal = sqlx::query_scalar(
+            r#"SELECT revenue FROM stock_financial_report_versions
+               WHERE source = $1 AND code = $2 AND end_date = $3
+                 AND report_type = $4 AND source_revision = $5"#,
+        )
+        .bind(&original.source)
+        .bind(&original.code)
+        .bind(original.end_date)
+        .bind(&original.report_type)
+        .bind(&original.source_revision)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(stored_revenue, original.revenue.unwrap());
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn dividend_replay_preserves_ingestion_audit_and_conflicts_are_immutable(
+        pool: PgPool,
+    ) -> crate::error::Result<()> {
+        let repo = CompanyRepository::new(pool.clone());
+        let original = dividend("immutable", "2.76000002");
+        repo.upsert_dividends(&[original.clone()]).await?;
+
+        let mut replay = original.clone();
+        replay.ingested_at = dt(2026, 4, 1, 12);
+        assert_eq!(repo.upsert_dividends(&[replay]).await?, 0);
+
+        let stored_ingested_at: chrono::DateTime<Utc> = sqlx::query_scalar(
+            r#"SELECT ingested_at FROM stock_dividend_versions
+               WHERE source = $1 AND action_key = $2 AND source_revision = $3"#,
+        )
+        .bind(&original.source)
+        .bind(&original.action_key)
+        .bind(&original.source_revision)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(stored_ingested_at, original.ingested_at);
+
+        let mut conflict = original.clone();
+        conflict.available_at = dt(2026, 3, 30, 9);
+        let error = repo.upsert_dividends(&[conflict]).await.unwrap_err();
+        assert!(error.to_string().contains("immutable dividend revision"));
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn immutable_conflict_rolls_back_earlier_inserts_in_the_batch(
+        pool: PgPool,
+    ) -> crate::error::Result<()> {
+        let repo = CompanyRepository::new(pool.clone());
+        let original = financial_report("existing", 20);
+        repo.upsert_financial_reports(&[original.clone()]).await?;
+
+        let mut new_revision = financial_report("new-before-conflict", 21);
+        new_revision.end_date = date(2024, 12, 31);
+        let mut conflict = original;
+        conflict.net_profit_parent = Some(decimal("1.0000"));
+
+        let error = repo
+            .upsert_financial_reports(&[new_revision, conflict])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("immutable financial revision"));
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM stock_financial_report_versions WHERE source_revision = 'new-before-conflict'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(count, 0);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn financial_latest_is_observation_first_and_ties_are_stable(
+        pool: PgPool,
+    ) -> crate::error::Result<()> {
+        let repo = CompanyRepository::new(pool);
+        let mut announced_later = financial_report("v1", 30);
+        announced_later.available_at = dt(2026, 4, 1, 8);
+        let mut correction = financial_report("v2", 10);
+        correction.available_at = dt(2026, 4, 2, 8);
+
+        let mut alpha_v1 = financial_report("v1", 20);
+        alpha_v1.source = "alpha".to_string();
+        alpha_v1.end_date = date(2024, 12, 31);
+        alpha_v1.available_at = dt(2026, 4, 3, 8);
+        let mut alpha_v2 = alpha_v1.clone();
+        alpha_v2.source_revision = "v2".to_string();
+        alpha_v2.raw_payload = json!({"revision": "v2"});
+        let mut zeta = alpha_v1.clone();
+        zeta.source = "zeta".to_string();
+        zeta.source_revision = "v9".to_string();
+
+        repo.upsert_financial_reports(&[announced_later, correction, alpha_v1, alpha_v2, zeta])
+            .await?;
+        let page = repo
+            .financial_history("600519.SH", FinancialFrequency::Annual, 10, None)
+            .await?;
+
+        assert_eq!(page.items[0].report.source_revision, "v2");
+        assert_eq!(
+            page.items[0].report.announcement_date,
+            Some(date(2026, 3, 10))
+        );
+        assert_eq!(page.items[1].report.source, "alpha");
+        assert_eq!(page.items[1].report.source_revision, "v2");
+        assert_eq!(page.items[1].revision_count, 3);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn dividend_latest_is_observation_first_and_revision_ties_are_stable(
+        pool: PgPool,
+    ) -> crate::error::Result<()> {
+        let repo = CompanyRepository::new(pool);
+        let mut announced_later = dividend("v1", "2.50000000");
+        announced_later.announcement_date = Some(date(2026, 3, 30));
+        announced_later.available_at = dt(2026, 4, 1, 8);
+        let mut correction = dividend("v2", "2.76000000");
+        correction.announcement_date = Some(date(2026, 3, 10));
+        correction.available_at = dt(2026, 4, 2, 8);
+        let mut tied = dividend("v3", "2.88000000");
+        tied.announcement_date = Some(date(2026, 3, 1));
+        tied.available_at = correction.available_at;
+
+        repo.upsert_dividends(&[announced_later, correction, tied])
+            .await?;
+        let page = repo.dividend_history("600519.SH", 10, None).await?;
+        assert_eq!(page.items[0].record.source_revision, "v3");
+        assert_eq!(
+            page.items[0].record.announcement_date,
+            Some(date(2026, 3, 1))
+        );
+        assert_eq!(page.items[0].revision_count, 3);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn dividend_cursor_keeps_same_date_and_null_date_actions(
+        pool: PgPool,
+    ) -> crate::error::Result<()> {
+        let repo = CompanyRepository::new(pool);
+        let mut records = Vec::new();
+        for suffix in ["a", "b", "c"] {
+            let mut record = dividend("v1", "1.00000001");
+            record.action_key = format!("same-date-{suffix}");
+            records.push(record);
+        }
+        for suffix in ["a", "b"] {
+            let mut record = dividend("v1", "1.00000001");
+            record.action_key = format!("null-date-{suffix}");
+            record.announcement_date = None;
+            record.record_date = None;
+            record.ex_date = None;
+            record.pay_date = None;
+            records.push(record);
+        }
+        repo.upsert_dividends(&records).await?;
+
+        let mut cursor = None;
+        let mut action_keys = Vec::new();
+        loop {
+            let page = repo.dividend_history("600519.SH", 1, cursor).await?;
+            action_keys.extend(page.items.into_iter().map(|item| item.record.action_key));
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+
+        assert_eq!(action_keys.len(), 5);
+        action_keys.sort();
+        action_keys.dedup();
+        assert_eq!(action_keys.len(), 5);
+        assert!(action_keys.contains(&"null-date-a".to_string()));
+        assert!(action_keys.contains(&"null-date-b".to_string()));
         Ok(())
     }
 
@@ -739,14 +1079,15 @@ mod tests {
     ) -> crate::error::Result<()> {
         let repo = CompanyRepository::new(pool);
 
-        repo.claim_checkpoint(
-            "financials",
-            "600519.SH",
-            Some(date(1998, 1, 1)),
-            Some(date(2026, 12, 31)),
-        )
-        .await?;
-        repo.fail_checkpoint("financials", "600519.SH", &"超".repeat(600))
+        let first_lease = repo
+            .claim_checkpoint(
+                "financials",
+                "600519.SH",
+                Some(date(1998, 1, 1)),
+                Some(date(2026, 12, 31)),
+            )
+            .await?;
+        repo.fail_checkpoint(&first_lease, &"超".repeat(600))
             .await?;
 
         let failed = repo.checkpoint("financials", "600519.SH").await?.unwrap();
@@ -754,19 +1095,115 @@ mod tests {
         assert_eq!(failed.attempts, 1);
         assert_eq!(failed.last_error.unwrap().chars().count(), 500);
 
-        repo.claim_checkpoint(
-            "financials",
-            "600519.SH",
-            Some(date(1998, 1, 1)),
-            Some(date(2026, 12, 31)),
-        )
-        .await?;
-        repo.complete_checkpoint("financials", "600519.SH").await?;
+        let second_lease = repo
+            .claim_checkpoint(
+                "financials",
+                "600519.SH",
+                Some(date(1998, 1, 1)),
+                Some(date(2026, 12, 31)),
+            )
+            .await?;
+        repo.complete_checkpoint(&second_lease).await?;
         let completed = repo.checkpoint("financials", "600519.SH").await?.unwrap();
         assert_eq!(completed.status, "completed");
         assert_eq!(completed.attempts, 2);
         assert!(completed.last_error.is_none());
         assert!(completed.completed_at.is_some());
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn checkpoint_rejects_active_stealing_stale_workers_and_missing_leases(
+        pool: PgPool,
+    ) -> crate::error::Result<()> {
+        let repo = CompanyRepository::new(pool);
+        let first = repo
+            .claim_checkpoint(
+                "dividends",
+                "600519.SH",
+                Some(date(1998, 1, 1)),
+                Some(date(2026, 12, 31)),
+            )
+            .await?;
+
+        let active_error = repo
+            .claim_checkpoint(
+                "dividends",
+                "600519.SH",
+                Some(date(1998, 1, 1)),
+                Some(date(2026, 12, 31)),
+            )
+            .await
+            .unwrap_err();
+        assert!(active_error.to_string().contains("already running"));
+
+        repo.fail_checkpoint(&first, "retry").await?;
+        let second = repo
+            .claim_checkpoint(
+                "dividends",
+                "600519.SH",
+                Some(date(1998, 1, 1)),
+                Some(date(2026, 12, 31)),
+            )
+            .await?;
+        assert_eq!(second.attempt, 2);
+
+        let stale_error = repo.complete_checkpoint(&first).await.unwrap_err();
+        assert!(stale_error
+            .to_string()
+            .contains("stale or missing checkpoint lease"));
+        repo.complete_checkpoint(&second).await?;
+
+        let missing = CheckpointLease {
+            phase: "financials".to_string(),
+            code: "missing.SH".to_string(),
+            attempt: 1,
+            token: Uuid::new_v4(),
+        };
+        let missing_error = repo.fail_checkpoint(&missing, "missing").await.unwrap_err();
+        assert!(missing_error
+            .to_string()
+            .contains("stale or missing checkpoint lease"));
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn company_schema_separates_dividend_revisions_and_guards_checkpoint_leases(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let (dividend_table, latest_index, effective_date_index, lease_column): (
+            bool,
+            bool,
+            bool,
+            bool,
+        ) = sqlx::query_as(
+            r#"SELECT to_regclass('stock_dividend_versions') IS NOT NULL,
+                      to_regclass('idx_dividend_versions_latest') IS NOT NULL,
+                      to_regclass('idx_dividend_versions_effective_date') IS NOT NULL,
+                      EXISTS (
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_name = 'company_data_repair_checkpoints'
+                          AND column_name = 'lease_token'
+                      )"#,
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert!(dividend_table);
+        assert!(latest_index);
+        assert!(effective_date_index);
+        assert!(lease_column);
+
+        let (constraint_definition,): (String,) = sqlx::query_as(
+            r#"SELECT pg_get_constraintdef(oid)
+               FROM pg_constraint
+               WHERE conname = 'company_repair_checkpoint_state_consistent'"#,
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert!(constraint_definition.contains("lease_token"));
+        assert!(constraint_definition.contains("completed_at"));
         Ok(())
     }
 }

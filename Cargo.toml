@@ -12,7 +12,7 @@ tokio = { version = "1", features = ["full"] }
 axum = { version = "0.7", features = ["json"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
-sqlx = { version = "0.7", features = ["runtime-tokio-native-tls", "postgres", "chrono", "uuid", "json", "migrate"] }
+sqlx = { version = "0.7", features = ["runtime-tokio-native-tls", "postgres", "chrono", "uuid", "json", "migrate", "rust_decimal"] }
 redis = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
 reqwest = { version = "0.11", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
@@ -32,6 +32,7 @@ argon2 = "0.5"
 base64 = "0.22"
 hmac = "0.12"
 rand = "0.8"
+rust_decimal = { version = "1.26.1", features = ["serde"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
