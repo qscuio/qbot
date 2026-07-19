@@ -159,3 +159,15 @@ test("browser back and forward restore scan and stock pages", async ({ page }) =
   await page.goForward();
   await expect(page).toHaveURL(/#stock\/000001$/);
 });
+
+test("stale stock links return to the scan without showing a chart error", async ({ page }) => {
+  const stockRequests = [];
+  await mockApi(page, true, bootstrap.results[0].hits, stockRequests);
+
+  await page.goto("/dashboard/#stock/000618.SZ");
+
+  await expect(page).toHaveURL(/#scan$/);
+  await expect(page.getByRole("heading", { name: "Latest scan" })).toBeVisible();
+  await expect(page.getByText("Chart unavailable")).toHaveCount(0);
+  expect(stockRequests).toEqual([]);
+});

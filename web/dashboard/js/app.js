@@ -1,5 +1,5 @@
-import { dashboardApi, ApiError } from "./api.js?v=20260718.5";
-import { activitySeries, mountChart } from "./chart.js?v=20260718.5";
+import { dashboardApi, ApiError } from "./api.js?v=20260719.1";
+import { activitySeries, mountChart } from "./chart.js?v=20260719.1";
 import {
   applyFilters,
   closeTab,
@@ -8,7 +8,7 @@ import {
   openStockTab,
   sortRows,
   updateTab,
-} from "./state.js?v=20260718.5";
+} from "./state.js?v=20260719.1";
 
 const app = document.querySelector("#app");
 let bootstrap = null;
@@ -263,7 +263,13 @@ function pushRoute(route) {
 }
 
 function openStock(code, { updateHistory = true } = {}) {
-  const row = rows.find((item) => item.code === code) || { code, name: code };
+  const row = rows.find((item) => item.code === code);
+  if (!row) {
+    workspace = { ...workspace, activeTab: "scan" };
+    if (location.hash !== "#scan") history.replaceState(null, "", "#scan");
+    renderWorkspace();
+    return;
+  }
   workspace = openStockTab(workspace, row);
   if (updateHistory) pushRoute(stockRoute(code));
   renderWorkspace();

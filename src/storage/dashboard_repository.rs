@@ -93,10 +93,12 @@ impl DashboardRepository {
 
     pub async fn scan_hits(&self, run_id: Uuid) -> Result<Vec<ScanHitRow>> {
         Ok(sqlx::query_as::<_, ScanHitRow>(
-            r#"SELECT code, COALESCE(name, code) AS name, signal_id, metadata
-               FROM scan_results
-               WHERE run_id = $1
-               ORDER BY code, signal_id"#,
+            r#"SELECT sr.code, COALESCE(si.name, sr.name, sr.code) AS name,
+                      sr.signal_id, sr.metadata
+               FROM scan_results sr
+               JOIN stock_info si ON si.code = sr.code
+               WHERE sr.run_id = $1
+               ORDER BY sr.code, sr.signal_id"#,
         )
         .bind(run_id)
         .fetch_all(&self.pool)
@@ -140,5 +142,34 @@ mod tests {
                 .unwrap();
         assert_eq!(failure.0, "failed");
         assert_eq!(failure.1.unwrap().chars().count(), 500);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn dashboard_scan_hits_hide_codes_missing_from_current_stock_master(pool: PgPool) {
+        let run_id = Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO stock_info (code, name, market)
+               VALUES ('000001.SZ', '平安银行', 'SZ')"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"INSERT INTO scan_results (run_id, code, name, signal_id, metadata)
+               VALUES
+               ($1, '000001.SZ', '平安银行', 'ma_bullish', '{}'),
+               ($1, '000618.SZ', '000618.SZ', 'ma_bullish', '{}')"#,
+        )
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let repo = DashboardRepository::new(pool);
+
+        let hits = repo.scan_hits(run_id).await.unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].code, "000001.SZ");
+        assert_eq!(hits[0].name, "平安银行");
     }
 }
