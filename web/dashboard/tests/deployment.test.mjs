@@ -192,7 +192,7 @@ test("dashboard HTML is fresh while versioned assets can be cached", async () =>
 
   assert.equal(versions.length, 7);
   assert.equal(new Set(versions).size, 1);
-  assert.equal(versions[0], "20260719.5");
+  assert.equal(versions[0], "20260719.6");
   assert.match(config, /set \$dashboard_cache_control "no-store";/);
   assert.match(
     config,
@@ -260,6 +260,7 @@ test("deployment atomically replaces a binary without disturbing its old running
 
 test("deployment launches one detached resumable company repair after health", async () => {
   const workflow = await readFile("../../.github/workflows/deploy.yml", "utf8");
+  const main = await readFile("../../src/main.rs", "utf8");
   const healthCheck = workflow.indexOf("- name: Health check");
   const repairStart = workflow.indexOf("- name: Start company intelligence repair");
   const nextStep = workflow.indexOf("\n      - name:", repairStart + 1);
@@ -279,6 +280,10 @@ test("deployment launches one detached resumable company repair after health", a
   assert.match(repair, /--unit="\$unit"/);
   assert.match(repair, /unit="qbot-company-intelligence-repair"/);
   assert.match(repair, /--property=Type=exec/);
+  assert.match(
+    repair,
+    /--description="QBot resumable company intelligence benchmark and chip backfill"/,
+  );
   assert.match(repair, /--property=EnvironmentFile=\/opt\/qbot\/\.env/);
   assert.match(repair, /--property="User=\$service_user"/);
   assert.match(repair, /--property=UMask=0077/);
@@ -294,6 +299,12 @@ test("deployment launches one detached resumable company repair after health", a
   assert.match(repair, /journalctl -u "\$unit"/);
   assert.doesNotMatch(repair, /--wait/);
   assert.doesNotMatch(repair, /github\.run_(?:id|attempt)/);
+  assert.match(
+    main,
+    /run_company_intelligence_repair\([\s\S]*?run_chip_benchmark\(\)[\s\S]*?backfill_chips\(\)/,
+  );
+  assert.match(main, /chip_benchmark:/);
+  assert.match(main, /chip_backfill:/);
 });
 
 test("an already-running company repair is skipped without a duplicate launch", async () => {

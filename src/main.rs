@@ -426,11 +426,12 @@ async fn main() -> Result<()> {
     }
 
     if state.config.enable_chip_dist {
-        let chip_dist = services::chip_dist::ChipDistService::new(state.clone());
+        let chip_pool = state.db.clone();
+        let chip_provider = tushare_client.clone();
         tokio::spawn(async move {
-            chip_dist.run_daily_update_loop().await;
+            services::chip_dist::run_validated_daily_update_loop(chip_pool, chip_provider).await;
         });
-        info!("Chip distribution loop started");
+        info!("Validated company/chip update loop scheduled for 18:00 Beijing");
     }
 
     if state.config.enable_ai_analysis {

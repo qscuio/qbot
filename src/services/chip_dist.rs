@@ -1,19 +1,138 @@
-use chrono::{Datelike, NaiveDate, Timelike};
+use chrono::{DateTime, FixedOffset, NaiveDate, Timelike};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::PgPool;
 use std::collections::HashSet;
+use std::future::Future;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+use crate::data::chip::OfficialChipProvider;
+use crate::data::company::CompanyDataProvider;
 use crate::error::Result;
 use crate::market_time::{beijing_now, beijing_today};
+use crate::services::company_intelligence::CompanyIntelligenceService;
 use crate::state::AppState;
 use crate::storage::postgres;
 
 const DEFAULT_LOOKBACK_DAYS: i64 = 120;
 const NUM_BUCKETS: usize = 30;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UpdateDecision {
+    Wait,
+    Run,
+    Retry,
+    StopForDay,
+}
+
+pub fn next_chip_update_attempt(
+    now: DateTime<FixedOffset>,
+    expected_date: NaiveDate,
+    observed_date: Option<NaiveDate>,
+    attempts: usize,
+) -> UpdateDecision {
+    if observed_date.is_some_and(|observed| observed >= expected_date) || attempts >= 5 {
+        return UpdateDecision::StopForDay;
+    }
+
+    let minutes = now.hour() * 60 + now.minute();
+    if minutes < 18 * 60 {
+        return UpdateDecision::Wait;
+    }
+    if minutes > 20 * 60 {
+        return UpdateDecision::StopForDay;
+    }
+    if attempts == 0 {
+        return UpdateDecision::Run;
+    }
+    if matches!(minutes, 1110 | 1140 | 1170 | 1200) {
+        UpdateDecision::Retry
+    } else {
+        UpdateDecision::Wait
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct ChipUpdateController {
+    beijing_date: Option<NaiveDate>,
+    attempts: usize,
+    executed_slots: HashSet<u32>,
+}
+
+impl ChipUpdateController {
+    pub fn decision(
+        &mut self,
+        now: DateTime<FixedOffset>,
+        expected_date: NaiveDate,
+        observed_date: Option<NaiveDate>,
+    ) -> UpdateDecision {
+        self.reset_for(now.date_naive());
+        let slot = now.hour() * 60 + now.minute();
+        let decision = next_chip_update_attempt(now, expected_date, observed_date, self.attempts);
+        if matches!(decision, UpdateDecision::Run | UpdateDecision::Retry)
+            && self.executed_slots.contains(&slot)
+        {
+            UpdateDecision::Wait
+        } else {
+            decision
+        }
+    }
+
+    pub fn record_attempt(&mut self, now: DateTime<FixedOffset>) {
+        self.reset_for(now.date_naive());
+        self.executed_slots.insert(now.hour() * 60 + now.minute());
+        self.attempts += 1;
+    }
+
+    pub fn attempts(&self) -> usize {
+        self.attempts
+    }
+
+    fn reset_for(&mut self, date: NaiveDate) {
+        if self.beijing_date != Some(date) {
+            self.beijing_date = Some(date);
+            self.attempts = 0;
+            self.executed_slots.clear();
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct DailyCategoryAttemptReport<C, K> {
+    pub company: Option<C>,
+    pub company_error: Option<String>,
+    pub chips: Option<K>,
+    pub chip_error: Option<String>,
+}
+
+pub async fn run_daily_category_attempt<Company, CompanyFuture, Chip, ChipFuture, C, K, CE, KE>(
+    company: Company,
+    chips: Chip,
+) -> DailyCategoryAttemptReport<C, K>
+where
+    Company: FnOnce() -> CompanyFuture,
+    CompanyFuture: Future<Output = std::result::Result<C, CE>>,
+    Chip: FnOnce() -> ChipFuture,
+    ChipFuture: Future<Output = std::result::Result<K, KE>>,
+    CE: std::fmt::Display,
+    KE: std::fmt::Display,
+{
+    let (company, company_error) = match company().await {
+        Ok(report) => (Some(report), None),
+        Err(error) => (None, Some(error.to_string())),
+    };
+    let (chips, chip_error) = match chips().await {
+        Ok(report) => (Some(report), None),
+        Err(error) => (None, Some(error.to_string())),
+    };
+    DailyCategoryAttemptReport {
+        company,
+        company_error,
+        chips,
+        chip_error,
+    }
+}
 
 #[derive(Debug, Clone)]
 struct BarPoint {
@@ -144,6 +263,134 @@ mod coexistence_tests {
     }
 }
 
+#[cfg(test)]
+mod schedule_tests {
+    use chrono::{NaiveDate, TimeZone};
+
+    use super::{
+        next_chip_update_attempt, run_daily_category_attempt, ChipUpdateController, UpdateDecision,
+    };
+    use crate::market_time::beijing_tz;
+
+    fn date(day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 7, day).unwrap()
+    }
+
+    fn bj(day: u32, hour: u32, minute: u32) -> chrono::DateTime<chrono::FixedOffset> {
+        beijing_tz()
+            .with_ymd_and_hms(2026, 7, day, hour, minute, 0)
+            .unwrap()
+    }
+
+    #[test]
+    fn daily_chip_schedule_honors_all_boundaries() {
+        let today = date(20);
+        let yesterday = date(19);
+
+        assert_eq!(
+            next_chip_update_attempt(bj(20, 17, 59), today, None, 0),
+            UpdateDecision::Wait
+        );
+        assert_eq!(
+            next_chip_update_attempt(bj(20, 18, 0), today, None, 0),
+            UpdateDecision::Run
+        );
+        assert_eq!(
+            next_chip_update_attempt(bj(20, 18, 29), today, Some(yesterday), 1),
+            UpdateDecision::Wait
+        );
+        assert_eq!(
+            next_chip_update_attempt(bj(20, 18, 30), today, Some(yesterday), 1),
+            UpdateDecision::Retry
+        );
+        assert_eq!(
+            next_chip_update_attempt(bj(20, 19, 0), today, None, 2),
+            UpdateDecision::Retry
+        );
+        assert_eq!(
+            next_chip_update_attempt(bj(20, 19, 30), today, None, 3),
+            UpdateDecision::Retry
+        );
+        assert_eq!(
+            next_chip_update_attempt(bj(20, 20, 0), today, Some(yesterday), 4),
+            UpdateDecision::Retry
+        );
+        assert_eq!(
+            next_chip_update_attempt(bj(20, 20, 1), today, Some(yesterday), 4),
+            UpdateDecision::StopForDay
+        );
+    }
+
+    #[test]
+    fn daily_chip_schedule_stops_after_success_or_attempt_cap() {
+        let today = date(20);
+
+        assert_eq!(
+            next_chip_update_attempt(bj(20, 18, 30), today, Some(today), 1),
+            UpdateDecision::StopForDay
+        );
+        assert_eq!(
+            next_chip_update_attempt(bj(20, 18, 30), today, Some(date(21)), 1),
+            UpdateDecision::StopForDay
+        );
+        assert_eq!(
+            next_chip_update_attempt(bj(20, 20, 0), today, None, 5),
+            UpdateDecision::StopForDay
+        );
+    }
+
+    #[test]
+    fn controller_does_not_execute_twice_in_one_slot_and_resets_next_day() {
+        let mut controller = ChipUpdateController::default();
+        let expected = date(20);
+
+        assert_eq!(
+            controller.decision(bj(20, 18, 0), expected, None),
+            UpdateDecision::Run
+        );
+        controller.record_attempt(bj(20, 18, 0));
+        assert_eq!(
+            controller.decision(bj(20, 18, 0), expected, None),
+            UpdateDecision::Wait
+        );
+        assert_eq!(
+            controller.decision(bj(20, 18, 30), expected, None),
+            UpdateDecision::Retry
+        );
+        controller.record_attempt(bj(20, 18, 30));
+
+        assert_eq!(
+            controller.decision(bj(21, 18, 0), date(21), None),
+            UpdateDecision::Run
+        );
+        assert_eq!(controller.attempts(), 0);
+    }
+
+    #[tokio::test]
+    async fn daily_categories_run_independently_when_company_update_fails() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let company_calls = calls.clone();
+        let chip_calls = calls.clone();
+
+        let report = run_daily_category_attempt(
+            || async move {
+                company_calls.lock().unwrap().push("company");
+                Err::<(), _>("financial failure")
+            },
+            || async move {
+                chip_calls.lock().unwrap().push("chips");
+                Ok::<_, &str>(date(20))
+            },
+        )
+        .await;
+
+        assert_eq!(*calls.lock().unwrap(), vec!["company", "chips"]);
+        assert_eq!(report.company_error.as_deref(), Some("financial failure"));
+        assert_eq!(report.chips, Some(date(20)));
+        assert!(report.chip_error.is_none());
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChipBucket {
     pub price: f64,
@@ -168,15 +415,11 @@ pub struct ChipDistributionResult {
 
 pub struct ChipDistService {
     state: Arc<AppState>,
-    update_lock: Arc<Mutex<()>>,
 }
 
 impl ChipDistService {
     pub fn new(state: Arc<AppState>) -> Self {
-        Self {
-            state,
-            update_lock: Arc::new(Mutex::new(())),
-        }
+        Self { state }
     }
 
     pub async fn get_chip_distribution(
@@ -427,75 +670,72 @@ impl ChipDistService {
             concentration: (concentration * 10.0).round() / 10.0,
         }))
     }
+}
 
-    pub async fn update_all_stocks(&self, target_date: Option<NaiveDate>) -> Result<usize> {
-        let _guard = match self.update_lock.try_lock() {
-            Ok(g) => g,
-            Err(_) => {
-                info!("chip distribution update is already running; skipping");
-                return Ok(0);
-            }
-        };
+pub async fn run_validated_daily_update_loop<P>(pool: PgPool, provider: Arc<P>)
+where
+    P: CompanyDataProvider + OfficialChipProvider + 'static,
+{
+    let mut controller = ChipUpdateController::default();
+    let mut controller_date = None;
+    let mut expected_date = None;
+    let mut observed_date = None;
 
-        let date = target_date.unwrap_or_else(beijing_today);
-        let codes: Vec<(String,)> = sqlx::query_as(
-            r#"SELECT DISTINCT code
-               FROM stock_daily_bars
-               WHERE trade_date <= $1
-               ORDER BY code"#,
-        )
-        .bind(date)
-        .fetch_all(&self.state.db)
-        .await?;
-
-        let mut updated = 0usize;
-        for (idx, (code,)) in codes.iter().enumerate() {
-            match self.calculate_chip_distribution(code, date).await? {
-                Some(dist) => {
-                    self.save_chip_distribution(&dist, date).await?;
-                    updated += 1;
-                }
-                None => {}
-            }
-
-            if idx > 0 && idx % 200 == 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
+    loop {
+        let now = beijing_now();
+        if controller_date != Some(now.date_naive()) {
+            controller_date = Some(now.date_naive());
+            expected_date = None;
+            observed_date = None;
         }
 
-        info!(
-            "chip distribution update finished for {}: {}/{}",
-            date,
-            updated,
-            codes.len()
-        );
-        Ok(updated)
-    }
-
-    pub async fn run_daily_update_loop(&self) {
-        let mut triggered_today: HashSet<String> = HashSet::new();
-
-        loop {
-            let now = beijing_now();
-            let date_key = now.format("%Y-%m-%d").to_string();
-
-            if now.hour() == 0 && now.minute() == 0 {
-                triggered_today.clear();
-            }
-
-            if now.weekday().number_from_monday() <= 5
-                && now.hour() == 15
-                && now.minute() == 30
-                && !triggered_today.contains(&date_key)
-            {
-                triggered_today.insert(date_key);
-                if let Err(e) = self.update_all_stocks(Some(beijing_today())).await {
-                    warn!("chip daily update failed: {}", e);
+        let scheduling_date = expected_date.unwrap_or(NaiveDate::MIN);
+        match controller.decision(now, scheduling_date, observed_date) {
+            UpdateDecision::Run | UpdateDecision::Retry => {
+                controller.record_attempt(now);
+                let service = CompanyIntelligenceService::new_at(
+                    pool.clone(),
+                    provider.clone(),
+                    now.date_naive(),
+                );
+                let attempt = run_daily_category_attempt(
+                    || service.update_latest(),
+                    || service.update_daily_chips(),
+                )
+                .await;
+                if let Some(report) = attempt.company {
+                    info!(
+                        "18:00 company update: financials={:?}, dividends={:?}",
+                        report.financials, report.dividends
+                    );
+                }
+                if let Some(error) = attempt.company_error {
+                    warn!("18:00 company update incomplete: {error}");
+                }
+                if let Some(report) = attempt.chips {
+                    expected_date = report.expected_date;
+                    observed_date = report.observed_date;
+                    info!(
+                        "18:00 canonical chip update: expected={:?}, observed={:?}, completed={}, failed={}, pending={}, snapshots={}",
+                        report.expected_date,
+                        report.observed_date,
+                        report.completed,
+                        report.failed,
+                        report.pending,
+                        report.snapshots
+                    );
+                    for error in report.errors {
+                        warn!("canonical chip update detail: {error}");
+                    }
+                }
+                if let Some(error) = attempt.chip_error {
+                    warn!("18:00 canonical chip update failed: {error}");
                 }
             }
-
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            UpdateDecision::Wait | UpdateDecision::StopForDay => {}
         }
+
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
     }
 }
 
