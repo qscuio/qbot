@@ -13,6 +13,7 @@ mod telegram;
 
 use crate::data::provider::DataProvider;
 use anyhow::Result;
+use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -25,6 +26,77 @@ fn repair_daily_bars_requested(args: impl IntoIterator<Item = String>) -> bool {
     args.into_iter().any(|arg| arg == "--repair-daily-bars")
 }
 
+fn repair_company_intelligence_requested(args: impl IntoIterator<Item = String>) -> bool {
+    args.into_iter()
+        .any(|arg| arg == "--repair-company-intelligence")
+}
+
+async fn run_company_intelligence_repair<Financials, FinancialFuture, Dividends, DividendFuture>(
+    financials: Financials,
+    dividends: Dividends,
+) -> Result<()>
+where
+    Financials: FnOnce() -> FinancialFuture,
+    FinancialFuture:
+        Future<Output = crate::error::Result<services::company_intelligence::CompanySyncReport>>,
+    Dividends: FnOnce() -> DividendFuture,
+    DividendFuture:
+        Future<Output = crate::error::Result<services::company_intelligence::CompanySyncReport>>,
+{
+    let financials = financials().await;
+    let financial_error = match financials {
+        Ok(report) => {
+            info!(
+                "Company financial repair finished: completed={}, failed={}, pending={}",
+                report.completed, report.failed, report.pending
+            );
+            (report.failed > 0 || report.pending > 0).then(|| {
+                format!(
+                    "financial repair incomplete: completed={}, failed={}, pending={}",
+                    report.completed, report.failed, report.pending
+                )
+            })
+        }
+        Err(error) => {
+            warn!("Company financial repair failed: {}", error);
+            Some(error.to_string())
+        }
+    };
+
+    let dividends = dividends().await;
+    let dividend_error = match dividends {
+        Ok(report) => {
+            info!(
+                "Company dividend repair finished: completed={}, failed={}, pending={}",
+                report.completed, report.failed, report.pending
+            );
+            (report.failed > 0 || report.pending > 0).then(|| {
+                format!(
+                    "dividend repair incomplete: completed={}, failed={}, pending={}",
+                    report.completed, report.failed, report.pending
+                )
+            })
+        }
+        Err(error) => {
+            warn!("Company dividend repair failed: {}", error);
+            Some(error.to_string())
+        }
+    };
+
+    match (financial_error, dividend_error) {
+        (None, None) => Ok(()),
+        (Some(financial_error), None) => {
+            anyhow::bail!("company intelligence repair failed: {financial_error}")
+        }
+        (None, Some(dividend_error)) => {
+            anyhow::bail!("company intelligence repair failed: {dividend_error}")
+        }
+        (Some(financial_error), Some(dividend_error)) => anyhow::bail!(
+            "company intelligence repair failed: financials: {financial_error}; dividends: {dividend_error}"
+        ),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -34,7 +106,9 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let repair_daily_bars = repair_daily_bars_requested(std::env::args());
+    let args = std::env::args().collect::<Vec<_>>();
+    let repair_daily_bars = repair_daily_bars_requested(args.iter().cloned());
+    let repair_company_intelligence = repair_company_intelligence_requested(args.iter().cloned());
     info!("qbot starting...");
 
     let config = config::Config::from_env()?;
@@ -64,6 +138,7 @@ async fn main() -> Result<()> {
     ));
     let tushare_provider: Arc<dyn DataProvider> = tushare_client.clone();
     let repair_provider = tushare_provider.clone();
+    let company_repair_provider = tushare_client.clone();
     let point_in_time_provider: Arc<dyn data::point_in_time_provider::PointInTimeDataProvider> =
         tushare_client.clone();
     let eastmoney_provider: Arc<dyn DataProvider> = Arc::new(
@@ -124,7 +199,7 @@ async fn main() -> Result<()> {
         ("dbcheck", "检查数据库"),
         ("dbsync", "同步今日数据"),
     ];
-    if !repair_daily_bars {
+    if !repair_daily_bars && !repair_company_intelligence {
         match pusher.set_my_commands(&bot_commands).await {
             Ok(_) => info!("Telegram bot commands registered"),
             Err(e) => warn!("Telegram setMyCommands failed: {}", e),
@@ -162,6 +237,19 @@ async fn main() -> Result<()> {
                 report.remaining_rows
             );
         }
+        return Ok(());
+    }
+
+    if repair_company_intelligence {
+        let service = services::company_intelligence::CompanyIntelligenceService::new(
+            state.db.clone(),
+            company_repair_provider,
+        );
+        run_company_intelligence_repair(
+            || service.backfill_financials(),
+            || service.backfill_dividends(),
+        )
+        .await?;
         return Ok(());
     }
 
@@ -326,7 +414,13 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{api_bind_addr, repair_daily_bars_requested};
+    use super::{
+        api_bind_addr, repair_company_intelligence_requested, repair_daily_bars_requested,
+        run_company_intelligence_repair,
+    };
+    use crate::error::AppError;
+    use crate::services::company_intelligence::CompanySyncReport;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn api_listener_is_loopback_only() {
@@ -346,5 +440,41 @@ mod tests {
             "qbot".to_string(),
             "--run-now".to_string(),
         ]));
+    }
+
+    #[test]
+    fn company_intelligence_repair_only_activates_for_explicit_flag() {
+        assert!(repair_company_intelligence_requested(
+            ["qbot", "--repair-company-intelligence"].map(str::to_string)
+        ));
+        assert!(!repair_company_intelligence_requested(
+            ["qbot", "--repair-daily-bars"].map(str::to_string)
+        ));
+    }
+
+    #[tokio::test]
+    async fn company_repair_attempts_dividends_after_financial_failure() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let financial_calls = calls.clone();
+        let dividend_calls = calls.clone();
+
+        let result = run_company_intelligence_repair(
+            move || async move {
+                financial_calls.lock().unwrap().push("financials");
+                Err(AppError::DataProvider("financial failure".to_string()))
+            },
+            move || async move {
+                dividend_calls.lock().unwrap().push("dividends");
+                Ok(CompanySyncReport {
+                    completed: 1,
+                    failed: 0,
+                    pending: 0,
+                })
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(*calls.lock().unwrap(), vec!["financials", "dividends"]);
     }
 }
