@@ -1,7 +1,8 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
+use crate::data::types::Candle;
 use crate::error::Result;
 
 #[derive(Debug, Clone, FromRow)]
@@ -21,6 +22,37 @@ pub struct ScanRunRow {
     pub stocks_checked: i32,
     pub hit_count: i32,
     pub error_summary: Option<String>,
+}
+
+#[derive(Debug, FromRow)]
+struct WeeklyCandleRow {
+    trade_date: NaiveDate,
+    open: Option<f64>,
+    high: Option<f64>,
+    low: Option<f64>,
+    close: Option<f64>,
+    volume: Option<i64>,
+    amount: Option<f64>,
+    turnover: Option<f64>,
+    pe: Option<f64>,
+    pb: Option<f64>,
+}
+
+impl From<WeeklyCandleRow> for Candle {
+    fn from(row: WeeklyCandleRow) -> Self {
+        Self {
+            trade_date: row.trade_date,
+            open: row.open.unwrap_or(0.0),
+            high: row.high.unwrap_or(0.0),
+            low: row.low.unwrap_or(0.0),
+            close: row.close.unwrap_or(0.0),
+            volume: row.volume.unwrap_or(0),
+            amount: row.amount.unwrap_or(0.0),
+            turnover: row.turnover,
+            pe: row.pe,
+            pb: row.pb,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -104,6 +136,32 @@ impl DashboardRepository {
         .fetch_all(&self.pool)
         .await?)
     }
+
+    pub async fn weekly_history(&self, code: &str) -> Result<Vec<Candle>> {
+        let rows = sqlx::query_as::<_, WeeklyCandleRow>(
+            r#"SELECT MAX(trade_date) AS trade_date,
+                      (ARRAY_AGG(open::float8 ORDER BY trade_date))[1] AS open,
+                      MAX(high)::float8 AS high,
+                      MIN(low)::float8 AS low,
+                      (ARRAY_AGG(close::float8 ORDER BY trade_date DESC))[1] AS close,
+                      SUM(volume)::int8 AS volume,
+                      SUM(amount)::float8 AS amount,
+                      (ARRAY_AGG(turnover::float8 ORDER BY trade_date DESC)
+                         FILTER (WHERE turnover IS NOT NULL))[1] AS turnover,
+                      (ARRAY_AGG(pe::float8 ORDER BY trade_date DESC)
+                         FILTER (WHERE pe IS NOT NULL))[1] AS pe,
+                      (ARRAY_AGG(pb::float8 ORDER BY trade_date DESC)
+                         FILTER (WHERE pb IS NOT NULL))[1] AS pb
+               FROM stock_daily_bars
+               WHERE code = $1
+               GROUP BY date_trunc('week', trade_date)
+               ORDER BY trade_date"#,
+        )
+        .bind(code)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
 }
 
 #[cfg(test)]
@@ -111,6 +169,10 @@ mod tests {
     use super::*;
     use sqlx::PgPool;
     use uuid::Uuid;
+
+    fn date(year: i32, month: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(year, month, day).unwrap()
+    }
 
     #[sqlx::test(migrations = "./migrations")]
     async fn scan_run_lifecycle_persists_zero_hit_completion(pool: PgPool) {
@@ -171,5 +233,55 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].code, "000001.SZ");
         assert_eq!(hits[0].name, "平安银行");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn weekly_history_aggregates_every_stored_daily_bar(pool: PgPool) {
+        sqlx::query(
+            r#"INSERT INTO stock_daily_bars
+               (code, trade_date, open, high, low, close, volume, amount, turnover, pe, pb)
+               SELECT '600519.SH', trade_date, 10, 11, 9, 10.5, 100, 1000, 1, 10, 1
+               FROM (
+                   SELECT stored_day::date AS trade_date
+                   FROM generate_series('2024-01-01'::date, '2025-12-31'::date, '1 day') stored_day
+                   WHERE EXTRACT(ISODOW FROM stored_day) <= 5
+                   ORDER BY stored_day
+                   LIMIT 501
+               ) stored_days"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"INSERT INTO stock_daily_bars
+               (code, trade_date, open, high, low, close, volume, amount, turnover, pe, pb)
+               VALUES
+               ('600519.SH', '2026-01-05', 100, 110, 95, 105, 100, 1000, 1, NULL, 1),
+               ('600519.SH', '2026-01-06', 105, 115, 100, 110, 200, 2000, NULL, 20, NULL),
+               ('600519.SH', '2026-01-07', 110, 120, 90, 115, 300, 3000, 3, NULL, 3)"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let weekly = DashboardRepository::new(pool)
+            .weekly_history("600519.SH")
+            .await
+            .unwrap();
+
+        assert!(weekly.len() > 100);
+        assert_eq!(weekly.first().unwrap().trade_date, date(2024, 1, 5));
+
+        let final_week = weekly.last().unwrap();
+        assert_eq!(final_week.trade_date, date(2026, 1, 7));
+        assert_eq!(final_week.open, 100.0);
+        assert_eq!(final_week.high, 120.0);
+        assert_eq!(final_week.low, 90.0);
+        assert_eq!(final_week.close, 115.0);
+        assert_eq!(final_week.volume, 600);
+        assert_eq!(final_week.amount, 6_000.0);
+        assert_eq!(final_week.turnover, Some(3.0));
+        assert_eq!(final_week.pe, Some(20.0));
+        assert_eq!(final_week.pb, Some(3.0));
     }
 }
