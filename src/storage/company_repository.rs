@@ -1,7 +1,7 @@
 use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use serde_json::Value;
-use sqlx::{FromRow, PgPool};
+use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -77,6 +77,12 @@ pub enum CheckpointClaimOutcome {
     Claimed(CheckpointLease),
     Completed,
     Busy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointClaimPolicy {
+    Resume,
+    RefreshCompletedBefore(DateTime<Utc>),
 }
 
 #[derive(Debug, FromRow)]
@@ -219,151 +225,42 @@ impl CompanyRepository {
 
     pub async fn upsert_financial_reports(&self, reports: &[FinancialReport]) -> Result<usize> {
         let mut transaction = self.pool.begin().await?;
-        let mut inserted = 0;
-
-        for report in reports {
-            let available_at = postgres_timestamp(report.available_at);
-            let ingested_at = postgres_timestamp(report.ingested_at);
-            let rows_affected = sqlx::query(
-                r#"INSERT INTO stock_financial_report_versions
-                   (source, code, end_date, announcement_date, report_type, frequency,
-                    source_revision, total_revenue, revenue, operating_profit, total_profit,
-                    net_profit_parent, deducted_net_profit, basic_eps, diluted_eps, roe,
-                    gross_margin, net_margin, revenue_yoy, net_profit_yoy, raw_payload,
-                    available_at, ingested_at)
-                   VALUES
-                   ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-                    $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
-                   ON CONFLICT (source, code, end_date, report_type, source_revision)
-                   DO NOTHING"#,
-            )
-            .bind(&report.source)
-            .bind(&report.code)
-            .bind(report.end_date)
-            .bind(report.announcement_date)
-            .bind(&report.report_type)
-            .bind(report.frequency.as_str())
-            .bind(&report.source_revision)
-            .bind(report.total_revenue)
-            .bind(report.revenue)
-            .bind(report.operating_profit)
-            .bind(report.total_profit)
-            .bind(report.net_profit_parent)
-            .bind(report.deducted_net_profit)
-            .bind(report.basic_eps)
-            .bind(report.diluted_eps)
-            .bind(report.roe)
-            .bind(report.gross_margin)
-            .bind(report.net_margin)
-            .bind(report.revenue_yoy)
-            .bind(report.net_profit_yoy)
-            .bind(&report.raw_payload)
-            .bind(available_at)
-            .bind(ingested_at)
-            .execute(&mut *transaction)
-            .await?
-            .rows_affected();
-
-            if rows_affected == 1 {
-                inserted += 1;
-                continue;
-            }
-
-            let stored = sqlx::query_as::<_, StoredFinancialRevision>(
-                r#"SELECT announcement_date, frequency, total_revenue, revenue,
-                          operating_profit, total_profit, net_profit_parent,
-                          deducted_net_profit, basic_eps, diluted_eps, roe,
-                          gross_margin, net_margin, revenue_yoy, net_profit_yoy,
-                          raw_payload, available_at
-                   FROM stock_financial_report_versions
-                   WHERE source = $1 AND code = $2 AND end_date = $3
-                     AND report_type = $4 AND source_revision = $5"#,
-            )
-            .bind(&report.source)
-            .bind(&report.code)
-            .bind(report.end_date)
-            .bind(&report.report_type)
-            .bind(&report.source_revision)
-            .fetch_optional(&mut *transaction)
-            .await?;
-
-            if !stored.is_some_and(|row| row.matches(report, available_at)) {
-                return Err(AppError::BadRequest(format!(
-                    "immutable financial revision conflicts with stored history: {}/{}/{}/{}/{}",
-                    report.source,
-                    report.code,
-                    report.end_date,
-                    report.report_type,
-                    report.source_revision
-                )));
-            }
-        }
-
+        let inserted = upsert_financial_reports_in_tx(&mut transaction, reports).await?;
         transaction.commit().await?;
         Ok(inserted)
     }
 
     pub async fn upsert_dividends(&self, records: &[DividendRecord]) -> Result<usize> {
         let mut transaction = self.pool.begin().await?;
-        let mut inserted = 0;
+        let inserted = upsert_dividends_in_tx(&mut transaction, records).await?;
+        transaction.commit().await?;
+        Ok(inserted)
+    }
 
-        for record in records {
-            let available_at = postgres_timestamp(record.available_at);
-            let ingested_at = postgres_timestamp(record.ingested_at);
-            let rows_affected = sqlx::query(
-                r#"INSERT INTO stock_dividend_versions
-                   (source, action_key, code, announcement_date, record_date, ex_date,
-                    pay_date, implementation_status, cash_dividend, cash_dividend_tax,
-                    stock_ratio, source_revision, raw_payload, available_at, ingested_at)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                           $13, $14, $15)
-                   ON CONFLICT (source, action_key, source_revision) DO NOTHING"#,
-            )
-            .bind(&record.source)
-            .bind(&record.action_key)
-            .bind(&record.code)
-            .bind(record.announcement_date)
-            .bind(record.record_date)
-            .bind(record.ex_date)
-            .bind(record.pay_date)
-            .bind(&record.implementation_status)
-            .bind(record.cash_dividend)
-            .bind(record.cash_dividend_tax)
-            .bind(record.stock_ratio)
-            .bind(&record.source_revision)
-            .bind(&record.raw_payload)
-            .bind(available_at)
-            .bind(ingested_at)
-            .execute(&mut *transaction)
-            .await?
-            .rows_affected();
+    pub async fn persist_financial_reports_and_complete_window(
+        &self,
+        lease: &CheckpointLease,
+        reports: &[FinancialReport],
+        lease_ttl: Duration,
+    ) -> Result<usize> {
+        let mut transaction = self.pool.begin().await?;
+        fence_checkpoint_in_tx(&mut transaction, lease, lease_ttl).await?;
+        let inserted = upsert_financial_reports_in_tx(&mut transaction, reports).await?;
+        complete_checkpoint_in_tx(&mut transaction, lease).await?;
+        transaction.commit().await?;
+        Ok(inserted)
+    }
 
-            if rows_affected == 1 {
-                inserted += 1;
-                continue;
-            }
-
-            let stored = sqlx::query_as::<_, StoredDividendRevision>(
-                r#"SELECT code, announcement_date, record_date, ex_date, pay_date,
-                          implementation_status, cash_dividend, cash_dividend_tax,
-                          stock_ratio, raw_payload, available_at
-                   FROM stock_dividend_versions
-                   WHERE source = $1 AND action_key = $2 AND source_revision = $3"#,
-            )
-            .bind(&record.source)
-            .bind(&record.action_key)
-            .bind(&record.source_revision)
-            .fetch_optional(&mut *transaction)
-            .await?;
-
-            if !stored.is_some_and(|row| row.matches(record, available_at)) {
-                return Err(AppError::BadRequest(format!(
-                    "immutable dividend revision conflicts with stored history: {}/{}/{}",
-                    record.source, record.action_key, record.source_revision
-                )));
-            }
-        }
-
+    pub async fn persist_dividends_and_complete_window(
+        &self,
+        lease: &CheckpointLease,
+        records: &[DividendRecord],
+        lease_ttl: Duration,
+    ) -> Result<usize> {
+        let mut transaction = self.pool.begin().await?;
+        fence_checkpoint_in_tx(&mut transaction, lease, lease_ttl).await?;
+        let inserted = upsert_dividends_in_tx(&mut transaction, records).await?;
+        complete_checkpoint_in_tx(&mut transaction, lease).await?;
         transaction.commit().await?;
         Ok(inserted)
     }
@@ -506,6 +403,26 @@ impl CompanyRepository {
         end_date: NaiveDate,
         lease_ttl: Duration,
     ) -> Result<CheckpointClaimOutcome> {
+        self.claim_checkpoint_window_with_policy(
+            phase,
+            code,
+            start_date,
+            end_date,
+            lease_ttl,
+            CheckpointClaimPolicy::Resume,
+        )
+        .await
+    }
+
+    pub async fn claim_checkpoint_window_with_policy(
+        &self,
+        phase: &str,
+        code: &str,
+        start_date: NaiveDate,
+        end_date: NaiveDate,
+        lease_ttl: Duration,
+        policy: CheckpointClaimPolicy,
+    ) -> Result<CheckpointClaimOutcome> {
         if start_date > end_date {
             return Err(AppError::BadRequest(format!(
                 "checkpoint window starts after it ends: {start_date} > {end_date}"
@@ -513,6 +430,10 @@ impl CompanyRepository {
         }
         let lease_ttl_seconds = lease_ttl_seconds(lease_ttl)?;
         let token = Uuid::new_v4();
+        let refresh_before = match policy {
+            CheckpointClaimPolicy::Resume => None,
+            CheckpointClaimPolicy::RefreshCompletedBefore(cutoff) => Some(cutoff),
+        };
         let (status, attempt, lease_token, lease_expires_at, owns_lease): (
             String,
             i32,
@@ -521,60 +442,69 @@ impl CompanyRepository {
             bool,
         ) = sqlx::query_as(
             r#"INSERT INTO company_data_repair_checkpoints
-               (phase, code, start_date, end_date, status, attempts, lease_token,
-                lease_expires_at)
+                 (phase, code, start_date, end_date, status, attempts, lease_token,
+                  lease_expires_at)
                VALUES ($1, $2, $3, $4, 'running', 1, $5,
                        NOW() + ($6::double precision * INTERVAL '1 second'))
                ON CONFLICT (phase, code, start_date, end_date) DO UPDATE SET
-                 status = CASE
-                   WHEN company_data_repair_checkpoints.status = 'failed'
-                     OR (company_data_repair_checkpoints.status = 'running'
-                         AND company_data_repair_checkpoints.lease_expires_at <= NOW())
-                   THEN 'running'
-                   ELSE company_data_repair_checkpoints.status
-                 END,
-                 attempts = CASE
-                   WHEN company_data_repair_checkpoints.status = 'failed'
-                     OR (company_data_repair_checkpoints.status = 'running'
-                         AND company_data_repair_checkpoints.lease_expires_at <= NOW())
-                   THEN company_data_repair_checkpoints.attempts + 1
-                   ELSE company_data_repair_checkpoints.attempts
-                 END,
-                 last_error = CASE
-                   WHEN company_data_repair_checkpoints.status = 'failed'
-                     OR (company_data_repair_checkpoints.status = 'running'
-                         AND company_data_repair_checkpoints.lease_expires_at <= NOW())
-                   THEN NULL
-                   ELSE company_data_repair_checkpoints.last_error
-                 END,
-                 lease_token = CASE
-                   WHEN company_data_repair_checkpoints.status = 'failed'
-                     OR (company_data_repair_checkpoints.status = 'running'
-                         AND company_data_repair_checkpoints.lease_expires_at <= NOW())
-                   THEN EXCLUDED.lease_token
-                   ELSE company_data_repair_checkpoints.lease_token
-                 END,
-                 lease_expires_at = CASE
-                   WHEN company_data_repair_checkpoints.status = 'failed'
-                     OR (company_data_repair_checkpoints.status = 'running'
-                         AND company_data_repair_checkpoints.lease_expires_at <= NOW())
-                   THEN EXCLUDED.lease_expires_at
-                   ELSE company_data_repair_checkpoints.lease_expires_at
-                 END,
-                 updated_at = CASE
-                   WHEN company_data_repair_checkpoints.status = 'failed'
-                     OR (company_data_repair_checkpoints.status = 'running'
-                         AND company_data_repair_checkpoints.lease_expires_at <= NOW())
-                   THEN NOW()
-                   ELSE company_data_repair_checkpoints.updated_at
-                 END,
-                 completed_at = CASE
-                   WHEN company_data_repair_checkpoints.status = 'failed'
-                     OR (company_data_repair_checkpoints.status = 'running'
-                         AND company_data_repair_checkpoints.lease_expires_at <= NOW())
-                   THEN NULL
-                   ELSE company_data_repair_checkpoints.completed_at
-                 END
+                 status = CASE WHEN
+                   company_data_repair_checkpoints.status = 'failed'
+                   OR (company_data_repair_checkpoints.status = 'running'
+                       AND company_data_repair_checkpoints.lease_expires_at <= NOW())
+                   OR (company_data_repair_checkpoints.status = 'completed'
+                       AND $7::timestamptz IS NOT NULL
+                       AND company_data_repair_checkpoints.completed_at < $7)
+                 THEN 'running' ELSE company_data_repair_checkpoints.status END,
+                 attempts = CASE WHEN
+                   company_data_repair_checkpoints.status = 'failed'
+                   OR (company_data_repair_checkpoints.status = 'running'
+                       AND company_data_repair_checkpoints.lease_expires_at <= NOW())
+                   OR (company_data_repair_checkpoints.status = 'completed'
+                       AND $7::timestamptz IS NOT NULL
+                       AND company_data_repair_checkpoints.completed_at < $7)
+                 THEN company_data_repair_checkpoints.attempts + 1
+                 ELSE company_data_repair_checkpoints.attempts END,
+                 last_error = CASE WHEN
+                   company_data_repair_checkpoints.status = 'failed'
+                   OR (company_data_repair_checkpoints.status = 'running'
+                       AND company_data_repair_checkpoints.lease_expires_at <= NOW())
+                   OR (company_data_repair_checkpoints.status = 'completed'
+                       AND $7::timestamptz IS NOT NULL
+                       AND company_data_repair_checkpoints.completed_at < $7)
+                 THEN NULL ELSE company_data_repair_checkpoints.last_error END,
+                 lease_token = CASE WHEN
+                   company_data_repair_checkpoints.status = 'failed'
+                   OR (company_data_repair_checkpoints.status = 'running'
+                       AND company_data_repair_checkpoints.lease_expires_at <= NOW())
+                   OR (company_data_repair_checkpoints.status = 'completed'
+                       AND $7::timestamptz IS NOT NULL
+                       AND company_data_repair_checkpoints.completed_at < $7)
+                 THEN EXCLUDED.lease_token ELSE company_data_repair_checkpoints.lease_token END,
+                 lease_expires_at = CASE WHEN
+                   company_data_repair_checkpoints.status = 'failed'
+                   OR (company_data_repair_checkpoints.status = 'running'
+                       AND company_data_repair_checkpoints.lease_expires_at <= NOW())
+                   OR (company_data_repair_checkpoints.status = 'completed'
+                       AND $7::timestamptz IS NOT NULL
+                       AND company_data_repair_checkpoints.completed_at < $7)
+                 THEN EXCLUDED.lease_expires_at
+                 ELSE company_data_repair_checkpoints.lease_expires_at END,
+                 updated_at = CASE WHEN
+                   company_data_repair_checkpoints.status = 'failed'
+                   OR (company_data_repair_checkpoints.status = 'running'
+                       AND company_data_repair_checkpoints.lease_expires_at <= NOW())
+                   OR (company_data_repair_checkpoints.status = 'completed'
+                       AND $7::timestamptz IS NOT NULL
+                       AND company_data_repair_checkpoints.completed_at < $7)
+                 THEN NOW() ELSE company_data_repair_checkpoints.updated_at END,
+                 completed_at = CASE WHEN
+                   company_data_repair_checkpoints.status = 'failed'
+                   OR (company_data_repair_checkpoints.status = 'running'
+                       AND company_data_repair_checkpoints.lease_expires_at <= NOW())
+                   OR (company_data_repair_checkpoints.status = 'completed'
+                       AND $7::timestamptz IS NOT NULL
+                       AND company_data_repair_checkpoints.completed_at < $7)
+                 THEN NULL ELSE company_data_repair_checkpoints.completed_at END
                RETURNING status, attempts, lease_token, lease_expires_at,
                          COALESCE(lease_token = $5, FALSE)"#,
         )
@@ -584,6 +514,7 @@ impl CompanyRepository {
         .bind(end_date)
         .bind(token)
         .bind(lease_ttl_seconds)
+        .bind(refresh_before)
         .fetch_one(&self.pool)
         .await?;
 
@@ -704,6 +635,200 @@ impl CompanyRepository {
     }
 }
 
+async fn upsert_financial_reports_in_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    reports: &[FinancialReport],
+) -> Result<usize> {
+    let mut inserted = 0;
+    for report in reports {
+        let available_at = postgres_timestamp(report.available_at);
+        let ingested_at = postgres_timestamp(report.ingested_at);
+        let rows_affected = sqlx::query(
+            r#"INSERT INTO stock_financial_report_versions
+               (source, code, end_date, announcement_date, report_type, frequency,
+                source_revision, total_revenue, revenue, operating_profit, total_profit,
+                net_profit_parent, deducted_net_profit, basic_eps, diluted_eps, roe,
+                gross_margin, net_margin, revenue_yoy, net_profit_yoy, raw_payload,
+                available_at, ingested_at)
+               VALUES
+               ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+               ON CONFLICT (source, code, end_date, report_type, source_revision)
+               DO NOTHING"#,
+        )
+        .bind(&report.source)
+        .bind(&report.code)
+        .bind(report.end_date)
+        .bind(report.announcement_date)
+        .bind(&report.report_type)
+        .bind(report.frequency.as_str())
+        .bind(&report.source_revision)
+        .bind(report.total_revenue)
+        .bind(report.revenue)
+        .bind(report.operating_profit)
+        .bind(report.total_profit)
+        .bind(report.net_profit_parent)
+        .bind(report.deducted_net_profit)
+        .bind(report.basic_eps)
+        .bind(report.diluted_eps)
+        .bind(report.roe)
+        .bind(report.gross_margin)
+        .bind(report.net_margin)
+        .bind(report.revenue_yoy)
+        .bind(report.net_profit_yoy)
+        .bind(&report.raw_payload)
+        .bind(available_at)
+        .bind(ingested_at)
+        .execute(&mut **transaction)
+        .await?
+        .rows_affected();
+        if rows_affected == 1 {
+            inserted += 1;
+            continue;
+        }
+        let stored = sqlx::query_as::<_, StoredFinancialRevision>(
+            r#"SELECT announcement_date, frequency, total_revenue, revenue,
+                      operating_profit, total_profit, net_profit_parent,
+                      deducted_net_profit, basic_eps, diluted_eps, roe,
+                      gross_margin, net_margin, revenue_yoy, net_profit_yoy,
+                      raw_payload, available_at
+               FROM stock_financial_report_versions
+               WHERE source = $1 AND code = $2 AND end_date = $3
+                 AND report_type = $4 AND source_revision = $5"#,
+        )
+        .bind(&report.source)
+        .bind(&report.code)
+        .bind(report.end_date)
+        .bind(&report.report_type)
+        .bind(&report.source_revision)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        if !stored.is_some_and(|row| row.matches(report, available_at)) {
+            return Err(AppError::BadRequest(format!(
+                "immutable financial revision conflicts with stored history: {}/{}/{}/{}/{}",
+                report.source,
+                report.code,
+                report.end_date,
+                report.report_type,
+                report.source_revision
+            )));
+        }
+    }
+    Ok(inserted)
+}
+
+async fn upsert_dividends_in_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    records: &[DividendRecord],
+) -> Result<usize> {
+    let mut inserted = 0;
+    for record in records {
+        let available_at = postgres_timestamp(record.available_at);
+        let ingested_at = postgres_timestamp(record.ingested_at);
+        let rows_affected = sqlx::query(
+            r#"INSERT INTO stock_dividend_versions
+               (source, action_key, code, announcement_date, record_date, ex_date,
+                pay_date, implementation_status, cash_dividend, cash_dividend_tax,
+                stock_ratio, source_revision, raw_payload, available_at, ingested_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                       $13, $14, $15)
+               ON CONFLICT (source, action_key, source_revision) DO NOTHING"#,
+        )
+        .bind(&record.source)
+        .bind(&record.action_key)
+        .bind(&record.code)
+        .bind(record.announcement_date)
+        .bind(record.record_date)
+        .bind(record.ex_date)
+        .bind(record.pay_date)
+        .bind(&record.implementation_status)
+        .bind(record.cash_dividend)
+        .bind(record.cash_dividend_tax)
+        .bind(record.stock_ratio)
+        .bind(&record.source_revision)
+        .bind(&record.raw_payload)
+        .bind(available_at)
+        .bind(ingested_at)
+        .execute(&mut **transaction)
+        .await?
+        .rows_affected();
+        if rows_affected == 1 {
+            inserted += 1;
+            continue;
+        }
+        let stored = sqlx::query_as::<_, StoredDividendRevision>(
+            r#"SELECT code, announcement_date, record_date, ex_date, pay_date,
+                      implementation_status, cash_dividend, cash_dividend_tax,
+                      stock_ratio, raw_payload, available_at
+               FROM stock_dividend_versions
+               WHERE source = $1 AND action_key = $2 AND source_revision = $3"#,
+        )
+        .bind(&record.source)
+        .bind(&record.action_key)
+        .bind(&record.source_revision)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        if !stored.is_some_and(|row| row.matches(record, available_at)) {
+            return Err(AppError::BadRequest(format!(
+                "immutable dividend revision conflicts with stored history: {}/{}/{}",
+                record.source, record.action_key, record.source_revision
+            )));
+        }
+    }
+    Ok(inserted)
+}
+
+async fn fence_checkpoint_in_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    lease: &CheckpointLease,
+    lease_ttl: Duration,
+) -> Result<()> {
+    let ttl = lease_ttl_seconds(lease_ttl)?;
+    let rows = sqlx::query(
+        r#"UPDATE company_data_repair_checkpoints
+           SET lease_expires_at = NOW() + ($7::double precision * INTERVAL '1 second'),
+               updated_at = NOW()
+           WHERE phase = $1 AND code = $2 AND start_date = $3 AND end_date = $4
+             AND status = 'running' AND attempts = $5 AND lease_token = $6
+             AND lease_expires_at > NOW()"#,
+    )
+    .bind(&lease.phase)
+    .bind(&lease.code)
+    .bind(lease.start_date)
+    .bind(lease.end_date)
+    .bind(lease.attempt)
+    .bind(lease.token)
+    .bind(ttl)
+    .execute(&mut **transaction)
+    .await?
+    .rows_affected();
+    checkpoint_transition_result(rows, lease)
+}
+
+async fn complete_checkpoint_in_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    lease: &CheckpointLease,
+) -> Result<()> {
+    let rows = sqlx::query(
+        r#"UPDATE company_data_repair_checkpoints
+           SET status = 'completed', last_error = NULL, lease_token = NULL,
+               lease_expires_at = NULL, updated_at = NOW(), completed_at = NOW()
+           WHERE phase = $1 AND code = $2 AND start_date = $3 AND end_date = $4
+             AND status = 'running' AND attempts = $5 AND lease_token = $6
+             AND lease_expires_at > NOW()"#,
+    )
+    .bind(&lease.phase)
+    .bind(&lease.code)
+    .bind(lease.start_date)
+    .bind(lease.end_date)
+    .bind(lease.attempt)
+    .bind(lease.token)
+    .execute(&mut **transaction)
+    .await?
+    .rows_affected();
+    checkpoint_transition_result(rows, lease)
+}
+
 fn lease_ttl_seconds(lease_ttl: Duration) -> Result<f64> {
     if lease_ttl.is_zero() {
         return Err(AppError::BadRequest(
@@ -799,7 +924,10 @@ mod tests {
     use sqlx::PgPool;
     use uuid::Uuid;
 
-    use super::{CheckpointClaimOutcome, CheckpointLease, CompanyRepository};
+    use super::{
+        complete_checkpoint_in_tx, fence_checkpoint_in_tx, upsert_financial_reports_in_tx,
+        CheckpointClaimOutcome, CheckpointClaimPolicy, CheckpointLease, CompanyRepository,
+    };
     use crate::data::company::{DividendRecord, FinancialFrequency, FinancialReport};
 
     fn date(year: i32, month: u32, day: u32) -> NaiveDate {
@@ -825,6 +953,14 @@ mod tests {
     fn migration_023_sql() -> String {
         std::fs::read_to_string(format!(
             "{}/migrations/023_windowed_company_checkpoint_leases.sql",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap_or_default()
+    }
+
+    fn migration_024_sql() -> String {
+        std::fs::read_to_string(format!(
+            "{}/migrations/024_expand_company_checkpoints.sql",
             env!("CARGO_MANIFEST_DIR")
         ))
         .unwrap_or_default()
@@ -956,7 +1092,6 @@ mod tests {
         .bind(dt(2026, 3, 30, 8))
         .execute(&pool)
         .await?;
-
         let original = dividend("v1", "2.50000001");
         let revision = dividend("v2", "2.76000002");
 
@@ -1606,6 +1741,122 @@ mod tests {
         .fetch_one(&pool)
         .await?;
         assert_eq!(window_count, 2);
+
+        let migration_024 = migration_024_sql();
+        assert!(!migration_024.is_empty(), "migration 024 must exist");
+        sqlx::raw_sql(&migration_024).execute(&pool).await?;
+        let exact_completed_years: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM company_data_repair_checkpoints
+               WHERE phase = 'financials' AND code = '000001.SZ'
+                 AND status = 'completed'
+                 AND start_date >= DATE '2020-01-01'
+                 AND end_date <= DATE '2026-12-31'
+                 AND EXTRACT(YEAR FROM start_date) = EXTRACT(YEAR FROM end_date)"#,
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            exact_completed_years, 7,
+            "023 broad coverage expands in 024"
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn migration_024_expands_completed_ranges_into_exact_yearly_windows(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        sqlx::query("DELETE FROM company_data_repair_checkpoints")
+            .execute(&pool)
+            .await?;
+        sqlx::query(
+            r#"INSERT INTO company_data_repair_checkpoints
+               (phase, code, start_date, end_date, status, attempts,
+                created_at, updated_at, completed_at)
+               VALUES ('financials', '000001.SZ', '2024-06-15', '2026-07-19',
+                       'completed', 3, '2026-07-19 01:00:00+00',
+                       '2026-07-19 02:00:00+00', '2026-07-19 02:00:00+00')"#,
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            r#"INSERT INTO company_data_repair_checkpoints
+               (phase, code, start_date, end_date, status, attempts, last_error,
+                created_at, updated_at)
+               VALUES ('financials', '000001.SZ', '2026-01-01', '2026-07-19',
+                       'failed', 7, 'newer exact failure', '2026-07-19 03:00:00+00',
+                       '2026-07-19 04:00:00+00')"#,
+        )
+        .execute(&pool)
+        .await?;
+
+        let migration_sql = migration_024_sql();
+        assert!(!migration_sql.is_empty(), "migration 024 must exist");
+        sqlx::raw_sql(&migration_sql).execute(&pool).await?;
+
+        let windows: Vec<(NaiveDate, NaiveDate, String, i32)> = sqlx::query_as(
+            r#"SELECT start_date, end_date, status, attempts
+               FROM company_data_repair_checkpoints
+               WHERE phase = 'financials' AND code = '000001.SZ'
+                 AND (start_date, end_date) IN (
+                     (DATE '2024-06-15', DATE '2024-12-31'),
+                     (DATE '2025-01-01', DATE '2025-12-31'),
+                     (DATE '2026-01-01', DATE '2026-07-19')
+                 )
+               ORDER BY start_date"#,
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(windows.len(), 3);
+        assert_eq!(windows[0].2, "completed");
+        assert_eq!(windows[1].2, "completed");
+        assert_eq!(windows[2].2, "failed");
+        assert_eq!(windows[2].3, 7, "exact collision remains authoritative");
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn migration_024_compacts_dated_latest_phases_idempotently(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        sqlx::query("DELETE FROM company_data_repair_checkpoints")
+            .execute(&pool)
+            .await?;
+        sqlx::raw_sql(
+            r#"INSERT INTO company_data_repair_checkpoints
+                 (phase, code, start_date, end_date, status, attempts, created_at, updated_at, completed_at)
+               VALUES ('financials_latest:2026-07-18', '000001.SZ', '2026-01-01', '2026-07-18',
+                       'completed', 1, '2026-07-18 01:00+00', '2026-07-18 02:00+00', '2026-07-18 02:00+00');
+               INSERT INTO company_data_repair_checkpoints
+                 (phase, code, start_date, end_date, status, attempts, last_error, created_at, updated_at)
+               VALUES ('financials_latest:2026-07-19', '000001.SZ', '2026-01-01', '2026-07-19',
+                       'failed', 2, 'timeout', '2026-07-18 01:00+00', '2026-07-19 02:00+00');"#,
+        ).execute(&pool).await?;
+
+        let migration_sql = migration_024_sql();
+        sqlx::raw_sql(&migration_sql).execute(&pool).await?;
+        sqlx::raw_sql(&migration_sql).execute(&pool).await?;
+        let stable: (String, NaiveDate, String, i32) = sqlx::query_as(
+            r#"SELECT phase, end_date, status, attempts
+               FROM company_data_repair_checkpoints WHERE code = '000001.SZ'"#,
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            stable,
+            (
+                "financials_latest".into(),
+                date(2026, 12, 31),
+                "failed".into(),
+                2
+            )
+        );
+        let dated: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM company_data_repair_checkpoints WHERE phase LIKE '%latest:%'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(dated, 0);
         Ok(())
     }
 
@@ -1659,6 +1910,59 @@ mod tests {
                 .status,
             "completed"
         );
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn completed_refresh_claim_uses_database_timestamp_cutoff(
+        pool: PgPool,
+    ) -> crate::error::Result<()> {
+        let repo = CompanyRepository::new(pool.clone());
+        let window = (date(2026, 1, 1), date(2026, 12, 31));
+        let CheckpointClaimOutcome::Claimed(lease) = repo
+            .claim_checkpoint_window(
+                "financials_latest",
+                "600519.SH",
+                window.0,
+                window.1,
+                Duration::from_secs(300),
+            )
+            .await?
+        else {
+            panic!("initial claim")
+        };
+        repo.complete_checkpoint(&lease).await?;
+        sqlx::query("UPDATE company_data_repair_checkpoints SET completed_at = '2026-07-19 01:00:00+00' WHERE phase = 'financials_latest'")
+            .execute(&pool).await?;
+
+        let cutoff = dt(2026, 7, 18, 16);
+        assert!(matches!(
+            repo.claim_checkpoint_window_with_policy(
+                "financials_latest",
+                "600519.SH",
+                window.0,
+                window.1,
+                Duration::from_secs(300),
+                CheckpointClaimPolicy::RefreshCompletedBefore(cutoff)
+            )
+            .await?,
+            CheckpointClaimOutcome::Completed
+        ));
+        let next_cutoff = dt(2026, 7, 19, 16);
+        let CheckpointClaimOutcome::Claimed(refreshed) = repo
+            .claim_checkpoint_window_with_policy(
+                "financials_latest",
+                "600519.SH",
+                window.0,
+                window.1,
+                Duration::from_secs(300),
+                CheckpointClaimPolicy::RefreshCompletedBefore(next_cutoff),
+            )
+            .await?
+        else {
+            panic!("the following Beijing day should refresh")
+        };
+        assert_eq!(refreshed.attempt, 2);
         Ok(())
     }
 
@@ -1758,6 +2062,184 @@ mod tests {
             .await?,
             CheckpointClaimOutcome::Completed
         ));
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn stale_worker_cannot_persist_after_checkpoint_takeover(
+        pool: PgPool,
+    ) -> crate::error::Result<()> {
+        let repo = CompanyRepository::new(pool.clone());
+        let window = (date(2025, 1, 1), date(2025, 12, 31));
+        let CheckpointClaimOutcome::Claimed(stale) = repo
+            .claim_checkpoint_window(
+                "financials",
+                "600519.SH",
+                window.0,
+                window.1,
+                Duration::from_secs(300),
+            )
+            .await?
+        else {
+            panic!("initial worker should own the window")
+        };
+        sqlx::query(
+            r#"UPDATE company_data_repair_checkpoints
+               SET lease_expires_at = NOW() - INTERVAL '1 second'
+               WHERE phase = 'financials' AND code = '600519.SH'
+                 AND start_date = $1 AND end_date = $2"#,
+        )
+        .bind(window.0)
+        .bind(window.1)
+        .execute(&pool)
+        .await?;
+        let CheckpointClaimOutcome::Claimed(winner) = repo
+            .claim_checkpoint_window(
+                "financials",
+                "600519.SH",
+                window.0,
+                window.1,
+                Duration::from_secs(300),
+            )
+            .await?
+        else {
+            panic!("replacement worker should take over")
+        };
+
+        let stale_error = repo
+            .persist_financial_reports_and_complete_window(
+                &stale,
+                &[financial_report("stale", 20)],
+                Duration::from_secs(300),
+            )
+            .await
+            .unwrap_err();
+        assert!(stale_error
+            .to_string()
+            .contains("stale or missing checkpoint lease"));
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stock_financial_report_versions")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(count, 0);
+
+        assert_eq!(
+            repo.persist_financial_reports_and_complete_window(
+                &winner,
+                &[financial_report("winner", 21)],
+                Duration::from_secs(300),
+            )
+            .await?,
+            1
+        );
+        assert_eq!(
+            repo.checkpoint_window("financials", "600519.SH", window.0, window.1)
+                .await?
+                .unwrap()
+                .status,
+            "completed"
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn fenced_persistence_rolls_back_records_and_checkpoint_together(
+        pool: PgPool,
+    ) -> crate::error::Result<()> {
+        let repo = CompanyRepository::new(pool.clone());
+        repo.upsert_financial_reports(&[financial_report("existing", 20)])
+            .await?;
+        let window = (date(2025, 1, 1), date(2025, 12, 31));
+        let CheckpointClaimOutcome::Claimed(lease) = repo
+            .claim_checkpoint_window(
+                "financials",
+                "600519.SH",
+                window.0,
+                window.1,
+                Duration::from_secs(300),
+            )
+            .await?
+        else {
+            panic!("worker should own the window")
+        };
+        let mut conflicting = financial_report("existing", 21);
+        conflicting.net_profit_parent = Some(decimal("1.0000"));
+
+        let error = repo
+            .persist_financial_reports_and_complete_window(
+                &lease,
+                &[financial_report("would-roll-back", 22), conflicting],
+                Duration::from_secs(300),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("immutable financial revision"));
+        let revisions: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM stock_financial_report_versions")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            revisions, 1,
+            "the earlier insert in the transaction rolls back"
+        );
+        let checkpoint = repo
+            .checkpoint_window("financials", "600519.SH", window.0, window.1)
+            .await?
+            .unwrap();
+        assert_eq!(checkpoint.status, "running");
+        assert_eq!(checkpoint.lease_token, Some(lease.token));
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn checkpoint_row_lock_blocks_claim_during_fenced_persistence(
+        pool: PgPool,
+    ) -> crate::error::Result<()> {
+        let repo = CompanyRepository::new(pool.clone());
+        let window = (date(2025, 1, 1), date(2025, 12, 31));
+        let CheckpointClaimOutcome::Claimed(lease) = repo
+            .claim_checkpoint_window(
+                "financials",
+                "600519.SH",
+                window.0,
+                window.1,
+                Duration::from_secs(300),
+            )
+            .await?
+        else {
+            panic!("initial claim")
+        };
+        let mut transaction = pool.begin().await?;
+        fence_checkpoint_in_tx(&mut transaction, &lease, Duration::from_secs(300)).await?;
+        upsert_financial_reports_in_tx(&mut transaction, &[financial_report("locked", 20)]).await?;
+
+        let contender_repo = repo.clone();
+        let mut contender = tokio::spawn(async move {
+            contender_repo
+                .claim_checkpoint_window(
+                    "financials",
+                    "600519.SH",
+                    window.0,
+                    window.1,
+                    Duration::from_secs(300),
+                )
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut contender)
+                .await
+                .is_err(),
+            "the competing atomic claim waits for the checkpoint row lock"
+        );
+        complete_checkpoint_in_tx(&mut transaction, &lease).await?;
+        transaction.commit().await?;
+        assert!(matches!(
+            contender.await.unwrap()?,
+            CheckpointClaimOutcome::Completed
+        ));
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stock_financial_report_versions")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(count, 1);
         Ok(())
     }
 
