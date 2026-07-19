@@ -101,3 +101,26 @@ Gate 4 Task 9: complete (commits bac6431..216f75d, review clean after compatibil
 Gate 4 Task 10: complete (commits d618ba5..0f69dc1, review clean after verified release-gate docs and market-overview README wording fix; verification: Rust full suite 446/446 passed with DATABASE_URL, research pytest 90/90 passed via .venv, ruff passed, mypy passed, DB decision-support trading-table assertion returned 0, fmt check passed, diff check passed)
 
 Gate 4 roadmap checklist: complete (linked Gate 4 plan fully checked; event adjustment defaults/cap and trading-table isolation verified in Task 10 release gate)
+
+## Dashboard Company Intelligence
+
+Layout Task 1: complete (commit 229a8a7, review approved; 472/472 Rust tests passed)
+Layout Task 2: complete (commit 51f1ef0, review approved; 473/473 Rust tests passed)
+Layout Task 3: complete (commit 42ba5cc, review approved; dashboard 18/18, assets 7/7)
+Layout Task 4: complete (commit 14dab05, review approved; dashboard 18/18, assets 7/7, Playwright 6/6)
+Layout Task 5: complete (commits 898d1a1..1647095, final review approved; dashboard 18/18, assets 7/7, Playwright 22/22)
+Layout Task 6: complete (commit 25a24d3, review approved; Rust dashboard 12/12, dashboard 18/18, Playwright 22/22)
+Financials Task 1: complete (commits bfaee00..e25d969, final review approved; repository 18/18, legacy 1/1, full Rust 491/491)
+Financials Task 2: complete (commits 91a9be1..f67fcb6, final review approved; provider 31/31, full Rust 510/510)
+Financials Task 3: complete (commits 73a687e..0a8a2c2, final review approved after annual-window recovery, lease fencing, stable latest checkpoints, and sentinel migration fixes; repository 28/28, service 16/16, full Rust 535/535 before SQL-only final fix, focused reapproval 3/3)
+Financials Task 4: complete (commits 43bf30a..da175ca, final review approved after mutually-exclusive startup validation and orchestration coverage; exact main tests 5/5, fmt/diff checks passed)
+Financials Task 5: complete (commits 96939fe..d064013, final review approved after PIT history filtering, private no-store caching, cursor domain separation, and Router auth-before-query fixes; dashboard company 4/4, dashboard 18/18, focused Router/future tests passed)
+Financials Task 6: complete (commits 850c088..b5b1e84, final review approved after empty-bars loading, exact virtual geometry/focus, and listener lifecycle fixes; Node 28/28, assets 8/8, Playwright 32/32)
+Financials Task 7: complete (commits 42b0db6..9e60b42, final review approved after atomic binary replacement and observable transient-unit lifecycle fixes; deployment 12/12, dashboard checks 37/37, prior Playwright 32/32 remains applicable, YAML/shell/fmt/diff checks passed)
+Historical Chips Task 1: complete (commits c8f664d..320269a, final review approved after legacy-service coexistence, exact 100% storage, DB-time validation recency, canonical provenance/metric/shape constraints, and adjustment-factor restore state; repository 12/12, coexistence 2/2, fmt/diff passed)
+Historical Chips Task 2: complete (commits 97db5b4..1c6048e, final review approved after adaptive current-range representation and minimum bucket-count fixes; chip model 13/13, adjustment convention 1/1, fmt/diff passed)
+Historical Chips Task 3: complete (commit b5e68f8, independent review approved; official chip tests 7/7, fmt/diff passed; full Tushare 36/38 with two verified pre-existing unrelated company replay failures)
+Historical Chips Task 4: complete (commits 9b132ab..7dbb582, final review approved after strict metric-shape aggregation and five-dimension subgroup reconciliation; focused validation tests 18/18, fmt/diff passed)
+Historical Chips Task 5: complete (commits b589ac0..84578f4, final review approved after real benchmark date alignment, bounded two-stage sampling, transaction-serialized concurrency, fenced fallback failure, lease renewal, and structured audit fixes; company intelligence 32/32, chip repository 16/16, chip validation 18/18, fmt/diff passed)
+Historical Chips Task 6: complete (commits 7f6f898..3225b06, final review approved after canonical-only dashboard lookup, invalid-payload safety, and exact zero-weight geometry fixes; dashboard chip 2/2, repository canonical 1/1, Node 43/43, assets 8/8, Playwright 36/36)
+Historical Chips Task 7: complete (commits 5767c43..63597b7, final review approved after complete-universe readiness, suspension-aware prerequisites, bounded 18:00 retries, shared mutation fencing, atomic same-date replacement, and cancellation-safe checkpoint fixes; full Rust 629/629 before final review fixes, focused daily 51/51, company repository 30/30, scheduler 8/8, Node 43/43, Playwright 36/36, fmt/diff passed)
