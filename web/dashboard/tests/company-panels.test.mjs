@@ -46,8 +46,21 @@ test("chipPanel renders escaped provenance, summary metrics, and bounded normali
 test("chipPanel handles missing and invalid distributions without throwing", () => {
   const empty = chipPanel({ distribution: [] });
   const invalid = chipPanel({ distribution: [{ price: "bad", weight: -1 }, null] });
+  const invalidPayloads = [null, undefined, "bad", 42, true].map((payload) => chipPanel(payload));
   assert.match(empty, /暂无筹码分布/);
   assert.match(invalid, /暂无筹码分布/);
+  invalidPayloads.forEach((html) => assert.match(html, /暂无筹码分布/));
+});
+
+test("chipPanel renders a zero-weight bucket at exactly zero width", () => {
+  const html = chipPanel({
+    distribution: [
+      { price: 12, weight: 0.5, percentage: 50 },
+      { price: 11, weight: 0, percentage: 0 },
+    ],
+  });
+  assert.match(html, /style="--chip-width:100%"/);
+  assert.match(html, /style="--chip-width:0%"/);
 });
 
 test("formatCurrency uses exact Chinese market units", () => {

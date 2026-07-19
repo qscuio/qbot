@@ -371,10 +371,10 @@ impl DashboardCompanyService {
         let snapshot = match requested_date {
             Some(date) => {
                 self.chip_repository
-                    .snapshot_at_or_before(code, date)
+                    .canonical_snapshot_at_or_before(code, date)
                     .await?
             }
-            None => self.chip_repository.latest_snapshot(code).await?,
+            None => self.chip_repository.latest_canonical_snapshot(code).await?,
         }
         .ok_or_else(|| AppError::NotFound(format!("chip snapshot for {code}")))?;
         let current_price = sqlx::query_scalar::<_, Decimal>(
@@ -808,6 +808,16 @@ mod tests {
         repository
             .upsert_snapshot(&chip_snapshot(date(2026, 7, 21), "tushare", None, false))
             .await?;
+        sqlx::query(
+            r#"INSERT INTO chip_distribution
+               (code, trade_date, distribution, avg_cost, profit_ratio, concentration,
+                source, validated, distribution_format)
+               VALUES ('600519.SH', '2026-07-23',
+                       '[{"price": 1600.0, "percentage": 100.0}]',
+                       1600, 50, 50, 'legacy', FALSE, 'legacy_peak_relative')"#,
+        )
+        .execute(&pool)
+        .await?;
         let service = DashboardCompanyService::from_parts(pool, "cursor-test-secret");
 
         let exact = service.chips("600519.SH", Some(date(2026, 7, 17))).await?;
@@ -834,6 +844,16 @@ mod tests {
         assert_eq!(latest.model_version, None);
         assert!(!latest.validated);
         assert_eq!(latest.validation_label, "未验证");
+
+        sqlx::query(
+            "DELETE FROM chip_distribution WHERE distribution_format = 'normalized_probability'",
+        )
+        .execute(&service.pool)
+        .await?;
+        assert!(matches!(
+            service.chips("600519.SH", None).await,
+            Err(AppError::NotFound(_))
+        ));
 
         assert!(matches!(
             service.chips("600519.SH", Some(date(2026, 7, 16))).await,

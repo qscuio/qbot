@@ -210,6 +210,64 @@ impl ChipRepository {
         row.map(snapshot_from_row).transpose()
     }
 
+    /// Resolves only canonical normalized snapshots suitable for the dashboard.
+    /// Legacy peak-relative rows remain readable through `snapshot_at_or_before`
+    /// for compatibility, but must never shadow a canonical historical result.
+    pub async fn canonical_snapshot_at_or_before(
+        &self,
+        code: &str,
+        requested_date: NaiveDate,
+    ) -> Result<Option<ChipSnapshot>> {
+        let row = sqlx::query_as::<_, SnapshotRow>(
+            r#"SELECT code, trade_date, distribution,
+                      avg_cost::float8 AS avg_cost,
+                      profit_ratio::float8 AS profit_ratio,
+                      concentration::float8 AS concentration,
+                      dominant_peak_price::float8 AS dominant_peak_price,
+                      source, model_version, validated, source_updated_at,
+                      distribution_format
+               FROM chip_distribution
+               WHERE code = $1 AND trade_date <= $2
+                 AND distribution_format = 'normalized_probability'
+                 AND ((source = 'qbot_estimate'
+                       AND NULLIF(BTRIM(model_version), '') IS NOT NULL)
+                      OR (source = 'tushare' AND model_version IS NULL))
+               ORDER BY trade_date DESC
+               LIMIT 1"#,
+        )
+        .bind(code)
+        .bind(requested_date)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(snapshot_from_row).transpose()
+    }
+
+    /// Returns the newest canonical normalized snapshot while ignoring any
+    /// newer compatibility row written by the legacy estimator.
+    pub async fn latest_canonical_snapshot(&self, code: &str) -> Result<Option<ChipSnapshot>> {
+        let row = sqlx::query_as::<_, SnapshotRow>(
+            r#"SELECT code, trade_date, distribution,
+                      avg_cost::float8 AS avg_cost,
+                      profit_ratio::float8 AS profit_ratio,
+                      concentration::float8 AS concentration,
+                      dominant_peak_price::float8 AS dominant_peak_price,
+                      source, model_version, validated, source_updated_at,
+                      distribution_format
+               FROM chip_distribution
+               WHERE code = $1
+                 AND distribution_format = 'normalized_probability'
+                 AND ((source = 'qbot_estimate'
+                       AND NULLIF(BTRIM(model_version), '') IS NOT NULL)
+                      OR (source = 'tushare' AND model_version IS NULL))
+               ORDER BY trade_date DESC
+               LIMIT 1"#,
+        )
+        .bind(code)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(snapshot_from_row).transpose()
+    }
+
     pub async fn save_model_state(&self, state: &ChipModelState) -> Result<bool> {
         validate_model_state(state)?;
         let mut transaction = self.pool.begin().await?;
@@ -695,6 +753,52 @@ mod tests {
                 .trade_date,
             date(2026, 7, 21)
         );
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn canonical_lookups_skip_newer_legacy_rows_and_reject_legacy_only_history(
+        pool: PgPool,
+    ) -> crate::error::Result<()> {
+        let repo = ChipRepository::new(pool.clone());
+        repo.upsert_snapshot(&snapshot(date(2026, 7, 17), 0.4))
+            .await?;
+        sqlx::query(
+            r#"INSERT INTO chip_distribution
+               (code, trade_date, distribution, avg_cost, profit_ratio, concentration,
+                source, validated, distribution_format)
+               VALUES ('600519.SH', '2026-07-21',
+                       '[{"price": 1600.0, "percentage": 100.0}]',
+                       1600, 50, 50, 'legacy', FALSE, 'legacy_peak_relative'),
+                      ('000001.SZ', '2026-07-21',
+                       '[{"price": 12.0, "percentage": 100.0}]',
+                       12, 50, 50, 'legacy', FALSE, 'legacy_peak_relative')"#,
+        )
+        .execute(&pool)
+        .await?;
+
+        let exact = repo
+            .canonical_snapshot_at_or_before("600519.SH", date(2026, 7, 17))
+            .await?
+            .expect("exact canonical snapshot");
+        assert_eq!(exact.trade_date, date(2026, 7, 17));
+        let prior = repo
+            .canonical_snapshot_at_or_before("600519.SH", date(2026, 7, 22))
+            .await?
+            .expect("legacy row must not hide prior canonical snapshot");
+        assert_eq!(prior.trade_date, date(2026, 7, 17));
+        assert_eq!(
+            repo.latest_canonical_snapshot("600519.SH")
+                .await?
+                .expect("latest canonical snapshot")
+                .trade_date,
+            date(2026, 7, 17)
+        );
+        assert!(repo
+            .canonical_snapshot_at_or_before("000001.SZ", date(2026, 7, 22))
+            .await?
+            .is_none());
+        assert!(repo.latest_canonical_snapshot("000001.SZ").await?.is_none());
         Ok(())
     }
 

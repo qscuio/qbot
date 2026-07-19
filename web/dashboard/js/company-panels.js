@@ -56,6 +56,7 @@ function revision(count) {
 const MAX_CHIP_BUCKETS = 60;
 
 export function chipPanel(payload = {}) {
+  payload = payload && typeof payload === "object" && !Array.isArray(payload) ? payload : {};
   const distribution = (Array.isArray(payload.distribution) ? payload.distribution : [])
     .map((bucket) => ({
       price: numeric(bucket?.price),
@@ -67,7 +68,9 @@ export function chipPanel(payload = {}) {
     .slice(0, MAX_CHIP_BUCKETS);
   const maxWeight = Math.max(...distribution.map((bucket) => bucket.weight), 0);
   const rows = distribution.map((bucket) => {
-    const width = maxWeight > 0 ? Math.max(1, Math.min(100, bucket.weight / maxWeight * 100)) : 0;
+    const width = bucket.weight > 0 && maxWeight > 0
+      ? Math.max(1, Math.min(100, bucket.weight / maxWeight * 100))
+      : 0;
     const percentage = bucket.percentage === null ? bucket.weight * 100 : bucket.percentage;
     return `<div class="chip-bucket" data-chip-bucket><span class="chip-price mono">${escapeHtml(fixed(bucket.price))}</span><span class="chip-bar-track"><span class="chip-bar" style="--chip-width:${escapeHtml(Number(width.toFixed(2)))}%"></span></span><span class="chip-weight mono">${escapeHtml(fixed(percentage))}%</span></div>`;
   }).join("");
