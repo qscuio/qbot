@@ -568,6 +568,38 @@ impl CompanyRepository {
         })
     }
 
+    pub async fn renew_checkpoint_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        lease: &CheckpointLease,
+        lease_ttl: Duration,
+    ) -> Result<CheckpointLease> {
+        let lease_ttl_seconds = lease_ttl_seconds(lease_ttl)?;
+        let lease_expires_at: Option<DateTime<Utc>> = sqlx::query_scalar(
+            r#"UPDATE company_data_repair_checkpoints
+               SET lease_expires_at = clock_timestamp() + ($7::double precision * INTERVAL '1 second'),
+                   updated_at = clock_timestamp()
+               WHERE phase = $1 AND code = $2 AND start_date = $3 AND end_date = $4
+                 AND status = 'running' AND attempts = $5 AND lease_token = $6
+                 AND lease_expires_at > clock_timestamp()
+               RETURNING lease_expires_at"#,
+        )
+        .bind(&lease.phase)
+        .bind(&lease.code)
+        .bind(lease.start_date)
+        .bind(lease.end_date)
+        .bind(lease.attempt)
+        .bind(lease.token)
+        .bind(lease_ttl_seconds)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        let lease_expires_at = lease_expires_at.ok_or_else(|| stale_lease_error(lease))?;
+        Ok(CheckpointLease {
+            lease_expires_at,
+            ..lease.clone()
+        })
+    }
+
     pub async fn complete_checkpoint(&self, lease: &CheckpointLease) -> Result<()> {
         let rows_affected = sqlx::query(
             r#"UPDATE company_data_repair_checkpoints
@@ -590,6 +622,14 @@ impl CompanyRepository {
         checkpoint_transition_result(rows_affected, lease)
     }
 
+    pub async fn complete_checkpoint_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        lease: &CheckpointLease,
+    ) -> Result<()> {
+        complete_checkpoint_in_tx(transaction, lease).await
+    }
+
     pub async fn fail_checkpoint(&self, lease: &CheckpointLease, error: &str) -> Result<()> {
         let bounded_error: String = error.chars().take(500).collect();
         let rows_affected = sqlx::query(
@@ -609,6 +649,35 @@ impl CompanyRepository {
         .bind(lease.attempt)
         .bind(lease.token)
         .execute(&self.pool)
+        .await?
+        .rows_affected();
+        checkpoint_transition_result(rows_affected, lease)
+    }
+
+    pub async fn fail_checkpoint_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        lease: &CheckpointLease,
+        error: &str,
+    ) -> Result<()> {
+        let bounded_error: String = error.chars().take(500).collect();
+        let rows_affected = sqlx::query(
+            r#"UPDATE company_data_repair_checkpoints
+               SET status = 'failed', last_error = $3,
+                   lease_token = NULL, lease_expires_at = NULL,
+                   updated_at = clock_timestamp(), completed_at = NULL
+               WHERE phase = $1 AND code = $2 AND start_date = $4 AND end_date = $5
+                 AND status = 'running' AND attempts = $6 AND lease_token = $7
+                 AND lease_expires_at > clock_timestamp()"#,
+        )
+        .bind(&lease.phase)
+        .bind(&lease.code)
+        .bind(bounded_error)
+        .bind(lease.start_date)
+        .bind(lease.end_date)
+        .bind(lease.attempt)
+        .bind(lease.token)
+        .execute(&mut **transaction)
         .await?
         .rows_affected();
         checkpoint_transition_result(rows_affected, lease)
@@ -787,11 +856,11 @@ async fn fence_checkpoint_in_tx(
     let ttl = lease_ttl_seconds(lease_ttl)?;
     let rows = sqlx::query(
         r#"UPDATE company_data_repair_checkpoints
-           SET lease_expires_at = NOW() + ($7::double precision * INTERVAL '1 second'),
-               updated_at = NOW()
+           SET lease_expires_at = clock_timestamp() + ($7::double precision * INTERVAL '1 second'),
+               updated_at = clock_timestamp()
            WHERE phase = $1 AND code = $2 AND start_date = $3 AND end_date = $4
              AND status = 'running' AND attempts = $5 AND lease_token = $6
-             AND lease_expires_at > NOW()"#,
+             AND lease_expires_at > clock_timestamp()"#,
     )
     .bind(&lease.phase)
     .bind(&lease.code)
@@ -813,10 +882,11 @@ async fn complete_checkpoint_in_tx(
     let rows = sqlx::query(
         r#"UPDATE company_data_repair_checkpoints
            SET status = 'completed', last_error = NULL, lease_token = NULL,
-               lease_expires_at = NULL, updated_at = NOW(), completed_at = NOW()
+               lease_expires_at = NULL, updated_at = clock_timestamp(),
+               completed_at = clock_timestamp()
            WHERE phase = $1 AND code = $2 AND start_date = $3 AND end_date = $4
              AND status = 'running' AND attempts = $5 AND lease_token = $6
-             AND lease_expires_at > NOW()"#,
+             AND lease_expires_at > clock_timestamp()"#,
     )
     .bind(&lease.phase)
     .bind(&lease.code)

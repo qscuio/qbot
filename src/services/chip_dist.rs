@@ -53,6 +53,14 @@ pub fn next_chip_update_attempt(
     }
 }
 
+pub fn should_poll_chip_readiness(now: DateTime<FixedOffset>, attempts: usize) -> bool {
+    let minutes = now.hour() * 60 + now.minute();
+    if !(18 * 60..=20 * 60).contains(&minutes) || attempts >= 5 {
+        return false;
+    }
+    attempts == 0 || matches!(minutes, 1110 | 1140 | 1170 | 1200)
+}
+
 #[derive(Debug, Default)]
 pub struct ChipUpdateController {
     beijing_date: Option<NaiveDate>,
@@ -300,7 +308,8 @@ mod schedule_tests {
 
     use super::{
         next_chip_update_attempt, run_daily_category_attempt,
-        run_daily_category_attempt_with_timeout, ChipUpdateController, UpdateDecision,
+        run_daily_category_attempt_with_timeout, should_poll_chip_readiness, ChipUpdateController,
+        UpdateDecision,
     };
     use crate::market_time::beijing_tz;
 
@@ -374,6 +383,18 @@ mod schedule_tests {
             next_chip_update_attempt(bj(20, 20, 0), today, None, 5),
             UpdateDecision::StopForDay
         );
+    }
+
+    #[test]
+    fn should_poll_chip_readiness_only_at_eligible_attempt_slots() {
+        assert!(!should_poll_chip_readiness(bj(20, 17, 59), 0));
+        assert!(should_poll_chip_readiness(bj(20, 18, 7), 0));
+        assert!(!should_poll_chip_readiness(bj(20, 18, 8), 1));
+        assert!(should_poll_chip_readiness(bj(20, 18, 30), 1));
+        assert!(should_poll_chip_readiness(bj(20, 19, 0), 2));
+        assert!(!should_poll_chip_readiness(bj(20, 19, 1), 2));
+        assert!(!should_poll_chip_readiness(bj(20, 20, 1), 4));
+        assert!(!should_poll_chip_readiness(bj(20, 18, 30), 5));
     }
 
     #[test]
@@ -731,11 +752,17 @@ where
     P: CompanyDataProvider + OfficialChipProvider + 'static,
 {
     let mut controller = ChipUpdateController::default();
+    let mut stopped_date = None;
 
     loop {
         let now = beijing_now();
-        let minutes = now.hour() * 60 + now.minute();
-        if !(18 * 60..=20 * 60).contains(&minutes) {
+        controller.reset_for(now.date_naive());
+        if stopped_date.is_some_and(|date| date != now.date_naive()) {
+            stopped_date = None;
+        }
+        if stopped_date == Some(now.date_naive())
+            || !should_poll_chip_readiness(now, controller.attempts())
+        {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             continue;
         }
@@ -796,7 +823,8 @@ where
                     warn!("18:00 canonical chip update failed: {error}");
                 }
             }
-            UpdateDecision::Wait | UpdateDecision::StopForDay => {}
+            UpdateDecision::StopForDay => stopped_date = Some(now.date_naive()),
+            UpdateDecision::Wait => {}
         }
 
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;

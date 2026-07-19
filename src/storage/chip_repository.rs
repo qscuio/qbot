@@ -1,6 +1,6 @@
 use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::Value;
-use sqlx::{FromRow, PgPool, Postgres, Transaction};
+use sqlx::{Acquire, FromRow, PgPool, Postgres, Transaction};
 
 use crate::data::chip::{
     ChipBucket, ChipModelState, ChipSnapshot, ChipSourceDecision, ChipValidationRun,
@@ -53,6 +53,54 @@ impl ChipRepository {
         snapshots: &[ChipSnapshot],
         error: &str,
     ) -> Result<usize> {
+        let mut transaction = self.pool.begin().await?;
+        let changed = self
+            .persist_unvalidated_estimates_and_fail_in_transaction(
+                &mut transaction,
+                lease,
+                snapshots,
+                error,
+            )
+            .await?;
+        transaction.commit().await?;
+        Ok(changed)
+    }
+
+    pub async fn persist_unvalidated_estimates_and_fail_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        lease: &CheckpointLease,
+        snapshots: &[ChipSnapshot],
+        error: &str,
+    ) -> Result<usize> {
+        let mut savepoint = transaction.begin().await?;
+        let result = self
+            .persist_unvalidated_estimates_and_fail_with_savepoint(
+                &mut savepoint,
+                lease,
+                snapshots,
+                error,
+            )
+            .await;
+        match result {
+            Ok(changed) => {
+                savepoint.commit().await?;
+                Ok(changed)
+            }
+            Err(error) => {
+                savepoint.rollback().await?;
+                Err(error)
+            }
+        }
+    }
+
+    async fn persist_unvalidated_estimates_and_fail_with_savepoint(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        lease: &CheckpointLease,
+        snapshots: &[ChipSnapshot],
+        error: &str,
+    ) -> Result<usize> {
         validate_snapshot_batch(snapshots)?;
         validate_batch_matches_lease(lease, snapshots)?;
         if snapshots.iter().any(|snapshot| {
@@ -64,12 +112,11 @@ impl ChipRepository {
                 "fallback chip batch must contain only unvalidated estimates".to_string(),
             ));
         }
-        let mut transaction = self.pool.begin().await?;
         let owns_live_lease: Option<bool> = sqlx::query_scalar(
             r#"SELECT TRUE FROM company_data_repair_checkpoints
                WHERE phase = $1 AND code = $2 AND start_date = $3 AND end_date = $4
                  AND status = 'running' AND attempts = $5 AND lease_token = $6
-                 AND lease_expires_at > NOW()
+                 AND lease_expires_at > clock_timestamp()
                FOR UPDATE"#,
         )
         .bind(&lease.phase)
@@ -78,20 +125,20 @@ impl ChipRepository {
         .bind(lease.end_date)
         .bind(lease.attempt)
         .bind(lease.token)
-        .fetch_optional(&mut *transaction)
+        .fetch_optional(&mut **transaction)
         .await?;
         if owns_live_lease.is_none() {
             return Err(stale_chip_lease(lease));
         }
         let mut changed = 0;
         for snapshot in snapshots {
-            changed += usize::from(upsert_snapshot_in_tx(&mut transaction, snapshot, true).await?);
+            changed += usize::from(upsert_snapshot_in_tx(transaction, snapshot, true).await?);
         }
         let failed = sqlx::query(
             r#"UPDATE company_data_repair_checkpoints
                SET status = 'failed', last_error = $7,
                    lease_token = NULL, lease_expires_at = NULL,
-                   updated_at = NOW(), completed_at = NULL
+                   updated_at = clock_timestamp(), completed_at = NULL
                WHERE phase = $1 AND code = $2 AND start_date = $3 AND end_date = $4
                  AND status = 'running' AND attempts = $5 AND lease_token = $6"#,
         )
@@ -102,13 +149,12 @@ impl ChipRepository {
         .bind(lease.attempt)
         .bind(lease.token)
         .bind(error.chars().take(500).collect::<String>())
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await?
         .rows_affected();
         if failed != 1 {
             return Err(stale_chip_lease(lease));
         }
-        transaction.commit().await?;
         Ok(changed)
     }
 
@@ -117,6 +163,54 @@ impl ChipRepository {
     /// an expired worker cannot publish snapshots after losing its lease.
     pub async fn persist_snapshot_batch_and_complete(
         &self,
+        lease: &CheckpointLease,
+        snapshots: &[ChipSnapshot],
+        model_state: Option<&ChipModelState>,
+    ) -> Result<usize> {
+        let mut transaction = self.pool.begin().await?;
+        let changed = self
+            .persist_snapshot_batch_and_complete_in_transaction(
+                &mut transaction,
+                lease,
+                snapshots,
+                model_state,
+            )
+            .await?;
+        transaction.commit().await?;
+        Ok(changed)
+    }
+
+    pub async fn persist_snapshot_batch_and_complete_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        lease: &CheckpointLease,
+        snapshots: &[ChipSnapshot],
+        model_state: Option<&ChipModelState>,
+    ) -> Result<usize> {
+        let mut savepoint = transaction.begin().await?;
+        let result = self
+            .persist_snapshot_batch_and_complete_with_savepoint(
+                &mut savepoint,
+                lease,
+                snapshots,
+                model_state,
+            )
+            .await;
+        match result {
+            Ok(changed) => {
+                savepoint.commit().await?;
+                Ok(changed)
+            }
+            Err(error) => {
+                savepoint.rollback().await?;
+                Err(error)
+            }
+        }
+    }
+
+    async fn persist_snapshot_batch_and_complete_with_savepoint(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
         lease: &CheckpointLease,
         snapshots: &[ChipSnapshot],
         model_state: Option<&ChipModelState>,
@@ -131,23 +225,21 @@ impl ChipRepository {
                 ));
             }
         }
-
-        let mut transaction = self.pool.begin().await?;
         let mut changed = 0;
         for snapshot in snapshots {
-            changed += usize::from(upsert_snapshot_in_tx(&mut transaction, snapshot, false).await?);
+            changed += usize::from(upsert_snapshot_in_tx(transaction, snapshot, false).await?);
         }
         if let Some(state) = model_state {
-            save_model_state_in_tx(&mut transaction, state).await?;
+            save_model_state_in_tx(transaction, state).await?;
         }
         let completed = sqlx::query(
             r#"UPDATE company_data_repair_checkpoints
                SET status = 'completed', last_error = NULL,
                    lease_token = NULL, lease_expires_at = NULL,
-                   updated_at = NOW(), completed_at = NOW()
+                   updated_at = clock_timestamp(), completed_at = clock_timestamp()
                WHERE phase = $1 AND code = $2 AND start_date = $3 AND end_date = $4
                  AND status = 'running' AND attempts = $5 AND lease_token = $6
-                 AND lease_expires_at > NOW()"#,
+                 AND lease_expires_at > clock_timestamp()"#,
         )
         .bind(&lease.phase)
         .bind(&lease.code)
@@ -155,13 +247,12 @@ impl ChipRepository {
         .bind(lease.end_date)
         .bind(lease.attempt)
         .bind(lease.token)
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await?
         .rows_affected();
         if completed != 1 {
             return Err(stale_chip_lease(lease));
         }
-        transaction.commit().await?;
         Ok(changed)
     }
 
@@ -238,6 +329,36 @@ impl ChipRepository {
         .bind(code)
         .bind(requested_date)
         .fetch_optional(&self.pool)
+        .await?;
+        row.map(snapshot_from_row).transpose()
+    }
+
+    pub async fn canonical_snapshot_at_or_before_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        code: &str,
+        requested_date: NaiveDate,
+    ) -> Result<Option<ChipSnapshot>> {
+        let row = sqlx::query_as::<_, SnapshotRow>(
+            r#"SELECT code, trade_date, distribution,
+                      avg_cost::float8 AS avg_cost,
+                      profit_ratio::float8 AS profit_ratio,
+                      concentration::float8 AS concentration,
+                      dominant_peak_price::float8 AS dominant_peak_price,
+                      source, model_version, validated, source_updated_at,
+                      distribution_format
+               FROM chip_distribution
+               WHERE code = $1 AND trade_date <= $2
+                 AND distribution_format = 'normalized_probability'
+                 AND ((source = 'qbot_estimate'
+                       AND NULLIF(BTRIM(model_version), '') IS NOT NULL)
+                      OR (source = 'tushare' AND model_version IS NULL))
+               ORDER BY trade_date DESC
+               LIMIT 1"#,
+        )
+        .bind(code)
+        .bind(requested_date)
+        .fetch_optional(&mut **transaction)
         .await?;
         row.map(snapshot_from_row).transpose()
     }

@@ -149,8 +149,9 @@ impl RawChipHistoryRow {
                 0.0,
                 100.0,
             )?,
-            // Deterministic fallback 1.0 is supplied by SQL only when no
-            // official factor exists at or before this date.
+            // Historical backfill SQL carries the latest applicable official
+            // factor (or 1.0 before the first one); daily SQL requires an
+            // exact-date factor before constructing this shared input type.
             adjustment_factor: finite_positive(
                 self.adjustment_factor,
                 code,
@@ -693,7 +694,7 @@ where
                    FROM security_master_versions
                    ORDER BY code, available_at DESC, ingested_at DESC, source DESC
                ), current_stocks AS (
-                   SELECT code
+                   SELECT code, list_date
                    FROM latest_master
                    WHERE list_status = 'L'
                      AND list_date IS NOT NULL
@@ -701,7 +702,7 @@ where
                      AND (delist_date IS NULL OR delist_date > $1)
                ), candidate_dates AS (
                    SELECT DISTINCT trade_date
-                   FROM stock_daily_bars
+                   FROM security_daily_status
                    WHERE trade_date <= $1
                )
                SELECT (
@@ -729,30 +730,44 @@ where
                            ORDER BY adjustment.available_at DESC, adjustment.ingested_at DESC
                            LIMIT 1
                        ) factor ON TRUE
-                       WHERE NOT (
-                                bars.code IS NOT NULL
-                                AND bars.open IS NOT NULL
-                                AND bars.high IS NOT NULL
-                                AND bars.low IS NOT NULL
-                                AND bars.close IS NOT NULL
-                                AND bars.volume IS NOT NULL
-                                AND bars.open::TEXT <> 'NaN' AND bars.open > 0
-                                AND bars.high::TEXT <> 'NaN' AND bars.high > 0
-                                AND bars.low::TEXT <> 'NaN' AND bars.low > 0
-                                AND bars.close::TEXT <> 'NaN' AND bars.close > 0
-                                AND bars.volume >= 0
-                                AND bars.high >= GREATEST(bars.open, bars.close)
-                                AND bars.low <= LEAST(bars.open, bars.close)
-                                AND bars.high >= bars.low
-                                AND COALESCE(bars.turnover, basic.turnover_rate) IS NOT NULL
-                                AND COALESCE(bars.turnover, basic.turnover_rate)::TEXT <> 'NaN'
-                                AND COALESCE(bars.turnover, basic.turnover_rate) BETWEEN 0 AND 100
-                                AND factor.adj_factor IS NOT NULL
-                                AND factor.adj_factor::TEXT <> 'NaN'
-                                AND factor.adj_factor > 0
-                       )
+                       LEFT JOIN LATERAL (
+                           SELECT is_suspended
+                           FROM security_daily_status status
+                           WHERE status.code = stocks.code
+                             AND status.trade_date = candidate.trade_date
+                           ORDER BY status.available_at DESC, status.ingested_at DESC,
+                                    status.source ASC
+                           LIMIT 1
+                       ) status ON TRUE
+                       WHERE stocks.list_date <= candidate.trade_date
+                         AND (status.is_suspended IS NULL
+                              OR (NOT status.is_suspended AND NOT (
+                                  bars.code IS NOT NULL
+                                  AND bars.open IS NOT NULL
+                                  AND bars.high IS NOT NULL
+                                  AND bars.low IS NOT NULL
+                                  AND bars.close IS NOT NULL
+                                  AND bars.volume IS NOT NULL
+                                  AND bars.open::TEXT <> 'NaN' AND bars.open > 0
+                                  AND bars.high::TEXT <> 'NaN' AND bars.high > 0
+                                  AND bars.low::TEXT <> 'NaN' AND bars.low > 0
+                                  AND bars.close::TEXT <> 'NaN' AND bars.close > 0
+                                  AND bars.volume >= 0
+                                  AND bars.high >= GREATEST(bars.open, bars.close)
+                                  AND bars.low <= LEAST(bars.open, bars.close)
+                                  AND bars.high >= bars.low
+                                  AND COALESCE(bars.turnover, basic.turnover_rate) IS NOT NULL
+                                  AND COALESCE(bars.turnover, basic.turnover_rate)::TEXT <> 'NaN'
+                                  AND COALESCE(bars.turnover, basic.turnover_rate) BETWEEN 0 AND 100
+                                  AND factor.adj_factor IS NOT NULL
+                                  AND factor.adj_factor::TEXT <> 'NaN'
+                                  AND factor.adj_factor > 0
+                              )))
                    )
-                     AND EXISTS (SELECT 1 FROM current_stocks)
+                     AND EXISTS (
+                         SELECT 1 FROM current_stocks stocks
+                         WHERE stocks.list_date <= candidate.trade_date
+                     )
                    ORDER BY candidate.trade_date DESC
                    LIMIT 1
                )
@@ -765,14 +780,28 @@ where
     }
 
     pub async fn update_daily_chips(&self) -> Result<DailyChipUpdateReport> {
-        let stocks = self.current_stocks().await?;
+        let current_stocks = self.current_stocks().await?;
         let expected_date = self.expected_chip_trade_date().await?;
         let mut report = DailyChipUpdateReport {
             expected_date,
             ..Default::default()
         };
         let Some(expected_date) = expected_date else {
-            report.pending = stocks.len();
+            report.pending = current_stocks.len();
+            return Ok(report);
+        };
+
+        let Some(stocks) = self
+            .traded_stocks_for_date(&current_stocks, expected_date)
+            .await?
+        else {
+            report.pending = current_stocks
+                .iter()
+                .filter(|stock| stock.list_date <= expected_date)
+                .count();
+            report.errors.push(format!(
+                "security status coverage is incomplete for {expected_date}"
+            ));
             return Ok(report);
         };
 
@@ -827,7 +856,7 @@ where
 
         report.observed_date =
             if report.completed == stocks.len() && report.failed == 0 && report.pending == 0 {
-                self.validated_chip_trade_date(&stocks, expected_date)
+                self.validated_chip_trade_date(&stocks, expected_date, decision)
                     .await?
             } else {
                 None
@@ -839,8 +868,22 @@ where
         &self,
         expected_date: NaiveDate,
     ) -> Result<Option<NaiveDate>> {
-        let stocks = self.current_stocks().await?;
-        self.validated_chip_trade_date(&stocks, expected_date).await
+        let current_stocks = self.current_stocks().await?;
+        let Some(stocks) = self
+            .traded_stocks_for_date(&current_stocks, expected_date)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let repository = ChipRepository::new(self.pool.clone());
+        let Some(decision) = repository
+            .latest_validation_decision(CHIP_MODEL_VERSION)
+            .await?
+        else {
+            return Ok(None);
+        };
+        self.validated_chip_trade_date(&stocks, expected_date, decision)
+            .await
     }
 
     async fn update_daily_chip_stock(
@@ -851,10 +894,6 @@ where
         code: &str,
         expected_date: NaiveDate,
     ) -> Result<DailyStockChipOutcome> {
-        // The transaction owns only the advisory lock. All persistence keeps
-        // its existing short transactions while this guard serializes daily
-        // and historical mutations for the same model/code.
-        let _mutation_fence = self.acquire_chip_mutation_fence(code).await?;
         let claim = company_repository
             .claim_checkpoint_window(
                 CHIP_DAILY_PHASE,
@@ -874,13 +913,73 @@ where
             CheckpointClaimOutcome::Claimed(lease) => Some(lease),
         };
 
-        let state = match self.load_chip_model_state(code).await {
+        let Some(mut transaction) = self.try_acquire_chip_mutation_fence(code).await? else {
+            let failure = "another chip writer owns the mutation fence";
+            return Ok(DailyStockChipOutcome::Pending(match lease.as_ref() {
+                Some(lease) => {
+                    self.fail_daily_checkpoint(company_repository, lease, failure)
+                        .await
+                }
+                None => failure.to_string(),
+            }));
+        };
+        let outcome = self
+            .update_daily_chip_stock_locked(
+                &mut transaction,
+                company_repository,
+                chip_repository,
+                decision,
+                code,
+                expected_date,
+                lease.clone(),
+            )
+            .await;
+        match outcome {
+            Ok(outcome) => {
+                transaction.commit().await?;
+                Ok(outcome)
+            }
+            Err(error) => {
+                let failure = error.to_string();
+                let failure = match lease.as_ref() {
+                    Some(lease) => {
+                        self.fail_daily_checkpoint_in_transaction(
+                            company_repository,
+                            &mut transaction,
+                            lease,
+                            &failure,
+                        )
+                        .await
+                    }
+                    None => failure,
+                };
+                transaction.commit().await?;
+                Ok(DailyStockChipOutcome::Failed(failure))
+            }
+        }
+    }
+
+    async fn update_daily_chip_stock_locked(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        company_repository: &CompanyRepository,
+        chip_repository: &ChipRepository,
+        decision: ChipSourceDecision,
+        code: &str,
+        expected_date: NaiveDate,
+        lease: Option<CheckpointLease>,
+    ) -> Result<DailyStockChipOutcome> {
+        let state = match self
+            .load_chip_model_state_in_transaction(transaction, code)
+            .await
+        {
             Ok(state) => state,
             Err(error) => {
                 return Ok(match lease.as_ref() {
                     Some(lease) => DailyStockChipOutcome::Failed(
-                        self.fail_daily_checkpoint(
+                        self.fail_daily_checkpoint_in_transaction(
                             company_repository,
+                            transaction,
                             lease,
                             &format!("model state read failed: {error}"),
                         )
@@ -896,8 +995,13 @@ where
             );
             return Ok(match lease.as_ref() {
                 Some(lease) => DailyStockChipOutcome::Pending(
-                    self.fail_daily_checkpoint(company_repository, lease, &failure)
-                        .await,
+                    self.fail_daily_checkpoint_in_transaction(
+                        company_repository,
+                        transaction,
+                        lease,
+                        &failure,
+                    )
+                    .await,
                 ),
                 None => DailyStockChipOutcome::Failed(failure),
             });
@@ -909,23 +1013,29 @@ where
             );
             return Ok(match lease.as_ref() {
                 Some(lease) => DailyStockChipOutcome::Failed(
-                    self.fail_daily_checkpoint(company_repository, lease, &failure)
-                        .await,
+                    self.fail_daily_checkpoint_in_transaction(
+                        company_repository,
+                        transaction,
+                        lease,
+                        &failure,
+                    )
+                    .await,
                 ),
                 None => DailyStockChipOutcome::Failed(failure),
             });
         }
         if state.through_date == expected_date {
             let canonical = match chip_repository
-                .canonical_snapshot_at_or_before(code, expected_date)
+                .canonical_snapshot_at_or_before_in_transaction(transaction, code, expected_date)
                 .await
             {
                 Ok(canonical) => canonical,
                 Err(error) => {
                     return Ok(match lease.as_ref() {
                         Some(lease) => DailyStockChipOutcome::Failed(
-                            self.fail_daily_checkpoint(
+                            self.fail_daily_checkpoint_in_transaction(
                                 company_repository,
+                                transaction,
                                 lease,
                                 &format!("canonical snapshot read failed: {error}"),
                             )
@@ -940,15 +1050,22 @@ where
                 .is_some_and(|snapshot| snapshot.trade_date == expected_date && snapshot.validated);
             return if ready {
                 if let Some(lease) = lease.as_ref() {
-                    company_repository.complete_checkpoint(lease).await?;
+                    company_repository
+                        .complete_checkpoint_in_transaction(transaction, lease)
+                        .await?;
                 }
                 Ok(DailyStockChipOutcome::Completed { changed: 0 })
             } else {
                 let failure = "model state reached target without a validated canonical snapshot";
                 Ok(DailyStockChipOutcome::Failed(match lease.as_ref() {
                     Some(lease) => {
-                        self.fail_daily_checkpoint(company_repository, lease, failure)
-                            .await
+                        self.fail_daily_checkpoint_in_transaction(
+                            company_repository,
+                            transaction,
+                            lease,
+                            failure,
+                        )
+                        .await
                     }
                     None => failure.to_string(),
                 }))
@@ -967,14 +1084,15 @@ where
         .bind(code)
         .bind(state.through_date)
         .bind(expected_date)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut **transaction)
         .await
         {
             Ok(next_date) => next_date,
             Err(error) => {
                 return Ok(DailyStockChipOutcome::Failed(
-                    self.fail_daily_checkpoint(
+                    self.fail_daily_checkpoint_in_transaction(
                         company_repository,
+                        transaction,
                         &lease,
                         &format!("chronology check failed: {error}"),
                     )
@@ -988,17 +1106,26 @@ where
                 next_date
             );
             return Ok(DailyStockChipOutcome::Pending(
-                self.fail_daily_checkpoint(company_repository, &lease, &failure)
-                    .await,
+                self.fail_daily_checkpoint_in_transaction(
+                    company_repository,
+                    transaction,
+                    &lease,
+                    &failure,
+                )
+                .await,
             ));
         }
 
-        let raw = match self.load_exact_daily_chip_input(code, expected_date).await {
+        let raw = match self
+            .load_exact_daily_chip_input_in_transaction(transaction, code, expected_date)
+            .await
+        {
             Ok(raw) => raw,
             Err(error) => {
                 return Ok(DailyStockChipOutcome::Failed(
-                    self.fail_daily_checkpoint(
+                    self.fail_daily_checkpoint_in_transaction(
                         company_repository,
+                        transaction,
                         &lease,
                         &format!("daily prerequisite read failed: {error}"),
                     )
@@ -1009,16 +1136,26 @@ where
         let Some(raw) = raw else {
             let failure = "daily bar prerequisite is missing";
             return Ok(DailyStockChipOutcome::Pending(
-                self.fail_daily_checkpoint(company_repository, &lease, failure)
-                    .await,
+                self.fail_daily_checkpoint_in_transaction(
+                    company_repository,
+                    transaction,
+                    &lease,
+                    failure,
+                )
+                .await,
             ));
         };
         let input = match raw.into_input(code) {
             Ok(input) => input,
             Err(error) => {
                 return Ok(DailyStockChipOutcome::Pending(
-                    self.fail_daily_checkpoint(company_repository, &lease, &error.to_string())
-                        .await,
+                    self.fail_daily_checkpoint_in_transaction(
+                        company_repository,
+                        transaction,
+                        &lease,
+                        &error.to_string(),
+                    )
+                    .await,
                 ))
             }
         };
@@ -1027,8 +1164,13 @@ where
             Ok(model) => model,
             Err(error) => {
                 return Ok(DailyStockChipOutcome::Failed(
-                    self.fail_daily_checkpoint(company_repository, &lease, &error.to_string())
-                        .await,
+                    self.fail_daily_checkpoint_in_transaction(
+                        company_repository,
+                        transaction,
+                        &lease,
+                        &error.to_string(),
+                    )
+                    .await,
                 ));
             }
         };
@@ -1036,16 +1178,26 @@ where
             Ok(snapshot) => snapshot,
             Err(error) => {
                 return Ok(DailyStockChipOutcome::Failed(
-                    self.fail_daily_checkpoint(company_repository, &lease, &error.to_string())
-                        .await,
+                    self.fail_daily_checkpoint_in_transaction(
+                        company_repository,
+                        transaction,
+                        &lease,
+                        &error.to_string(),
+                    )
+                    .await,
                 ));
             }
         };
         let Some(state) = model.state() else {
             let failure = "daily chip model did not produce state";
             return Ok(DailyStockChipOutcome::Failed(
-                self.fail_daily_checkpoint(company_repository, &lease, failure)
-                    .await,
+                self.fail_daily_checkpoint_in_transaction(
+                    company_repository,
+                    transaction,
+                    &lease,
+                    failure,
+                )
+                .await,
             ));
         };
 
@@ -1065,14 +1217,15 @@ where
                         "official chip data for {expected_date} is unavailable or stale: {error}"
                     );
                     let lease = match company_repository
-                        .renew_checkpoint(&lease, self.lease_ttl)
+                        .renew_checkpoint_in_transaction(transaction, &lease, self.lease_ttl)
                         .await
                     {
                         Ok(lease) => lease,
                         Err(error) => {
                             return Ok(DailyStockChipOutcome::Failed(
-                                self.fail_daily_checkpoint(
+                                self.fail_daily_checkpoint_in_transaction(
                                     company_repository,
+                                    transaction,
                                     &lease,
                                     &format!("{failure}; lease renewal failed: {error}"),
                                 )
@@ -1081,12 +1234,18 @@ where
                         }
                     };
                     if let Err(storage) = chip_repository
-                        .persist_unvalidated_estimates_and_fail(&lease, &[estimate], &failure)
+                        .persist_unvalidated_estimates_and_fail_in_transaction(
+                            transaction,
+                            &lease,
+                            &[estimate],
+                            &failure,
+                        )
                         .await
                     {
                         return Ok(DailyStockChipOutcome::Failed(
-                            self.fail_daily_checkpoint(
+                            self.fail_daily_checkpoint_in_transaction(
                                 company_repository,
+                                transaction,
                                 &lease,
                                 &format!("{failure}; fallback persistence failed: {storage}"),
                             )
@@ -1098,14 +1257,15 @@ where
             },
         };
         let lease = match company_repository
-            .renew_checkpoint(&lease, self.lease_ttl)
+            .renew_checkpoint_in_transaction(transaction, &lease, self.lease_ttl)
             .await
         {
             Ok(lease) => lease,
             Err(error) => {
                 return Ok(DailyStockChipOutcome::Failed(
-                    self.fail_daily_checkpoint(
+                    self.fail_daily_checkpoint_in_transaction(
                         company_repository,
+                        transaction,
                         &lease,
                         &format!("lease renewal failed: {error}"),
                     )
@@ -1114,28 +1274,44 @@ where
             }
         };
         match chip_repository
-            .persist_snapshot_batch_and_complete(&lease, &snapshots, Some(&state))
+            .persist_snapshot_batch_and_complete_in_transaction(
+                transaction,
+                &lease,
+                &snapshots,
+                Some(&state),
+            )
             .await
         {
             Ok(changed) => Ok(DailyStockChipOutcome::Completed { changed }),
             Err(error) => Ok(DailyStockChipOutcome::Failed(
-                self.fail_daily_checkpoint(company_repository, &lease, &error.to_string())
-                    .await,
+                self.fail_daily_checkpoint_in_transaction(
+                    company_repository,
+                    transaction,
+                    &lease,
+                    &error.to_string(),
+                )
+                .await,
             )),
         }
     }
 
-    async fn acquire_chip_mutation_fence(
+    async fn try_acquire_chip_mutation_fence(
         &self,
         code: &str,
-    ) -> Result<Transaction<'static, Postgres>> {
+    ) -> Result<Option<Transaction<'static, Postgres>>> {
         let mut transaction = self.pool.begin().await?;
         let key = format!("chip-mutation:{CHIP_MODEL_VERSION}:{code}");
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-            .bind(key)
-            .execute(&mut *transaction)
-            .await?;
-        Ok(transaction)
+        let acquired: bool =
+            sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(key)
+                .fetch_one(&mut *transaction)
+                .await?;
+        if acquired {
+            Ok(Some(transaction))
+        } else {
+            transaction.rollback().await?;
+            Ok(None)
+        }
     }
 
     async fn fail_daily_checkpoint(
@@ -1153,7 +1329,27 @@ where
         format!("{failure}{release_suffix}")
     }
 
-    async fn load_chip_model_state(&self, code: &str) -> Result<Option<ChipModelState>> {
+    async fn fail_daily_checkpoint_in_transaction(
+        &self,
+        repository: &CompanyRepository,
+        transaction: &mut Transaction<'_, Postgres>,
+        lease: &CheckpointLease,
+        failure: &str,
+    ) -> String {
+        let release_suffix = repository
+            .fail_checkpoint_in_transaction(transaction, lease, failure)
+            .await
+            .err()
+            .map(|release| format!("; checkpoint release failed: {release}"))
+            .unwrap_or_default();
+        format!("{failure}{release_suffix}")
+    }
+
+    async fn load_chip_model_state_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        code: &str,
+    ) -> Result<Option<ChipModelState>> {
         let row = sqlx::query_as::<_, (NaiveDate, serde_json::Value, f64)>(
             r#"SELECT through_date, distribution, last_adjustment_factor::float8
                FROM chip_model_states
@@ -1161,7 +1357,7 @@ where
         )
         .bind(code)
         .bind(CHIP_MODEL_VERSION)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut **transaction)
         .await?;
         row.map(|(through_date, distribution, last_adjustment_factor)| {
             Ok(ChipModelState {
@@ -1175,8 +1371,9 @@ where
         .transpose()
     }
 
-    async fn load_exact_daily_chip_input(
+    async fn load_exact_daily_chip_input_in_transaction(
         &self,
+        transaction: &mut Transaction<'_, Postgres>,
         code: &str,
         trade_date: NaiveDate,
     ) -> Result<Option<RawChipHistoryRow>> {
@@ -1217,7 +1414,7 @@ where
         )
         .bind(code)
         .bind(trade_date)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut **transaction)
         .await?;
         Ok(row.map(
             |(trade_date, open, high, low, close, volume, turnover_rate, adjustment_factor)| {
@@ -1239,9 +1436,10 @@ where
         &self,
         stocks: &[CurrentStock],
         expected_date: NaiveDate,
+        decision: ChipSourceDecision,
     ) -> Result<Option<NaiveDate>> {
         if stocks.is_empty() {
-            return Ok(None);
+            return Ok(Some(expected_date));
         }
         let codes = stocks
             .iter()
@@ -1250,16 +1448,70 @@ where
         let ready: bool = sqlx::query_scalar(
             r#"SELECT COUNT(DISTINCT snapshot.code) = cardinality($1::text[])
                FROM chip_distribution snapshot
+               JOIN chip_model_states state
+                 ON state.code = snapshot.code
+                AND state.model_version = $3
+                AND state.through_date = $2
                WHERE snapshot.code = ANY($1::text[])
                  AND snapshot.trade_date = $2
                  AND snapshot.validated
-                 AND snapshot.distribution_format = 'normalized_probability'"#,
+                 AND snapshot.distribution_format = 'normalized_probability'
+                 AND (($4 = 'estimate'
+                       AND snapshot.source = 'qbot_estimate'
+                       AND snapshot.model_version = $3)
+                      OR ($4 = 'official'
+                          AND snapshot.source = 'tushare'
+                          AND snapshot.model_version IS NULL))"#,
         )
         .bind(&codes)
         .bind(expected_date)
+        .bind(CHIP_MODEL_VERSION)
+        .bind(decision.as_str())
         .fetch_one(&self.pool)
         .await?;
         Ok(ready.then_some(expected_date))
+    }
+
+    async fn traded_stocks_for_date(
+        &self,
+        stocks: &[CurrentStock],
+        trade_date: NaiveDate,
+    ) -> Result<Option<Vec<CurrentStock>>> {
+        let eligible = stocks
+            .iter()
+            .filter(|stock| stock.list_date <= trade_date)
+            .cloned()
+            .collect::<Vec<_>>();
+        if eligible.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let codes = eligible
+            .iter()
+            .map(|stock| stock.code.as_str())
+            .collect::<Vec<_>>();
+        let statuses = sqlx::query_as::<_, (String, bool)>(
+            r#"SELECT DISTINCT ON (code) code, is_suspended
+               FROM security_daily_status
+               WHERE code = ANY($1::text[]) AND trade_date = $2
+               ORDER BY code, available_at DESC, ingested_at DESC, source ASC"#,
+        )
+        .bind(&codes)
+        .bind(trade_date)
+        .fetch_all(&self.pool)
+        .await?;
+        if statuses.len() != eligible.len() {
+            return Ok(None);
+        }
+        let suspended = statuses
+            .into_iter()
+            .filter_map(|(code, is_suspended)| is_suspended.then_some(code))
+            .collect::<BTreeSet<_>>();
+        Ok(Some(
+            eligible
+                .into_iter()
+                .filter(|stock| !suspended.contains(&stock.code))
+                .collect(),
+        ))
     }
 
     pub async fn backfill_chips(&self) -> Result<ChipBackfillReport> {
@@ -1318,7 +1570,6 @@ where
         decision: ChipSourceDecision,
         code: &str,
     ) -> Result<ChipBackfillReport> {
-        let _mutation_fence = self.acquire_chip_mutation_fence(code).await?;
         let history = self.load_raw_chip_history(code).await?;
         if history.is_empty() {
             return Err(AppError::DataProvider(format!(
@@ -1374,9 +1625,30 @@ where
                 // advances the estimator for the next incomplete window.
                 continue;
             };
-            let lease = company_repository
-                .renew_checkpoint(&lease, self.lease_ttl)
-                .await?;
+            let Some(mut transaction) = self.try_acquire_chip_mutation_fence(code).await? else {
+                let failure = "another chip writer owns the mutation fence";
+                company_repository.fail_checkpoint(&lease, failure).await?;
+                report.pending += 1;
+                break;
+            };
+            let lease = match company_repository
+                .renew_checkpoint_in_transaction(&mut transaction, &lease, self.lease_ttl)
+                .await
+            {
+                Ok(lease) => lease,
+                Err(error) => {
+                    let failure = self
+                        .fail_daily_checkpoint_in_transaction(
+                            &company_repository,
+                            &mut transaction,
+                            &lease,
+                            &format!("lease renewal failed: {error}"),
+                        )
+                        .await;
+                    transaction.commit().await?;
+                    return Err(AppError::DataProvider(failure));
+                }
+            };
 
             let fallback_estimates = estimates.clone();
             let snapshots = match self
@@ -1392,29 +1664,60 @@ where
                         // Provider calls can outlive the lease. Re-fence before
                         // any fallback write so an expired worker cannot mutate
                         // a window already reclaimed by another worker.
-                        let lease = company_repository
-                            .renew_checkpoint(&lease, self.lease_ttl)
+                        let lease = match company_repository
+                            .renew_checkpoint_in_transaction(
+                                &mut transaction,
+                                &lease,
+                                self.lease_ttl,
+                            )
                             .await
-                            .map_err(|renewal| {
-                                AppError::DataProvider(format!(
+                        {
+                            Ok(lease) => lease,
+                            Err(renewal) => {
+                                let cleanup_error = format!(
                                     "{provider_failure}; lease renewal failed after provider failure: {renewal}"
-                                ))
-                            })?;
+                                );
+                                let release_suffix = company_repository
+                                    .fail_checkpoint_in_transaction(
+                                        &mut transaction,
+                                        &lease,
+                                        &cleanup_error,
+                                    )
+                                    .await
+                                    .err()
+                                    .map(|release| {
+                                        format!("; checkpoint release failed: {release}")
+                                    })
+                                    .unwrap_or_default();
+                                transaction.commit().await?;
+                                return Err(AppError::DataProvider(format!(
+                                    "{cleanup_error}{release_suffix}"
+                                )));
+                            }
+                        };
                         match chip_repository
-                            .persist_unvalidated_estimates_and_fail(
+                            .persist_unvalidated_estimates_and_fail_in_transaction(
+                                &mut transaction,
                                 &lease,
                                 &fallback_estimates,
                                 &provider_failure,
                             )
                             .await
                         {
-                            Ok(_) => return Err(AppError::DataProvider(provider_failure)),
+                            Ok(_) => {
+                                transaction.commit().await?;
+                                return Err(AppError::DataProvider(provider_failure));
+                            }
                             Err(storage) => {
                                 let cleanup_error = format!(
                                     "{provider_failure}; fallback persistence failed: {storage}"
                                 );
                                 let release = match company_repository
-                                    .fail_checkpoint(&lease, &cleanup_error)
+                                    .fail_checkpoint_in_transaction(
+                                        &mut transaction,
+                                        &lease,
+                                        &cleanup_error,
+                                    )
                                     .await
                                 {
                                     Ok(()) => "checkpoint release succeeded".to_string(),
@@ -1422,38 +1725,72 @@ where
                                         format!("checkpoint release failed: {error}")
                                     }
                                 };
-                                return Err(AppError::DataProvider(format!(
-                                    "{cleanup_error}; {release}"
-                                )));
+                                let failure =
+                                    AppError::DataProvider(format!("{cleanup_error}; {release}"));
+                                transaction.commit().await?;
+                                return Err(failure);
                             }
                         }
                     }
                     let failure = format!("official chip data unavailable: {error}");
-                    company_repository.fail_checkpoint(&lease, &failure).await?;
+                    company_repository
+                        .fail_checkpoint_in_transaction(&mut transaction, &lease, &failure)
+                        .await?;
+                    transaction.commit().await?;
                     return Err(AppError::DataProvider(failure));
                 }
             };
-            let lease = company_repository
-                .renew_checkpoint(&lease, self.lease_ttl)
-                .await?;
-            let state = model.state().ok_or_else(|| {
-                AppError::Internal("chip model did not produce state".to_string())
-            })?;
-            match chip_repository
-                .persist_snapshot_batch_and_complete(&lease, &snapshots, Some(&state))
+            let lease = match company_repository
+                .renew_checkpoint_in_transaction(&mut transaction, &lease, self.lease_ttl)
                 .await
             {
-                Ok(changed) => report.snapshots += changed,
-                Err(error) => {
+                Ok(lease) => lease,
+                Err(renewal) => {
+                    let cleanup_error = format!("lease renewal failed: {renewal}");
                     let release_suffix = company_repository
-                        .fail_checkpoint(&lease, &error.to_string())
+                        .fail_checkpoint_in_transaction(&mut transaction, &lease, &cleanup_error)
                         .await
                         .err()
                         .map(|release| format!("; checkpoint release failed: {release}"))
                         .unwrap_or_default();
+                    transaction.commit().await?;
                     return Err(AppError::DataProvider(format!(
-                        "chip batch persistence failed for {code}/{start}..{end}: {error}{release_suffix}"
+                        "{cleanup_error}{release_suffix}"
                     )));
+                }
+            };
+            let state = model.state().ok_or_else(|| {
+                AppError::Internal("chip model did not produce state".to_string())
+            })?;
+            match chip_repository
+                .persist_snapshot_batch_and_complete_in_transaction(
+                    &mut transaction,
+                    &lease,
+                    &snapshots,
+                    Some(&state),
+                )
+                .await
+            {
+                Ok(changed) => {
+                    report.snapshots += changed;
+                    transaction.commit().await?;
+                }
+                Err(error) => {
+                    let release_suffix = company_repository
+                        .fail_checkpoint_in_transaction(
+                            &mut transaction,
+                            &lease,
+                            &error.to_string(),
+                        )
+                        .await
+                        .err()
+                        .map(|release| format!("; checkpoint release failed: {release}"))
+                        .unwrap_or_default();
+                    let failure = AppError::DataProvider(format!(
+                        "chip batch persistence failed for {code}/{start}..{end}: {error}{release_suffix}"
+                    ));
+                    transaction.commit().await?;
+                    return Err(failure);
                 }
             }
         }
@@ -2667,6 +3004,28 @@ mod tests {
         .unwrap();
     }
 
+    async fn seed_security_status(
+        pool: &PgPool,
+        code: &str,
+        trade_date: NaiveDate,
+        is_suspended: bool,
+    ) {
+        sqlx::query(
+            r#"INSERT INTO security_daily_status
+               (code, trade_date, listed_days, is_st, is_suspended, price_limit_pct,
+                available_at, availability_quality, source)
+               VALUES ($1, $2, 100, FALSE, $3, 10.0,
+                       $4, 'observed', 'test')"#,
+        )
+        .bind(code)
+        .bind(trade_date)
+        .bind(is_suspended)
+        .bind(trade_date.and_hms_opt(10, 0, 0).unwrap().and_utc())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     async fn seed_stock_version(
         pool: &PgPool,
         code: &str,
@@ -3017,8 +3376,10 @@ mod tests {
         let outlier = date(2026, 7, 20);
         for code in [first, second] {
             seed_current_stock(&pool, code, previous).await;
+            seed_security_status(&pool, code, previous, false).await;
             seed_chip_bars(&pool, code, previous, 1).await;
             seed_adjustment_factor(&pool, code, previous).await;
+            seed_security_status(&pool, code, outlier, false).await;
         }
         seed_chip_bars(&pool, first, outlier, 1).await;
         seed_adjustment_factor(&pool, first, outlier).await;
@@ -3035,12 +3396,87 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn daily_target_accepts_a_confirmed_suspension_without_a_bar(pool: PgPool) {
+        let traded = "000001.SZ";
+        let suspended = "000002.SZ";
+        let expected = date(2026, 7, 20);
+        for code in [traded, suspended] {
+            seed_current_stock(&pool, code, date(2020, 1, 1)).await;
+        }
+        seed_security_status(&pool, traded, expected, false).await;
+        seed_security_status(&pool, suspended, expected, true).await;
+        seed_chip_bars(&pool, traded, expected, 1).await;
+        seed_adjustment_factor(&pool, traded, expected).await;
+        let service = CompanyIntelligenceService::new_at(
+            pool,
+            Arc::new(RecordingChipProvider::default()),
+            expected,
+        );
+
+        assert_eq!(
+            service.expected_chip_trade_date().await.unwrap(),
+            Some(expected)
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn daily_target_excludes_a_current_ipo_before_its_listing_date(pool: PgPool) {
+        let incumbent = "000001.SZ";
+        let ipo = "000002.SZ";
+        let previous = date(2026, 7, 17);
+        let ipo_list_date = date(2026, 7, 20);
+        seed_current_stock(&pool, incumbent, date(2020, 1, 1)).await;
+        seed_current_stock(&pool, ipo, ipo_list_date).await;
+        seed_security_status(&pool, incumbent, previous, false).await;
+        seed_chip_bars(&pool, incumbent, previous, 1).await;
+        seed_adjustment_factor(&pool, incumbent, previous).await;
+        let service = CompanyIntelligenceService::new_at(
+            pool,
+            Arc::new(RecordingChipProvider::default()),
+            ipo_list_date,
+        );
+
+        assert_eq!(
+            service.expected_chip_trade_date().await.unwrap(),
+            Some(previous)
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn daily_target_rejects_a_partial_security_status_batch(pool: PgPool) {
+        let first = "000001.SZ";
+        let second = "000002.SZ";
+        let previous = date(2026, 7, 17);
+        let partial = date(2026, 7, 20);
+        for code in [first, second] {
+            seed_current_stock(&pool, code, date(2020, 1, 1)).await;
+            seed_security_status(&pool, code, previous, false).await;
+            seed_chip_bars(&pool, code, previous, 1).await;
+            seed_adjustment_factor(&pool, code, previous).await;
+            seed_chip_bars(&pool, code, partial, 1).await;
+            seed_adjustment_factor(&pool, code, partial).await;
+        }
+        seed_security_status(&pool, first, partial, false).await;
+        let service = CompanyIntelligenceService::new_at(
+            pool,
+            Arc::new(RecordingChipProvider::default()),
+            partial,
+        );
+
+        assert_eq!(
+            service.expected_chip_trade_date().await.unwrap(),
+            Some(previous)
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn daily_observed_date_is_none_when_any_current_stock_is_pending(pool: PgPool) {
         let first = "000001.SZ";
         let second = "000002.SZ";
         let expected = date(2026, 7, 20);
         for code in [first, second] {
             seed_current_stock(&pool, code, expected).await;
+            seed_security_status(&pool, code, expected, false).await;
             seed_chip_bars(&pool, code, expected, 1).await;
             seed_adjustment_factor(&pool, code, expected).await;
         }
@@ -3061,12 +3497,88 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn chip_preflight_requires_a_successful_current_model_decision(pool: PgPool) {
+        let code = "000001.SZ";
+        let expected = date(2026, 7, 20);
+        seed_current_stock(&pool, code, date(2020, 1, 1)).await;
+        seed_security_status(&pool, code, expected, false).await;
+        seed_chip_bars(&pool, code, expected, 1).await;
+        seed_adjustment_factor(&pool, code, expected).await;
+        seed_validated_estimate(&pool, code, expected).await;
+        let service = CompanyIntelligenceService::new_at(
+            pool,
+            Arc::new(RecordingChipProvider::default()),
+            expected,
+        );
+
+        assert_eq!(
+            service.observed_chip_trade_date(expected).await.unwrap(),
+            None
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn chip_preflight_requires_exact_model_state_through_the_target(pool: PgPool) {
+        let code = "000001.SZ";
+        let previous = date(2026, 7, 17);
+        let expected = date(2026, 7, 20);
+        seed_current_stock(&pool, code, date(2020, 1, 1)).await;
+        seed_security_status(&pool, code, expected, false).await;
+        seed_chip_bars(&pool, code, expected, 1).await;
+        seed_adjustment_factor(&pool, code, expected).await;
+        seed_chip_decision(&pool, ChipSourceDecision::Estimate).await;
+        seed_validated_estimate(&pool, code, expected).await;
+        sqlx::query(
+            "UPDATE chip_model_states SET through_date = $1 WHERE code = $2 AND model_version = 'qbot-chip-v2'",
+        )
+        .bind(previous)
+        .bind(code)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let service = CompanyIntelligenceService::new_at(
+            pool,
+            Arc::new(RecordingChipProvider::default()),
+            expected,
+        );
+
+        assert_eq!(
+            service.observed_chip_trade_date(expected).await.unwrap(),
+            None
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn chip_preflight_requires_snapshot_provenance_matching_the_decision(pool: PgPool) {
+        let code = "000001.SZ";
+        let expected = date(2026, 7, 20);
+        seed_current_stock(&pool, code, date(2020, 1, 1)).await;
+        seed_security_status(&pool, code, expected, false).await;
+        seed_chip_bars(&pool, code, expected, 1).await;
+        seed_adjustment_factor(&pool, code, expected).await;
+        seed_chip_decision(&pool, ChipSourceDecision::Official).await;
+        seed_validated_estimate(&pool, code, expected).await;
+        let service = CompanyIntelligenceService::new_at(
+            pool,
+            Arc::new(RecordingChipProvider::default()),
+            expected,
+        );
+
+        assert_eq!(
+            service.observed_chip_trade_date(expected).await.unwrap(),
+            None
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn daily_target_requires_an_exact_date_adjustment_factor(pool: PgPool) {
         let code = "000001.SZ";
         let previous = date(2026, 7, 17);
         let candidate = date(2026, 7, 20);
         seed_current_stock(&pool, code, previous).await;
         seed_chip_decision(&pool, ChipSourceDecision::Estimate).await;
+        seed_security_status(&pool, code, previous, false).await;
+        seed_security_status(&pool, code, candidate, false).await;
         seed_chip_bars(&pool, code, previous, 1).await;
         seed_chip_bars(&pool, code, candidate, 1).await;
         seed_adjustment_factor(&pool, code, previous).await;
@@ -3095,7 +3607,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn daily_and_backfill_writers_keep_snapshot_and_state_consistent(pool: PgPool) {
+    async fn contended_daily_writer_returns_pending_without_waiting_for_backfill(pool: PgPool) {
         let code = "000001.SZ";
         let start = date(2026, 7, 19);
         let expected = date(2026, 7, 20);
@@ -3104,6 +3616,7 @@ mod tests {
         seed_chip_bars(&pool, code, start, 2).await;
         seed_adjustment_factor(&pool, code, start).await;
         seed_adjustment_factor(&pool, code, expected).await;
+        seed_security_status(&pool, code, expected, false).await;
         let provider = Arc::new(RecordingChipProvider {
             official_delay: Duration::from_millis(200),
             ..Default::default()
@@ -3130,8 +3643,19 @@ mod tests {
         .await
         .expect("backfill must claim its checkpoint");
 
-        let daily = daily_service.update_daily_chips().await.unwrap();
+        let contended = tokio::time::timeout(
+            Duration::from_millis(100),
+            daily_service.update_daily_chips(),
+        )
+        .await
+        .expect("a contended advisory fence must return without waiting")
+        .unwrap();
+        assert_eq!(contended.completed, 0);
+        assert_eq!(contended.pending, 1);
+        assert_eq!(contended.observed_date, None);
+
         let backfill = backfill.await.unwrap().unwrap();
+        let daily = daily_service.update_daily_chips().await.unwrap();
 
         assert_eq!(backfill.completed, 1);
         assert_eq!(daily.completed, 1);
@@ -3159,6 +3683,37 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn daily_writer_completes_with_a_single_database_connection(pool: PgPool) {
+        let code = "000001.SZ";
+        let previous = date(2026, 7, 17);
+        let expected = date(2026, 7, 20);
+        seed_current_stock(&pool, code, date(2020, 1, 1)).await;
+        seed_chip_decision(&pool, ChipSourceDecision::Estimate).await;
+        seed_chip_state(&pool, code, previous).await;
+        seed_security_status(&pool, code, expected, false).await;
+        seed_chip_bars(&pool, code, expected, 1).await;
+        seed_adjustment_factor(&pool, code, expected).await;
+        let constrained_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(pool.connect_options().as_ref().clone())
+            .await
+            .unwrap();
+        let service = CompanyIntelligenceService::new_at(
+            constrained_pool,
+            Arc::new(RecordingChipProvider::default()),
+            expected,
+        );
+
+        let report = tokio::time::timeout(Duration::from_secs(2), service.update_daily_chips())
+            .await
+            .expect("daily writer must not reacquire its locked pool connection")
+            .unwrap();
+
+        assert_eq!(report.completed, 1);
+        assert_eq!(report.observed_date, Some(expected));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn daily_estimate_requires_complete_prerequisites_and_advances_once(pool: PgPool) {
         let code = "000001.SZ";
         let previous = date(2026, 7, 17);
@@ -3166,6 +3721,7 @@ mod tests {
         seed_current_stock(&pool, code, previous).await;
         seed_chip_decision(&pool, ChipSourceDecision::Estimate).await;
         seed_chip_state(&pool, code, previous).await;
+        seed_security_status(&pool, code, expected, false).await;
         seed_chip_bars(&pool, code, expected, 1).await;
         seed_adjustment_factor(&pool, code, expected).await;
         let provider = Arc::new(RecordingChipProvider::default());
@@ -3225,6 +3781,7 @@ mod tests {
         seed_current_stock(&pool, code, previous).await;
         seed_chip_decision(&pool, ChipSourceDecision::Official).await;
         seed_chip_state(&pool, code, previous).await;
+        seed_security_status(&pool, code, expected, false).await;
         seed_chip_bars(&pool, code, expected, 1).await;
         seed_adjustment_factor(&pool, code, expected).await;
         let provider = Arc::new(RecordingChipProvider::default());
@@ -3444,7 +4001,10 @@ mod tests {
         let error = worker.await.unwrap().unwrap_err().to_string();
 
         assert!(error.contains("injected official failure"));
-        assert!(error.contains("lease renewal failed after provider failure"));
+        assert!(
+            error.contains("lease renewal failed after provider failure"),
+            "unexpected error: {error}"
+        );
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM chip_distribution")
                 .fetch_one(&pool)
@@ -3498,7 +4058,10 @@ mod tests {
 
         assert!(error.contains("injected official failure"));
         assert!(error.contains("injected fallback storage failure"));
-        assert!(error.contains("checkpoint release succeeded"));
+        assert!(
+            error.contains("checkpoint release succeeded"),
+            "unexpected error: {error}"
+        );
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM chip_distribution")
                 .fetch_one(&pool)
