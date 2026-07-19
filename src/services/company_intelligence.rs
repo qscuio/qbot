@@ -5,7 +5,7 @@ use std::time::Duration;
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, NaiveDate, TimeZone, Utc};
 use serde::Serialize;
 use serde_json::json;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::data::chip::{
@@ -78,6 +78,39 @@ struct RawChipHistoryRow {
     volume: Option<f64>,
     turnover_rate: Option<f64>,
     adjustment_factor: Option<f64>,
+}
+
+#[derive(Debug)]
+struct ChipBenchmarkFailure {
+    stage: &'static str,
+    sample: Option<ChipValidationSample>,
+    partial_context: serde_json::Value,
+    detail: String,
+}
+
+impl ChipBenchmarkFailure {
+    fn before_sample(stage: &'static str, error: impl std::fmt::Display) -> Self {
+        Self {
+            stage,
+            sample: None,
+            partial_context: json!({"sample_available": false}),
+            detail: error.to_string(),
+        }
+    }
+
+    fn after_sample(
+        stage: &'static str,
+        sample: ChipValidationSample,
+        partial_context: serde_json::Value,
+        error: impl std::fmt::Display,
+    ) -> Self {
+        Self {
+            stage,
+            sample: Some(sample),
+            partial_context,
+            detail: error.to_string(),
+        }
+    }
 }
 
 impl RawChipHistoryRow {
@@ -431,45 +464,80 @@ where
             });
         }
 
+        // A transaction-scoped advisory lock serializes the decision check,
+        // provider work, and persistence for this model version. It is released
+        // automatically on every commit/rollback path and cannot leak through a
+        // pooled session.
+        let mut serialization = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("chip-benchmark:{CHIP_MODEL_VERSION}"))
+            .execute(&mut *serialization)
+            .await?;
+        if let Some(decision) =
+            latest_validation_decision_in_tx(&mut serialization, CHIP_MODEL_VERSION).await?
+        {
+            serialization.commit().await?;
+            return Ok(ChipBenchmarkReport {
+                reused: true,
+                decision,
+            });
+        }
+
         let started_at = Utc::now();
         let run_id = Uuid::new_v4();
         match self.execute_chip_benchmark().await {
             Ok((sample, report, decision)) => {
                 repository
-                    .save_validation_run(&ChipValidationRun {
-                        run_id,
-                        model_version: CHIP_MODEL_VERSION.to_string(),
-                        sample_definition: json_value(&sample)?,
-                        aggregate_metrics: json_value(&report.aggregate)?,
-                        subgroup_metrics: json_value(&report.subgroups)?,
-                        decision: Some(decision),
-                        started_at,
-                        completed_at: Some(Utc::now()),
-                        error_summary: None,
-                    })
+                    .save_validation_run_in_transaction(
+                        &mut serialization,
+                        &ChipValidationRun {
+                            run_id,
+                            model_version: CHIP_MODEL_VERSION.to_string(),
+                            sample_definition: json_value(&sample)?,
+                            aggregate_metrics: json_value(&report.aggregate)?,
+                            subgroup_metrics: json_value(&report.subgroups)?,
+                            decision: Some(decision),
+                            started_at,
+                            completed_at: Some(Utc::now()),
+                            error_summary: None,
+                        },
+                    )
                     .await?;
+                serialization.commit().await?;
                 Ok(ChipBenchmarkReport {
                     reused: false,
                     decision,
                 })
             }
-            Err(error) => {
-                let summary = error.to_string();
+            Err(failure) => {
+                let summary = failure.detail.clone();
+                let sample_definition = json!({
+                    "failure_stage": failure.stage,
+                    "sample": failure.sample,
+                });
                 repository
-                    .save_validation_run(&ChipValidationRun {
-                        run_id,
-                        model_version: CHIP_MODEL_VERSION.to_string(),
-                        sample_definition: json!({}),
-                        aggregate_metrics: json!({}),
-                        subgroup_metrics: json!({}),
-                        decision: None,
-                        started_at,
-                        completed_at: Some(Utc::now()),
-                        error_summary: Some(summary.clone()),
-                    })
+                    .save_validation_run_in_transaction(
+                        &mut serialization,
+                        &ChipValidationRun {
+                            run_id,
+                            model_version: CHIP_MODEL_VERSION.to_string(),
+                            sample_definition,
+                            aggregate_metrics: json!({
+                                "failure_stage": failure.stage,
+                                "partial_context": failure.partial_context,
+                            }),
+                            subgroup_metrics: json!({}),
+                            decision: None,
+                            started_at,
+                            completed_at: Some(Utc::now()),
+                            error_summary: Some(summary.clone()),
+                        },
+                    )
                     .await?;
+                serialization.commit().await?;
                 Err(AppError::DataProvider(format!(
-                    "chip benchmark failed: {summary}"
+                    "chip benchmark failed at {}: {summary}",
+                    failure.stage
                 )))
             }
         }
@@ -477,15 +545,51 @@ where
 
     async fn execute_chip_benchmark(
         &self,
-    ) -> Result<(
-        ChipValidationSample,
-        crate::services::chip_validation::ChipValidationReport,
-        ChipSourceDecision,
-    )> {
-        let (universe, observations, actions) = self.load_validation_inputs().await?;
+    ) -> std::result::Result<
+        (
+            ChipValidationSample,
+            crate::services::chip_validation::ChipValidationReport,
+            ChipSourceDecision,
+        ),
+        ChipBenchmarkFailure,
+    > {
+        let (universe, observations, actions) = self
+            .load_validation_inputs()
+            .await
+            .map_err(|error| ChipBenchmarkFailure::before_sample("load_inputs", error))?;
         let sample =
-            build_validation_sample(CHIP_MODEL_VERSION, &universe, &observations, &actions)?;
-        validate_benchmark_sample_shape(&sample)?;
+            build_validation_sample(CHIP_MODEL_VERSION, &universe, &observations, &actions)
+                .map_err(|error| ChipBenchmarkFailure::before_sample("build_sample", error))?;
+        validate_benchmark_sample_shape(&sample).map_err(|error| {
+            ChipBenchmarkFailure::after_sample(
+                "validate_sample",
+                sample.clone(),
+                json!({"observation_rows": observations.len()}),
+                error,
+            )
+        })?;
+        let report = self.execute_chip_sample(&sample).await.map_err(|error| {
+            ChipBenchmarkFailure::after_sample(
+                "provider_or_comparison",
+                sample.clone(),
+                json!({
+                    "sample_stocks": sample.stocks.len(),
+                    "performance_pairs": sample.stocks.iter()
+                        .map(|stock| stock.performance_dates.len()).sum::<usize>(),
+                    "distribution_pairs": sample.stocks.iter()
+                        .map(|stock| stock.distribution_dates.len()).sum::<usize>(),
+                }),
+                error,
+            )
+        })?;
+        let decision = decide_chip_source(&report);
+        Ok((sample, report, decision))
+    }
+
+    async fn execute_chip_sample(
+        &self,
+        sample: &ChipValidationSample,
+    ) -> Result<crate::services::chip_validation::ChipValidationReport> {
         let mut comparisons = Vec::new();
 
         for sampled in &sample.stocks {
@@ -553,8 +657,7 @@ where
         }
 
         let report = aggregate_chip_comparisons(&sample, &comparisons)?;
-        let decision = decide_chip_source(&report);
-        Ok((sample, report, decision))
+        Ok(report)
     }
 
     pub async fn backfill_chips(&self) -> Result<ChipBackfillReport> {
@@ -668,6 +771,9 @@ where
                 // advances the estimator for the next incomplete window.
                 continue;
             };
+            let lease = company_repository
+                .renew_checkpoint(&lease, self.lease_ttl)
+                .await?;
 
             let fallback_estimates = estimates.clone();
             let snapshots = match self
@@ -679,15 +785,24 @@ where
                     // Estimates are useful fallback evidence but are explicitly
                     // unvalidated and the checkpoint remains retryable.
                     if decision == ChipSourceDecision::Official {
+                        let failure = format!("official chip data unavailable: {error}");
                         chip_repository
-                            .upsert_unvalidated_estimate_batch(&fallback_estimates)
+                            .persist_unvalidated_estimates_and_fail(
+                                &lease,
+                                &fallback_estimates,
+                                &failure,
+                            )
                             .await?;
+                        return Err(AppError::DataProvider(failure));
                     }
                     let failure = format!("official chip data unavailable: {error}");
                     company_repository.fail_checkpoint(&lease, &failure).await?;
                     return Err(AppError::DataProvider(failure));
                 }
             };
+            let lease = company_repository
+                .renew_checkpoint(&lease, self.lease_ttl)
+                .await?;
             let state = model.state().ok_or_else(|| {
                 AppError::Internal("chip model did not produce state".to_string())
             })?;
@@ -870,42 +985,78 @@ where
             .iter()
             .map(|stock| stock.code.clone())
             .collect::<Vec<_>>();
-        let raw = sqlx::query_as::<_, (String, NaiveDate, Option<f64>, Option<f64>)>(
-            r#"SELECT bars.code, bars.trade_date, bars.close::float8,
-                      COALESCE(bars.turnover::float8, basic.turnover_rate)
-               FROM stock_daily_bars bars
-               LEFT JOIN LATERAL (
-                   SELECT turnover_rate::float8 AS turnover_rate
-                   FROM stock_daily_basic_versions daily
-                   WHERE daily.code = bars.code AND daily.trade_date = bars.trade_date
-                   ORDER BY daily.available_at DESC, daily.ingested_at DESC
-                   LIMIT 1
-               ) basic ON TRUE
-               WHERE bars.code = ANY($1)
-                 AND bars.trade_date >= DATE '2018-01-01'
-                 AND bars.trade_date <= $2
-               ORDER BY bars.code, bars.trade_date"#,
+        let raw = sqlx::query_as::<_, (String, NaiveDate, f64, f64)>(
+            r#"WITH base AS (
+                   SELECT bars.code, bars.trade_date, bars.close::float8 AS close,
+                          COALESCE(bars.turnover::float8, basic.turnover_rate) AS turnover
+                   FROM stock_daily_bars bars
+                   LEFT JOIN LATERAL (
+                       SELECT turnover_rate::float8 AS turnover_rate
+                       FROM stock_daily_basic_versions daily
+                       WHERE daily.code = bars.code AND daily.trade_date = bars.trade_date
+                       ORDER BY daily.available_at DESC, daily.ingested_at DESC
+                       LIMIT 1
+                   ) basic ON TRUE
+                   WHERE bars.code = ANY($1)
+                     AND bars.trade_date >= DATE '2018-01-01'
+                     AND bars.trade_date <= $2
+               ), valid AS (
+                   SELECT * FROM base
+                   WHERE close IS NOT NULL AND close > 0
+                     AND turnover IS NOT NULL AND turnover BETWEEN 0 AND 100
+               ), with_returns AS (
+                   SELECT code, trade_date, turnover,
+                          ABS(close / LAG(close) OVER
+                              (PARTITION BY code ORDER BY trade_date) - 1.0) AS volatility
+                   FROM valid
+               ), stats AS (
+                   SELECT code, COUNT(*)::bigint AS observation_count,
+                          AVG(turnover)::float8 AS average_turnover,
+                          COALESCE(AVG(volatility), 0)::float8 AS average_volatility
+                   FROM with_returns
+                   GROUP BY code
+                   HAVING COUNT(*) >= 24
+               ), ranked AS (
+                   SELECT rows.code, rows.trade_date, stats.observation_count,
+                          stats.average_turnover, stats.average_volatility,
+                          ROW_NUMBER() OVER
+                              (PARTITION BY rows.code ORDER BY rows.trade_date) AS position
+                   FROM with_returns rows
+                   JOIN stats USING (code)
+               ), targets AS (
+                   SELECT stats.code,
+                          1 + FLOOR(index * (stats.observation_count - 1)::numeric / 23)::bigint
+                              AS position
+                   FROM stats CROSS JOIN generate_series(0, 23) AS index
+               )
+               SELECT ranked.code, ranked.trade_date,
+                      ranked.average_turnover, ranked.average_volatility
+               FROM ranked
+               JOIN targets USING (code, position)
+               ORDER BY ranked.code, ranked.trade_date"#,
         )
         .bind(&codes)
         .bind(self.today)
         .fetch_all(&self.pool)
         .await?;
-        let mut previous = BTreeMap::<String, f64>::new();
-        let mut observations = Vec::with_capacity(raw.len());
-        for (code, trade_date, close, turnover) in raw {
-            let close = finite_positive(close, &code, trade_date, "close")?;
-            let turnover_rate =
-                finite_in_range(turnover, &code, trade_date, "turnover", 0.0, 100.0)?;
-            let volatility = previous
-                .insert(code.clone(), close)
-                .map_or(0.0, |prior| ((close / prior) - 1.0).abs());
-            observations.push(ValidationObservation {
-                code,
-                trade_date,
-                turnover_rate,
-                volatility,
-            });
+        if raw.len() > stocks.len() * 24 {
+            return Err(AppError::Internal(format!(
+                "bounded chip validation query returned {} rows for {} stocks",
+                raw.len(),
+                stocks.len()
+            )));
         }
+        let observations = raw
+            .into_iter()
+            .map(
+                |(code, trade_date, turnover_rate, volatility)| ValidationObservation {
+                    code,
+                    trade_date,
+                    turnover_rate,
+                    volatility,
+                },
+            )
+            .collect();
         let actions = sqlx::query_as::<_, (String, NaiveDate)>(
             r#"SELECT DISTINCT ON (code, action_date) code, action_date
                FROM (
@@ -998,6 +1149,29 @@ where
 
 fn json_value(value: &impl Serialize) -> Result<serde_json::Value> {
     serde_json::to_value(value).map_err(AppError::from)
+}
+
+async fn latest_validation_decision_in_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    model_version: &str,
+) -> Result<Option<ChipSourceDecision>> {
+    let decision: Option<String> = sqlx::query_scalar(
+        r#"SELECT decision
+           FROM chip_model_validation_runs
+           WHERE model_version = $1 AND completed_at IS NOT NULL
+             AND decision IS NOT NULL AND error_summary IS NULL
+           ORDER BY recorded_at DESC, run_id DESC LIMIT 1"#,
+    )
+    .bind(model_version)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    decision
+        .map(|value| {
+            ChipSourceDecision::from_storage(&value).ok_or_else(|| {
+                AppError::Internal(format!("unknown stored chip source decision: {value}"))
+            })
+        })
+        .transpose()
 }
 
 fn estimate_history_at_dates(
@@ -1253,6 +1427,7 @@ mod tests {
     struct RecordingChipProvider {
         official_calls: Mutex<usize>,
         fail_official: bool,
+        official_delay: Duration,
     }
 
     #[async_trait]
@@ -1285,6 +1460,9 @@ mod tests {
             end: NaiveDate,
         ) -> Result<Vec<OfficialChipPerformance>> {
             *self.official_calls.lock().unwrap() += 1;
+            if !self.official_delay.is_zero() {
+                tokio::time::sleep(self.official_delay).await;
+            }
             if self.fail_official {
                 return Err(AppError::DataProvider("injected official failure".into()));
             }
@@ -1312,6 +1490,9 @@ mod tests {
             end: NaiveDate,
         ) -> Result<Vec<OfficialChipBucket>> {
             *self.official_calls.lock().unwrap() += 1;
+            if !self.official_delay.is_zero() {
+                tokio::time::sleep(self.official_delay).await;
+            }
             if self.fail_official {
                 return Err(AppError::DataProvider("injected official failure".into()));
             }
@@ -1524,6 +1705,67 @@ mod tests {
         }
     }
 
+    async fn seed_benchmark_universe(pool: &PgPool) -> String {
+        let start = date(2020, 1, 1);
+        let codes = (1..=201)
+            .map(|index| format!("{index:06}.SZ"))
+            .collect::<Vec<_>>();
+        let list_dates = vec![start; codes.len()];
+        sqlx::query(
+            r#"INSERT INTO security_master_versions
+               (code, name, market, exchange, list_status, list_date, delist_date,
+                available_at, availability_quality, source)
+               SELECT code, code, 'A', 'SZ', 'L', list_date, NULL,
+                      TIMESTAMPTZ '2026-07-19 00:00:00+00', 'observed', 'test'
+               FROM UNNEST($1::text[], $2::date[]) AS rows(code, list_date)"#,
+        )
+        .bind(&codes)
+        .bind(&list_dates)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"INSERT INTO stock_daily_basic_versions
+               (code, trade_date, turnover_rate, total_mv, available_at,
+                availability_quality, source)
+               SELECT code, DATE '2020-01-25', 5.0, 1000000 + ordinal,
+                      TIMESTAMPTZ '2020-01-25 10:00:00+00', 'observed', 'test'
+               FROM UNNEST($1::text[]) WITH ORDINALITY AS rows(code, ordinal)"#,
+        )
+        .bind(&codes)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let recent_code = codes.last().unwrap().clone();
+        let mut bar_codes = Vec::new();
+        let mut bar_dates = Vec::new();
+        let mut prices = Vec::new();
+        for (index, code) in codes.iter().enumerate() {
+            let count = if *code == recent_code { 23 } else { 25 };
+            for offset in 0..count {
+                bar_codes.push(code.clone());
+                bar_dates.push(start + ChronoDuration::days(offset as i64));
+                prices.push(10.0 + index as f64 / 100.0 + offset as f64 / 1000.0);
+            }
+        }
+        sqlx::query(
+            r#"INSERT INTO stock_daily_bars
+               (code, trade_date, open, high, low, close, volume, turnover)
+               SELECT code, trade_date, price, price + 0.5, price - 0.5,
+                      price + 0.1, 1000, 5.0
+               FROM UNNEST($1::text[], $2::date[], $3::float8[])
+                    AS rows(code, trade_date, price)"#,
+        )
+        .bind(&bar_codes)
+        .bind(&bar_dates)
+        .bind(&prices)
+        .execute(pool)
+        .await
+        .unwrap();
+        recent_code
+    }
+
     fn migration_024_sql() -> String {
         std::fs::read_to_string(format!(
             "{}/migrations/024_expand_company_checkpoints.sql",
@@ -1719,14 +1961,60 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn concurrent_full_benchmark_runs_once_with_bounded_eligible_sample(pool: PgPool) {
+        let recent_code = seed_benchmark_universe(&pool).await;
+        let provider = Arc::new(RecordingChipProvider::default());
+        let service = Arc::new(CompanyIntelligenceService::new_at(
+            pool.clone(),
+            provider.clone(),
+            date(2026, 7, 19),
+        ));
+
+        let (first, second) =
+            tokio::join!(service.run_chip_benchmark(), service.run_chip_benchmark());
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(first.decision, second.decision);
+        assert_ne!(first.reused, second.reused);
+        assert_eq!(
+            *provider.official_calls.lock().unwrap(),
+            250,
+            "one benchmark performs 200 performance and 50 distribution calls"
+        );
+        let (decision, sample): (String, serde_json::Value) = sqlx::query_as(
+            r#"SELECT decision, sample_definition
+               FROM chip_model_validation_runs
+               WHERE model_version = 'qbot-chip-v2' AND error_summary IS NULL"#,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(matches!(decision.as_str(), "estimate" | "official"));
+        let stocks = sample["stocks"].as_array().unwrap();
+        assert_eq!(stocks.len(), 200);
+        assert!(stocks.iter().all(|stock| stock["code"] != recent_code));
+        assert!(stocks.iter().all(|stock| {
+            let performance = stock["performance_dates"].as_array().unwrap();
+            let distribution = stock["distribution_dates"].as_array().unwrap();
+            performance.len() == 24
+                && (distribution.is_empty()
+                    || (distribution.len() == 12
+                        && distribution.iter().all(|date| performance.contains(date))))
+        }));
+        let input_rows = service.load_validation_inputs().await.unwrap().1.len();
+        assert_eq!(input_rows, 200 * 24);
+        assert!(input_rows <= 201 * 24);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn failed_benchmark_is_persisted_completed_and_retried(pool: PgPool) {
         let provider = Arc::new(RecordingChipProvider::default());
         let service = CompanyIntelligenceService::new_at(pool.clone(), provider, date(2026, 7, 19));
 
         assert!(service.run_chip_benchmark().await.is_err());
         assert!(service.run_chip_benchmark().await.is_err());
-        let rows: Vec<(Option<String>, bool, Option<String>)> = sqlx::query_as(
-            r#"SELECT decision, completed_at IS NOT NULL, error_summary
+        let rows: Vec<(Option<String>, bool, Option<String>, serde_json::Value)> = sqlx::query_as(
+            r#"SELECT decision, completed_at IS NOT NULL, error_summary, sample_definition
                FROM chip_model_validation_runs
                WHERE model_version = 'qbot-chip-v2'
                ORDER BY recorded_at"#,
@@ -1735,9 +2023,47 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(rows.len(), 2);
-        assert!(rows
-            .iter()
-            .all(|row| row.0.is_none() && row.1 && row.2.is_some()));
+        assert!(rows.iter().all(|row| row.0.is_none()
+            && row.1
+            && row.2.is_some()
+            && row.3["failure_stage"] == "load_inputs"
+            && row.3["sample"].is_null()));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn provider_failure_persists_sample_stage_and_partial_audit_context(pool: PgPool) {
+        seed_benchmark_universe(&pool).await;
+        let provider = Arc::new(RecordingChipProvider {
+            fail_official: true,
+            ..Default::default()
+        });
+        let service = CompanyIntelligenceService::new_at(pool.clone(), provider, date(2026, 7, 19));
+
+        let error = service.run_chip_benchmark().await.unwrap_err();
+        assert!(error.to_string().contains("provider_or_comparison"));
+        let (sample, metrics, completed, decision, summary): (
+            serde_json::Value,
+            serde_json::Value,
+            bool,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            r#"SELECT sample_definition, aggregate_metrics,
+                      completed_at IS NOT NULL, decision, error_summary
+               FROM chip_model_validation_runs
+               WHERE model_version = 'qbot-chip-v2'"#,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(completed);
+        assert!(decision.is_none());
+        assert!(summary.unwrap().contains("injected official failure"));
+        assert_eq!(sample["failure_stage"], "provider_or_comparison");
+        assert_eq!(sample["sample"]["stocks"].as_array().unwrap().len(), 200);
+        assert_eq!(metrics["failure_stage"], "provider_or_comparison");
+        assert_eq!(metrics["partial_context"]["performance_pairs"], 4_800);
+        assert_eq!(metrics["partial_context"]["distribution_pairs"], 600);
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -1868,6 +2194,41 @@ mod tests {
             .unwrap();
         assert_eq!(checkpoint.status, "failed");
         assert!(checkpoint.lease_token.is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn short_checkpoint_lease_is_renewed_around_delayed_official_provider(pool: PgPool) {
+        let code = "000001.SZ";
+        let start = date(2020, 1, 2);
+        seed_current_stock(&pool, code, start).await;
+        seed_chip_decision(&pool, ChipSourceDecision::Official).await;
+        seed_chip_bars(&pool, code, start, 2).await;
+        let provider = Arc::new(RecordingChipProvider {
+            official_delay: Duration::from_millis(50),
+            ..Default::default()
+        });
+        let service = CompanyIntelligenceService::new_at(
+            pool.clone(),
+            provider,
+            start + ChronoDuration::days(1),
+        )
+        .with_lease_ttl(Duration::from_millis(180));
+
+        let report = service.backfill_chips().await.unwrap();
+        assert_eq!(report.completed, 1);
+        assert_eq!(report.snapshots, 2);
+        let checkpoint = CompanyRepository::new(pool)
+            .checkpoint_window(
+                "chip_backfill",
+                code,
+                start,
+                start + ChronoDuration::days(1),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.status, "completed");
+        assert_eq!(checkpoint.attempts, 1);
     }
 
     #[sqlx::test(migrations = "./migrations")]

@@ -45,16 +45,16 @@ impl ChipRepository {
         Ok(changed)
     }
 
-    /// Atomically replaces a bounded set of canonical snapshots.
-    ///
-    /// This variant deliberately does not mutate a repair checkpoint. It is
-    /// used to retain explicitly unvalidated estimates after an official
-    /// provider failure while leaving the window retryable.
-    pub async fn upsert_unvalidated_estimate_batch(
+    /// Fences an official-provider failure, retains honestly labeled fallback
+    /// estimates, and marks the exact owned checkpoint failed atomically.
+    pub async fn persist_unvalidated_estimates_and_fail(
         &self,
+        lease: &CheckpointLease,
         snapshots: &[ChipSnapshot],
+        error: &str,
     ) -> Result<usize> {
         validate_snapshot_batch(snapshots)?;
+        validate_batch_matches_lease(lease, snapshots)?;
         if snapshots.iter().any(|snapshot| {
             snapshot.source != "qbot_estimate"
                 || snapshot.model_version.as_deref().is_none()
@@ -65,9 +65,48 @@ impl ChipRepository {
             ));
         }
         let mut transaction = self.pool.begin().await?;
+        let owns_live_lease: Option<bool> = sqlx::query_scalar(
+            r#"SELECT TRUE FROM company_data_repair_checkpoints
+               WHERE phase = $1 AND code = $2 AND start_date = $3 AND end_date = $4
+                 AND status = 'running' AND attempts = $5 AND lease_token = $6
+                 AND lease_expires_at > NOW()
+               FOR UPDATE"#,
+        )
+        .bind(&lease.phase)
+        .bind(&lease.code)
+        .bind(lease.start_date)
+        .bind(lease.end_date)
+        .bind(lease.attempt)
+        .bind(lease.token)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if owns_live_lease.is_none() {
+            return Err(stale_chip_lease(lease));
+        }
         let mut changed = 0;
         for snapshot in snapshots {
             changed += usize::from(upsert_snapshot_in_tx(&mut transaction, snapshot, true).await?);
+        }
+        let failed = sqlx::query(
+            r#"UPDATE company_data_repair_checkpoints
+               SET status = 'failed', last_error = $7,
+                   lease_token = NULL, lease_expires_at = NULL,
+                   updated_at = NOW(), completed_at = NULL
+               WHERE phase = $1 AND code = $2 AND start_date = $3 AND end_date = $4
+                 AND status = 'running' AND attempts = $5 AND lease_token = $6"#,
+        )
+        .bind(&lease.phase)
+        .bind(&lease.code)
+        .bind(lease.start_date)
+        .bind(lease.end_date)
+        .bind(lease.attempt)
+        .bind(lease.token)
+        .bind(error.chars().take(500).collect::<String>())
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        if failed != 1 {
+            return Err(stale_chip_lease(lease));
         }
         transaction.commit().await?;
         Ok(changed)
@@ -83,20 +122,7 @@ impl ChipRepository {
         model_state: Option<&ChipModelState>,
     ) -> Result<usize> {
         validate_snapshot_batch(snapshots)?;
-        if snapshots.is_empty() {
-            return Err(AppError::BadRequest(
-                "chip snapshot batch is empty".to_string(),
-            ));
-        }
-        if snapshots.iter().any(|snapshot| {
-            snapshot.code != lease.code
-                || snapshot.trade_date < lease.start_date
-                || snapshot.trade_date > lease.end_date
-        }) {
-            return Err(AppError::BadRequest(
-                "chip snapshot batch does not match its checkpoint window".to_string(),
-            ));
-        }
+        validate_batch_matches_lease(lease, snapshots)?;
         if let Some(state) = model_state {
             validate_model_state(state)?;
             if state.code != lease.code || state.through_date != lease.end_date {
@@ -133,10 +159,7 @@ impl ChipRepository {
         .await?
         .rows_affected();
         if completed != 1 {
-            return Err(AppError::DataProvider(format!(
-                "stale checkpoint lease for {}/{}/{}..{}",
-                lease.phase, lease.code, lease.start_date, lease.end_date
-            )));
+            return Err(stale_chip_lease(lease));
         }
         transaction.commit().await?;
         Ok(changed)
@@ -196,6 +219,19 @@ impl ChipRepository {
     }
 
     pub async fn save_validation_run(&self, run: &ChipValidationRun) -> Result<bool> {
+        let mut transaction = self.pool.begin().await?;
+        let saved = self
+            .save_validation_run_in_transaction(&mut transaction, run)
+            .await?;
+        transaction.commit().await?;
+        Ok(saved)
+    }
+
+    pub async fn save_validation_run_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        run: &ChipValidationRun,
+    ) -> Result<bool> {
         let result = sqlx::query(
             r#"INSERT INTO chip_model_validation_runs
                (run_id, model_version, sample_definition, aggregate_metrics,
@@ -213,7 +249,7 @@ impl ChipRepository {
         .bind(run.started_at)
         .bind(run.completed_at)
         .bind(&run.error_summary)
-        .execute(&self.pool)
+        .execute(&mut **transaction)
         .await?;
         Ok(result.rows_affected() == 1)
     }
@@ -255,6 +291,31 @@ fn validate_snapshot_batch(snapshots: &[ChipSnapshot]) -> Result<()> {
         validate_snapshot(snapshot)?;
     }
     Ok(())
+}
+
+fn validate_batch_matches_lease(lease: &CheckpointLease, snapshots: &[ChipSnapshot]) -> Result<()> {
+    if snapshots.is_empty() {
+        return Err(AppError::BadRequest(
+            "chip snapshot batch is empty".to_string(),
+        ));
+    }
+    if snapshots.iter().any(|snapshot| {
+        snapshot.code != lease.code
+            || snapshot.trade_date < lease.start_date
+            || snapshot.trade_date > lease.end_date
+    }) {
+        return Err(AppError::BadRequest(
+            "chip snapshot batch does not match its checkpoint window".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn stale_chip_lease(lease: &CheckpointLease) -> AppError {
+    AppError::BadRequest(format!(
+        "stale checkpoint lease for {}/{}/{}..{} attempt {}",
+        lease.phase, lease.code, lease.start_date, lease.end_date, lease.attempt
+    ))
 }
 
 fn validate_model_state(state: &ChipModelState) -> Result<()> {
@@ -666,7 +727,7 @@ mod tests {
     async fn unvalidated_fallback_never_overwrites_validated_official_snapshot(
         pool: PgPool,
     ) -> crate::error::Result<()> {
-        let repo = ChipRepository::new(pool);
+        let repo = ChipRepository::new(pool.clone());
         let day = date(2026, 7, 17);
         let mut official = snapshot(day, 0.4);
         official.source = "tushare".into();
@@ -676,14 +737,155 @@ mod tests {
 
         let mut fallback = snapshot(day, 0.2);
         fallback.validated = false;
+        let claim = CompanyRepository::new(pool.clone())
+            .claim_checkpoint_window(
+                "chip_backfill",
+                "600519.SH",
+                day,
+                day,
+                Duration::from_secs(300),
+            )
+            .await?;
+        let CheckpointClaimOutcome::Claimed(lease) = claim else {
+            panic!("fallback checkpoint must be claimed")
+        };
         assert_eq!(
-            repo.upsert_unvalidated_estimate_batch(&[fallback]).await?,
+            repo.persist_unvalidated_estimates_and_fail(&lease, &[fallback], "provider failed")
+                .await?,
             0
         );
         let stored = repo.latest_snapshot("600519.SH").await?.unwrap();
         assert_eq!(stored.source, "tushare");
         assert!(stored.validated);
         assert_eq!(stored.distribution, official.distribution);
+        assert_eq!(
+            CompanyRepository::new(pool)
+                .checkpoint_window("chip_backfill", "600519.SH", day, day)
+                .await?
+                .unwrap()
+                .status,
+            "failed"
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn reclaimed_fallback_lease_writes_nothing_and_cannot_fail_new_owner(
+        pool: PgPool,
+    ) -> crate::error::Result<()> {
+        let checkpoints = CompanyRepository::new(pool.clone());
+        let first = checkpoints
+            .claim_checkpoint_window(
+                "chip_backfill",
+                "600519.SH",
+                date(2026, 7, 17),
+                date(2026, 7, 17),
+                Duration::from_secs(300),
+            )
+            .await?;
+        let CheckpointClaimOutcome::Claimed(first) = first else {
+            panic!("first worker claims checkpoint")
+        };
+        sqlx::query(
+            "UPDATE company_data_repair_checkpoints SET lease_expires_at = NOW() - INTERVAL '1 second'",
+        )
+        .execute(&pool)
+        .await?;
+        let second = checkpoints
+            .claim_checkpoint_window(
+                "chip_backfill",
+                "600519.SH",
+                date(2026, 7, 17),
+                date(2026, 7, 17),
+                Duration::from_secs(300),
+            )
+            .await?;
+        let CheckpointClaimOutcome::Claimed(second) = second else {
+            panic!("second worker reclaims checkpoint")
+        };
+        let mut fallback = snapshot(date(2026, 7, 17), 0.4);
+        fallback.validated = false;
+
+        assert!(ChipRepository::new(pool.clone())
+            .persist_unvalidated_estimates_and_fail(&first, &[fallback], "late failure")
+            .await
+            .is_err());
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chip_distribution")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(count, 0);
+        let checkpoint = checkpoints
+            .checkpoint_window(
+                "chip_backfill",
+                "600519.SH",
+                date(2026, 7, 17),
+                date(2026, 7, 17),
+            )
+            .await?
+            .unwrap();
+        assert_eq!(checkpoint.status, "running");
+        assert_eq!(checkpoint.lease_token, Some(second.token));
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn fallback_storage_error_rolls_back_rows_and_failed_transition(
+        pool: PgPool,
+    ) -> crate::error::Result<()> {
+        let checkpoints = CompanyRepository::new(pool.clone());
+        let claim = checkpoints
+            .claim_checkpoint_window(
+                "chip_backfill",
+                "600519.SH",
+                date(2026, 7, 19),
+                date(2026, 7, 20),
+                Duration::from_secs(300),
+            )
+            .await?;
+        let CheckpointClaimOutcome::Claimed(lease) = claim else {
+            panic!("worker claims checkpoint")
+        };
+        sqlx::raw_sql(
+            r#"CREATE FUNCTION reject_fallback_second_row() RETURNS trigger AS $$
+               BEGIN
+                   IF NEW.trade_date = DATE '2026-07-20' THEN
+                       RAISE EXCEPTION 'injected fallback failure';
+                   END IF;
+                   RETURN NEW;
+               END;
+               $$ LANGUAGE plpgsql;
+               CREATE TRIGGER reject_fallback_second_row
+               BEFORE INSERT ON chip_distribution
+               FOR EACH ROW EXECUTE FUNCTION reject_fallback_second_row();"#,
+        )
+        .execute(&pool)
+        .await?;
+        let mut first = snapshot(date(2026, 7, 19), 0.4);
+        first.validated = false;
+        let mut second = snapshot(date(2026, 7, 20), 0.3);
+        second.validated = false;
+
+        assert!(ChipRepository::new(pool.clone())
+            .persist_unvalidated_estimates_and_fail(&lease, &[first, second], "provider failure",)
+            .await
+            .is_err());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM chip_distribution")
+                .fetch_one(&pool)
+                .await?,
+            0
+        );
+        let checkpoint = checkpoints
+            .checkpoint_window(
+                "chip_backfill",
+                "600519.SH",
+                date(2026, 7, 19),
+                date(2026, 7, 20),
+            )
+            .await?
+            .unwrap();
+        assert_eq!(checkpoint.status, "running");
+        assert_eq!(checkpoint.lease_token, Some(lease.token));
         Ok(())
     }
 

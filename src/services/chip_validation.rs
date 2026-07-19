@@ -287,7 +287,7 @@ pub fn build_validation_sample(
         .map(|candidate| {
             let performance_dates = evenly_spaced_dates(&candidate.dates, PERFORMANCE_DATE_CAP);
             let distribution_dates = if distribution_codes.contains(&candidate.code) {
-                evenly_spaced_dates(&candidate.dates, DISTRIBUTION_DATE_CAP)
+                evenly_spaced_dates(&performance_dates, DISTRIBUTION_DATE_CAP)
             } else {
                 Vec::new()
             };
@@ -1082,6 +1082,10 @@ mod tests {
         assert_eq!(dense.performance_dates.first(), Some(&date(1)));
         assert_eq!(dense.performance_dates.last(), Some(&date(31)));
         assert_eq!(dense.distribution_dates.len(), 12);
+        assert!(dense
+            .distribution_dates
+            .iter()
+            .all(|date| dense.performance_dates.contains(date)));
         assert_eq!(sparse.performance_dates, vec![date(1), date(3)]);
         assert_eq!(sparse.distribution_dates, vec![date(1), date(3)]);
         assert_eq!(
