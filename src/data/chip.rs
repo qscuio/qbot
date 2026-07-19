@@ -1,7 +1,10 @@
+use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
+
+use crate::error::Result;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChipBucket {
@@ -81,4 +84,44 @@ pub struct ChipValidationRun {
     pub started_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
     pub error_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OfficialChipPerformance {
+    pub code: String,
+    pub trade_date: NaiveDate,
+    pub historical_low: f64,
+    pub historical_high: f64,
+    pub cost_5pct: f64,
+    pub cost_15pct: f64,
+    pub cost_50pct: f64,
+    pub cost_85pct: f64,
+    pub cost_95pct: f64,
+    pub average_cost: f64,
+    pub winner_rate: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OfficialChipBucket {
+    pub code: String,
+    pub trade_date: NaiveDate,
+    pub price: f64,
+    pub weight: f64,
+}
+
+#[async_trait]
+pub trait OfficialChipProvider: Send + Sync {
+    async fn chip_performance(
+        &self,
+        code: &str,
+        start: NaiveDate,
+        end: NaiveDate,
+    ) -> Result<Vec<OfficialChipPerformance>>;
+
+    async fn chip_distribution(
+        &self,
+        code: &str,
+        start: NaiveDate,
+        end: NaiveDate,
+    ) -> Result<Vec<OfficialChipBucket>>;
 }

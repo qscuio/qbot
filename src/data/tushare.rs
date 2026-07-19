@@ -13,6 +13,7 @@ use crate::analysis::market_snapshot::{
     AdjustmentFactor, AvailabilityQuality, CorporateAction, DailyBasicSnapshot, IndexDailyBar,
     SectorMembership, SecurityDailyStatus, SecurityMasterVersion,
 };
+use crate::data::chip::{OfficialChipBucket, OfficialChipPerformance, OfficialChipProvider};
 use crate::data::company::{
     CompanyDataProvider, DividendRecord, FinancialFrequency, FinancialReport,
 };
@@ -25,6 +26,12 @@ const TUSHARE_URL: &str = "https://api.tushare.pro";
 const INCOME_FIELDS: &str = "ts_code,ann_date,f_ann_date,end_date,report_type,basic_eps,diluted_eps,total_revenue,revenue,operate_profit,total_profit,n_income_attr_p,update_flag";
 const INDICATOR_FIELDS: &str = "ts_code,ann_date,end_date,eps,dt_eps,profit_dedt,roe,grossprofit_margin,netprofit_margin,tr_yoy,netprofit_yoy,update_flag";
 const DIVIDEND_FIELDS: &str = "ts_code,end_date,ann_date,div_proc,stk_div,stk_bo_rate,stk_co_rate,cash_div,cash_div_tax,record_date,ex_date,pay_date,div_listdate,imp_ann_date,base_date,base_share";
+const CHIP_PERFORMANCE_FIELDS: &str = "ts_code,trade_date,his_low,his_high,cost_5pct,cost_15pct,cost_50pct,cost_85pct,cost_95pct,weight_avg,winner_rate";
+const CHIP_DISTRIBUTION_FIELDS: &str = "ts_code,trade_date,price,percent";
+const OFFICIAL_CHIP_FIRST_DATE: (i32, u32, u32) = (2018, 1, 1);
+const CHIP_PERFORMANCE_MAX_CALENDAR_DAYS: i64 = 366;
+const CHIP_DISTRIBUTION_MAX_CALENDAR_DAYS: i64 = 45;
+const TUSHARE_CHIP_ROW_LIMIT: usize = 6_000;
 
 pub struct TushareClient {
     token: String,
@@ -165,12 +172,380 @@ impl TushareClient {
         DIVIDEND_FIELDS
     }
 
+    fn chip_performance_fields() -> &'static str {
+        CHIP_PERFORMANCE_FIELDS
+    }
+
+    fn chip_distribution_fields() -> &'static str {
+        CHIP_DISTRIBUTION_FIELDS
+    }
+
     fn company_window_params(code: &str, start: NaiveDate, end: NaiveDate) -> Value {
         json!({
             "ts_code": code,
             "start_date": start.format("%Y%m%d").to_string(),
             "end_date": end.format("%Y%m%d").to_string(),
         })
+    }
+
+    fn official_chip_window_params(code: &str, start: NaiveDate, end: NaiveDate) -> Value {
+        json!({
+            "ts_code": code,
+            "start_date": start.format("%Y%m%d").to_string(),
+            "end_date": end.format("%Y%m%d").to_string(),
+        })
+    }
+
+    fn malformed_chip_data(endpoint: &str, detail: impl std::fmt::Display) -> AppError {
+        AppError::DataProvider(format!("Tushare {endpoint} data is malformed: {detail}"))
+    }
+
+    fn official_chip_first_date() -> NaiveDate {
+        NaiveDate::from_ymd_opt(
+            OFFICIAL_CHIP_FIRST_DATE.0,
+            OFFICIAL_CHIP_FIRST_DATE.1,
+            OFFICIAL_CHIP_FIRST_DATE.2,
+        )
+        .expect("the documented official-chip availability date is valid")
+    }
+
+    fn valid_tushare_stock_code(code: &str) -> bool {
+        let Some((digits, exchange)) = code.split_once('.') else {
+            return false;
+        };
+        digits.len() == 6
+            && digits.bytes().all(|byte| byte.is_ascii_digit())
+            && matches!(exchange, "SH" | "SZ" | "BJ")
+    }
+
+    fn validate_official_chip_window(
+        endpoint: &str,
+        code: &str,
+        start: NaiveDate,
+        end: NaiveDate,
+        maximum_calendar_days: i64,
+    ) -> Result<()> {
+        if !Self::valid_tushare_stock_code(code) {
+            return Err(AppError::BadRequest(format!(
+                "{endpoint} requires a valid Tushare stock code"
+            )));
+        }
+        if start > end {
+            return Err(AppError::BadRequest(format!(
+                "{endpoint} window starts after it ends: {start} > {end}"
+            )));
+        }
+        if start < Self::official_chip_first_date() {
+            return Err(AppError::BadRequest(format!(
+                "{endpoint} official history is unavailable before 2018-01-01"
+            )));
+        }
+        let calendar_days = (end - start).num_days() + 1;
+        if calendar_days > maximum_calendar_days {
+            return Err(AppError::BadRequest(format!(
+                "{endpoint} window contains {calendar_days} calendar days; maximum is {maximum_calendar_days}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn ensure_complete_chip_response(data: &Value, endpoint: &str) -> Result<()> {
+        let items = data
+            .get("items")
+            .and_then(Value::as_array)
+            .ok_or_else(|| Self::malformed_chip_data(endpoint, "missing items array"))?;
+        let has_more = match data.get("has_more") {
+            None => false,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => {
+                return Err(Self::malformed_chip_data(
+                    endpoint,
+                    "has_more must be a boolean",
+                ))
+            }
+        };
+        let total = match data.get("total") {
+            None => None,
+            Some(value) => Some(value.as_u64().ok_or_else(|| {
+                Self::malformed_chip_data(endpoint, "total must be a non-negative integer")
+            })?),
+        };
+        if has_more
+            || items.len() >= TUSHARE_CHIP_ROW_LIMIT
+            || total.is_some_and(|declared| declared > items.len() as u64)
+        {
+            return Err(AppError::DataProvider(format!(
+                "Tushare {endpoint} response is truncated at the provider row limit"
+            )));
+        }
+        Ok(())
+    }
+
+    fn chip_rows(
+        data: &Value,
+        endpoint: &str,
+        required_fields: &[&str],
+    ) -> Result<Vec<serde_json::Map<String, Value>>> {
+        let fields = data
+            .get("fields")
+            .and_then(Value::as_array)
+            .ok_or_else(|| Self::malformed_chip_data(endpoint, "missing fields array"))?;
+        let mut seen = HashSet::with_capacity(fields.len());
+        for field in fields {
+            let name = field
+                .as_str()
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| {
+                    Self::malformed_chip_data(endpoint, "field names must be non-empty strings")
+                })?;
+            if !seen.insert(name) {
+                return Err(Self::malformed_chip_data(
+                    endpoint,
+                    format!("duplicate field {name}"),
+                ));
+            }
+        }
+        for required in required_fields {
+            if !seen.contains(required) {
+                return Err(Self::malformed_chip_data(
+                    endpoint,
+                    format!("missing required field {required}"),
+                ));
+            }
+        }
+        Self::company_rows(data, endpoint)
+    }
+
+    fn required_chip_text(
+        row: &serde_json::Map<String, Value>,
+        endpoint: &str,
+        field: &str,
+    ) -> Result<String> {
+        let value = row
+            .get(field)
+            .ok_or_else(|| Self::malformed_chip_data(endpoint, format!("missing {field}")))?;
+        match value {
+            Value::String(value) if !value.trim().is_empty() => Ok(value.trim().to_string()),
+            _ => Err(Self::malformed_chip_data(
+                endpoint,
+                format!("{field} must be non-blank text"),
+            )),
+        }
+    }
+
+    fn required_chip_number(
+        row: &serde_json::Map<String, Value>,
+        endpoint: &str,
+        field: &str,
+    ) -> Result<f64> {
+        let value = row
+            .get(field)
+            .ok_or_else(|| Self::malformed_chip_data(endpoint, format!("missing {field}")))?;
+        let parsed = match value {
+            Value::Number(value) => value.as_f64(),
+            Value::String(value) if !value.trim().is_empty() => value.trim().parse::<f64>().ok(),
+            _ => None,
+        }
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| {
+            Self::malformed_chip_data(endpoint, format!("{field} must be a finite number"))
+        })?;
+        Ok(parsed)
+    }
+
+    fn required_chip_date(
+        row: &serde_json::Map<String, Value>,
+        endpoint: &str,
+    ) -> Result<NaiveDate> {
+        let value = Self::required_chip_text(row, endpoint, "trade_date")?;
+        NaiveDate::parse_from_str(&value, "%Y%m%d").map_err(|_| {
+            Self::malformed_chip_data(endpoint, format!("trade_date is not YYYYMMDD: {value}"))
+        })
+    }
+
+    fn required_chip_code(row: &serde_json::Map<String, Value>, endpoint: &str) -> Result<String> {
+        let code = Self::required_chip_text(row, endpoint, "ts_code")?;
+        if !Self::valid_tushare_stock_code(&code) {
+            return Err(Self::malformed_chip_data(
+                endpoint,
+                format!("invalid ts_code {code}"),
+            ));
+        }
+        Ok(code)
+    }
+
+    fn parse_chip_performance(data: &Value) -> Result<Vec<OfficialChipPerformance>> {
+        let required = [
+            "ts_code",
+            "trade_date",
+            "his_low",
+            "his_high",
+            "cost_5pct",
+            "cost_15pct",
+            "cost_50pct",
+            "cost_85pct",
+            "cost_95pct",
+            "weight_avg",
+            "winner_rate",
+        ];
+        let mut seen = HashSet::new();
+        let mut parsed = Self::chip_rows(data, "cyq_perf", &required)?
+            .into_iter()
+            .map(|row| {
+                let code = Self::required_chip_code(&row, "cyq_perf")?;
+                let trade_date = Self::required_chip_date(&row, "cyq_perf")?;
+                if !seen.insert((code.clone(), trade_date)) {
+                    return Err(Self::malformed_chip_data(
+                        "cyq_perf",
+                        format!("duplicate row for {code} on {trade_date}"),
+                    ));
+                }
+                let historical_low = Self::required_chip_number(&row, "cyq_perf", "his_low")?;
+                let historical_high = Self::required_chip_number(&row, "cyq_perf", "his_high")?;
+                let cost_5pct = Self::required_chip_number(&row, "cyq_perf", "cost_5pct")?;
+                let cost_15pct = Self::required_chip_number(&row, "cyq_perf", "cost_15pct")?;
+                let cost_50pct = Self::required_chip_number(&row, "cyq_perf", "cost_50pct")?;
+                let cost_85pct = Self::required_chip_number(&row, "cyq_perf", "cost_85pct")?;
+                let cost_95pct = Self::required_chip_number(&row, "cyq_perf", "cost_95pct")?;
+                let average_cost = Self::required_chip_number(&row, "cyq_perf", "weight_avg")?;
+                let winner_rate = Self::required_chip_number(&row, "cyq_perf", "winner_rate")?;
+                let ordered_costs = [
+                    historical_low,
+                    cost_5pct,
+                    cost_15pct,
+                    cost_50pct,
+                    cost_85pct,
+                    cost_95pct,
+                    historical_high,
+                ];
+                if ordered_costs.iter().any(|value| *value <= 0.0)
+                    || ordered_costs.windows(2).any(|pair| pair[0] > pair[1])
+                    || average_cost < historical_low
+                    || average_cost > historical_high
+                    || !(0.0..=100.0).contains(&winner_rate)
+                {
+                    return Err(Self::malformed_chip_data(
+                        "cyq_perf",
+                        format!("invalid cost or percentage ranges for {code} on {trade_date}"),
+                    ));
+                }
+                Ok(OfficialChipPerformance {
+                    code,
+                    trade_date,
+                    historical_low,
+                    historical_high,
+                    cost_5pct,
+                    cost_15pct,
+                    cost_50pct,
+                    cost_85pct,
+                    cost_95pct,
+                    average_cost,
+                    winner_rate,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        parsed.sort_by(|left, right| {
+            left.trade_date
+                .cmp(&right.trade_date)
+                .then_with(|| left.code.cmp(&right.code))
+        });
+        Ok(parsed)
+    }
+
+    fn parse_official_chip_distribution(data: &Value) -> Result<Vec<OfficialChipBucket>> {
+        let required = ["ts_code", "trade_date", "price", "percent"];
+        let mut seen = HashSet::new();
+        let mut groups: BTreeMap<(String, NaiveDate), Vec<(f64, f64)>> = BTreeMap::new();
+        for row in Self::chip_rows(data, "cyq_chips", &required)? {
+            let code = Self::required_chip_code(&row, "cyq_chips")?;
+            let trade_date = Self::required_chip_date(&row, "cyq_chips")?;
+            let price = Self::required_chip_number(&row, "cyq_chips", "price")?;
+            let percent = Self::required_chip_number(&row, "cyq_chips", "percent")?;
+            if price <= 0.0 || !(0.0..=100.0).contains(&percent) {
+                return Err(Self::malformed_chip_data(
+                    "cyq_chips",
+                    format!("invalid price or percent for {code} on {trade_date}"),
+                ));
+            }
+            if !seen.insert((code.clone(), trade_date, price.to_bits())) {
+                return Err(Self::malformed_chip_data(
+                    "cyq_chips",
+                    format!("duplicate price {price} for {code} on {trade_date}"),
+                ));
+            }
+            groups
+                .entry((code, trade_date))
+                .or_default()
+                .push((price, percent / 100.0));
+        }
+
+        let mut parsed = Vec::new();
+        for ((code, trade_date), mut buckets) in groups {
+            let total = buckets.iter().map(|(_, weight)| weight).sum::<f64>();
+            if !total.is_finite() || total <= 0.0 {
+                return Err(Self::malformed_chip_data(
+                    "cyq_chips",
+                    format!("zero or invalid total mass for {code} on {trade_date}"),
+                ));
+            }
+            buckets.sort_by(|left, right| left.0.total_cmp(&right.0));
+            parsed.extend(
+                buckets
+                    .into_iter()
+                    .map(|(price, weight)| OfficialChipBucket {
+                        code: code.clone(),
+                        trade_date,
+                        price,
+                        weight: weight / total,
+                    }),
+            );
+        }
+        parsed.sort_by(|left, right| {
+            left.trade_date
+                .cmp(&right.trade_date)
+                .then_with(|| left.code.cmp(&right.code))
+                .then_with(|| left.price.total_cmp(&right.price))
+        });
+        Ok(parsed)
+    }
+
+    fn ensure_chip_rows_match_request<T, Code, Date>(
+        rows: &[T],
+        endpoint: &str,
+        requested_code: &str,
+        start: NaiveDate,
+        end: NaiveDate,
+        code_of: Code,
+        date_of: Date,
+    ) -> Result<()>
+    where
+        Code: Fn(&T) -> &str,
+        Date: Fn(&T) -> NaiveDate,
+    {
+        for row in rows {
+            let code = code_of(row);
+            if code != requested_code {
+                return Err(Self::malformed_chip_data(
+                    endpoint,
+                    format!("response code {code} does not match requested {requested_code}"),
+                ));
+            }
+        }
+        if start == end && !rows.iter().any(|row| date_of(row) == start) {
+            return Err(AppError::DataProvider(format!(
+                "Tushare {endpoint} data for {requested_code} on {start} is not ready"
+            )));
+        }
+        for row in rows {
+            let date = date_of(row);
+            if date < start || date > end {
+                return Err(Self::malformed_chip_data(
+                    endpoint,
+                    format!("response date {date} is outside requested window {start}..{end}"),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn company_report_periods(start: NaiveDate, end: NaiveDate) -> Result<Vec<NaiveDate>> {
@@ -863,6 +1238,80 @@ impl TushareClient {
             effective_source_date >= start && effective_source_date <= end
         });
         Ok(records)
+    }
+
+    async fn chip_performance_with<C, Fut>(
+        code: &str,
+        start: NaiveDate,
+        end: NaiveDate,
+        mut call: C,
+    ) -> Result<Vec<OfficialChipPerformance>>
+    where
+        C: FnMut(&'static str, Value, &'static str) -> Fut,
+        Fut: Future<Output = Result<Value>>,
+    {
+        Self::validate_official_chip_window(
+            "cyq_perf",
+            code,
+            start,
+            end,
+            CHIP_PERFORMANCE_MAX_CALENDAR_DAYS,
+        )?;
+        let data = call(
+            "cyq_perf",
+            Self::official_chip_window_params(code, start, end),
+            Self::chip_performance_fields(),
+        )
+        .await?;
+        Self::ensure_complete_chip_response(&data, "cyq_perf")?;
+        let rows = Self::parse_chip_performance(&data)?;
+        Self::ensure_chip_rows_match_request(
+            &rows,
+            "cyq_perf",
+            code,
+            start,
+            end,
+            |row| row.code.as_str(),
+            |row| row.trade_date,
+        )?;
+        Ok(rows)
+    }
+
+    async fn chip_distribution_with<C, Fut>(
+        code: &str,
+        start: NaiveDate,
+        end: NaiveDate,
+        mut call: C,
+    ) -> Result<Vec<OfficialChipBucket>>
+    where
+        C: FnMut(&'static str, Value, &'static str) -> Fut,
+        Fut: Future<Output = Result<Value>>,
+    {
+        Self::validate_official_chip_window(
+            "cyq_chips",
+            code,
+            start,
+            end,
+            CHIP_DISTRIBUTION_MAX_CALENDAR_DAYS,
+        )?;
+        let data = call(
+            "cyq_chips",
+            Self::official_chip_window_params(code, start, end),
+            Self::chip_distribution_fields(),
+        )
+        .await?;
+        Self::ensure_complete_chip_response(&data, "cyq_chips")?;
+        let rows = Self::parse_official_chip_distribution(&data)?;
+        Self::ensure_chip_rows_match_request(
+            &rows,
+            "cyq_chips",
+            code,
+            start,
+            end,
+            |row| row.code.as_str(),
+            |row| row.trade_date,
+        )?;
+        Ok(rows)
     }
 
     async fn get_sector_name_map(&self) -> Result<HashMap<String, String>> {
@@ -1896,6 +2345,33 @@ impl CompanyDataProvider for TushareClient {
 }
 
 #[async_trait]
+impl OfficialChipProvider for TushareClient {
+    async fn chip_performance(
+        &self,
+        code: &str,
+        start: NaiveDate,
+        end: NaiveDate,
+    ) -> Result<Vec<OfficialChipPerformance>> {
+        Self::chip_performance_with(code, start, end, |api_name, params, fields| {
+            self.call(api_name, params, fields)
+        })
+        .await
+    }
+
+    async fn chip_distribution(
+        &self,
+        code: &str,
+        start: NaiveDate,
+        end: NaiveDate,
+    ) -> Result<Vec<OfficialChipBucket>> {
+        Self::chip_distribution_with(code, start, end, |api_name, params, fields| {
+            self.call(api_name, params, fields)
+        })
+        .await
+    }
+}
+
+#[async_trait]
 impl DataProvider for TushareClient {
     fn name(&self) -> &'static str {
         "tushare"
@@ -2290,6 +2766,7 @@ impl DataProvider for TushareClient {
 mod tests {
     use super::*;
     use crate::analysis::market_snapshot::AvailabilityQuality;
+    use crate::data::chip::OfficialChipProvider;
     use crate::data::company::{CompanyDataProvider, FinancialFrequency};
     use crate::storage::company_repository::CompanyRepository;
     use chrono::{TimeZone, Utc};
@@ -2353,6 +2830,356 @@ mod tests {
                  null, null, null, null, null, null, null]
             ]
         })
+    }
+
+    fn cyq_perf_fixture() -> Value {
+        serde_json::json!({
+            "fields": [
+                "winner_rate", "cost_50pct", "ts_code", "his_high", "trade_date",
+                "cost_5pct", "weight_avg", "cost_95pct", "his_low", "cost_15pct",
+                "cost_85pct"
+            ],
+            "items": [
+                ["72.5", "1500", "600519.SH", "1800", "20260717", "1200",
+                 "1512.40", "1750", "1000", "1300", "1650"],
+                [60, 1490, "600519.SH", 1790, "20260716", 1190,
+                 1502.25, 1740, 990, 1290, 1640]
+            ]
+        })
+    }
+
+    fn cyq_chips_fixture() -> Value {
+        serde_json::json!({
+            "fields": ["percent", "trade_date", "price", "ts_code"],
+            "items": [
+                ["70", "20260716", "1510", "600519.SH"],
+                ["30", "20260716", "1500", "600519.SH"],
+                ["3", "20260717", "1520", "600519.SH"],
+                ["1", "20260717", "1510", "600519.SH"]
+            ]
+        })
+    }
+
+    fn replace_table_cell(data: &Value, row: usize, field: &str, value: Value) -> Value {
+        let mut changed = data.clone();
+        let field_index = changed["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|candidate| candidate.as_str() == Some(field))
+            .unwrap();
+        changed["items"][row][field_index] = value;
+        changed
+    }
+
+    #[test]
+    fn parses_official_chip_fixtures_by_name_and_normalizes_each_date() {
+        fn assert_provider<T: OfficialChipProvider>() {}
+        assert_provider::<TushareClient>();
+
+        let performance = TushareClient::parse_chip_performance(&cyq_perf_fixture()).unwrap();
+        assert_eq!(performance.len(), 2);
+        assert_eq!(performance[0].trade_date.to_string(), "2026-07-16");
+        assert_eq!(performance[1].average_cost, 1512.40);
+        assert_eq!(performance[1].winner_rate, 72.5);
+        assert_eq!(performance[1].cost_5pct, 1200.0);
+        assert_eq!(performance[1].cost_95pct, 1750.0);
+
+        let buckets =
+            TushareClient::parse_official_chip_distribution(&cyq_chips_fixture()).unwrap();
+        assert_eq!(buckets.len(), 4);
+        assert_eq!(buckets[0].trade_date.to_string(), "2026-07-16");
+        assert_eq!(buckets[0].price, 1500.0);
+        assert!((buckets[0].weight - 0.3).abs() < 1e-12);
+        let by_date = buckets.iter().fold(BTreeMap::new(), |mut totals, bucket| {
+            *totals.entry(bucket.trade_date).or_insert(0.0) += bucket.weight;
+            totals
+        });
+        assert_eq!(by_date.len(), 2);
+        assert!(by_date.values().all(|total| (total - 1.0).abs() < 1e-12));
+        let latest: Vec<_> = buckets
+            .iter()
+            .filter(|bucket| bucket.trade_date.to_string() == "2026-07-17")
+            .collect();
+        assert_eq!(latest[0].price, 1510.0);
+        assert!((latest[0].weight - 0.25).abs() < 1e-12);
+        assert!((latest[1].weight - 0.75).abs() < 1e-12);
+    }
+
+    #[test]
+    fn official_chip_parsers_reject_invalid_required_values() {
+        for (field, value) in [
+            ("weight_avg", Value::Null),
+            ("weight_avg", serde_json::json!("  ")),
+            ("weight_avg", serde_json::json!("not-a-number")),
+            ("weight_avg", serde_json::json!("NaN")),
+            ("weight_avg", serde_json::json!(-1)),
+            ("winner_rate", serde_json::json!(101)),
+            ("cost_15pct", serde_json::json!(1100)),
+            ("weight_avg", serde_json::json!(1900)),
+            ("trade_date", serde_json::json!("20260230")),
+            ("ts_code", serde_json::json!("bad-code")),
+        ] {
+            let invalid = replace_table_cell(&cyq_perf_fixture(), 0, field, value);
+            assert!(
+                TushareClient::parse_chip_performance(&invalid).is_err(),
+                "{field} should be rejected"
+            );
+        }
+
+        for (field, value) in [
+            ("percent", Value::Null),
+            ("percent", serde_json::json!("")),
+            ("percent", serde_json::json!("infinity")),
+            ("percent", serde_json::json!(-1)),
+            ("percent", serde_json::json!(101)),
+            ("price", serde_json::json!(0)),
+            ("trade_date", serde_json::json!("20261301")),
+            ("ts_code", serde_json::json!("600519")),
+        ] {
+            let invalid = replace_table_cell(&cyq_chips_fixture(), 0, field, value);
+            assert!(
+                TushareClient::parse_official_chip_distribution(&invalid).is_err(),
+                "{field} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn official_chip_parsers_reject_bad_table_shapes_and_duplicates() {
+        let mut missing = cyq_perf_fixture();
+        missing["fields"].as_array_mut().unwrap().remove(0);
+        for row in missing["items"].as_array_mut().unwrap() {
+            row.as_array_mut().unwrap().remove(0);
+        }
+        assert!(TushareClient::parse_chip_performance(&missing).is_err());
+
+        let mut duplicate_field = cyq_perf_fixture();
+        duplicate_field["fields"][0] = serde_json::json!("cost_50pct");
+        assert!(TushareClient::parse_chip_performance(&duplicate_field).is_err());
+
+        let mut wrong_length = cyq_chips_fixture();
+        wrong_length["items"][0].as_array_mut().unwrap().pop();
+        assert!(TushareClient::parse_official_chip_distribution(&wrong_length).is_err());
+
+        let mut duplicate_performance = cyq_perf_fixture();
+        let row = duplicate_performance["items"][0].clone();
+        duplicate_performance["items"]
+            .as_array_mut()
+            .unwrap()
+            .push(row);
+        assert!(TushareClient::parse_chip_performance(&duplicate_performance).is_err());
+
+        let mut duplicate_bucket = cyq_chips_fixture();
+        let row = duplicate_bucket["items"][0].clone();
+        duplicate_bucket["items"].as_array_mut().unwrap().push(row);
+        assert!(TushareClient::parse_official_chip_distribution(&duplicate_bucket).is_err());
+
+        let mut zero_total = cyq_chips_fixture();
+        let percent_index = zero_total["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|field| field == "percent")
+            .unwrap();
+        for row in zero_total["items"].as_array_mut().unwrap() {
+            row[percent_index] = serde_json::json!(0);
+        }
+        assert!(TushareClient::parse_official_chip_distribution(&zero_total).is_err());
+    }
+
+    #[tokio::test]
+    async fn official_chip_provider_sends_exact_requests_and_accepts_weekend_ended_history() {
+        let start = NaiveDate::from_ymd_opt(2026, 7, 16).unwrap();
+        let end = NaiveDate::from_ymd_opt(2026, 7, 19).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let performance = TushareClient::chip_performance_with(
+            "600519.SH",
+            start,
+            end,
+            move |api_name, params, fields| {
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push((api_name.to_string(), params, fields.to_string()));
+                async { Ok(cyq_perf_fixture()) }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(performance.len(), 2);
+
+        let recorded = calls.clone();
+        let buckets = TushareClient::chip_distribution_with(
+            "600519.SH",
+            start,
+            end,
+            move |api_name, params, fields| {
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push((api_name.to_string(), params, fields.to_string()));
+                async { Ok(cyq_chips_fixture()) }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(buckets.len(), 4);
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "cyq_perf");
+        assert_eq!(
+            calls[0].1,
+            serde_json::json!({
+                "ts_code": "600519.SH", "start_date": "20260716", "end_date": "20260719"
+            })
+        );
+        assert_eq!(calls[0].2, TushareClient::chip_performance_fields());
+        assert_eq!(calls[1].0, "cyq_chips");
+        assert_eq!(calls[1].1, calls[0].1);
+        assert_eq!(calls[1].2, TushareClient::chip_distribution_fields());
+    }
+
+    #[tokio::test]
+    async fn official_chip_provider_rejects_invalid_windows_before_calling_upstream() {
+        let calls = Arc::new(Mutex::new(0));
+        for (start, end, distribution) in [
+            (
+                NaiveDate::from_ymd_opt(2017, 12, 31).unwrap(),
+                NaiveDate::from_ymd_opt(2018, 1, 1).unwrap(),
+                false,
+            ),
+            (
+                NaiveDate::from_ymd_opt(2026, 7, 19).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 7, 18).unwrap(),
+                false,
+            ),
+            (
+                NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 3, 1).unwrap(),
+                true,
+            ),
+        ] {
+            let recorded = calls.clone();
+            let result = if distribution {
+                TushareClient::chip_distribution_with("600519.SH", start, end, move |_, _, _| {
+                    *recorded.lock().unwrap() += 1;
+                    async { Ok(cyq_chips_fixture()) }
+                })
+                .await
+                .map(|_| ())
+            } else {
+                TushareClient::chip_performance_with("600519.SH", start, end, move |_, _, _| {
+                    *recorded.lock().unwrap() += 1;
+                    async { Ok(cyq_perf_fixture()) }
+                })
+                .await
+                .map(|_| ())
+            };
+            assert!(result.is_err());
+        }
+        assert_eq!(*calls.lock().unwrap(), 0);
+
+        let result = TushareClient::chip_performance_with(
+            "",
+            NaiveDate::from_ymd_opt(2026, 7, 17).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 7, 17).unwrap(),
+            |_, _, _| async { Ok(cyq_perf_fixture()) },
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn official_chip_provider_rejects_wrong_code_dates_and_stale_daily_results() {
+        let date = NaiveDate::from_ymd_opt(2026, 7, 17).unwrap();
+        let wrong_code = replace_table_cell(
+            &cyq_perf_fixture(),
+            0,
+            "ts_code",
+            serde_json::json!("000001.SZ"),
+        );
+        let error = TushareClient::chip_performance_with(
+            "600519.SH",
+            NaiveDate::from_ymd_opt(2026, 7, 16).unwrap(),
+            date,
+            move |_, _, _| {
+                let response = wrong_code.clone();
+                async move { Ok(response) }
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("600519.SH"));
+
+        let empty = serde_json::json!({ "fields": [
+            "ts_code", "trade_date", "his_low", "his_high", "cost_5pct", "cost_15pct",
+            "cost_50pct", "cost_85pct", "cost_95pct", "weight_avg", "winner_rate"
+        ], "items": [] });
+        let error =
+            TushareClient::chip_performance_with("600519.SH", date, date, move |_, _, _| {
+                let response = empty.clone();
+                async move { Ok(response) }
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not ready"));
+
+        let mut stale = cyq_perf_fixture();
+        let stale_row = stale["items"][1].clone();
+        stale["items"] = serde_json::json!([stale_row]);
+        let error =
+            TushareClient::chip_performance_with("600519.SH", date, date, move |_, _, _| {
+                let response = stale.clone();
+                async move { Ok(response) }
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not ready"));
+
+        let out_of_window = replace_table_cell(
+            &cyq_chips_fixture(),
+            0,
+            "trade_date",
+            serde_json::json!("20260715"),
+        );
+        let error = TushareClient::chip_distribution_with(
+            "600519.SH",
+            NaiveDate::from_ymd_opt(2026, 7, 16).unwrap(),
+            date,
+            move |_, _, _| {
+                let response = out_of_window.clone();
+                async move { Ok(response) }
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("outside"));
+    }
+
+    #[tokio::test]
+    async fn official_chip_provider_rejects_truncated_responses() {
+        let start = NaiveDate::from_ymd_opt(2026, 7, 16).unwrap();
+        let end = NaiveDate::from_ymd_opt(2026, 7, 17).unwrap();
+        for response in [
+            serde_json::json!({ "fields": [], "items": [], "has_more": true }),
+            serde_json::json!({ "fields": [], "items": [], "total": 1 }),
+            serde_json::json!({
+                "fields": ["ts_code", "trade_date", "price", "percent"],
+                "items": vec![serde_json::json!(["600519.SH", "20260716", 1500, 1]); 6000]
+            }),
+        ] {
+            let error =
+                TushareClient::chip_distribution_with("600519.SH", start, end, move |_, _, _| {
+                    let response = response.clone();
+                    async move { Ok(response) }
+                })
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("truncated"));
+        }
     }
 
     fn reorder_table(data: &Value) -> Value {
