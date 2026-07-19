@@ -5,7 +5,8 @@ use std::time::Duration;
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, NaiveDate, TimeZone, Utc};
 use serde::Serialize;
 use serde_json::json;
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::pool::PoolConnection;
+use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::data::chip::{
@@ -36,12 +37,28 @@ const CHIP_DAILY_PHASE: &str = "chip_daily";
 const OFFICIAL_CHIP_FIRST_DATE: NaiveDate =
     NaiveDate::from_ymd_opt(2018, 1, 1).expect("valid official chip first date");
 const CHIP_BUCKET_COUNT: usize = 30;
+const CHIP_DB_HANDOFF_TIMEOUT: Duration = Duration::from_millis(50);
+const CHIP_WRITE_HANDOFF_TIMEOUT: Duration = Duration::from_millis(100);
 
-static ACTIVE_CHIP_MUTATIONS: LazyLock<StdMutex<BTreeSet<String>>> =
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ChipPoolIdentity {
+    host: String,
+    port: u16,
+    username: String,
+    database: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ChipMutationKey {
+    pool: ChipPoolIdentity,
+    code: String,
+}
+
+static ACTIVE_CHIP_MUTATIONS: LazyLock<StdMutex<BTreeSet<ChipMutationKey>>> =
     LazyLock::new(|| StdMutex::new(BTreeSet::new()));
 
 struct ChipMutationGuard {
-    code: String,
+    key: ChipMutationKey,
 }
 
 impl Drop for ChipMutationGuard {
@@ -49,28 +66,55 @@ impl Drop for ChipMutationGuard {
         ACTIVE_CHIP_MUTATIONS
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&self.code);
+            .remove(&self.key);
     }
 }
 
-fn try_acquire_local_chip_mutation(scope: &str, code: &str) -> Option<ChipMutationGuard> {
-    let key = format!("{scope}:{code}");
+fn try_acquire_local_chip_mutation(
+    pool: &ChipPoolIdentity,
+    code: &str,
+) -> Option<ChipMutationGuard> {
+    let key = ChipMutationKey {
+        pool: pool.clone(),
+        code: code.to_string(),
+    };
     let mut active = ACTIVE_CHIP_MUTATIONS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     active
         .insert(key.clone())
-        .then(|| ChipMutationGuard { code: key })
+        .then(|| ChipMutationGuard { key })
 }
 
-fn active_chip_mutation_count(scope: &str) -> usize {
-    let prefix = format!("{scope}:");
+#[cfg(test)]
+fn local_chip_mutation_is_active(pool: &ChipPoolIdentity, code: &str) -> bool {
     ACTIVE_CHIP_MUTATIONS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .iter()
-        .filter(|key| key.starts_with(&prefix))
-        .count()
+        .contains(&ChipMutationKey {
+            pool: pool.clone(),
+            code: code.to_string(),
+        })
+}
+
+async fn acquire_chip_connection(pool: &PgPool) -> Result<Option<PoolConnection<Postgres>>> {
+    if let Some(connection) = pool.try_acquire() {
+        return Ok(Some(connection));
+    }
+    match tokio::time::timeout(CHIP_DB_HANDOFF_TIMEOUT, pool.acquire()).await {
+        Ok(connection) => connection.map(Some).map_err(AppError::from),
+        Err(_) => Ok(None),
+    }
+}
+
+async fn begin_chip_transaction(pool: &PgPool) -> Result<Option<Transaction<'static, Postgres>>> {
+    if let Some(transaction) = pool.try_begin().await? {
+        return Ok(Some(transaction));
+    }
+    match tokio::time::timeout(CHIP_WRITE_HANDOFF_TIMEOUT, pool.begin()).await {
+        Ok(transaction) => transaction.map(Some).map_err(AppError::from),
+        Err(_) => Ok(None),
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -231,7 +275,7 @@ pub struct CompanyIntelligenceService<P: CompanyDataProvider> {
     provider: Arc<P>,
     today: NaiveDate,
     lease_ttl: Duration,
-    mutation_scope: String,
+    mutation_pool: ChipPoolIdentity,
 }
 
 impl<P: CompanyDataProvider> CompanyIntelligenceService<P> {
@@ -240,18 +284,20 @@ impl<P: CompanyDataProvider> CompanyIntelligenceService<P> {
     }
 
     pub fn new_at(pool: PgPool, provider: Arc<P>, today: NaiveDate) -> Self {
-        let mutation_scope = pool
-            .connect_options()
-            .get_database()
-            .unwrap_or_default()
-            .to_string();
+        let options = pool.connect_options();
+        let mutation_pool = ChipPoolIdentity {
+            host: options.get_host().to_string(),
+            port: options.get_port(),
+            username: options.get_username().to_string(),
+            database: options.get_database().unwrap_or_default().to_string(),
+        };
         Self {
             repository: CompanyRepository::new(pool.clone()),
             pool,
             provider,
             today,
             lease_ttl: DEFAULT_LEASE_TTL,
-            mutation_scope,
+            mutation_pool,
         }
     }
 
@@ -468,6 +514,14 @@ impl<P: CompanyDataProvider> CompanyIntelligenceService<P> {
     }
 
     async fn current_stocks(&self) -> Result<Vec<CurrentStock>> {
+        let mut connection = self.pool.acquire().await?;
+        self.current_stocks_in_connection(&mut connection).await
+    }
+
+    async fn current_stocks_in_connection(
+        &self,
+        connection: &mut PgConnection,
+    ) -> Result<Vec<CurrentStock>> {
         Ok(sqlx::query_as::<_, (String, NaiveDate)>(
             r#"WITH latest AS (
                    SELECT DISTINCT ON (code)
@@ -484,7 +538,7 @@ impl<P: CompanyDataProvider> CompanyIntelligenceService<P> {
                ORDER BY code"#,
         )
         .bind(self.today)
-        .fetch_all(&self.pool)
+        .fetch_all(connection)
         .await?
         .into_iter()
         .map(|(code, list_date)| CurrentStock { code, list_date })
@@ -730,6 +784,17 @@ where
     }
 
     pub async fn expected_chip_trade_date(&self) -> Result<Option<NaiveDate>> {
+        let Some(mut connection) = acquire_chip_connection(&self.pool).await? else {
+            return Ok(None);
+        };
+        self.expected_chip_trade_date_in_connection(&mut connection)
+            .await
+    }
+
+    async fn expected_chip_trade_date_in_connection(
+        &self,
+        connection: &mut PgConnection,
+    ) -> Result<Option<NaiveDate>> {
         sqlx::query_scalar(
             r#"WITH latest_master AS (
                    SELECT DISTINCT ON (code)
@@ -820,22 +885,23 @@ where
                "#,
         )
         .bind(self.today)
-        .fetch_one(&self.pool)
+        .fetch_one(connection)
         .await
         .map_err(AppError::from)
     }
 
     pub async fn update_daily_chips(&self) -> Result<DailyChipUpdateReport> {
-        let active_mutations = active_chip_mutation_count(&self.mutation_scope);
-        if active_mutations > 0 {
+        let Some(mut preflight) = acquire_chip_connection(&self.pool).await? else {
             return Ok(DailyChipUpdateReport {
-                pending: active_mutations,
-                errors: vec!["an in-process chip writer is already active".to_string()],
+                pending: 1,
+                errors: vec!["chip readiness connection is busy".to_string()],
                 ..Default::default()
             });
-        }
-        let current_stocks = self.current_stocks().await?;
-        let expected_date = self.expected_chip_trade_date().await?;
+        };
+        let current_stocks = self.current_stocks_in_connection(&mut preflight).await?;
+        let expected_date = self
+            .expected_chip_trade_date_in_connection(&mut preflight)
+            .await?;
         let mut report = DailyChipUpdateReport {
             expected_date,
             ..Default::default()
@@ -846,7 +912,7 @@ where
         };
 
         let Some(stocks) = self
-            .traded_stocks_for_date(&current_stocks, expected_date)
+            .traded_stocks_for_date_in_connection(&mut preflight, &current_stocks, expected_date)
             .await?
         else {
             report.pending = current_stocks
@@ -859,10 +925,8 @@ where
             return Ok(report);
         };
 
-        let chip_repository = ChipRepository::new(self.pool.clone());
-        let Some(decision) = chip_repository
-            .latest_validation_decision(CHIP_MODEL_VERSION)
-            .await?
+        let Some(decision) =
+            latest_validation_decision_in_connection(&mut preflight, CHIP_MODEL_VERSION).await?
         else {
             report.failed = stocks.len();
             report.errors.push(format!(
@@ -870,6 +934,8 @@ where
             ));
             return Ok(report);
         };
+        preflight.return_to_pool().await;
+        let chip_repository = ChipRepository::new(self.pool.clone());
         let company_repository = CompanyRepository::new(self.pool.clone());
 
         for stock in &stocks {
@@ -922,22 +988,28 @@ where
         &self,
         expected_date: NaiveDate,
     ) -> Result<Option<NaiveDate>> {
-        let current_stocks = self.current_stocks().await?;
+        let Some(mut connection) = acquire_chip_connection(&self.pool).await? else {
+            return Ok(None);
+        };
+        let current_stocks = self.current_stocks_in_connection(&mut connection).await?;
         let Some(stocks) = self
-            .traded_stocks_for_date(&current_stocks, expected_date)
+            .traded_stocks_for_date_in_connection(&mut connection, &current_stocks, expected_date)
             .await?
         else {
             return Ok(None);
         };
-        let repository = ChipRepository::new(self.pool.clone());
-        let Some(decision) = repository
-            .latest_validation_decision(CHIP_MODEL_VERSION)
-            .await?
+        let Some(decision) =
+            latest_validation_decision_in_connection(&mut connection, CHIP_MODEL_VERSION).await?
         else {
             return Ok(None);
         };
-        self.validated_chip_trade_date(&stocks, expected_date, decision)
-            .await
+        self.validated_chip_trade_date_in_connection(
+            &mut connection,
+            &stocks,
+            expected_date,
+            decision,
+        )
+        .await
     }
 
     async fn update_daily_chip_stock(
@@ -948,20 +1020,30 @@ where
         code: &str,
         expected_date: NaiveDate,
     ) -> Result<DailyStockChipOutcome> {
-        let Some(_local_guard) = try_acquire_local_chip_mutation(&self.mutation_scope, code) else {
+        let Some(_local_guard) = try_acquire_local_chip_mutation(&self.mutation_pool, code) else {
             return Ok(DailyStockChipOutcome::Pending(
                 "another in-process chip writer owns the mutation guard".to_string(),
             ));
         };
-        let claim = company_repository
-            .claim_checkpoint_window(
+        let claim = match tokio::time::timeout(
+            CHIP_WRITE_HANDOFF_TIMEOUT,
+            company_repository.claim_checkpoint_window(
                 CHIP_DAILY_PHASE,
                 code,
                 expected_date,
                 expected_date,
                 self.lease_ttl,
-            )
-            .await?;
+            ),
+        )
+        .await
+        {
+            Ok(claim) => claim?,
+            Err(_) => {
+                return Ok(DailyStockChipOutcome::Pending(
+                    "daily checkpoint connection is busy".to_string(),
+                ))
+            }
+        };
         let lease = match claim {
             CheckpointClaimOutcome::Completed => None,
             CheckpointClaimOutcome::Busy => {
@@ -1296,7 +1378,9 @@ where
         &self,
         code: &str,
     ) -> Result<Option<Transaction<'static, Postgres>>> {
-        let mut transaction = self.pool.begin().await?;
+        let Some(mut transaction) = begin_chip_transaction(&self.pool).await? else {
+            return Ok(None);
+        };
         let key = format!("chip-mutation:{CHIP_MODEL_VERSION}:{code}");
         let acquired: bool =
             sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))")
@@ -1435,6 +1519,25 @@ where
         expected_date: NaiveDate,
         decision: ChipSourceDecision,
     ) -> Result<Option<NaiveDate>> {
+        let Some(mut connection) = acquire_chip_connection(&self.pool).await? else {
+            return Ok(None);
+        };
+        self.validated_chip_trade_date_in_connection(
+            &mut connection,
+            stocks,
+            expected_date,
+            decision,
+        )
+        .await
+    }
+
+    async fn validated_chip_trade_date_in_connection(
+        &self,
+        connection: &mut PgConnection,
+        stocks: &[CurrentStock],
+        expected_date: NaiveDate,
+        decision: ChipSourceDecision,
+    ) -> Result<Option<NaiveDate>> {
         if stocks.is_empty() {
             return Ok(Some(expected_date));
         }
@@ -1464,13 +1567,26 @@ where
         .bind(expected_date)
         .bind(CHIP_MODEL_VERSION)
         .bind(decision.as_str())
-        .fetch_one(&self.pool)
+        .fetch_one(connection)
         .await?;
         Ok(ready.then_some(expected_date))
     }
 
     async fn traded_stocks_for_date(
         &self,
+        stocks: &[CurrentStock],
+        trade_date: NaiveDate,
+    ) -> Result<Option<Vec<CurrentStock>>> {
+        let Some(mut connection) = acquire_chip_connection(&self.pool).await? else {
+            return Ok(None);
+        };
+        self.traded_stocks_for_date_in_connection(&mut connection, stocks, trade_date)
+            .await
+    }
+
+    async fn traded_stocks_for_date_in_connection(
+        &self,
+        connection: &mut PgConnection,
         stocks: &[CurrentStock],
         trade_date: NaiveDate,
     ) -> Result<Option<Vec<CurrentStock>>> {
@@ -1494,7 +1610,7 @@ where
         )
         .bind(&codes)
         .bind(trade_date)
-        .fetch_all(&self.pool)
+        .fetch_all(connection)
         .await?;
         if statuses.len() != eligible.len() {
             return Ok(None);
@@ -1512,16 +1628,22 @@ where
     }
 
     pub async fn backfill_chips(&self) -> Result<ChipBackfillReport> {
-        let chip_repository = ChipRepository::new(self.pool.clone());
-        let decision = chip_repository
-            .latest_validation_decision(CHIP_MODEL_VERSION)
+        let Some(mut preflight) = acquire_chip_connection(&self.pool).await? else {
+            return Ok(ChipBackfillReport {
+                pending: 1,
+                ..Default::default()
+            });
+        };
+        let decision = latest_validation_decision_in_connection(&mut preflight, CHIP_MODEL_VERSION)
             .await?
             .ok_or_else(|| {
                 AppError::DataProvider(format!(
                     "chip backfill has no successful {CHIP_MODEL_VERSION} validation decision"
                 ))
             })?;
-        let stocks = self.current_stocks().await?;
+        let stocks = self.current_stocks_in_connection(&mut preflight).await?;
+        preflight.return_to_pool().await;
+        let chip_repository = ChipRepository::new(self.pool.clone());
         let mut report = ChipBackfillReport::default();
         let mut errors = Vec::new();
 
@@ -1567,13 +1689,20 @@ where
         decision: ChipSourceDecision,
         code: &str,
     ) -> Result<ChipBackfillReport> {
-        let Some(_local_guard) = try_acquire_local_chip_mutation(&self.mutation_scope, code) else {
+        let Some(_local_guard) = try_acquire_local_chip_mutation(&self.mutation_pool, code) else {
             return Ok(ChipBackfillReport {
                 pending: 1,
                 ..Default::default()
             });
         };
-        let history = self.load_raw_chip_history(code).await?;
+        let Some(mut history_connection) = acquire_chip_connection(&self.pool).await? else {
+            return Ok(ChipBackfillReport {
+                pending: 1,
+                ..Default::default()
+            });
+        };
+        let history = fetch_raw_chip_history(&mut *history_connection, code, self.today).await?;
+        history_connection.return_to_pool().await;
         if history.is_empty() {
             return Err(AppError::DataProvider(format!(
                 "no valid daily bars for {code}"
@@ -1587,9 +1716,24 @@ where
             let start = rows.first().expect("non-empty chunk").trade_date;
             let end = rows.last().expect("non-empty chunk").trade_date;
 
-            let claim = company_repository
-                .claim_checkpoint_window(CHIP_BACKFILL_PHASE, code, start, end, self.lease_ttl)
-                .await?;
+            let claim = match tokio::time::timeout(
+                CHIP_WRITE_HANDOFF_TIMEOUT,
+                company_repository.claim_checkpoint_window(
+                    CHIP_BACKFILL_PHASE,
+                    code,
+                    start,
+                    end,
+                    self.lease_ttl,
+                ),
+            )
+            .await
+            {
+                Ok(claim) => claim?,
+                Err(_) => {
+                    report.pending += 1;
+                    break;
+                }
+            };
             let lease = match claim {
                 CheckpointClaimOutcome::Completed => None,
                 CheckpointClaimOutcome::Busy => {
@@ -2261,6 +2405,29 @@ async fn latest_validation_decision_in_tx(
         .transpose()
 }
 
+async fn latest_validation_decision_in_connection(
+    connection: &mut PgConnection,
+    model_version: &str,
+) -> Result<Option<ChipSourceDecision>> {
+    let decision: Option<String> = sqlx::query_scalar(
+        r#"SELECT decision
+           FROM chip_model_validation_runs
+           WHERE model_version = $1 AND completed_at IS NOT NULL
+             AND decision IS NOT NULL AND error_summary IS NULL
+           ORDER BY recorded_at DESC, run_id DESC LIMIT 1"#,
+    )
+    .bind(model_version)
+    .fetch_optional(connection)
+    .await?;
+    decision
+        .map(|value| {
+            ChipSourceDecision::from_storage(&value).ok_or_else(|| {
+                AppError::Internal(format!("unknown stored chip source decision: {value}"))
+            })
+        })
+        .transpose()
+}
+
 fn estimate_history_at_dates(
     history: impl IntoIterator<Item = ChipDayInput>,
     requested: &BTreeSet<NaiveDate>,
@@ -2497,8 +2664,9 @@ mod tests {
     use sqlx::{postgres::PgPoolOptions, PgPool};
 
     use super::{
-        bounded_date_windows, estimate_history_at_dates, official_snapshot,
-        CompanyIntelligenceService, DailyStockChipOutcome, CHIP_DAILY_PHASE,
+        bounded_date_windows, estimate_history_at_dates, local_chip_mutation_is_active,
+        official_snapshot, CompanyIntelligenceService, DailyStockChipOutcome, CHIP_BACKFILL_PHASE,
+        CHIP_DAILY_PHASE,
     };
     use crate::data::chip::{
         ChipDayInput, ChipSourceDecision, OfficialChipBucket, OfficialChipPerformance,
@@ -3725,6 +3893,123 @@ mod tests {
         .unwrap();
         assert_eq!(state_date, expected);
         assert_eq!(canonical, (expected, "tushare".to_string(), true));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn unrelated_backfill_does_not_suppress_an_uncontended_daily_stock(pool: PgPool) {
+        let contended = "000001.SZ";
+        let uncontented = "000002.SZ";
+        let previous = date(2026, 7, 19);
+        let expected = date(2026, 7, 20);
+        for code in [contended, uncontented] {
+            seed_current_stock(&pool, code, date(2020, 1, 1)).await;
+            seed_security_status(&pool, code, expected, false).await;
+            seed_adjustment_factor(&pool, code, previous).await;
+            seed_adjustment_factor(&pool, code, expected).await;
+        }
+        seed_chip_decision(&pool, ChipSourceDecision::Official).await;
+        seed_chip_bars(&pool, contended, previous, 2).await;
+        seed_chip_bars(&pool, uncontented, expected, 1).await;
+        seed_chip_state(&pool, uncontented, previous).await;
+        let provider = Arc::new(RecordingChipProvider {
+            official_delay: Duration::from_millis(200),
+            ..Default::default()
+        });
+        let backfill_service =
+            CompanyIntelligenceService::new_at(pool.clone(), provider.clone(), expected);
+        let daily_service =
+            CompanyIntelligenceService::new_at(pool.clone(), provider.clone(), expected);
+        let backfill_pool = pool.clone();
+        let mut backfill = tokio::spawn(async move {
+            let repository = ChipRepository::new(backfill_pool);
+            backfill_service
+                .backfill_chip_stock(&repository, ChipSourceDecision::Official, contended)
+                .await
+        });
+        let entered = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if *provider.official_calls.lock().unwrap() > 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        if entered.is_err() && backfill.is_finished() {
+            panic!(
+                "contended stock backfill ended before its protected window: {:?}",
+                (&mut backfill).await
+            );
+        }
+        entered.expect("contended stock backfill must enter its protected window");
+
+        let report = daily_service.update_daily_chips().await.unwrap();
+
+        assert_eq!(report.completed, 1);
+        assert_eq!(report.pending, 1);
+        let uncontented_date: NaiveDate = sqlx::query_scalar(
+            "SELECT through_date FROM chip_model_states WHERE code = $1 AND model_version = 'qbot-chip-v2'",
+        )
+        .bind(uncontented)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(uncontented_date, expected);
+        backfill.await.unwrap().unwrap();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn daily_first_handoff_makes_same_key_backfill_return_promptly(pool: PgPool) {
+        let code = "000001.SZ";
+        let previous = date(2026, 7, 19);
+        let expected = date(2026, 7, 20);
+        seed_current_stock(&pool, code, date(2020, 1, 1)).await;
+        seed_chip_decision(&pool, ChipSourceDecision::Official).await;
+        seed_chip_state(&pool, code, previous).await;
+        seed_security_status(&pool, code, expected, false).await;
+        seed_chip_bars(&pool, code, expected, 1).await;
+        seed_adjustment_factor(&pool, code, expected).await;
+        let constrained_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(pool.connect_options().as_ref().clone())
+            .await
+            .unwrap();
+        let provider = Arc::new(RecordingChipProvider {
+            official_delay: Duration::from_millis(200),
+            ..Default::default()
+        });
+        let daily_service = CompanyIntelligenceService::new_at(
+            constrained_pool.clone(),
+            provider.clone(),
+            expected,
+        );
+        let mutation_pool = daily_service.mutation_pool.clone();
+        let daily = tokio::spawn(async move { daily_service.update_daily_chips().await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !local_chip_mutation_is_active(&mutation_pool, code) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("daily writer must acquire its local guard");
+        let backfill_service =
+            CompanyIntelligenceService::new_at(constrained_pool.clone(), provider, expected);
+        let repository = ChipRepository::new(constrained_pool);
+
+        let backfill = tokio::time::timeout(
+            Duration::from_millis(100),
+            backfill_service.backfill_chip_stock(&repository, ChipSourceDecision::Official, code),
+        )
+        .await
+        .expect("same-key backfill must lose locally before acquiring the pool")
+        .unwrap();
+
+        assert_eq!(backfill.pending, 1);
+        assert_eq!(backfill.completed, 0);
+        let daily = daily.await.unwrap().unwrap();
+        assert_eq!(daily.completed, 1);
+        assert_eq!(daily.pending, 0);
+        assert_eq!(daily.observed_date, Some(expected));
     }
 
     #[sqlx::test(migrations = "./migrations")]
