@@ -109,6 +109,23 @@ impl FromStr for DashboardPeriod {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum HistorySource {
+    RecentDaily(usize),
+    CompleteWeekly,
+    CompleteMonthly,
+}
+
+fn history_source(period: DashboardPeriod, requested_days: Option<usize>) -> HistorySource {
+    match period {
+        DashboardPeriod::Daily => {
+            HistorySource::RecentDaily(requested_days.unwrap_or(500).clamp(30, 5_000))
+        }
+        DashboardPeriod::Weekly => HistorySource::CompleteWeekly,
+        DashboardPeriod::Monthly => HistorySource::CompleteMonthly,
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DashboardBar {
@@ -249,16 +266,14 @@ impl DashboardService {
         let name = postgres::get_stock_name(&self.state.db, &code)
             .await?
             .unwrap_or_else(|| code.clone());
-        let period_bars = if period == DashboardPeriod::Monthly {
-            postgres::get_stock_monthly_history(&self.state.db, &code).await?
-        } else {
-            let daily = postgres::get_stock_history(
-                &self.state.db,
-                &code,
-                requested_days.unwrap_or(500).clamp(30, 5_000),
-            )
-            .await?;
-            resample_dashboard_bars(&daily, period)
+        let period_bars = match history_source(period, requested_days) {
+            HistorySource::RecentDaily(days) => {
+                postgres::get_stock_history(&self.state.db, &code, days).await?
+            }
+            HistorySource::CompleteWeekly => self.repo.weekly_history(&code).await?,
+            HistorySource::CompleteMonthly => {
+                postgres::get_stock_monthly_history(&self.state.db, &code).await?
+            }
         };
         let partial = period_bars.is_empty();
         let latest = period_bars.last().map(DashboardBar::from);
@@ -472,5 +487,29 @@ mod tests {
         assert_eq!(weekly[0].close, 13.0);
         assert_eq!(weekly[0].high, 14.0);
         assert_eq!(weekly[0].low, 8.0);
+    }
+
+    #[test]
+    fn dashboard_history_source_keeps_weekly_unbounded() {
+        assert_eq!(
+            history_source(DashboardPeriod::Weekly, Some(30)),
+            HistorySource::CompleteWeekly
+        );
+        assert_eq!(
+            history_source(DashboardPeriod::Daily, None),
+            HistorySource::RecentDaily(500)
+        );
+        assert_eq!(
+            history_source(DashboardPeriod::Daily, Some(1)),
+            HistorySource::RecentDaily(30)
+        );
+        assert_eq!(
+            history_source(DashboardPeriod::Daily, Some(10_000)),
+            HistorySource::RecentDaily(5_000)
+        );
+        assert_eq!(
+            history_source(DashboardPeriod::Monthly, None),
+            HistorySource::CompleteMonthly
+        );
     }
 }
