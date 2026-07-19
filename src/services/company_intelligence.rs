@@ -276,6 +276,8 @@ pub struct CompanyIntelligenceService<P: CompanyDataProvider> {
     today: NaiveDate,
     lease_ttl: Duration,
     mutation_pool: ChipPoolIdentity,
+    #[cfg(test)]
+    checkpoint_claim_pause: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 }
 
 impl<P: CompanyDataProvider> CompanyIntelligenceService<P> {
@@ -298,6 +300,8 @@ impl<P: CompanyDataProvider> CompanyIntelligenceService<P> {
             today,
             lease_ttl: DEFAULT_LEASE_TTL,
             mutation_pool,
+            #[cfg(test)]
+            checkpoint_claim_pause: None,
         }
     }
 
@@ -305,6 +309,27 @@ impl<P: CompanyDataProvider> CompanyIntelligenceService<P> {
         self.lease_ttl = lease_ttl;
         self
     }
+
+    #[cfg(test)]
+    fn with_checkpoint_claim_pause(
+        mut self,
+        reached: Arc<tokio::sync::Notify>,
+        resume: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.checkpoint_claim_pause = Some((reached, resume));
+        self
+    }
+
+    #[cfg(test)]
+    async fn pause_after_checkpoint_claim(&self) {
+        if let Some((reached, resume)) = &self.checkpoint_claim_pause {
+            reached.notify_one();
+            resume.notified().await;
+        }
+    }
+
+    #[cfg(not(test))]
+    async fn pause_after_checkpoint_claim(&self) {}
 
     pub async fn backfill_financials(&self) -> Result<CompanySyncReport> {
         self.finish(
@@ -1025,44 +1050,31 @@ where
                 "another in-process chip writer owns the mutation guard".to_string(),
             ));
         };
-        let claim = match tokio::time::timeout(
-            CHIP_WRITE_HANDOFF_TIMEOUT,
-            company_repository.claim_checkpoint_window(
+        let Some(mut transaction) = self.try_acquire_chip_mutation_fence(code).await? else {
+            return Ok(DailyStockChipOutcome::Pending(
+                "another chip writer owns the mutation fence".to_string(),
+            ));
+        };
+        let claim = company_repository
+            .claim_checkpoint_window_in_transaction(
+                &mut transaction,
                 CHIP_DAILY_PHASE,
                 code,
                 expected_date,
                 expected_date,
                 self.lease_ttl,
-            ),
-        )
-        .await
-        {
-            Ok(claim) => claim?,
-            Err(_) => {
-                return Ok(DailyStockChipOutcome::Pending(
-                    "daily checkpoint connection is busy".to_string(),
-                ))
-            }
-        };
+            )
+            .await?;
+        self.pause_after_checkpoint_claim().await;
         let lease = match claim {
             CheckpointClaimOutcome::Completed => None,
             CheckpointClaimOutcome::Busy => {
+                transaction.rollback().await?;
                 return Ok(DailyStockChipOutcome::Pending(
                     "another worker owns the daily checkpoint".to_string(),
-                ))
+                ));
             }
             CheckpointClaimOutcome::Claimed(lease) => Some(lease),
-        };
-
-        let Some(mut transaction) = self.try_acquire_chip_mutation_fence(code).await? else {
-            let failure = "another chip writer owns the mutation fence";
-            return Ok(DailyStockChipOutcome::Pending(match lease.as_ref() {
-                Some(lease) => {
-                    self.fail_daily_checkpoint(company_repository, lease, failure)
-                        .await
-                }
-                None => failure.to_string(),
-            }));
         };
         let outcome = self
             .update_daily_chip_stock_locked(
@@ -1088,13 +1100,6 @@ where
                     .map(|rollback| format!("; fence rollback failed: {rollback}"))
                     .unwrap_or_default();
                 let failure = format!("{error}{rollback_suffix}");
-                let failure = match lease.as_ref() {
-                    Some(lease) => {
-                        self.fail_daily_checkpoint(company_repository, lease, &failure)
-                            .await
-                    }
-                    None => failure,
-                };
                 Ok(DailyStockChipOutcome::Failed(failure))
             }
         }
@@ -1125,7 +1130,7 @@ where
                         lease,
                         &failure,
                     )
-                    .await,
+                    .await?,
                 ),
                 None => DailyStockChipOutcome::Failed(failure),
             });
@@ -1143,7 +1148,7 @@ where
                         lease,
                         &failure,
                     )
-                    .await,
+                    .await?,
                 ),
                 None => DailyStockChipOutcome::Failed(failure),
             });
@@ -1172,7 +1177,7 @@ where
                             lease,
                             failure,
                         )
-                        .await
+                        .await?
                     }
                     None => failure.to_string(),
                 }))
@@ -1205,7 +1210,7 @@ where
                     &lease,
                     &failure,
                 )
-                .await,
+                .await?,
             ));
         }
 
@@ -1221,7 +1226,7 @@ where
                     &lease,
                     failure,
                 )
-                .await,
+                .await?,
             ));
         };
         let input = match raw.into_input(code) {
@@ -1234,7 +1239,7 @@ where
                         &lease,
                         &error.to_string(),
                     )
-                    .await,
+                    .await?,
                 ))
             }
         };
@@ -1249,7 +1254,7 @@ where
                         &lease,
                         &error.to_string(),
                     )
-                    .await,
+                    .await?,
                 ));
             }
         };
@@ -1263,7 +1268,7 @@ where
                         &lease,
                         &error.to_string(),
                     )
-                    .await,
+                    .await?,
                 ));
             }
         };
@@ -1276,7 +1281,7 @@ where
                     &lease,
                     failure,
                 )
-                .await,
+                .await?,
             ));
         };
 
@@ -1308,7 +1313,7 @@ where
                                     &lease,
                                     &format!("{failure}; lease renewal failed: {error}"),
                                 )
-                                .await,
+                                .await?,
                             ))
                         }
                     };
@@ -1328,7 +1333,7 @@ where
                                 &lease,
                                 &format!("{failure}; fallback persistence failed: {storage}"),
                             )
-                            .await,
+                            .await?,
                         ));
                     }
                     return Ok(DailyStockChipOutcome::Failed(failure));
@@ -1348,7 +1353,7 @@ where
                         &lease,
                         &format!("lease renewal failed: {error}"),
                     )
-                    .await,
+                    .await?,
                 ))
             }
         };
@@ -1369,7 +1374,7 @@ where
                     &lease,
                     &error.to_string(),
                 )
-                .await,
+                .await?,
             )),
         }
     }
@@ -1395,35 +1400,20 @@ where
         }
     }
 
-    async fn fail_daily_checkpoint(
-        &self,
-        repository: &CompanyRepository,
-        lease: &CheckpointLease,
-        failure: &str,
-    ) -> String {
-        let release_suffix = repository
-            .fail_checkpoint(lease, failure)
-            .await
-            .err()
-            .map(|release| format!("; checkpoint release failed: {release}"))
-            .unwrap_or_default();
-        format!("{failure}{release_suffix}")
-    }
-
     async fn fail_daily_checkpoint_in_transaction(
         &self,
         repository: &CompanyRepository,
         transaction: &mut Transaction<'_, Postgres>,
         lease: &CheckpointLease,
         failure: &str,
-    ) -> String {
-        let release_suffix = repository
+    ) -> Result<String> {
+        repository
             .fail_checkpoint_in_transaction(transaction, lease, failure)
             .await
-            .err()
-            .map(|release| format!("; checkpoint release failed: {release}"))
-            .unwrap_or_default();
-        format!("{failure}{release_suffix}")
+            .map_err(|release| {
+                AppError::DataProvider(format!("{failure}; checkpoint release failed: {release}"))
+            })?;
+        Ok(failure.to_string())
     }
 
     async fn load_chip_model_state_in_transaction(
@@ -1716,27 +1706,25 @@ where
             let start = rows.first().expect("non-empty chunk").trade_date;
             let end = rows.last().expect("non-empty chunk").trade_date;
 
-            let claim = match tokio::time::timeout(
-                CHIP_WRITE_HANDOFF_TIMEOUT,
-                company_repository.claim_checkpoint_window(
+            let Some(mut transaction) = self.try_acquire_chip_mutation_fence(code).await? else {
+                report.pending += 1;
+                break;
+            };
+            let claim = company_repository
+                .claim_checkpoint_window_in_transaction(
+                    &mut transaction,
                     CHIP_BACKFILL_PHASE,
                     code,
                     start,
                     end,
                     self.lease_ttl,
-                ),
-            )
-            .await
-            {
-                Ok(claim) => claim?,
-                Err(_) => {
-                    report.pending += 1;
-                    break;
-                }
-            };
+                )
+                .await?;
+            self.pause_after_checkpoint_claim().await;
             let lease = match claim {
                 CheckpointClaimOutcome::Completed => None,
                 CheckpointClaimOutcome::Busy => {
+                    transaction.rollback().await?;
                     report.pending += 1;
                     break;
                 }
@@ -1757,12 +1745,18 @@ where
             if let Some(error) = input_error {
                 if let Some(lease) = lease.as_ref() {
                     company_repository
-                        .fail_checkpoint(lease, &format!("invalid chip input: {error}"))
+                        .fail_checkpoint_in_transaction(
+                            &mut transaction,
+                            lease,
+                            &format!("invalid chip input: {error}"),
+                        )
                         .await?;
+                    transaction.commit().await?;
                     return Err(AppError::DataProvider(format!(
                         "invalid chip input in {code}/{start}..{end}: {error}"
                     )));
                 }
+                transaction.rollback().await?;
                 return Err(AppError::DataProvider(format!(
                     "completed chip checkpoint {code}/{start}..{end} can no longer be replayed: {error}"
                 )));
@@ -1770,13 +1764,8 @@ where
             let Some(lease) = lease else {
                 // Completed snapshots are not rewritten, but every bar still
                 // advances the estimator for the next incomplete window.
+                transaction.rollback().await?;
                 continue;
-            };
-            let Some(mut transaction) = self.try_acquire_chip_mutation_fence(code).await? else {
-                let failure = "another chip writer owns the mutation fence";
-                company_repository.fail_checkpoint(&lease, failure).await?;
-                report.pending += 1;
-                break;
             };
             let lease = match company_repository
                 .renew_checkpoint_in_transaction(&mut transaction, &lease, self.lease_ttl)
@@ -1791,7 +1780,7 @@ where
                             &lease,
                             &format!("lease renewal failed: {error}"),
                         )
-                        .await;
+                        .await?;
                     transaction.commit().await?;
                     return Err(AppError::DataProvider(failure));
                 }
@@ -1824,21 +1813,17 @@ where
                                 let cleanup_error = format!(
                                     "{provider_failure}; lease renewal failed after provider failure: {renewal}"
                                 );
-                                let release_suffix = company_repository
-                                    .fail_checkpoint_in_transaction(
+                                let failure = self
+                                    .fail_daily_checkpoint_in_transaction(
+                                        &company_repository,
                                         &mut transaction,
                                         &lease,
                                         &cleanup_error,
                                     )
-                                    .await
-                                    .err()
-                                    .map(|release| {
-                                        format!("; checkpoint release failed: {release}")
-                                    })
-                                    .unwrap_or_default();
+                                    .await?;
                                 transaction.commit().await?;
                                 return Err(AppError::DataProvider(format!(
-                                    "{cleanup_error}{release_suffix}"
+                                    "{failure}; checkpoint release succeeded"
                                 )));
                             }
                         };
@@ -1859,23 +1844,18 @@ where
                                 let cleanup_error = format!(
                                     "{provider_failure}; fallback persistence failed: {storage}"
                                 );
-                                let release = match company_repository
-                                    .fail_checkpoint_in_transaction(
+                                let failure = self
+                                    .fail_daily_checkpoint_in_transaction(
+                                        &company_repository,
                                         &mut transaction,
                                         &lease,
                                         &cleanup_error,
                                     )
-                                    .await
-                                {
-                                    Ok(()) => "checkpoint release succeeded".to_string(),
-                                    Err(error) => {
-                                        format!("checkpoint release failed: {error}")
-                                    }
-                                };
-                                let failure =
-                                    AppError::DataProvider(format!("{cleanup_error}; {release}"));
+                                    .await?;
                                 transaction.commit().await?;
-                                return Err(failure);
+                                return Err(AppError::DataProvider(format!(
+                                    "{failure}; checkpoint release succeeded"
+                                )));
                             }
                         }
                     }
@@ -1894,16 +1874,16 @@ where
                 Ok(lease) => lease,
                 Err(renewal) => {
                     let cleanup_error = format!("lease renewal failed: {renewal}");
-                    let release_suffix = company_repository
-                        .fail_checkpoint_in_transaction(&mut transaction, &lease, &cleanup_error)
-                        .await
-                        .err()
-                        .map(|release| format!("; checkpoint release failed: {release}"))
-                        .unwrap_or_default();
+                    let failure = self
+                        .fail_daily_checkpoint_in_transaction(
+                            &company_repository,
+                            &mut transaction,
+                            &lease,
+                            &cleanup_error,
+                        )
+                        .await?;
                     transaction.commit().await?;
-                    return Err(AppError::DataProvider(format!(
-                        "{cleanup_error}{release_suffix}"
-                    )));
+                    return Err(AppError::DataProvider(failure));
                 }
             };
             let state = model.state().ok_or_else(|| {
@@ -1923,21 +1903,18 @@ where
                     transaction.commit().await?;
                 }
                 Err(error) => {
-                    let release_suffix = company_repository
-                        .fail_checkpoint_in_transaction(
+                    let failure = self
+                        .fail_daily_checkpoint_in_transaction(
+                            &company_repository,
                             &mut transaction,
                             &lease,
                             &error.to_string(),
                         )
-                        .await
-                        .err()
-                        .map(|release| format!("; checkpoint release failed: {release}"))
-                        .unwrap_or_default();
-                    let failure = AppError::DataProvider(format!(
-                        "chip batch persistence failed for {code}/{start}..{end}: {error}{release_suffix}"
-                    ));
+                        .await?;
                     transaction.commit().await?;
-                    return Err(failure);
+                    return Err(AppError::DataProvider(format!(
+                        "chip batch persistence failed for {code}/{start}..{end}: {failure}"
+                    )));
                 }
             }
         }
@@ -2665,8 +2642,7 @@ mod tests {
 
     use super::{
         bounded_date_windows, estimate_history_at_dates, local_chip_mutation_is_active,
-        official_snapshot, CompanyIntelligenceService, DailyStockChipOutcome, CHIP_BACKFILL_PHASE,
-        CHIP_DAILY_PHASE,
+        official_snapshot, CompanyIntelligenceService, DailyStockChipOutcome, CHIP_DAILY_PHASE,
     };
     use crate::data::chip::{
         ChipDayInput, ChipSourceDecision, OfficialChipBucket, OfficialChipPerformance,
@@ -2677,7 +2653,7 @@ mod tests {
     };
     use crate::error::{AppError, Result};
     use crate::storage::chip_repository::ChipRepository;
-    use crate::storage::company_repository::{CheckpointClaimOutcome, CompanyRepository};
+    use crate::storage::company_repository::CompanyRepository;
 
     #[derive(Default)]
     struct RecordingChipProvider {
@@ -3836,25 +3812,19 @@ mod tests {
             expected,
         );
         let daily_service =
-            CompanyIntelligenceService::new_at(constrained_pool, provider, expected);
+            CompanyIntelligenceService::new_at(constrained_pool, provider.clone(), expected);
         let backfill = tokio::spawn(async move { backfill_service.backfill_chips().await });
-        let checkpoints = CompanyRepository::new(pool.clone());
 
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if checkpoints
-                    .checkpoint_window(super::CHIP_BACKFILL_PHASE, code, start, expected)
-                    .await
-                    .unwrap()
-                    .is_some_and(|checkpoint| checkpoint.status == "running")
-                {
+                if *provider.official_calls.lock().unwrap() > 0 {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
-        .expect("backfill must claim its checkpoint");
+        .expect("backfill must reach the delayed provider while owning the pool connection");
 
         let contended = tokio::time::timeout(
             Duration::from_millis(100),
@@ -4044,7 +4014,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn daily_sql_error_rolls_back_fence_before_fresh_checkpoint_cleanup(pool: PgPool) {
+    async fn daily_sql_error_rolls_back_fence_and_checkpoint_claim(pool: PgPool) {
         let code = "000001.SZ";
         let expected = date(2026, 7, 20);
         let service = CompanyIntelligenceService::new_at(
@@ -4074,10 +4044,50 @@ mod tests {
         let checkpoint = company_repository
             .checkpoint_window(CHIP_DAILY_PHASE, code, expected, expected)
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(checkpoint.status, "failed");
-        assert!(checkpoint.lease_token.is_none());
+        assert_eq!(checkpoint, None);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn cancelling_after_daily_checkpoint_claim_does_not_leave_running_lease(pool: PgPool) {
+        let code = "000001.SZ";
+        let expected = date(2026, 7, 20);
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let service = CompanyIntelligenceService::new_at(
+            pool.clone(),
+            Arc::new(RecordingChipProvider::default()),
+            expected,
+        )
+        .with_checkpoint_claim_pause(reached.clone(), resume);
+        let worker_pool = pool.clone();
+        let worker = tokio::spawn(async move {
+            service
+                .update_daily_chip_stock(
+                    &CompanyRepository::new(worker_pool.clone()),
+                    &ChipRepository::new(worker_pool),
+                    ChipSourceDecision::Estimate,
+                    code,
+                    expected,
+                )
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), reached.notified())
+            .await
+            .expect("daily writer must reach the post-claim cancellation boundary");
+        worker.abort();
+        let cancellation = worker.await;
+        assert!(matches!(cancellation, Err(error) if error.is_cancelled()));
+
+        let checkpoint = CompanyRepository::new(pool)
+            .checkpoint_window(CHIP_DAILY_PHASE, code, expected, expected)
+            .await
+            .unwrap();
+        assert_eq!(
+            checkpoint, None,
+            "cancelling a writer must roll back its uncommitted checkpoint claim"
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -4319,59 +4329,45 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn delayed_provider_failure_renews_before_fallback_and_cannot_touch_new_owner(
-        pool: PgPool,
-    ) {
+    async fn delayed_provider_failure_keeps_claim_private_until_failure_is_committed(pool: PgPool) {
         let code = "000001.SZ";
         let start = date(2020, 1, 2);
         let end = start + ChronoDuration::days(1);
         seed_current_stock(&pool, code, start).await;
         seed_chip_decision(&pool, ChipSourceDecision::Official).await;
         seed_chip_bars(&pool, code, start, 2).await;
-        let service = CompanyIntelligenceService::new_at(
-            pool.clone(),
-            Arc::new(RecordingChipProvider {
-                fail_official: true,
-                official_delay: Duration::from_millis(300),
-                ..Default::default()
-            }),
-            end,
-        )
-        .with_lease_ttl(Duration::from_millis(100));
+        let provider = Arc::new(RecordingChipProvider {
+            fail_official: true,
+            official_delay: Duration::from_millis(300),
+            ..Default::default()
+        });
+        let service = CompanyIntelligenceService::new_at(pool.clone(), provider.clone(), end)
+            .with_lease_ttl(Duration::from_millis(100));
         let worker = tokio::spawn(async move { service.backfill_chips().await });
         let checkpoints = CompanyRepository::new(pool.clone());
 
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if checkpoints
-                    .checkpoint_window("chip_backfill", code, start, end)
-                    .await
-                    .unwrap()
-                    .is_some()
-                {
+                if *provider.official_calls.lock().unwrap() > 0 {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
-        .expect("first worker must publish its checkpoint claim");
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        let second = checkpoints
-            .claim_checkpoint_window("chip_backfill", code, start, end, Duration::from_secs(5))
+        .expect("worker must reach the delayed provider");
+        let in_flight = checkpoints
+            .checkpoint_window("chip_backfill", code, start, end)
             .await
             .unwrap();
-        let CheckpointClaimOutcome::Claimed(second) = second else {
-            panic!("expired provider worker must be reclaimable")
-        };
+        assert_eq!(
+            in_flight, None,
+            "an in-flight claim must remain uncommitted"
+        );
 
         let error = worker.await.unwrap().unwrap_err().to_string();
 
         assert!(error.contains("injected official failure"));
-        assert!(
-            error.contains("lease renewal failed after provider failure"),
-            "unexpected error: {error}"
-        );
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM chip_distribution")
                 .fetch_one(&pool)
@@ -4382,11 +4378,8 @@ mod tests {
         let checkpoint = checkpoints
             .checkpoint_window("chip_backfill", code, start, end)
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(checkpoint.status, "running");
-        assert_eq!(checkpoint.attempts, second.attempt);
-        assert_eq!(checkpoint.lease_token, Some(second.token));
+        assert_eq!(checkpoint, None, "an unreleasable claim must roll back");
     }
 
     #[sqlx::test(migrations = "./migrations")]

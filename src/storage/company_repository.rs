@@ -1,7 +1,7 @@
 use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use serde_json::Value;
-use sqlx::{FromRow, PgPool, Postgres, Transaction};
+use sqlx::{Executor, FromRow, PgPool, Postgres, Transaction};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -424,6 +424,46 @@ impl CompanyRepository {
         lease_ttl: Duration,
         policy: CheckpointClaimPolicy,
     ) -> Result<CheckpointClaimOutcome> {
+        self.claim_checkpoint_window_with_policy_on(
+            &self.pool, phase, code, start_date, end_date, lease_ttl, policy,
+        )
+        .await
+    }
+
+    pub async fn claim_checkpoint_window_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        phase: &str,
+        code: &str,
+        start_date: NaiveDate,
+        end_date: NaiveDate,
+        lease_ttl: Duration,
+    ) -> Result<CheckpointClaimOutcome> {
+        self.claim_checkpoint_window_with_policy_on(
+            &mut **transaction,
+            phase,
+            code,
+            start_date,
+            end_date,
+            lease_ttl,
+            CheckpointClaimPolicy::Resume,
+        )
+        .await
+    }
+
+    async fn claim_checkpoint_window_with_policy_on<'e, E>(
+        &self,
+        executor: E,
+        phase: &str,
+        code: &str,
+        start_date: NaiveDate,
+        end_date: NaiveDate,
+        lease_ttl: Duration,
+        policy: CheckpointClaimPolicy,
+    ) -> Result<CheckpointClaimOutcome>
+    where
+        E: Executor<'e, Database = Postgres>,
+    {
         if start_date > end_date {
             return Err(AppError::BadRequest(format!(
                 "checkpoint window starts after it ends: {start_date} > {end_date}"
@@ -516,7 +556,7 @@ impl CompanyRepository {
         .bind(token)
         .bind(lease_ttl_seconds)
         .bind(refresh_before)
-        .fetch_one(&self.pool)
+        .fetch_one(executor)
         .await?;
 
         if owns_lease {
