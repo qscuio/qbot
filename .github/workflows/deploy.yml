@@ -523,20 +523,23 @@ jobs:
               observed="$active_state:$sub_state:$result:$exec_status"
 
               case "$observed" in
-                active:running:*:*|activating:*:*:*)
-                  echo "$unit launch accepted (state: $active_state/$sub_state)"
-                  echo "Follow progress with: sudo journalctl -fu $unit"
-                  exit 0
-                  ;;
                 active:exited:success:0)
                   echo "$unit completed successfully before deployment observation finished"
                   clear_transient_unit
                   exit 0
                   ;;
-                failed:*:*:*|*:failed:*:*|active:exited:*:*|*:*:*:[!0]*)
+                failed:*:*:*|inactive:*:*:*|deactivating:*:*:*|*:failed:*:*|active:exited:*:*|*:*:*:[!0]*)
                   echo "$unit failed during launch observation (state: $observed)"
                   show_repair_failure
                   exit 1
+                  ;;
+                active:running:*:*)
+                  echo "$unit launch accepted (state: $active_state/$sub_state)"
+                  echo "Follow progress with: sudo journalctl -fu $unit"
+                  exit 0
+                  ;;
+                activating:*:*:*)
+                  echo "$unit is still activating (attempt $attempt/10)"
                   ;;
               esac
 

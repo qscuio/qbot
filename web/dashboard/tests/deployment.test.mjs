@@ -76,21 +76,29 @@ if [ "$verb" = "show" ]; then
   fi
   phase="$(tr -d '\\n' < "$MOCK_STATE")"
   case "$phase:$property" in
-    running:LoadState|stale:LoadState|fast-success:LoadState|fast-failure:LoadState) echo loaded ;;
+    running:LoadState|stale:LoadState|fast-success:LoadState|fast-failure:LoadState|activating-failed:LoadState|activating-running:LoadState) echo loaded ;;
     gone:LoadState|missing:LoadState) echo not-found ;;
     running:ActiveState|fast-success:ActiveState) echo active ;;
+    activating-failed:ActiveState|activating-running:ActiveState) echo activating ;;
     stale:ActiveState|fast-failure:ActiveState) echo failed ;;
     gone:ActiveState|missing:ActiveState) echo inactive ;;
     running:SubState) echo running ;;
+    activating-failed:SubState|activating-running:SubState) echo start ;;
     fast-success:SubState) echo exited ;;
     stale:SubState|fast-failure:SubState) echo failed ;;
     gone:SubState|missing:SubState) echo dead ;;
-    running:Result|fast-success:Result|gone:Result|missing:Result) echo success ;;
+    running:Result|fast-success:Result|gone:Result|missing:Result|activating-failed:Result|activating-running:Result) echo success ;;
     stale:Result|fast-failure:Result) echo exit-code ;;
-    running:ExecMainStatus|fast-success:ExecMainStatus|gone:ExecMainStatus|missing:ExecMainStatus) echo 0 ;;
+    running:ExecMainStatus|fast-success:ExecMainStatus|gone:ExecMainStatus|missing:ExecMainStatus|activating-failed:ExecMainStatus|activating-running:ExecMainStatus) echo 0 ;;
     stale:ExecMainStatus|fast-failure:ExecMainStatus) echo 17 ;;
     *) echo "unexpected show request: $phase:$property" >&2; exit 64 ;;
   esac
+  if [ "$property" = "ExecMainStatus" ]; then
+    case "$phase" in
+      activating-failed) echo fast-failure > "$MOCK_STATE" ;;
+      activating-running) echo running > "$MOCK_STATE" ;;
+    esac
+  fi
   exit 0
 fi
 
@@ -122,6 +130,8 @@ case "$MOCK_SCENARIO" in
     ;;
   fast-success) echo fast-success > "$MOCK_STATE" ;;
   fast-failure) echo fast-failure > "$MOCK_STATE" ;;
+  activating-failure) echo activating-failed > "$MOCK_STATE" ;;
+  activating-running) echo activating-running > "$MOCK_STATE" ;;
   stale-relaunch) echo running > "$MOCK_STATE" ;;
   *) echo "unexpected launch in scenario $MOCK_SCENARIO" >&2; exit 64 ;;
 esac
@@ -326,4 +336,26 @@ test("a fast failed company repair exposes journal diagnostics and fails", async
 
   assert.notEqual(result.status, 0);
   assert.match(result.log, /journalctl -u qbot-company-intelligence-repair/);
+});
+
+test("an activating company repair is polled until its later failure is visible", async () => {
+  const result = await runRepairScenario("activating-failure", "missing");
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.log, /journalctl -u qbot-company-intelligence-repair/);
+  assert.ok(
+    (result.log.match(/--property=ActiveState/g)?.length ?? 0) >= 2,
+    result.log,
+  );
+});
+
+test("an activating company repair is polled until it is actually running", async () => {
+  const result = await runRepairScenario("activating-running", "missing");
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /state: active\/running/);
+  assert.ok(
+    (result.log.match(/--property=ActiveState/g)?.length ?? 0) >= 2,
+    result.log,
+  );
 });
