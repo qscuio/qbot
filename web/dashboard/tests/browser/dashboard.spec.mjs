@@ -41,19 +41,30 @@ async function mockApi(page, initiallyAuthenticated = true, stockHits = bootstra
       authenticated = true;
       return route.fulfill({ status: 200, json: { authenticated: true } });
     }
-    if (url.pathname.endsWith("/auth/logout")) return route.fulfill({ status: 204, body: "" });
+    if (url.pathname.endsWith("/auth/logout")) {
+      if (gates.logout) {
+        gates.logout.requested?.();
+        await gates.logout.release;
+      }
+      return route.fulfill({ status: 204, body: "" });
+    }
     if (!authenticated) return route.fulfill({ status: 401, json: { error: "unauthorized" } });
     if (url.pathname.endsWith("/bootstrap")) {
       bootstrapRequests += 1;
-      if (gates.bootstrap && bootstrapRequests > (gates.bootstrap.afterRequests ?? 0)) {
+      const response = gates.bootstrap?.responses?.[bootstrapRequests];
+      if (response) {
+        response.requested?.();
+        if (response.release) await response.release;
+      } else if (gates.bootstrap && bootstrapRequests > (gates.bootstrap.afterRequests ?? 0)) {
         gates.bootstrap.requested?.();
         await gates.bootstrap.release;
       }
+      const responseBootstrap = response?.payload ?? bootstrap;
       return route.fulfill({
         status: 200,
         json: {
-          ...bootstrap,
-          results: bootstrap.results.map((row) => row.code === "600519" ? { ...row, hits: stockHits } : row),
+          ...responseBootstrap,
+          results: responseBootstrap.results.map((row) => row.code === "600519" ? { ...row, hits: stockHits } : row),
         },
       });
     }
@@ -273,6 +284,92 @@ test("delayed quiet bootstrap cannot replace the auth root after logout", async 
     listeners: window.__dashboardLifecycleProbe.resizeListeners.size,
     observes: window.__dashboardLifecycleProbe.observes,
   }))).toEqual(authLifecycle);
+});
+
+test("history navigation cannot restore cached protected views after logout", async ({ page }) => {
+  await installLifecycleProbe(page);
+  await mockApi(page);
+  await page.goto("/dashboard/");
+  await page.locator("tbody tr").first().click();
+  await expect(page.locator("#stock-chart canvas").first()).toBeVisible();
+
+  await page.getByRole("button", { name: "Settings" }).click();
+  await page.getByRole("button", { name: "Sign out" }).click();
+  await expect(page.getByRole("button", { name: "Sign in" })).toBeVisible();
+  const authLifecycle = await page.evaluate(() => ({
+    listeners: window.__dashboardLifecycleProbe.resizeListeners.size,
+    observes: window.__dashboardLifecycleProbe.observes,
+  }));
+
+  await page.goBack();
+  await expect(page.getByRole("button", { name: "Sign in" })).toBeVisible();
+  await expect(page.locator(".shell, .stock-inspector, #stock-chart")).toHaveCount(0);
+  await page.goForward();
+  await expect(page.getByRole("button", { name: "Sign in" })).toBeVisible();
+  await expect(page.locator(".shell, .stock-inspector, #stock-chart")).toHaveCount(0);
+  expect(await page.evaluate(() => ({
+    listeners: window.__dashboardLifecycleProbe.resizeListeners.size,
+    observes: window.__dashboardLifecycleProbe.observes,
+  }))).toEqual(authLifecycle);
+});
+
+test("late logout response cannot replace a newer authenticated workspace", async ({ page }) => {
+  let releaseLogout;
+  const logoutRelease = new Promise((resolve) => { releaseLogout = resolve; });
+  let markLogoutRequested;
+  const logoutRequested = new Promise((resolve) => { markLogoutRequested = resolve; });
+  await mockApi(page, true, bootstrap.results[0].hits, [], {
+    logout: { release: logoutRelease, requested: markLogoutRequested },
+  });
+  await page.goto("/dashboard/");
+
+  await page.getByRole("button", { name: "Settings" }).click();
+  await page.getByRole("button", { name: "Sign out" }).click();
+  await logoutRequested;
+  await expect(page.getByRole("button", { name: "Sign in" })).toBeVisible();
+  await page.getByLabel("Username").fill("analyst");
+  await page.getByLabel("Password").fill("secret");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByRole("heading", { name: "Latest scan" })).toBeVisible();
+
+  const logoutResponse = page.waitForResponse((response) => response.url().endsWith("/api/dashboard/auth/logout"));
+  releaseLogout();
+  await logoutResponse;
+  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+
+  await expect(page.getByRole("heading", { name: "Latest scan" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Sign in" })).toHaveCount(0);
+});
+
+test("newer quiet bootstrap wins when an earlier refresh resolves last", async ({ page }) => {
+  let releaseOlder;
+  const olderRelease = new Promise((resolve) => { releaseOlder = resolve; });
+  let markOlderRequested;
+  const olderRequested = new Promise((resolve) => { markOlderRequested = resolve; });
+  let markNewerRequested;
+  const newerRequested = new Promise((resolve) => { markNewerRequested = resolve; });
+  await mockApi(page, true, bootstrap.results[0].hits, [], {
+    bootstrap: {
+      responses: {
+        2: { release: olderRelease, requested: markOlderRequested, payload: { ...bootstrap, runId: "older-refresh" } },
+        3: { requested: markNewerRequested, payload: { ...bootstrap, runId: "newer-refresh" } },
+      },
+    },
+  });
+  await page.goto("/dashboard/");
+
+  await page.getByRole("button", { name: "Refresh" }).click();
+  await olderRequested;
+  await page.getByRole("button", { name: "Refresh" }).click();
+  await newerRequested;
+  await expect(page.locator(".view-heading p")).toHaveText("Run newer-refresh");
+
+  const olderResponse = page.waitForResponse((response) => response.url().endsWith("/api/dashboard/bootstrap"));
+  releaseOlder();
+  await olderResponse;
+  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+
+  await expect(page.locator(".view-heading p")).toHaveText("Run newer-refresh");
 });
 
 test("stock detail fills the viewport without an evidence sidebar", async ({ page }) => {

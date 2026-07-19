@@ -26,7 +26,9 @@ const details = new Map();
 let chartHandle = null;
 let inspectorCleanup = null;
 let closeInspectorOverlay = null;
+let authenticated = false;
 let protectedViewGeneration = 0;
+let bootstrapRequestSequence = 0;
 let refreshTimer = null;
 let filterMenuOpen = false;
 let inspectorTab = "overview";
@@ -48,6 +50,15 @@ function invalidateProtectedView() {
   protectedViewGeneration += 1;
   teardownWorkspaceView();
   return protectedViewGeneration;
+}
+
+function enterAuthenticationBoundary() {
+  authenticated = false;
+  bootstrap = null;
+  rows = [];
+  workspace = createWorkspaceState();
+  details.clear();
+  return invalidateProtectedView();
 }
 
 function scheduleRefresh() {
@@ -86,7 +97,7 @@ function visibleRows() {
 
 function renderLogin(error = "") {
   clearInterval(refreshTimer);
-  invalidateProtectedView();
+  const generation = enterAuthenticationBoundary();
   app.innerHTML = `
     <main class="login-screen">
       <form class="login-card" id="login-form">
@@ -110,6 +121,7 @@ function renderLogin(error = "") {
     try {
       await dashboardApi.login(event.currentTarget.username.value, event.currentTarget.password.value);
       if (generation !== protectedViewGeneration) return;
+      authenticated = true;
       if (await loadBootstrap()) scheduleRefresh();
     } catch (error) {
       if (generation !== protectedViewGeneration) return;
@@ -118,22 +130,25 @@ function renderLogin(error = "") {
       button.textContent = "Sign in";
     }
   });
+  return generation;
 }
 
 async function loadBootstrap({ quiet = false } = {}) {
+  if (!authenticated) return false;
+  const requestSequence = ++bootstrapRequestSequence;
   const generation = quiet ? protectedViewGeneration : invalidateProtectedView();
   if (!quiet) {
     app.innerHTML = `<div class="boot-screen"><span class="spinner"></span><span>Loading latest scan…</span></div>`;
   }
   try {
     const payload = await dashboardApi.bootstrap();
-    if (generation !== protectedViewGeneration) return false;
+    if (!authenticated || generation !== protectedViewGeneration || requestSequence !== bootstrapRequestSequence) return false;
     bootstrap = payload;
     rows = normalizeRows(bootstrap.results);
     restoreLocation();
     return true;
   } catch (error) {
-    if (generation !== protectedViewGeneration) return false;
+    if (!authenticated || generation !== protectedViewGeneration || requestSequence !== bootstrapRequestSequence) return false;
     if (error instanceof ApiError && error.status === 401) return renderLogin();
     if (quiet) return showTransientError("Refresh failed. Existing results are unchanged.");
     renderFailure(error.message);
@@ -255,6 +270,7 @@ function stockTemplate(tab, detail) {
 }
 
 function renderWorkspace() {
+  if (!authenticated || !bootstrap) return;
   teardownWorkspaceView();
   const tab = workspace.tabs.find((item) => item.id === workspace.activeTab) || workspace.tabs[0];
   workspace = { ...workspace, activeTab: tab.id };
@@ -270,8 +286,14 @@ function renderWorkspace() {
 
 function bindShell(activeTab) {
   app.querySelector("#logout").addEventListener("click", async () => {
-    invalidateProtectedView();
-    try { await dashboardApi.logout(); } finally { renderLogin(); }
+    const logoutGeneration = renderLogin();
+    try {
+      await dashboardApi.logout();
+      if (logoutGeneration !== protectedViewGeneration || authenticated) return;
+    } catch {
+      if (logoutGeneration !== protectedViewGeneration || authenticated) return;
+      renderLogin("Sign out could not be confirmed. Please sign in again.");
+    }
   });
   const settingsMenu = app.querySelector("#settings-menu");
   const toggleSettings = () => {
@@ -482,6 +504,7 @@ function pushRoute(route) {
 }
 
 function openStock(code, { updateHistory = true } = {}) {
+  if (!authenticated || !bootstrap) return;
   const row = rows.find((item) => item.code === code);
   if (!row) {
     workspace = { ...workspace, activeTab: "scan" };
@@ -495,22 +518,24 @@ function openStock(code, { updateHistory = true } = {}) {
 }
 
 async function loadStock(tab) {
+  if (!authenticated) return;
   const key = `${tab.code}:${tab.period}`;
   const generation = protectedViewGeneration;
   try {
     const detail = await dashboardApi.stock(tab.code, tab.period);
-    if (generation !== protectedViewGeneration) return;
+    if (!authenticated || generation !== protectedViewGeneration) return;
     details.set(key, detail);
   } catch (error) {
-    if (generation !== protectedViewGeneration) return;
+    if (!authenticated || generation !== protectedViewGeneration) return;
     if (error.status === 401) return renderLogin("Your session expired. Please sign in again.");
     details.set(key, { error: error.message });
   }
-  if (generation !== protectedViewGeneration) return;
+  if (!authenticated || generation !== protectedViewGeneration) return;
   if (workspace.activeTab === tab.id && workspace.tabs.find((item) => item.id === tab.id)?.period === tab.period) renderWorkspace();
 }
 
 function restoreLocation() {
+  if (!authenticated || !bootstrap) return;
   const match = location.hash.match(/^#stock\/(.+)$/);
   if (match) {
     openStock(decodeURIComponent(match[1]), { updateHistory: false });
@@ -534,6 +559,7 @@ function showTransientError(message) {
 async function start() {
   try {
     await dashboardApi.session();
+    authenticated = true;
     if (await loadBootstrap()) scheduleRefresh();
   } catch (error) {
     if (error.status === 401 || error.status === 503) renderLogin(error.status === 503 ? "Dashboard authentication is not configured." : "");
@@ -543,5 +569,5 @@ async function start() {
 
 start();
 window.addEventListener("popstate", () => {
-  if (bootstrap) restoreLocation();
+  if (authenticated && bootstrap) restoreLocation();
 });
