@@ -1070,13 +1070,7 @@ impl TushareClient {
                 .map(|(index, _)| index)
                 .collect();
 
-            let period_has_income = income_identities.iter().any(|income_identity| {
-                income_identity.code == indicator_identity.code
-                    && income_identity.end_date == indicator_identity.end_date
-            });
-            if candidates.is_empty()
-                && (indicator_identity.report_type.is_some() || !period_has_income)
-            {
+            if candidates.is_empty() {
                 indicator_only.push(indicator_index);
                 continue;
             }
@@ -3931,6 +3925,40 @@ mod tests {
         assert_eq!(rows[0].report_type, "indicator");
         assert_eq!(rows[0].roe, Some(decimal("8.88")));
         assert!(rows[0].raw_payload["income"].is_null());
+    }
+
+    #[test]
+    fn unmatched_untyped_indicator_is_kept_separate_from_same_period_income() {
+        let fetched_at = Utc.with_ymd_and_hms(2026, 7, 19, 12, 30, 0).unwrap();
+        let income = serde_json::json!({
+            "fields": [
+                "ts_code", "end_date", "report_type", "update_flag", "f_ann_date",
+                "total_revenue"
+            ],
+            "items": [["000001.SZ", "19941231", "1", "0", "19950301", "100.01"]]
+        });
+        let indicators = serde_json::json!({
+            "fields": [
+                "ts_code", "end_date", "update_flag", "ann_date", "roe"
+            ],
+            "items": [["000001.SZ", "19941231", "0", "19950302", "8.88"]]
+        });
+
+        let rows =
+            TushareClient::parse_financial_reports(&income, &indicators, fetched_at).unwrap();
+
+        assert_eq!(rows.len(), 2);
+        let income_only = rows.iter().find(|row| row.report_type == "1").unwrap();
+        assert_eq!(income_only.total_revenue, Some(decimal("100.01")));
+        assert_eq!(income_only.roe, None);
+        assert!(income_only.raw_payload["indicator"].is_null());
+        let indicator_only = rows
+            .iter()
+            .find(|row| row.report_type == "indicator")
+            .unwrap();
+        assert_eq!(indicator_only.total_revenue, None);
+        assert_eq!(indicator_only.roe, Some(decimal("8.88")));
+        assert!(indicator_only.raw_payload["income"].is_null());
     }
 
     #[test]
