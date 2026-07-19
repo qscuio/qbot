@@ -53,9 +53,20 @@ fn repair_mode(args: impl IntoIterator<Item = String>) -> Result<RepairMode> {
     }
 }
 
-async fn run_company_intelligence_repair<Financials, FinancialFuture, Dividends, DividendFuture>(
+async fn run_company_intelligence_repair<
+    Financials,
+    FinancialFuture,
+    Dividends,
+    DividendFuture,
+    Benchmark,
+    BenchmarkFuture,
+    Backfill,
+    BackfillFuture,
+>(
     financials: Financials,
     dividends: Dividends,
+    benchmark: Benchmark,
+    backfill: Backfill,
 ) -> Result<()>
 where
     Financials: FnOnce() -> FinancialFuture,
@@ -64,6 +75,12 @@ where
     Dividends: FnOnce() -> DividendFuture,
     DividendFuture:
         Future<Output = crate::error::Result<services::company_intelligence::CompanySyncReport>>,
+    Benchmark: FnOnce() -> BenchmarkFuture,
+    BenchmarkFuture:
+        Future<Output = crate::error::Result<services::company_intelligence::ChipBenchmarkReport>>,
+    Backfill: FnOnce() -> BackfillFuture,
+    BackfillFuture:
+        Future<Output = crate::error::Result<services::company_intelligence::ChipBackfillReport>>,
 {
     let financials = financials().await;
     let financial_error = match financials {
@@ -105,17 +122,53 @@ where
         }
     };
 
-    match (financial_error, dividend_error) {
-        (None, None) => Ok(()),
-        (Some(financial_error), None) => {
-            anyhow::bail!("company intelligence repair failed: {financial_error}")
+    let benchmark_error = match benchmark().await {
+        Ok(report) => {
+            info!(
+                "Chip benchmark finished: reused={}, decision={}",
+                report.reused,
+                report.decision.as_str()
+            );
+            None
         }
-        (None, Some(dividend_error)) => {
-            anyhow::bail!("company intelligence repair failed: {dividend_error}")
+        Err(error) => {
+            warn!("Chip benchmark failed: {}", error);
+            Some(error.to_string())
         }
-        (Some(financial_error), Some(dividend_error)) => anyhow::bail!(
-            "company intelligence repair failed: financials: {financial_error}; dividends: {dividend_error}"
-        ),
+    };
+
+    let backfill_error = match backfill().await {
+        Ok(report) => {
+            info!(
+                "Chip backfill finished: completed={}, failed={}, pending={}, snapshots={}",
+                report.completed, report.failed, report.pending, report.snapshots
+            );
+            (report.failed > 0 || report.pending > 0).then(|| {
+                format!(
+                    "chip backfill incomplete: completed={}, failed={}, pending={}, snapshots={}",
+                    report.completed, report.failed, report.pending, report.snapshots
+                )
+            })
+        }
+        Err(error) => {
+            warn!("Chip backfill failed: {}", error);
+            Some(error.to_string())
+        }
+    };
+
+    let errors = [
+        financial_error.map(|error| format!("financials: {error}")),
+        dividend_error.map(|error| format!("dividends: {error}")),
+        benchmark_error.map(|error| format!("chip_benchmark: {error}")),
+        backfill_error.map(|error| format!("chip_backfill: {error}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("company intelligence repair failed: {}", errors.join("; "))
     }
 }
 
@@ -271,6 +324,8 @@ async fn main() -> Result<()> {
         run_company_intelligence_repair(
             || service.backfill_financials(),
             || service.backfill_dividends(),
+            || service.run_chip_benchmark(),
+            || service.backfill_chips(),
         )
         .await?;
         return Ok(());
@@ -518,7 +573,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn company_repair_attempts_both_phases_and_reports_every_outcome() {
+    async fn company_repair_attempts_all_four_phases_and_reports_every_outcome() {
         struct Case {
             name: &'static str,
             financials: RepairOutcome,
@@ -582,6 +637,8 @@ mod tests {
             let calls = Arc::new(Mutex::new(Vec::new()));
             let financial_calls = calls.clone();
             let dividend_calls = calls.clone();
+            let benchmark_calls = calls.clone();
+            let backfill_calls = calls.clone();
             let financials = case.financials;
             let dividends = case.dividends;
 
@@ -594,6 +651,22 @@ mod tests {
                     dividend_calls.lock().unwrap().push("dividends");
                     dividends.result()
                 },
+                move || async move {
+                    benchmark_calls.lock().unwrap().push("chip_benchmark");
+                    Ok(crate::services::company_intelligence::ChipBenchmarkReport {
+                        reused: false,
+                        decision: crate::data::chip::ChipSourceDecision::Estimate,
+                    })
+                },
+                move || async move {
+                    backfill_calls.lock().unwrap().push("chip_backfill");
+                    Ok(crate::services::company_intelligence::ChipBackfillReport {
+                        completed: 2,
+                        failed: 0,
+                        pending: 0,
+                        snapshots: 500,
+                    })
+                },
             )
             .await;
             let error = result
@@ -605,7 +678,7 @@ mod tests {
             assert_eq!(result.is_ok(), case.succeeds, "{}: {error}", case.name);
             assert_eq!(
                 *calls.lock().unwrap(),
-                vec!["financials", "dividends"],
+                vec!["financials", "dividends", "chip_benchmark", "chip_backfill"],
                 "{}",
                 case.name
             );
@@ -617,6 +690,59 @@ mod tests {
                     .unwrap_or_else(|| panic!("{}: missing {expected:?} in {error:?}", case.name));
                 previous_position = position + expected.len();
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn company_repair_preserves_all_four_errors_in_phase_order() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let result = run_company_intelligence_repair(
+            {
+                let calls = calls.clone();
+                move || async move {
+                    calls.lock().unwrap().push("financials");
+                    Err(AppError::DataProvider("financial failure".into()))
+                }
+            },
+            {
+                let calls = calls.clone();
+                move || async move {
+                    calls.lock().unwrap().push("dividends");
+                    Err(AppError::DataProvider("dividend failure".into()))
+                }
+            },
+            {
+                let calls = calls.clone();
+                move || async move {
+                    calls.lock().unwrap().push("chip_benchmark");
+                    Err(AppError::DataProvider("benchmark failure".into()))
+                }
+            },
+            {
+                let calls = calls.clone();
+                move || async move {
+                    calls.lock().unwrap().push("chip_backfill");
+                    Err(AppError::DataProvider("backfill failure".into()))
+                }
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["financials", "dividends", "chip_benchmark", "chip_backfill"]
+        );
+        let mut offset = 0;
+        for expected in [
+            "financial failure",
+            "dividend failure",
+            "benchmark failure",
+            "backfill failure",
+        ] {
+            let position = result[offset..].find(expected).unwrap() + offset;
+            offset = position + expected.len();
         }
     }
 }

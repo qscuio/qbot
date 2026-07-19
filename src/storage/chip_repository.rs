@@ -1,13 +1,15 @@
 use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::Value;
-use sqlx::{FromRow, PgPool};
+use sqlx::{FromRow, PgPool, Postgres, Transaction};
 
 use crate::data::chip::{
     ChipBucket, ChipModelState, ChipSnapshot, ChipSourceDecision, ChipValidationRun,
 };
 use crate::error::{AppError, Result};
+use crate::storage::company_repository::CheckpointLease;
 
 const NORMALIZED_TOLERANCE: f64 = 1e-9;
+pub const MAX_CHIP_SNAPSHOTS_PER_TRANSACTION: usize = 250;
 
 #[derive(Debug, FromRow)]
 struct SnapshotRow {
@@ -37,59 +39,107 @@ impl ChipRepository {
 
     pub async fn upsert_snapshot(&self, snapshot: &ChipSnapshot) -> Result<bool> {
         validate_snapshot(snapshot)?;
-        let distribution = serde_json::to_value(&snapshot.distribution)?;
-        let result = sqlx::query(
-            r#"INSERT INTO chip_distribution
-               (code, trade_date, distribution, avg_cost, profit_ratio, concentration,
-                dominant_peak_price, source, model_version, validated,
-                source_updated_at, distribution_format, updated_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                       NOW(), 'normalized_probability', NOW())
-               ON CONFLICT (code, trade_date) DO UPDATE SET
-                 distribution = EXCLUDED.distribution,
-                 avg_cost = EXCLUDED.avg_cost,
-                 profit_ratio = EXCLUDED.profit_ratio,
-                 concentration = EXCLUDED.concentration,
-                 dominant_peak_price = EXCLUDED.dominant_peak_price,
-                 source = EXCLUDED.source,
-                 model_version = EXCLUDED.model_version,
-                 validated = EXCLUDED.validated,
-                 source_updated_at = NOW(),
-                 distribution_format = EXCLUDED.distribution_format,
-                 updated_at = NOW()
-               WHERE (chip_distribution.distribution,
-                      chip_distribution.avg_cost,
-                      chip_distribution.profit_ratio,
-                      chip_distribution.concentration,
-                      chip_distribution.dominant_peak_price,
-                      chip_distribution.source,
-                      chip_distribution.model_version,
-                      chip_distribution.validated,
-                      chip_distribution.distribution_format)
-                     IS DISTINCT FROM
-                     (EXCLUDED.distribution,
-                      EXCLUDED.avg_cost,
-                      EXCLUDED.profit_ratio,
-                      EXCLUDED.concentration,
-                      EXCLUDED.dominant_peak_price,
-                      EXCLUDED.source,
-                      EXCLUDED.model_version,
-                      EXCLUDED.validated,
-                      EXCLUDED.distribution_format)"#,
+        let mut transaction = self.pool.begin().await?;
+        let changed = upsert_snapshot_in_tx(&mut transaction, snapshot, false).await?;
+        transaction.commit().await?;
+        Ok(changed)
+    }
+
+    /// Atomically replaces a bounded set of canonical snapshots.
+    ///
+    /// This variant deliberately does not mutate a repair checkpoint. It is
+    /// used to retain explicitly unvalidated estimates after an official
+    /// provider failure while leaving the window retryable.
+    pub async fn upsert_unvalidated_estimate_batch(
+        &self,
+        snapshots: &[ChipSnapshot],
+    ) -> Result<usize> {
+        validate_snapshot_batch(snapshots)?;
+        if snapshots.iter().any(|snapshot| {
+            snapshot.source != "qbot_estimate"
+                || snapshot.model_version.as_deref().is_none()
+                || snapshot.validated
+        }) {
+            return Err(AppError::BadRequest(
+                "fallback chip batch must contain only unvalidated estimates".to_string(),
+            ));
+        }
+        let mut transaction = self.pool.begin().await?;
+        let mut changed = 0;
+        for snapshot in snapshots {
+            changed += usize::from(upsert_snapshot_in_tx(&mut transaction, snapshot, true).await?);
+        }
+        transaction.commit().await?;
+        Ok(changed)
+    }
+
+    /// Persists one bounded backfill batch, advances model state, and completes
+    /// the owned checkpoint in the same transaction. Fencing guarantees that
+    /// an expired worker cannot publish snapshots after losing its lease.
+    pub async fn persist_snapshot_batch_and_complete(
+        &self,
+        lease: &CheckpointLease,
+        snapshots: &[ChipSnapshot],
+        model_state: Option<&ChipModelState>,
+    ) -> Result<usize> {
+        validate_snapshot_batch(snapshots)?;
+        if snapshots.is_empty() {
+            return Err(AppError::BadRequest(
+                "chip snapshot batch is empty".to_string(),
+            ));
+        }
+        if snapshots.iter().any(|snapshot| {
+            snapshot.code != lease.code
+                || snapshot.trade_date < lease.start_date
+                || snapshot.trade_date > lease.end_date
+        }) {
+            return Err(AppError::BadRequest(
+                "chip snapshot batch does not match its checkpoint window".to_string(),
+            ));
+        }
+        if let Some(state) = model_state {
+            validate_model_state(state)?;
+            if state.code != lease.code || state.through_date != lease.end_date {
+                return Err(AppError::BadRequest(
+                    "chip model state does not end at its checkpoint boundary".to_string(),
+                ));
+            }
+        }
+
+        let mut transaction = self.pool.begin().await?;
+        let mut changed = 0;
+        for snapshot in snapshots {
+            changed += usize::from(upsert_snapshot_in_tx(&mut transaction, snapshot, false).await?);
+        }
+        if let Some(state) = model_state {
+            save_model_state_in_tx(&mut transaction, state).await?;
+        }
+        let completed = sqlx::query(
+            r#"UPDATE company_data_repair_checkpoints
+               SET status = 'completed', last_error = NULL,
+                   lease_token = NULL, lease_expires_at = NULL,
+                   updated_at = NOW(), completed_at = NOW()
+               WHERE phase = $1 AND code = $2 AND start_date = $3 AND end_date = $4
+                 AND status = 'running' AND attempts = $5 AND lease_token = $6
+                 AND lease_expires_at > NOW()"#,
         )
-        .bind(&snapshot.code)
-        .bind(snapshot.trade_date)
-        .bind(distribution)
-        .bind(snapshot.average_cost)
-        .bind(snapshot.winner_rate)
-        .bind(snapshot.concentration)
-        .bind(snapshot.dominant_peak_price)
-        .bind(&snapshot.source)
-        .bind(&snapshot.model_version)
-        .bind(snapshot.validated)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() == 1)
+        .bind(&lease.phase)
+        .bind(&lease.code)
+        .bind(lease.start_date)
+        .bind(lease.end_date)
+        .bind(lease.attempt)
+        .bind(lease.token)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        if completed != 1 {
+            return Err(AppError::DataProvider(format!(
+                "stale checkpoint lease for {}/{}/{}..{}",
+                lease.phase, lease.code, lease.start_date, lease.end_date
+            )));
+        }
+        transaction.commit().await?;
+        Ok(changed)
     }
 
     pub async fn snapshot_at_or_before(
@@ -138,42 +188,11 @@ impl ChipRepository {
     }
 
     pub async fn save_model_state(&self, state: &ChipModelState) -> Result<bool> {
-        if state.code.trim().is_empty() {
-            return Err(AppError::BadRequest(
-                "chip model state code is empty".to_string(),
-            ));
-        }
-        if state.model_version.trim().is_empty() {
-            return Err(AppError::BadRequest(
-                "chip model state version is empty".to_string(),
-            ));
-        }
-        if !state.last_adjustment_factor.is_finite() || state.last_adjustment_factor <= 0.0 {
-            return Err(AppError::BadRequest(
-                "chip model state adjustment factor must be finite and positive".to_string(),
-            ));
-        }
-        validate_buckets(&state.distribution, true)?;
-        let result = sqlx::query(
-            r#"INSERT INTO chip_model_states
-               (code, model_version, through_date, distribution,
-                last_adjustment_factor, updated_at)
-               VALUES ($1, $2, $3, $4, $5, NOW())
-               ON CONFLICT (code, model_version) DO UPDATE SET
-                 through_date = EXCLUDED.through_date,
-                 distribution = EXCLUDED.distribution,
-                 last_adjustment_factor = EXCLUDED.last_adjustment_factor,
-                 updated_at = NOW()
-               WHERE chip_model_states.through_date < EXCLUDED.through_date"#,
-        )
-        .bind(&state.code)
-        .bind(&state.model_version)
-        .bind(state.through_date)
-        .bind(serde_json::to_value(&state.distribution)?)
-        .bind(state.last_adjustment_factor)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() == 1)
+        validate_model_state(state)?;
+        let mut transaction = self.pool.begin().await?;
+        let changed = save_model_state_in_tx(&mut transaction, state).await?;
+        transaction.commit().await?;
+        Ok(changed)
     }
 
     pub async fn save_validation_run(&self, run: &ChipValidationRun) -> Result<bool> {
@@ -224,6 +243,126 @@ impl ChipRepository {
             })
             .transpose()
     }
+}
+
+fn validate_snapshot_batch(snapshots: &[ChipSnapshot]) -> Result<()> {
+    if snapshots.len() > MAX_CHIP_SNAPSHOTS_PER_TRANSACTION {
+        return Err(AppError::BadRequest(format!(
+            "chip snapshot batch exceeds {MAX_CHIP_SNAPSHOTS_PER_TRANSACTION} rows"
+        )));
+    }
+    for snapshot in snapshots {
+        validate_snapshot(snapshot)?;
+    }
+    Ok(())
+}
+
+fn validate_model_state(state: &ChipModelState) -> Result<()> {
+    if state.code.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "chip model state code is empty".to_string(),
+        ));
+    }
+    if state.model_version.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "chip model state version is empty".to_string(),
+        ));
+    }
+    if !state.last_adjustment_factor.is_finite() || state.last_adjustment_factor <= 0.0 {
+        return Err(AppError::BadRequest(
+            "chip model state adjustment factor must be finite and positive".to_string(),
+        ));
+    }
+    validate_buckets(&state.distribution, true)
+}
+
+async fn upsert_snapshot_in_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    snapshot: &ChipSnapshot,
+    preserve_validated_official: bool,
+) -> Result<bool> {
+    let distribution = serde_json::to_value(&snapshot.distribution)?;
+    let result = sqlx::query(
+        r#"INSERT INTO chip_distribution
+           (code, trade_date, distribution, avg_cost, profit_ratio, concentration,
+            dominant_peak_price, source, model_version, validated,
+            source_updated_at, distribution_format, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                   NOW(), 'normalized_probability', NOW())
+           ON CONFLICT (code, trade_date) DO UPDATE SET
+             distribution = EXCLUDED.distribution,
+             avg_cost = EXCLUDED.avg_cost,
+             profit_ratio = EXCLUDED.profit_ratio,
+             concentration = EXCLUDED.concentration,
+             dominant_peak_price = EXCLUDED.dominant_peak_price,
+             source = EXCLUDED.source,
+             model_version = EXCLUDED.model_version,
+             validated = EXCLUDED.validated,
+             source_updated_at = NOW(),
+             distribution_format = EXCLUDED.distribution_format,
+             updated_at = NOW()
+           WHERE (chip_distribution.distribution,
+                  chip_distribution.avg_cost,
+                  chip_distribution.profit_ratio,
+                  chip_distribution.concentration,
+                  chip_distribution.dominant_peak_price,
+                  chip_distribution.source,
+                  chip_distribution.model_version,
+                  chip_distribution.validated,
+                  chip_distribution.distribution_format)
+                 IS DISTINCT FROM
+                 (EXCLUDED.distribution,
+                  EXCLUDED.avg_cost,
+                  EXCLUDED.profit_ratio,
+                  EXCLUDED.concentration,
+                  EXCLUDED.dominant_peak_price,
+                  EXCLUDED.source,
+                  EXCLUDED.model_version,
+                  EXCLUDED.validated,
+                  EXCLUDED.distribution_format)
+             AND (NOT $11 OR NOT (chip_distribution.source = 'tushare'
+                                   AND chip_distribution.validated))"#,
+    )
+    .bind(&snapshot.code)
+    .bind(snapshot.trade_date)
+    .bind(distribution)
+    .bind(snapshot.average_cost)
+    .bind(snapshot.winner_rate)
+    .bind(snapshot.concentration)
+    .bind(snapshot.dominant_peak_price)
+    .bind(&snapshot.source)
+    .bind(&snapshot.model_version)
+    .bind(snapshot.validated)
+    .bind(preserve_validated_official)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+async fn save_model_state_in_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    state: &ChipModelState,
+) -> Result<bool> {
+    let result = sqlx::query(
+        r#"INSERT INTO chip_model_states
+           (code, model_version, through_date, distribution,
+            last_adjustment_factor, updated_at)
+           VALUES ($1, $2, $3, $4, $5, NOW())
+           ON CONFLICT (code, model_version) DO UPDATE SET
+             through_date = EXCLUDED.through_date,
+             distribution = EXCLUDED.distribution,
+             last_adjustment_factor = EXCLUDED.last_adjustment_factor,
+             updated_at = NOW()
+           WHERE chip_model_states.through_date < EXCLUDED.through_date"#,
+    )
+    .bind(&state.code)
+    .bind(&state.model_version)
+    .bind(state.through_date)
+    .bind(serde_json::to_value(&state.distribution)?)
+    .bind(state.last_adjustment_factor)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(result.rows_affected() == 1)
 }
 
 fn validate_snapshot(snapshot: &ChipSnapshot) -> Result<()> {
@@ -388,6 +527,8 @@ fn decode_legacy_buckets(value: Value) -> Result<Vec<ChipBucket>> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use chrono::{NaiveDate, TimeZone, Utc};
     use serde_json::json;
     use sqlx::PgPool;
@@ -398,6 +539,7 @@ mod tests {
         ChipBucket, ChipDayInput, ChipModelState, ChipSnapshot, ChipSourceDecision,
         ChipValidationRun,
     };
+    use crate::storage::company_repository::{CheckpointClaimOutcome, CompanyRepository};
 
     fn date(year: i32, month: u32, day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(year, month, day).unwrap()
@@ -517,6 +659,145 @@ mod tests {
         .fetch_one(&pool)
         .await?;
         assert_eq!(count, 1);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn unvalidated_fallback_never_overwrites_validated_official_snapshot(
+        pool: PgPool,
+    ) -> crate::error::Result<()> {
+        let repo = ChipRepository::new(pool);
+        let day = date(2026, 7, 17);
+        let mut official = snapshot(day, 0.4);
+        official.source = "tushare".into();
+        official.model_version = None;
+        official.validated = true;
+        repo.upsert_snapshot(&official).await?;
+
+        let mut fallback = snapshot(day, 0.2);
+        fallback.validated = false;
+        assert_eq!(
+            repo.upsert_unvalidated_estimate_batch(&[fallback]).await?,
+            0
+        );
+        let stored = repo.latest_snapshot("600519.SH").await?.unwrap();
+        assert_eq!(stored.source, "tushare");
+        assert!(stored.validated);
+        assert_eq!(stored.distribution, official.distribution);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn chip_batch_is_atomic_idempotent_and_completes_only_after_commit(
+        pool: PgPool,
+    ) -> crate::error::Result<()> {
+        let checkpoints = CompanyRepository::new(pool.clone());
+        let claim = checkpoints
+            .claim_checkpoint_window(
+                "chip_backfill",
+                "600519.SH",
+                date(2026, 7, 17),
+                date(2026, 7, 18),
+                Duration::from_secs(300),
+            )
+            .await?;
+        let CheckpointClaimOutcome::Claimed(lease) = claim else {
+            panic!("new checkpoint must be claimed")
+        };
+        let repo = ChipRepository::new(pool.clone());
+        let state = ChipModelState {
+            code: "600519.SH".into(),
+            model_version: "qbot-chip-v2".into(),
+            through_date: date(2026, 7, 18),
+            distribution: snapshot(date(2026, 7, 18), 0.3).distribution,
+            last_adjustment_factor: 1.0,
+        };
+
+        repo.persist_snapshot_batch_and_complete(
+            &lease,
+            &[
+                snapshot(date(2026, 7, 17), 0.4),
+                snapshot(date(2026, 7, 18), 0.3),
+            ],
+            Some(&state),
+        )
+        .await?;
+        assert_eq!(
+            checkpoints
+                .checkpoint_window(
+                    "chip_backfill",
+                    "600519.SH",
+                    date(2026, 7, 17),
+                    date(2026, 7, 18),
+                )
+                .await?
+                .unwrap()
+                .status,
+            "completed"
+        );
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM chip_distribution WHERE code = '600519.SH'")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(rows, 2);
+
+        let retry = checkpoints
+            .claim_checkpoint_window(
+                "chip_backfill",
+                "600519.SH",
+                date(2026, 7, 19),
+                date(2026, 7, 20),
+                Duration::from_secs(300),
+            )
+            .await?;
+        let CheckpointClaimOutcome::Claimed(retry) = retry else {
+            panic!("second checkpoint must be claimed")
+        };
+        sqlx::raw_sql(
+            r#"CREATE FUNCTION reject_second_chip_snapshot() RETURNS trigger AS $$
+               BEGIN
+                   IF NEW.trade_date = DATE '2026-07-20' THEN
+                       RAISE EXCEPTION 'injected second snapshot failure';
+                   END IF;
+                   RETURN NEW;
+               END;
+               $$ LANGUAGE plpgsql;
+               CREATE TRIGGER reject_second_chip_snapshot
+               BEFORE INSERT ON chip_distribution
+               FOR EACH ROW EXECUTE FUNCTION reject_second_chip_snapshot();"#,
+        )
+        .execute(&pool)
+        .await?;
+        assert!(repo
+            .persist_snapshot_batch_and_complete(
+                &retry,
+                &[
+                    snapshot(date(2026, 7, 19), 0.2),
+                    snapshot(date(2026, 7, 20), 0.2),
+                ],
+                None,
+            )
+            .await
+            .is_err());
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM chip_distribution WHERE code = '600519.SH'")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(rows, 2, "validation failure must insert no partial batch");
+        assert_eq!(
+            checkpoints
+                .checkpoint_window(
+                    "chip_backfill",
+                    "600519.SH",
+                    date(2026, 7, 19),
+                    date(2026, 7, 20),
+                )
+                .await?
+                .unwrap()
+                .status,
+            "running",
+            "checkpoint completion cannot precede the snapshot commit"
+        );
         Ok(())
     }
 
