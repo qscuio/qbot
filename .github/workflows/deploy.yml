@@ -437,7 +437,7 @@ jobs:
             echo "Health check failed after retries"
             exit 1
 
-      - name: Start company intelligence repair
+      - name: Start company data repair
         if: steps.check.outputs.skip != 'true'
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -494,7 +494,7 @@ jobs:
 
             sudo systemd-run --no-block \
               --unit="$unit" \
-              --description="QBot resumable company intelligence benchmark and chip backfill" \
+              --description="QBot resumable company financial and dividend backfill" \
               --property=Type=exec \
               --property=RemainAfterExit=yes \
               --property=EnvironmentFile=/opt/qbot/.env \
@@ -503,11 +503,111 @@ jobs:
               --property=StandardOutput=journal \
               --property=StandardError=journal \
               --working-directory=/opt/qbot \
-              /opt/qbot/qbot --repair-company-intelligence
+              /opt/qbot/qbot --repair-company-data
 
             # RemainAfterExit keeps fast success inspectable as active/exited.
             # Failures remain loaded for diagnostics and are cleared on the next
             # deployment before the stable name is reused.
+            for attempt in 1 2 3 4 5 6 7 8 9 10; do
+              active_state="$(unit_property ActiveState)"
+              sub_state="$(unit_property SubState)"
+              result="$(unit_property Result)"
+              exec_status="$(unit_property ExecMainStatus)"
+              observed="$active_state:$sub_state:$result:$exec_status"
+
+              case "$observed" in
+                active:exited:success:0)
+                  echo "$unit completed successfully before deployment observation finished"
+                  clear_transient_unit
+                  exit 0
+                  ;;
+                failed:*:*:*|inactive:*:*:*|deactivating:*:*:*|*:failed:*:*|active:exited:*:*|*:*:*:[!0]*)
+                  echo "$unit failed during launch observation (state: $observed)"
+                  show_repair_failure
+                  exit 1
+                  ;;
+                active:running:*:*)
+                  echo "$unit launch accepted (state: $active_state/$sub_state)"
+                  echo "Follow progress with: sudo journalctl -fu $unit"
+                  exit 0
+                  ;;
+                activating:*:*:*)
+                  echo "$unit is still activating (attempt $attempt/10)"
+                  ;;
+              esac
+
+              sleep 1
+            done
+
+            echo "$unit launch observation timed out"
+            show_repair_failure
+            exit 1
+
+      - name: Start chip repair
+        if: steps.check.outputs.skip != 'true'
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            set -e
+            unit="qbot-chip-repair"
+            service_user="$(sudo systemctl show qbot --property=User --value)"
+
+            if [ -z "$service_user" ]; then
+              echo "Could not determine the deployed qbot service user"
+              exit 1
+            fi
+
+            unit_property() {
+              sudo systemctl show "$unit" --property="$1" --value 2>/dev/null || true
+            }
+
+            clear_transient_unit() {
+              sudo systemctl stop "$unit"
+              sudo systemctl reset-failed "$unit" 2>/dev/null || true
+
+              for attempt in 1 2 3 4 5; do
+                load_state="$(unit_property LoadState)"
+                if [ -z "$load_state" ] || [ "$load_state" = "not-found" ]; then
+                  return 0
+                fi
+                sudo systemctl reset-failed "$unit" 2>/dev/null || true
+                sleep 1
+              done
+
+              echo "Unable to clear stale transient unit $unit (load state: $load_state)"
+              sudo systemctl status "$unit" --no-pager || true
+              return 1
+            }
+
+            show_repair_failure() {
+              sudo systemctl status "$unit" --no-pager || true
+              sudo journalctl -u "$unit" -n 80 --no-pager || true
+            }
+
+            load_state="$(unit_property LoadState)"
+            if [ -n "$load_state" ] && [ "$load_state" != "not-found" ]; then
+              active_state="$(unit_property ActiveState)"
+              sub_state="$(unit_property SubState)"
+              echo "Replacing $unit (state: $active_state/$sub_state)"
+              clear_transient_unit
+            fi
+
+            sudo systemd-run --no-block \
+              --unit="$unit" \
+              --description="QBot resumable chip benchmark and backfill" \
+              --property=Type=exec \
+              --property=RemainAfterExit=yes \
+              --property=EnvironmentFile=/opt/qbot/.env \
+              --property="User=$service_user" \
+              --property=UMask=0077 \
+              --property=StandardOutput=journal \
+              --property=StandardError=journal \
+              --working-directory=/opt/qbot \
+              /opt/qbot/qbot --repair-chips
+
             for attempt in 1 2 3 4 5 6 7 8 9 10; do
               active_state="$(unit_property ActiveState)"
               sub_state="$(unit_property SubState)"

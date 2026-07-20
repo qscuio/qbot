@@ -31,42 +31,53 @@ fn repair_company_intelligence_requested(args: impl IntoIterator<Item = String>)
         .any(|arg| arg == "--repair-company-intelligence")
 }
 
+fn repair_company_data_requested(args: impl IntoIterator<Item = String>) -> bool {
+    args.into_iter().any(|arg| arg == "--repair-company-data")
+}
+
+fn repair_chip_requested(args: impl IntoIterator<Item = String>) -> bool {
+    args.into_iter().any(|arg| arg == "--repair-chips")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RepairMode {
     None,
     DailyBars,
+    CompanyData,
+    Chips,
     CompanyIntelligence,
 }
 
 fn repair_mode(args: impl IntoIterator<Item = String>) -> Result<RepairMode> {
     let args = args.into_iter().collect::<Vec<_>>();
     let daily_bars = repair_daily_bars_requested(args.iter().cloned());
+    let company_data = repair_company_data_requested(args.iter().cloned());
+    let chips = repair_chip_requested(args.iter().cloned());
     let company_intelligence = repair_company_intelligence_requested(args.iter().cloned());
 
-    match (daily_bars, company_intelligence) {
-        (true, true) => anyhow::bail!(
-            "--repair-daily-bars and --repair-company-intelligence are mutually exclusive"
-        ),
-        (true, false) => Ok(RepairMode::DailyBars),
-        (false, true) => Ok(RepairMode::CompanyIntelligence),
-        (false, false) => Ok(RepairMode::None),
+    let requested = [daily_bars, company_data, chips, company_intelligence]
+        .into_iter()
+        .filter(|requested| *requested)
+        .count();
+    if requested > 1 {
+        anyhow::bail!("repair modes are mutually exclusive");
+    }
+    if daily_bars {
+        Ok(RepairMode::DailyBars)
+    } else if company_data {
+        Ok(RepairMode::CompanyData)
+    } else if chips {
+        Ok(RepairMode::Chips)
+    } else if company_intelligence {
+        Ok(RepairMode::CompanyIntelligence)
+    } else {
+        Ok(RepairMode::None)
     }
 }
 
-async fn run_company_intelligence_repair<
-    Financials,
-    FinancialFuture,
-    Dividends,
-    DividendFuture,
-    Benchmark,
-    BenchmarkFuture,
-    Backfill,
-    BackfillFuture,
->(
+async fn run_company_data_repair<Financials, FinancialFuture, Dividends, DividendFuture>(
     financials: Financials,
     dividends: Dividends,
-    benchmark: Benchmark,
-    backfill: Backfill,
 ) -> Result<()>
 where
     Financials: FnOnce() -> FinancialFuture,
@@ -75,15 +86,8 @@ where
     Dividends: FnOnce() -> DividendFuture,
     DividendFuture:
         Future<Output = crate::error::Result<services::company_intelligence::CompanySyncReport>>,
-    Benchmark: FnOnce() -> BenchmarkFuture,
-    BenchmarkFuture:
-        Future<Output = crate::error::Result<services::company_intelligence::ChipBenchmarkReport>>,
-    Backfill: FnOnce() -> BackfillFuture,
-    BackfillFuture:
-        Future<Output = crate::error::Result<services::company_intelligence::ChipBackfillReport>>,
 {
-    let financials = financials().await;
-    let financial_error = match financials {
+    let financial_error = match financials().await {
         Ok(report) => {
             info!(
                 "Company financial repair finished: completed={}, failed={}, pending={}",
@@ -102,8 +106,7 @@ where
         }
     };
 
-    let dividends = dividends().await;
-    let dividend_error = match dividends {
+    let dividend_error = match dividends().await {
         Ok(report) => {
             info!(
                 "Company dividend repair finished: completed={}, failed={}, pending={}",
@@ -122,6 +125,32 @@ where
         }
     };
 
+    let errors = [
+        financial_error.map(|error| format!("financials: {error}")),
+        dividend_error.map(|error| format!("dividends: {error}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("company data repair failed: {}", errors.join("; "))
+    }
+}
+
+async fn run_chip_repair<Benchmark, BenchmarkFuture, Backfill, BackfillFuture>(
+    benchmark: Benchmark,
+    backfill: Backfill,
+) -> Result<()>
+where
+    Benchmark: FnOnce() -> BenchmarkFuture,
+    BenchmarkFuture:
+        Future<Output = crate::error::Result<services::company_intelligence::ChipBenchmarkReport>>,
+    Backfill: FnOnce() -> BackfillFuture,
+    BackfillFuture:
+        Future<Output = crate::error::Result<services::company_intelligence::ChipBackfillReport>>,
+{
     let benchmark_error = match benchmark().await {
         Ok(report) => {
             info!(
@@ -157,14 +186,60 @@ where
     };
 
     let errors = [
-        financial_error.map(|error| format!("financials: {error}")),
-        dividend_error.map(|error| format!("dividends: {error}")),
         benchmark_error.map(|error| format!("chip_benchmark: {error}")),
         backfill_error.map(|error| format!("chip_backfill: {error}")),
     ]
     .into_iter()
     .flatten()
     .collect::<Vec<_>>();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("chip repair failed: {}", errors.join("; "))
+    }
+}
+
+async fn run_company_intelligence_repair<
+    Financials,
+    FinancialFuture,
+    Dividends,
+    DividendFuture,
+    Benchmark,
+    BenchmarkFuture,
+    Backfill,
+    BackfillFuture,
+>(
+    financials: Financials,
+    dividends: Dividends,
+    benchmark: Benchmark,
+    backfill: Backfill,
+) -> Result<()>
+where
+    Financials: FnOnce() -> FinancialFuture,
+    FinancialFuture:
+        Future<Output = crate::error::Result<services::company_intelligence::CompanySyncReport>>,
+    Dividends: FnOnce() -> DividendFuture,
+    DividendFuture:
+        Future<Output = crate::error::Result<services::company_intelligence::CompanySyncReport>>,
+    Benchmark: FnOnce() -> BenchmarkFuture,
+    BenchmarkFuture:
+        Future<Output = crate::error::Result<services::company_intelligence::ChipBenchmarkReport>>,
+    Backfill: FnOnce() -> BackfillFuture,
+    BackfillFuture:
+        Future<Output = crate::error::Result<services::company_intelligence::ChipBackfillReport>>,
+{
+    let company_error = run_company_data_repair(financials, dividends)
+        .await
+        .err()
+        .map(|error| error.to_string());
+    let chip_error = run_chip_repair(benchmark, backfill)
+        .await
+        .err()
+        .map(|error| error.to_string());
+    let errors = [company_error, chip_error]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
     if errors.is_empty() {
         Ok(())
     } else {
@@ -184,6 +259,8 @@ async fn main() -> Result<()> {
         .init();
 
     let repair_daily_bars = repair_mode == RepairMode::DailyBars;
+    let repair_company_data = repair_mode == RepairMode::CompanyData;
+    let repair_chips = repair_mode == RepairMode::Chips;
     let repair_company_intelligence = repair_mode == RepairMode::CompanyIntelligence;
     info!("qbot starting...");
 
@@ -275,7 +352,7 @@ async fn main() -> Result<()> {
         ("dbcheck", "检查数据库"),
         ("dbsync", "同步今日数据"),
     ];
-    if !repair_daily_bars && !repair_company_intelligence {
+    if repair_mode == RepairMode::None {
         match pusher.set_my_commands(&bot_commands).await {
             Ok(_) => info!("Telegram bot commands registered"),
             Err(e) => warn!("Telegram setMyCommands failed: {}", e),
@@ -319,7 +396,7 @@ async fn main() -> Result<()> {
     if repair_company_intelligence {
         let service = services::company_intelligence::CompanyIntelligenceService::new(
             state.db.clone(),
-            company_repair_provider,
+            company_repair_provider.clone(),
         );
         run_company_intelligence_repair(
             || service.backfill_financials(),
@@ -328,6 +405,28 @@ async fn main() -> Result<()> {
             || service.backfill_chips(),
         )
         .await?;
+        return Ok(());
+    }
+
+    if repair_company_data {
+        let service = services::company_intelligence::CompanyIntelligenceService::new(
+            state.db.clone(),
+            company_repair_provider.clone(),
+        );
+        run_company_data_repair(
+            || service.backfill_financials(),
+            || service.backfill_dividends(),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if repair_chips {
+        let service = services::company_intelligence::CompanyIntelligenceService::new(
+            state.db.clone(),
+            company_repair_provider,
+        );
+        run_chip_repair(|| service.run_chip_benchmark(), || service.backfill_chips()).await?;
         return Ok(());
     }
 
@@ -494,8 +593,9 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        api_bind_addr, repair_company_intelligence_requested, repair_daily_bars_requested,
-        repair_mode, run_company_intelligence_repair,
+        api_bind_addr, repair_chip_requested, repair_company_data_requested,
+        repair_company_intelligence_requested, repair_daily_bars_requested, repair_mode,
+        run_chip_repair, run_company_data_repair, run_company_intelligence_repair, RepairMode,
     };
     use crate::error::AppError;
     use crate::services::company_intelligence::CompanySyncReport;
@@ -529,6 +629,24 @@ mod tests {
         assert!(!repair_company_intelligence_requested(
             ["qbot", "--repair-daily-bars"].map(str::to_string)
         ));
+    }
+
+    #[test]
+    fn independent_company_and_chip_repairs_have_explicit_modes() {
+        assert!(repair_company_data_requested(
+            ["qbot", "--repair-company-data"].map(str::to_string)
+        ));
+        assert!(repair_chip_requested(
+            ["qbot", "--repair-chips"].map(str::to_string)
+        ));
+        assert_eq!(
+            repair_mode(["qbot", "--repair-company-data"].map(str::to_string)).unwrap(),
+            RepairMode::CompanyData
+        );
+        assert_eq!(
+            repair_mode(["qbot", "--repair-chips"].map(str::to_string)).unwrap(),
+            RepairMode::Chips
+        );
     }
 
     #[test]
@@ -571,6 +689,70 @@ mod tests {
                 Self::Error(message) => Err(AppError::DataProvider(message.to_string())),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn split_repair_runners_only_execute_their_own_phases() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let company_result = run_company_data_repair(
+            {
+                let calls = calls.clone();
+                move || async move {
+                    calls.lock().unwrap().push("financials");
+                    Ok(CompanySyncReport {
+                        completed: 1,
+                        failed: 0,
+                        pending: 0,
+                    })
+                }
+            },
+            {
+                let calls = calls.clone();
+                move || async move {
+                    calls.lock().unwrap().push("dividends");
+                    Ok(CompanySyncReport {
+                        completed: 1,
+                        failed: 0,
+                        pending: 0,
+                    })
+                }
+            },
+        )
+        .await;
+        assert!(company_result.is_ok());
+        assert_eq!(*calls.lock().unwrap(), vec!["financials", "dividends"]);
+
+        calls.lock().unwrap().clear();
+        let chip_result = run_chip_repair(
+            {
+                let calls = calls.clone();
+                move || async move {
+                    calls.lock().unwrap().push("chip_benchmark");
+                    Ok(crate::services::company_intelligence::ChipBenchmarkReport {
+                        reused: false,
+                        decision: crate::data::chip::ChipSourceDecision::Estimate,
+                    })
+                }
+            },
+            {
+                let calls = calls.clone();
+                move || async move {
+                    calls.lock().unwrap().push("chip_backfill");
+                    Ok(crate::services::company_intelligence::ChipBackfillReport {
+                        completed: 1,
+                        failed: 0,
+                        pending: 0,
+                        snapshots: 10,
+                    })
+                }
+            },
+        )
+        .await;
+        assert!(chip_result.is_ok());
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["chip_benchmark", "chip_backfill"]
+        );
     }
 
     #[tokio::test]

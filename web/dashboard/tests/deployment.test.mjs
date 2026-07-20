@@ -38,7 +38,7 @@ function stepScript(step) {
 
 async function runRepairScenario(scenario, initialState) {
   const workflow = await readFile("../../.github/workflows/deploy.yml", "utf8");
-  const script = stepScript(deploymentStep(workflow, "Start company intelligence repair"));
+  const script = stepScript(deploymentStep(workflow, "Start company data repair"));
   const directory = await mkdtemp(join(tmpdir(), "qbot-repair-deploy-"));
   const bin = join(directory, "bin");
   const state = join(directory, "state");
@@ -273,11 +273,11 @@ test("deployment atomically replaces a binary without disturbing its old running
   }
 });
 
-test("deployment launches one detached resumable company repair after health", async () => {
+test("deployment launches one detached resumable company data repair after health", async () => {
   const workflow = await readFile("../../.github/workflows/deploy.yml", "utf8");
   const main = await readFile("../../src/main.rs", "utf8");
   const healthCheck = workflow.indexOf("- name: Health check");
-  const repairStart = workflow.indexOf("- name: Start company intelligence repair");
+  const repairStart = workflow.indexOf("- name: Start company data repair");
   const nextStep = workflow.indexOf("\n      - name:", repairStart + 1);
   const repair = workflow.slice(repairStart, nextStep);
 
@@ -297,7 +297,7 @@ test("deployment launches one detached resumable company repair after health", a
   assert.match(repair, /--property=Type=exec/);
   assert.match(
     repair,
-    /--description="QBot resumable company intelligence benchmark and chip backfill"/,
+    /--description="QBot resumable company financial and dividend backfill"/,
   );
   assert.match(repair, /--property=EnvironmentFile=\/opt\/qbot\/\.env/);
   assert.match(repair, /--property="User=\$service_user"/);
@@ -305,7 +305,7 @@ test("deployment launches one detached resumable company repair after health", a
   assert.match(repair, /--property=StandardOutput=journal/);
   assert.match(repair, /--property=StandardError=journal/);
   assert.match(repair, /--working-directory=\/opt\/qbot/);
-  assert.match(repair, /\/opt\/qbot\/qbot --repair-company-intelligence/);
+  assert.match(repair, /\/opt\/qbot\/qbot --repair-company-data/);
   assert.match(repair, /ActiveState/);
   assert.match(repair, /SubState/);
   assert.match(repair, /ExecMainStatus/);
@@ -314,12 +314,23 @@ test("deployment launches one detached resumable company repair after health", a
   assert.match(repair, /journalctl -u "\$unit"/);
   assert.doesNotMatch(repair, /--wait/);
   assert.doesNotMatch(repair, /github\.run_(?:id|attempt)/);
-  assert.match(
-    main,
-    /run_company_intelligence_repair\([\s\S]*?run_chip_benchmark\(\)[\s\S]*?backfill_chips\(\)/,
-  );
-  assert.match(main, /chip_benchmark:/);
-  assert.match(main, /chip_backfill:/);
+  assert.match(main, /run_company_data_repair\([\s\S]*?backfill_financials\(\)[\s\S]*?backfill_dividends\(\)/);
+});
+
+test("deployment launches chip benchmark and backfill independently", async () => {
+  const workflow = await readFile("../../.github/workflows/deploy.yml", "utf8");
+  const main = await readFile("../../src/main.rs", "utf8");
+  const companyStart = workflow.indexOf("- name: Start company data repair");
+  const chipStart = workflow.indexOf("- name: Start chip repair");
+  const chip = deploymentStep(workflow, "Start chip repair");
+
+  assert.ok(chipStart > companyStart);
+  assert.match(chip, /unit="qbot-chip-repair"/);
+  assert.match(chip, /systemd-run --no-block/);
+  assert.match(chip, /--description="QBot resumable chip benchmark and backfill"/);
+  assert.match(chip, /\/opt\/qbot\/qbot --repair-chips/);
+  assert.match(chip, /journalctl -u "\$unit"/);
+  assert.match(main, /run_chip_repair\([\s\S]*?run_chip_benchmark\(\)[\s\S]*?backfill_chips\(\)/);
 });
 
 test("an already-running company repair is restarted onto the deployed binary", async () => {
