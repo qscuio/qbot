@@ -1,3 +1,5 @@
+import { chipProfileRows, chipProfileSummary } from "./chip-profile.js?v=20260720.1";
+
 const COLORS = {
   up: "#ef5350",
   down: "#26a69a",
@@ -99,8 +101,75 @@ export function fitChartAfterLayout(
   return () => { active = false; };
 }
 
-export function mountChart(container, bars, hits = [], { onCandleSelect } = {}) {
-  if (!window.LightweightCharts || !container) return { resize() {}, destroy() {} };
+function createChipProfileOverlay(container) {
+  const ownerDocument = container.ownerDocument || document;
+  const root = ownerDocument.createElement("div");
+  root.className = "chip-profile-overlay";
+  root.dataset.state = "loading";
+  const meta = ownerDocument.createElement("div");
+  meta.className = "chip-profile-meta";
+  const summary = ownerDocument.createElement("span");
+  summary.className = "chip-profile-summary";
+  summary.textContent = "筹码加载中";
+  const provenance = ownerDocument.createElement("span");
+  provenance.className = "chip-profile-provenance";
+  meta.append(summary, provenance);
+  const svg = ownerDocument.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("aria-label", "筹码峰");
+  svg.setAttribute("role", "img");
+  root.append(meta, svg);
+  container.append(root);
+  return { root, meta: summary, provenance, svg, ownerDocument };
+}
+
+function drawChipProfile(overlay, snapshot, state, candleSeries, container) {
+  overlay.root.dataset.state = state;
+  overlay.svg.replaceChildren();
+  if (state !== "ready" || !snapshot) {
+    overlay.meta.textContent = state === "loading" ? "筹码加载中" : "筹码待回填";
+    overlay.provenance.textContent = "";
+    overlay.root.removeAttribute?.("title");
+    return;
+  }
+
+  const profileWidth = Math.min(180, Math.max(110, container.clientWidth * 0.14));
+  const profileHeight = container.clientHeight;
+  const rows = chipProfileRows(
+    snapshot,
+    (price) => candleSeries.priceToCoordinate(price),
+    container.clientWidth,
+    profileHeight,
+  );
+  const summary = chipProfileSummary(snapshot);
+  overlay.root.style.width = `${profileWidth}px`;
+  overlay.svg.setAttribute("viewBox", `0 0 ${profileWidth} ${profileHeight}`);
+  overlay.svg.setAttribute("preserveAspectRatio", "none");
+  overlay.meta.textContent = `${summary.date} · 成本 ${summary.averageCost} · 获利 ${summary.winnerRate}`;
+  overlay.provenance.textContent = summary.source;
+  overlay.root.setAttribute?.("title", summary.source);
+  const lines = rows.map((row) => {
+    const line = overlay.ownerDocument.createElementNS("http://www.w3.org/2000/svg", "line");
+    line.setAttribute("class", `chip-profile-row ${row.tone}${row.dominant ? " dominant" : ""}`);
+    line.setAttribute("x1", Math.max(0, profileWidth - row.width).toFixed(2));
+    line.setAttribute("x2", profileWidth.toFixed(2));
+    line.setAttribute("y1", row.y.toFixed(2));
+    line.setAttribute("y2", row.y.toFixed(2));
+    line.setAttribute("data-price", row.price);
+    line.setAttribute("data-weight", row.weight);
+    return line;
+  });
+  overlay.svg.replaceChildren(...lines);
+}
+
+export function mountChart(container, bars, hits = [], { onChipDateChange } = {}) {
+  if (!window.LightweightCharts || !container) {
+    return {
+      resize() {},
+      setChipProfile() {},
+      setChipProfileVisible() {},
+      destroy() {},
+    };
+  }
   container.replaceChildren();
   const chart = window.LightweightCharts.createChart(container, {
     ...CHART_INTERACTION_OPTIONS,
@@ -156,18 +225,42 @@ export function mountChart(container, bars, hits = [], { onCandleSelect } = {}) 
       candleSeries.setMarkers(markers);
     }
   }
-  const cancelInitialFit = fitChartAfterLayout(chart.timeScale(), undefined, bars.length);
+  const timeScale = chart.timeScale();
+  const cancelInitialFit = fitChartAfterLayout(timeScale, undefined, bars.length);
+  const overlay = createChipProfileOverlay(container);
   let active = true;
-  const handleClick = (param) => {
-    if (!active || typeof onCandleSelect !== "function") return;
-    const date = selectedChipDate(param);
-    if (!date || !param?.point || !param.seriesData?.has?.(candleSeries)) return;
-    onCandleSelect(date);
+  let chipSnapshot = null;
+  let chipState = "loading";
+  let redrawFrame = null;
+  let lastChipDate = null;
+  const redraw = () => {
+    redrawFrame = null;
+    if (!active || overlay.root.hidden) return;
+    drawChipProfile(overlay, chipSnapshot, chipState, candleSeries, container);
   };
-  if (typeof chart.subscribeClick === "function") chart.subscribeClick(handleClick);
+  const scheduleRedraw = () => {
+    if (!active || redrawFrame !== null) return;
+    redrawFrame = window.requestAnimationFrame(redraw);
+  };
+  const handleCrosshair = (param) => {
+    if (!active || typeof onChipDateChange !== "function") return;
+    const date = param?.point && param.seriesData?.has?.(candleSeries)
+      ? selectedChipDate(param)
+      : null;
+    if (date === lastChipDate) return;
+    lastChipDate = date;
+    onChipDateChange(date);
+  };
+  if (typeof chart.subscribeCrosshairMove === "function") chart.subscribeCrosshairMove(handleCrosshair);
+  if (typeof timeScale.subscribeVisibleLogicalRangeChange === "function") {
+    timeScale.subscribeVisibleLogicalRangeChange(scheduleRedraw);
+  }
+  container.addEventListener?.("wheel", scheduleRedraw, { passive: true });
+  container.addEventListener?.("pointerup", scheduleRedraw);
   const resize = () => {
     if (!active || !container.clientWidth || !container.clientHeight) return;
     chart.resize(container.clientWidth, container.clientHeight);
+    scheduleRedraw();
   };
   const resizeObserver = typeof window.ResizeObserver === "function"
     ? new window.ResizeObserver(resize)
@@ -176,12 +269,28 @@ export function mountChart(container, bars, hits = [], { onCandleSelect } = {}) 
   else window.addEventListener("resize", resize);
   return {
     resize,
+    setChipProfile: (snapshot, state = snapshot ? "ready" : "pending") => {
+      chipSnapshot = snapshot;
+      chipState = state;
+      scheduleRedraw();
+    },
+    setChipProfileVisible: (visible) => {
+      overlay.root.hidden = !visible;
+      if (visible) scheduleRedraw();
+    },
     destroy: () => {
       active = false;
-      if (typeof chart.unsubscribeClick === "function") chart.unsubscribeClick(handleClick);
+      if (redrawFrame !== null) window.cancelAnimationFrame?.(redrawFrame);
+      if (typeof chart.unsubscribeCrosshairMove === "function") chart.unsubscribeCrosshairMove(handleCrosshair);
+      if (typeof timeScale.unsubscribeVisibleLogicalRangeChange === "function") {
+        timeScale.unsubscribeVisibleLogicalRangeChange(scheduleRedraw);
+      }
+      container.removeEventListener?.("wheel", scheduleRedraw);
+      container.removeEventListener?.("pointerup", scheduleRedraw);
       resizeObserver?.disconnect();
       if (!resizeObserver) window.removeEventListener("resize", resize);
       cancelInitialFit();
+      overlay.root.remove();
       chart.remove();
     },
   };

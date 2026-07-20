@@ -13,25 +13,58 @@ test("selectedChipDate accepts exact ISO candle times and rejects invalid select
   assert.equal(chartModule.selectedChipDate({}), null);
 });
 
-test("mounted chart emits candle click dates only and unsubscribes on destroy", () => {
+test("mounted chart emits each crosshair candle once, restores latest on leave, and cleans up", () => {
   const originalWindow = globalThis.window;
-  let clickHandler;
-  let unsubscribed;
-  let crosshairSubscriptions = 0;
+  const originalDocument = globalThis.document;
+  let crosshairHandler;
+  let unsubscribedCrosshair;
+  let visibleRangeHandler;
+  let unsubscribedVisibleRange;
   const series = [];
+  const frames = [];
+  class FakeElement {
+    constructor(tagName = "div") {
+      this.tagName = tagName;
+      this.children = [];
+      this.dataset = {};
+      this.style = {};
+      this.attributes = new Map();
+      this.listeners = new Map();
+      this.className = "";
+      this.classList = { toggle() {} };
+      this.clientWidth = 800;
+      this.clientHeight = 500;
+    }
+    append(...children) { this.children.push(...children); }
+    replaceChildren(...children) { this.children = [...children]; }
+    setAttribute(name, value) { this.attributes.set(name, String(value)); }
+    addEventListener(name, handler) { this.listeners.set(name, handler); }
+    removeEventListener(name) { this.listeners.delete(name); }
+    remove() { this.removed = true; }
+  }
+  globalThis.document = {
+    createElement: (tagName) => new FakeElement(tagName),
+    createElementNS: (_namespace, tagName) => new FakeElement(tagName),
+  };
+  const timeScale = {
+    fitContent() {},
+    setVisibleLogicalRange() {},
+    subscribeVisibleLogicalRangeChange: (handler) => { visibleRangeHandler = handler; },
+    unsubscribeVisibleLogicalRangeChange: (handler) => { unsubscribedVisibleRange = handler; },
+  };
   const chart = {
     addSeries: () => {
       const item = {
         setData() {},
         priceScale: () => ({ applyOptions() {} }),
+        priceToCoordinate: (price) => price * 10,
       };
       series.push(item);
       return item;
     },
-    timeScale: () => ({ fitContent() {}, setVisibleLogicalRange() {} }),
-    subscribeClick: (handler) => { clickHandler = handler; },
-    unsubscribeClick: (handler) => { unsubscribed = handler; },
-    subscribeCrosshairMove: () => { crosshairSubscriptions += 1; },
+    timeScale: () => timeScale,
+    subscribeCrosshairMove: (handler) => { crosshairHandler = handler; },
+    unsubscribeCrosshairMove: (handler) => { unsubscribedCrosshair = handler; },
     resize() {},
     remove() {},
   };
@@ -40,31 +73,38 @@ test("mounted chart emits candle click dates only and unsubscribes on destroy", 
       CandlestickSeries: {}, HistogramSeries: {}, LineSeries: {},
       createChart: () => chart,
     },
-    requestAnimationFrame: () => 1,
+    requestAnimationFrame: (callback) => { frames.push(callback); return frames.length; },
+    cancelAnimationFrame() {},
     addEventListener() {},
     removeEventListener() {},
   };
   const selected = [];
-  const container = { replaceChildren() {}, clientWidth: 800, clientHeight: 500 };
+  const container = new FakeElement();
 
   try {
     const handle = chartModule.mountChart(
       container,
       [{ time: "2026-07-17", open: 10, high: 12, low: 9, close: 11, volume: 5 }],
       [],
-      { onCandleSelect: (date) => selected.push(date) },
+      { onChipDateChange: (date) => selected.push(date) },
     );
-    assert.equal(crosshairSubscriptions, 0);
-    clickHandler({ time: "2026-07-17", point: { x: 10, y: 10 }, seriesData: new Map() });
-    clickHandler({ time: "bad", point: { x: 10, y: 10 }, seriesData: new Map([[series[0], {}]]) });
-    clickHandler({ time: "2026-07-17", point: { x: 10, y: 10 }, seriesData: new Map([[series[0], {}]]) });
-    assert.deepEqual(selected, ["2026-07-17"]);
+    const candle = (time) => ({ time, point: { x: 10, y: 10 }, seriesData: new Map([[series[0], {}]]) });
+    crosshairHandler(candle("2026-07-17"));
+    crosshairHandler(candle("2026-07-17"));
+    crosshairHandler(candle("bad"));
+    crosshairHandler({ point: undefined });
+    assert.deepEqual(selected, ["2026-07-17", null]);
+    assert.equal(typeof handle.setChipProfile, "function");
+    assert.equal(typeof handle.setChipProfileVisible, "function");
+    assert.equal(typeof visibleRangeHandler, "function");
     handle.destroy();
-    assert.equal(unsubscribed, clickHandler);
-    clickHandler({ time: "2026-07-18", point: { x: 10, y: 10 }, seriesData: new Map([[series[0], {}]]) });
-    assert.deepEqual(selected, ["2026-07-17"]);
+    assert.equal(unsubscribedCrosshair, crosshairHandler);
+    assert.equal(unsubscribedVisibleRange, visibleRangeHandler);
+    crosshairHandler(candle("2026-07-18"));
+    assert.deepEqual(selected, ["2026-07-17", null]);
   } finally {
     globalThis.window = originalWindow;
+    globalThis.document = originalDocument;
   }
 });
 
