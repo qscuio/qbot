@@ -394,6 +394,19 @@ async fn main() -> Result<()> {
     }
 
     if repair_company_intelligence {
+        let prerequisite_service = services::chip_prerequisites::ChipPrerequisiteRepairService::new(
+            state.db.clone(),
+            state.point_in_time_provider.clone(),
+        );
+        let prerequisite_report = prerequisite_service.repair().await?;
+        info!(
+            "Chip prerequisites repaired: completed_dates={}, skipped_dates={}, turnover_rows={}, factor_rows={}, market_value_rows={}",
+            prerequisite_report.completed_dates,
+            prerequisite_report.skipped_dates,
+            prerequisite_report.turnover_rows,
+            prerequisite_report.factor_rows,
+            prerequisite_report.market_value_rows
+        );
         let service = services::company_intelligence::CompanyIntelligenceService::new(
             state.db.clone(),
             company_repair_provider.clone(),
@@ -422,6 +435,19 @@ async fn main() -> Result<()> {
     }
 
     if repair_chips {
+        let prerequisite_service = services::chip_prerequisites::ChipPrerequisiteRepairService::new(
+            state.db.clone(),
+            state.point_in_time_provider.clone(),
+        );
+        let prerequisite_report = prerequisite_service.repair().await?;
+        info!(
+            "Chip prerequisites repaired: completed_dates={}, skipped_dates={}, turnover_rows={}, factor_rows={}, market_value_rows={}",
+            prerequisite_report.completed_dates,
+            prerequisite_report.skipped_dates,
+            prerequisite_report.turnover_rows,
+            prerequisite_report.factor_rows,
+            prerequisite_report.market_value_rows
+        );
         let service = services::company_intelligence::CompanyIntelligenceService::new(
             state.db.clone(),
             company_repair_provider,

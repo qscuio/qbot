@@ -321,16 +321,22 @@ test("deployment launches chip benchmark and backfill independently", async () =
   const workflow = await readFile("../../.github/workflows/deploy.yml", "utf8");
   const main = await readFile("../../src/main.rs", "utf8");
   const companyStart = workflow.indexOf("- name: Start company data repair");
+  const dailyBarRepair = workflow.indexOf("- name: Repair persisted OHLCV data");
   const chipStart = workflow.indexOf("- name: Start chip repair");
   const chip = deploymentStep(workflow, "Start chip repair");
 
   assert.ok(chipStart > companyStart);
+  assert.ok(chipStart > dailyBarRepair);
   assert.match(chip, /unit="qbot-chip-repair"/);
   assert.match(chip, /systemd-run --no-block/);
   assert.match(chip, /--description="QBot resumable chip benchmark and backfill"/);
   assert.match(chip, /\/opt\/qbot\/qbot --repair-chips/);
   assert.match(chip, /journalctl -u "\$unit"/);
   assert.match(main, /run_chip_repair\([\s\S]*?run_chip_benchmark\(\)[\s\S]*?backfill_chips\(\)/);
+  assert.match(
+    main,
+    /ChipPrerequisiteRepairService::new\([\s\S]*?prerequisite_service\.repair\(\)\.await\?[\s\S]*?run_chip_repair/,
+  );
 });
 
 test("an already-running company repair is restarted onto the deployed binary", async () => {

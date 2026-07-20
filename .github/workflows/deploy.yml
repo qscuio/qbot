@@ -543,6 +543,23 @@ jobs:
             show_repair_failure
             exit 1
 
+      - name: Repair persisted OHLCV data
+        if: steps.check.outputs.skip != 'true'
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          command_timeout: 6h
+          script: |
+            set -e
+            sudo systemd-run --wait --collect --pipe \
+              --unit=qbot-daily-bar-repair-${{ github.run_id }}-${{ github.run_attempt }} \
+              --property=Type=exec \
+              --property=EnvironmentFile=/opt/qbot/.env \
+              --working-directory=/opt/qbot \
+              /opt/qbot/qbot --repair-daily-bars
+
       - name: Start chip repair
         if: steps.check.outputs.skip != 'true'
         uses: appleboy/ssh-action@v1.0.3
@@ -642,23 +659,6 @@ jobs:
             echo "$unit launch observation timed out"
             show_repair_failure
             exit 1
-
-      - name: Repair persisted OHLCV data
-        if: steps.check.outputs.skip != 'true'
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          key: ${{ secrets.VPS_SSH_KEY }}
-          command_timeout: 6h
-          script: |
-            set -e
-            sudo systemd-run --wait --collect --pipe \
-              --unit=qbot-daily-bar-repair-${{ github.run_id }}-${{ github.run_attempt }} \
-              --property=Type=exec \
-              --property=EnvironmentFile=/opt/qbot/.env \
-              --working-directory=/opt/qbot \
-              /opt/qbot/qbot --repair-daily-bars
 
       - name: Cloudflare dashboard smoke check
         if: steps.check.outputs.skip != 'true'

@@ -102,6 +102,9 @@ impl TushareClient {
         match api_name {
             // Leave margin below the account's observed 200 requests/minute cap.
             "income" => Some(StdDuration::from_millis(310)),
+            // The historical prerequisite repair alternates these endpoints.
+            // 620 ms per endpoint keeps their combined rate below ~200/minute.
+            "daily_basic" | "adj_factor" => Some(StdDuration::from_millis(620)),
             // These endpoints can have a 60 requests/minute cap depending on
             // the account tier. A small margin avoids boundary-window bursts.
             "fina_indicator" | "dividend" => Some(StdDuration::from_millis(1_010)),
@@ -4049,6 +4052,14 @@ mod tests {
         assert!(
             TushareClient::company_request_spacing("dividend")
                 >= Some(std::time::Duration::from_millis(1_010))
+        );
+        assert!(
+            TushareClient::company_request_spacing("daily_basic")
+                >= Some(std::time::Duration::from_millis(310))
+        );
+        assert!(
+            TushareClient::company_request_spacing("adj_factor")
+                >= Some(std::time::Duration::from_millis(310))
         );
         assert_eq!(TushareClient::company_request_spacing("daily"), None);
     }
