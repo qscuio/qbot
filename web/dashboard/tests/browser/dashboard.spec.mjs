@@ -191,6 +191,7 @@ test("chip profile loads latest, follows a debounced crosshair, and restores cac
   });
   await page.goto("/dashboard/");
   await page.locator("tbody tr").first().click();
+  await page.mouse.move(10, 10);
   const chart = page.locator("#stock-chart");
   const profile = page.locator(".chip-profile-overlay");
   await expect(chart.locator("canvas").first()).toBeVisible();
@@ -218,6 +219,7 @@ test("missing chip data stays quiet while the K-line remains usable", async ({ p
   });
   await page.goto("/dashboard/");
   await page.locator("tbody tr").first().click();
+  await page.mouse.move(10, 10);
 
   await expect(page.locator("#stock-chart canvas").first()).toBeVisible();
   await expect(page.locator(".chip-profile-overlay")).toHaveAttribute("data-state", "pending");
@@ -261,6 +263,7 @@ test("rapid chip selections keep the newest response and use weekly/monthly fina
   });
   await page.goto("/dashboard/");
   await page.locator("tbody tr").first().click();
+  await page.mouse.move(10, 10);
   const chart = page.locator("#stock-chart");
   const profile = page.locator(".chip-profile-overlay");
   await expect(profile).toContainText("latest-response");

@@ -13,7 +13,7 @@ test("selectedChipDate accepts exact ISO candle times and rejects invalid select
   assert.equal(chartModule.selectedChipDate({}), null);
 });
 
-test("mounted chart emits each crosshair candle once, restores latest on leave, and cleans up", () => {
+test("mounted chart only follows real pointer movement, restores latest on leave, and cleans up", () => {
   const originalWindow = globalThis.window;
   const originalDocument = globalThis.document;
   let crosshairHandler;
@@ -90,9 +90,12 @@ test("mounted chart emits each crosshair candle once, restores latest on leave, 
     );
     const candle = (time) => ({ time, point: { x: 10, y: 10 }, seriesData: new Map([[series[0], {}]]) });
     crosshairHandler(candle("2026-07-17"));
+    assert.deepEqual(selected, []);
+    container.listeners.get("pointermove")();
+    crosshairHandler(candle("2026-07-17"));
     crosshairHandler(candle("2026-07-17"));
     crosshairHandler(candle("bad"));
-    crosshairHandler({ point: undefined });
+    container.listeners.get("pointerleave")();
     assert.deepEqual(selected, ["2026-07-17", null]);
     assert.equal(typeof handle.setChipProfile, "function");
     assert.equal(typeof handle.setChipProfileVisible, "function");
@@ -100,6 +103,8 @@ test("mounted chart emits each crosshair candle once, restores latest on leave, 
     handle.destroy();
     assert.equal(unsubscribedCrosshair, crosshairHandler);
     assert.equal(unsubscribedVisibleRange, visibleRangeHandler);
+    assert.equal(container.listeners.has("pointermove"), false);
+    assert.equal(container.listeners.has("pointerleave"), false);
     crosshairHandler(candle("2026-07-18"));
     assert.deepEqual(selected, ["2026-07-17", null]);
   } finally {

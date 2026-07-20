@@ -233,6 +233,7 @@ export function mountChart(container, bars, hits = [], { onChipDateChange } = {}
   let chipState = "loading";
   let redrawFrame = null;
   let lastChipDate = null;
+  let pointerMovedInside = false;
   const redraw = () => {
     redrawFrame = null;
     if (!active || overlay.root.hidden) return;
@@ -243,7 +244,7 @@ export function mountChart(container, bars, hits = [], { onChipDateChange } = {}
     redrawFrame = window.requestAnimationFrame(redraw);
   };
   const handleCrosshair = (param) => {
-    if (!active || typeof onChipDateChange !== "function") return;
+    if (!active || !pointerMovedInside || typeof onChipDateChange !== "function") return;
     const date = param?.point && param.seriesData?.has?.(candleSeries)
       ? selectedChipDate(param)
       : null;
@@ -251,12 +252,21 @@ export function mountChart(container, bars, hits = [], { onChipDateChange } = {}
     lastChipDate = date;
     onChipDateChange(date);
   };
+  const handlePointerMove = () => { pointerMovedInside = true; };
+  const handlePointerLeave = () => {
+    pointerMovedInside = false;
+    if (!active || lastChipDate === null || typeof onChipDateChange !== "function") return;
+    lastChipDate = null;
+    onChipDateChange(null);
+  };
   if (typeof chart.subscribeCrosshairMove === "function") chart.subscribeCrosshairMove(handleCrosshair);
   if (typeof timeScale.subscribeVisibleLogicalRangeChange === "function") {
     timeScale.subscribeVisibleLogicalRangeChange(scheduleRedraw);
   }
   container.addEventListener?.("wheel", scheduleRedraw, { passive: true });
   container.addEventListener?.("pointerup", scheduleRedraw);
+  container.addEventListener?.("pointermove", handlePointerMove, { passive: true });
+  container.addEventListener?.("pointerleave", handlePointerLeave);
   const resize = () => {
     if (!active || !container.clientWidth || !container.clientHeight) return;
     chart.resize(container.clientWidth, container.clientHeight);
@@ -287,6 +297,8 @@ export function mountChart(container, bars, hits = [], { onChipDateChange } = {}
       }
       container.removeEventListener?.("wheel", scheduleRedraw);
       container.removeEventListener?.("pointerup", scheduleRedraw);
+      container.removeEventListener?.("pointermove", handlePointerMove);
+      container.removeEventListener?.("pointerleave", handlePointerLeave);
       resizeObserver?.disconnect();
       if (!resizeObserver) window.removeEventListener("resize", resize);
       cancelInitialFit();
