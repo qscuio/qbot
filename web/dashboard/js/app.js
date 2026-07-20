@@ -1,6 +1,6 @@
-import { dashboardApi, ApiError } from "./api.js?v=20260719.7";
-import { activitySeries, mountChart } from "./chart.js?v=20260719.7";
-import { chipPanel, companyPanel, dividendPanel, financialPanel } from "./company-panels.js?v=20260719.7";
+import { dashboardApi, ApiError } from "./api.js?v=20260720.1";
+import { activitySeries, mountChart } from "./chart.js?v=20260720.1";
+import { companyPanel, dividendPanel, financialPanel } from "./company-panels.js?v=20260720.1";
 import {
   activeFilterCount,
   applyFilters,
@@ -16,9 +16,11 @@ import {
   saveInspectorPreferences,
   sortRows,
   updateTab,
-} from "./state.js?v=20260719.7";
+} from "./state.js?v=20260720.1";
 
 const app = document.querySelector("#app");
+const CHIP_PROFILE_VISIBILITY_KEY = "qbot.dashboard.chip-profile-visible";
+const CHIP_PROFILE_HOVER_DELAY = 200;
 let bootstrap = null;
 let rows = [];
 let workspace = createWorkspaceState();
@@ -29,8 +31,11 @@ const companyPanelStates = new Map();
 const optionalRequestCache = new Map();
 const optionalRequestSequences = new Map();
 const financialFrequencies = new Map();
-const chipRequestedDates = new Map();
+const chipProfileCache = new Map();
 let chartHandle = null;
+let chipProfileTimer = null;
+let chipProfileAbortController = null;
+let chipProfileRequestSequence = 0;
 let inspectorCleanup = null;
 let closeInspectorOverlay = null;
 let authenticated = false;
@@ -40,12 +45,34 @@ let refreshTimer = null;
 let filterMenuOpen = false;
 let inspectorTab = "overview";
 let inspectorPreferences = loadInspectorPreferences(window.localStorage, Number.POSITIVE_INFINITY);
+let chipProfileVisible = loadChipProfileVisibility(window.localStorage);
+
+function loadChipProfileVisibility(storage) {
+  try {
+    return storage.getItem(CHIP_PROFILE_VISIBILITY_KEY) !== "false";
+  } catch {
+    return true;
+  }
+}
+
+function saveChipProfileVisibility(storage, visible) {
+  try {
+    storage.setItem(CHIP_PROFILE_VISIBILITY_KEY, String(visible));
+  } catch {
+    // A storage quota or privacy mode must not disable the chart.
+  }
+}
 
 function effectiveInspectorWidth() {
   return clampInspectorWidth(inspectorPreferences.width, window.innerWidth);
 }
 
 function teardownWorkspaceView() {
+  clearTimeout(chipProfileTimer);
+  chipProfileTimer = null;
+  chipProfileAbortController?.abort();
+  chipProfileAbortController = null;
+  chipProfileRequestSequence += 1;
   inspectorCleanup?.();
   inspectorCleanup = null;
   closeInspectorOverlay = null;
@@ -70,7 +97,7 @@ function enterAuthenticationBoundary() {
   optionalRequestCache.clear();
   optionalRequestSequences.clear();
   financialFrequencies.clear();
-  chipRequestedDates.clear();
+  chipProfileCache.clear();
   return invalidateProtectedView();
 }
 
@@ -256,18 +283,6 @@ function currentFinancialFrequency(code) {
   return financialFrequencies.get(code) || "annual";
 }
 
-function chipSelectionKey(code) {
-  return `${protectedViewGeneration}:${code}`;
-}
-
-function currentChipRequest(code) {
-  return chipRequestedDates.get(chipSelectionKey(code)) ?? "latest";
-}
-
-function chipControls() {
-  return `<div class="panel-section-toolbar chip-toolbar"><strong>筹码分布</strong><button type="button" class="outline-button" data-chip-latest>Latest</button></div>`;
-}
-
 function getPanelState(kind, code, frequency = "") {
   const key = panelStateKey(kind, code, frequency);
   if (!companyPanelStates.has(key)) {
@@ -320,19 +335,73 @@ function panelMarkup(kind, code) {
     if (state.status === "error") return panelError("dividends", state.error);
     return panelLoading("dividends");
   }
-  if (kind === "chips") {
-    const requestDate = currentChipRequest(code);
-    const state = getPanelState("chips", code, requestDate);
-    if (state.status === "loaded") return chipPanel(state.payload);
-    if (state.status === "error") return `${chipControls()}${panelError("chips", state.error)}`;
-    return `${chipControls()}${panelLoading("chips")}`;
-  }
   return "";
 }
 
 function currentStockTab() {
   const tab = workspace.tabs.find((item) => item.id === workspace.activeTab);
   return tab?.type === "stock" ? tab : null;
+}
+
+function chipProfileCacheKey(code, date) {
+  return `${protectedViewGeneration}:${code}:${date || "latest"}`;
+}
+
+function chipProfileRequestIsCurrent(tab, handle, generation, sequence) {
+  const activeTab = currentStockTab();
+  return authenticated
+    && generation === protectedViewGeneration
+    && sequence === chipProfileRequestSequence
+    && handle === chartHandle
+    && activeTab?.id === tab.id
+    && activeTab.period === tab.period;
+}
+
+async function loadChipProfile(tab, date = null) {
+  if (!authenticated || !chartHandle) return;
+  chipProfileAbortController?.abort();
+  chipProfileAbortController = null;
+  const sequence = ++chipProfileRequestSequence;
+  const generation = protectedViewGeneration;
+  const handle = chartHandle;
+  const cacheKey = chipProfileCacheKey(tab.code, date);
+  if (chipProfileCache.has(cacheKey)) {
+    if (chipProfileRequestIsCurrent(tab, handle, generation, sequence)) {
+      handle.setChipProfile(chipProfileCache.get(cacheKey), "ready");
+    }
+    return;
+  }
+
+  const controller = new AbortController();
+  chipProfileAbortController = controller;
+  try {
+    const payload = await dashboardApi.chips(tab.code, date, { signal: controller.signal });
+    if (!chipProfileRequestIsCurrent(tab, handle, generation, sequence)) return;
+    chipProfileCache.set(cacheKey, payload);
+    handle.setChipProfile(payload, "ready");
+  } catch (error) {
+    if (error?.name === "AbortError" || !chipProfileRequestIsCurrent(tab, handle, generation, sequence)) return;
+    if (error instanceof ApiError && error.status === 401) {
+      renderLogin("Your session expired. Please sign in again.");
+      return;
+    }
+    handle.setChipProfile(null, "pending");
+  } finally {
+    if (chipProfileAbortController === controller) chipProfileAbortController = null;
+  }
+}
+
+function scheduleChipProfile(tab, date) {
+  clearTimeout(chipProfileTimer);
+  chipProfileTimer = null;
+  if (date === null) {
+    loadChipProfile(tab, null);
+    return;
+  }
+  chipProfileTimer = setTimeout(() => {
+    chipProfileTimer = null;
+    loadChipProfile(tab, date);
+  }, CHIP_PROFILE_HOVER_DELAY);
 }
 
 function renderInspectorPanel(kind, code) {
@@ -393,11 +462,9 @@ async function loadPanelPage(kind, code, { frequency = "", cursor = null, retry 
         ? await dashboardApi.company(code)
         : kind === "financials"
           ? await dashboardApi.financials(code, frequency, cursor)
-          : kind === "dividends"
-            ? await dashboardApi.dividends(code, cursor)
-            : await dashboardApi.chips(code, frequency === "latest" ? null : frequency);
+          : await dashboardApi.dividends(code, cursor);
       if (!isCurrent()) return;
-      if (kind === "company" || kind === "chips") state.payload = payload;
+      if (kind === "company") state.payload = payload;
       else state.items = cursor
         ? appendUnique(kind, state.items, Array.isArray(payload.items) ? payload.items : [])
         : (Array.isArray(payload.items) ? payload.items : []);
@@ -427,7 +494,6 @@ function ensureInspectorPanel(kind, code) {
   if (kind === "overview") return loadPanelPage("company", code);
   if (kind === "financials") return loadPanelPage("financials", code, { frequency: currentFinancialFrequency(code) });
   if (kind === "dividends") return loadPanelPage("dividends", code);
-  if (kind === "chips") return loadPanelPage("chips", code, { frequency: currentChipRequest(code) });
   return null;
 }
 
@@ -440,16 +506,9 @@ function bindPanelActions(panel, kind, code) {
   }));
   panel.querySelector("[data-panel-retry]")?.addEventListener("click", () => {
     const requestKind = kind === "overview" ? "company" : kind;
-    const frequency = requestKind === "financials"
-      ? currentFinancialFrequency(code)
-      : requestKind === "chips" ? currentChipRequest(code) : "";
+    const frequency = requestKind === "financials" ? currentFinancialFrequency(code) : "";
     const state = getPanelState(requestKind, code, frequency);
     loadPanelPage(requestKind, code, { frequency, cursor: state.failedCursor, retry: true });
-  });
-  panel.querySelector("[data-chip-latest]")?.addEventListener("click", () => {
-    chipRequestedDates.set(chipSelectionKey(code), "latest");
-    renderInspectorPanel("chips", code);
-    loadPanelPage("chips", code, { frequency: "latest" });
   });
   panel.querySelector("[data-load-more]")?.addEventListener("click", () => {
     const requestKind = panel.querySelector("[data-load-more]").dataset.loadMore;
@@ -484,7 +543,6 @@ function inspectorTemplate(detail) {
     ["overview", "Overview"],
     ["financials", "Financials"],
     ["dividends", "Dividends"],
-    ["chips", "Chips"],
   ];
   const tabButtons = tabs.map(([id, label]) => `<button type="button" role="tab" data-inspector-tab="${id}" id="inspector-tab-${id}" aria-controls="inspector-panel-${id}" aria-selected="${inspectorTab === id}" tabindex="${inspectorTab === id ? "0" : "-1"}" class="inspector-tab ${inspectorTab === id ? "active" : ""}">${label}</button>`).join("");
   return `<aside class="stock-inspector" id="stock-inspector" aria-label="Stock information">
@@ -509,7 +567,7 @@ function stockTemplate(tab, detail) {
   const inspectorWidth = effectiveInspectorWidth();
   return `<section class="stock-view">
     <header class="stock-toolbar"><div class="stock-identity"><h1>${escapeHtml(detail.name)}<span>${escapeHtml(detail.code)}</span></h1><div class="muted mono">${latest ? escapeHtml(latest.time) : "No market history"}${detail.partial ? " · partial data" : ""}</div></div><div class="stock-quote"><span class="stock-price">${formatNumber(latest?.close)}</span><span class="number ${changeClass(change)}">${change == null ? "—" : `${change > 0 ? "+" : ""}${formatNumber(change)}%`}</span></div><div class="periods" aria-label="Chart period">${periods.map(([period, label, name]) => `<button class="period-button ${tab.period === period ? "active" : ""}" data-period="${period}" aria-label="${name}" title="${name}">${label}</button>`).join("")}</div><div class="nav-buttons"><button class="ghost-button" data-neighbor="${escapeHtml(activeRows[index - 1]?.code || "")}" ${index <= 0 ? "disabled" : ""}>← Prev</button><button class="ghost-button" data-neighbor="${escapeHtml(activeRows[index + 1]?.code || "")}" ${index < 0 || index >= activeRows.length - 1 ? "disabled" : ""}>Next →</button></div><button class="ghost-button inspector-toggle" type="button" aria-controls="stock-inspector" aria-expanded="${!inspectorPreferences.collapsed}" aria-label="${inspectorPreferences.collapsed ? "Show" : "Hide"} stock information">ⓘ</button></header>
-    <div class="stock-workspace ${inspectorPreferences.collapsed ? "inspector-collapsed" : ""}" style="--inspector-width:${inspectorWidth}px"><div class="stock-content">${detail.bars.length ? `<div class="chart-pane"><div class="chart-legend"><strong class="chart-period">${periodName} · ${detail.bars.length} bars · ${detail.hits.length} signals</strong><span class="chart-activity">${escapeHtml(activity.label)}</span><span class="ma5">MA5</span><span class="ma10">MA10</span><span class="ma20">MA20</span><span class="ma60">MA60</span></div><div class="chart" id="stock-chart"></div><a class="chart-watermark" href="https://www.tradingview.com/" target="_blank" rel="noopener">Charts by TradingView</a></div>` : `<div class="empty-state"><strong>No usable chart history</strong><span>No historical bars are available for this period.</span></div>`}</div><div class="inspector-resizer" role="separator" tabindex="0" aria-controls="stock-inspector" aria-label="Resize stock information panel" aria-orientation="vertical" aria-valuemin="${MINIMUM_INSPECTOR_WIDTH}" aria-valuemax="${maximumInspectorWidth(window.innerWidth)}" aria-valuenow="${inspectorWidth}" title="Drag or use arrow keys to resize · Press Enter to reset"></div>${inspectorTemplate(detail)}</div>
+    <div class="stock-workspace ${inspectorPreferences.collapsed ? "inspector-collapsed" : ""}" style="--inspector-width:${inspectorWidth}px"><div class="stock-content">${detail.bars.length ? `<div class="chart-pane"><div class="chart-legend"><strong class="chart-period">${periodName} · ${detail.bars.length} bars · ${detail.hits.length} signals</strong><button type="button" class="chip-profile-toggle" data-chip-profile-toggle aria-pressed="${chipProfileVisible}" title="显示或隐藏筹码峰">筹码</button><span class="chart-activity">${escapeHtml(activity.label)}</span><span class="ma5">MA5</span><span class="ma10">MA10</span><span class="ma20">MA20</span><span class="ma60">MA60</span></div><div class="chart" id="stock-chart"></div><a class="chart-watermark" href="https://www.tradingview.com/" target="_blank" rel="noopener">Charts by TradingView</a></div>` : `<div class="empty-state"><strong>No usable chart history</strong><span>No historical bars are available for this period.</span></div>`}</div><div class="inspector-resizer" role="separator" tabindex="0" aria-controls="stock-inspector" aria-label="Resize stock information panel" aria-orientation="vertical" aria-valuemin="${MINIMUM_INSPECTOR_WIDTH}" aria-valuemax="${maximumInspectorWidth(window.innerWidth)}" aria-valuenow="${inspectorWidth}" title="Drag or use arrow keys to resize · Press Enter to reset"></div>${inspectorTemplate(detail)}</div>
   </section>`;
 }
 
@@ -528,13 +586,17 @@ function renderWorkspace() {
       if (detail.bars.length) {
         const chartGeneration = protectedViewGeneration;
         chartHandle = mountChart(app.querySelector("#stock-chart"), detail.bars, detail.hits, {
-          onCandleSelect: (date) => {
+          onChipDateChange: (date) => {
             const activeStock = currentStockTab();
-            if (!authenticated || chartGeneration !== protectedViewGeneration || activeStock?.code !== tab.code) return;
-            chipRequestedDates.set(chipSelectionKey(tab.code), date);
-            app.querySelector('[data-inspector-tab="chips"]')?.click();
+            if (!authenticated
+              || chartGeneration !== protectedViewGeneration
+              || activeStock?.code !== tab.code
+              || activeStock.period !== tab.period) return;
+            scheduleChipProfile(tab, date);
           },
         });
+        chartHandle.setChipProfileVisible(chipProfileVisible);
+        loadChipProfile(tab, null);
       }
       queueMicrotask(() => {
         if (currentStockTab()?.code !== tab.code) return;
@@ -564,6 +626,12 @@ function bindShell(activeTab) {
   };
   app.querySelector("#settings").addEventListener("click", toggleSettings);
   app.querySelector("#mobile-settings")?.addEventListener("click", toggleSettings);
+  app.querySelector("[data-chip-profile-toggle]")?.addEventListener("click", (event) => {
+    chipProfileVisible = !chipProfileVisible;
+    saveChipProfileVisibility(window.localStorage, chipProfileVisible);
+    event.currentTarget.setAttribute("aria-pressed", String(chipProfileVisible));
+    chartHandle?.setChipProfileVisible(chipProfileVisible);
+  });
   app.querySelector("#filter-toggle")?.addEventListener("click", () => setFilterMenuOpen(!filterMenuOpen));
   app.querySelector("#filters")?.addEventListener("input", (event) => {
     const form = event.currentTarget;

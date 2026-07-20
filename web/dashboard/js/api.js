@@ -41,8 +41,8 @@ export const dashboardApi = {
     const suffix = query.size ? `?${query}` : "";
     return request(`/api/dashboard/stocks/${encodeURIComponent(code)}/dividends${suffix}`);
   },
-  chips: (code, date = null) => {
+  chips: (code, date = null, { signal } = {}) => {
     const suffix = date === null ? "" : `?date=${encodeURIComponent(date)}`;
-    return request(`/api/dashboard/stocks/${encodeURIComponent(code)}/chips${suffix}`);
+    return request(`/api/dashboard/stocks/${encodeURIComponent(code)}/chips${suffix}`, { signal });
   },
 };

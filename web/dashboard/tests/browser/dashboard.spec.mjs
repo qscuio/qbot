@@ -140,7 +140,7 @@ async function mockApi(page, initiallyAuthenticated = true, stockHits = bootstra
       if (response?.status && response.status !== 200) {
         return route.fulfill({ status: response.status, json: response.payload ?? { error: `${optionalKind} request failed` } });
       }
-      const payload = response?.payload ?? (optionalKind === "company"
+      const payload = response?.payload ?? configuration?.payload ?? (optionalKind === "company"
         ? company
         : optionalKind === "financials"
           ? annualFinancials
@@ -178,47 +178,71 @@ async function mockApi(page, initiallyAuthenticated = true, stockHits = bootstra
   });
 }
 
-test("chips stay lazy, crosshair movement is silent, and Latest loads without a date", async ({ page }) => {
+test("chip profile loads latest, follows a debounced crosshair, and restores cached latest", async ({ page }) => {
   const requests = [];
   await mockApi(page, true, bootstrap.results[0].hits, [], {
-    chips: { requested: ({ url }) => requests.push(url.search) },
-  });
-  await page.goto("/dashboard/");
-  await page.locator("tbody tr").first().click();
-  await expect(page.locator("#stock-chart canvas").first()).toBeVisible();
-
-  await page.locator("#stock-chart").hover({ position: { x: 300, y: 180 } });
-  await page.mouse.move(500, 240, { steps: 8 });
-  expect(requests).toEqual([]);
-
-  await page.getByRole("tab", { name: "Chips" }).click();
-  await expect(page.locator('[data-inspector-panel="chips"]')).toContainText("QBot 估算");
-  expect(requests).toEqual([""]);
-  await page.locator("[data-chip-latest]").click();
-  await page.waitForTimeout(20);
-  expect(requests).toEqual([""]);
-});
-
-test("candle click selects Chips once, resolves fallback, and Latest requests the newest snapshot", async ({ page }) => {
-  const requests = [];
-  await mockApi(page, true, bootstrap.results[0].hits, [], {
-    chips: { requested: ({ url }) => requests.push(url.searchParams.get("date")) },
+    chips: {
+      requested: ({ url }) => requests.push(url.searchParams.get("date")),
+      responses: {
+        1: { payload: { ...chipSnapshot, requestedDate: null, resolvedDate: "latest-snapshot" } },
+        2: { payload: { ...chipSnapshot, resolvedDate: "selected-snapshot" } },
+      },
+    },
   });
   await page.goto("/dashboard/");
   await page.locator("tbody tr").first().click();
   const chart = page.locator("#stock-chart");
+  const profile = page.locator(".chip-profile-overlay");
   await expect(chart.locator("canvas").first()).toBeVisible();
-  await chart.click({ position: { x: 380, y: 180 } });
+  await expect(profile).toHaveAttribute("data-state", "ready");
+  await expect(profile).toContainText("latest-snapshot");
+  expect(requests).toEqual([null]);
 
-  await expect(page.getByRole("tab", { name: "Chips" })).toHaveAttribute("aria-selected", "true");
-  await expect(page.locator('[data-inspector-panel="chips"]')).toContainText("请求 2026-02-15");
-  await expect(page.locator('[data-inspector-panel="chips"]')).toContainText("实际 2026-02-13");
-  expect(requests).toHaveLength(1);
-  expect(requests[0]).toMatch(/^2026-\d{2}-\d{2}$/);
-
-  await page.locator("[data-chip-latest]").click();
+  await chart.hover({ position: { x: 300, y: 180 } });
   await expect.poll(() => requests.length).toBe(2);
-  expect(requests[1]).toBeNull();
+  expect(requests[1]).toMatch(/^2026-\d{2}-\d{2}$/);
+  await expect(profile).toContainText("selected-snapshot");
+  await chart.hover({ position: { x: 300, y: 180 } });
+  await page.waitForTimeout(250);
+  expect(requests).toHaveLength(2);
+
+  await page.mouse.move(10, 10);
+  await expect(profile).toContainText("latest-snapshot");
+  expect(requests).toHaveLength(2);
+  await expect(page.getByRole("tab", { name: "Chips" })).toHaveCount(0);
+});
+
+test("missing chip data stays quiet while the K-line remains usable", async ({ page }) => {
+  await mockApi(page, true, bootstrap.results[0].hits, [], {
+    chips: { responses: { 1: { status: 404, payload: { error: "stock not found" } } } },
+  });
+  await page.goto("/dashboard/");
+  await page.locator("tbody tr").first().click();
+
+  await expect(page.locator("#stock-chart canvas").first()).toBeVisible();
+  await expect(page.locator(".chip-profile-overlay")).toHaveAttribute("data-state", "pending");
+  await expect(page.locator(".chip-profile-overlay")).toContainText("筹码待回填");
+  await expect(page.locator("body")).not.toContainText("stock not found");
+  await expect(page.locator(".panel-error")).toHaveCount(0);
+});
+
+test("chip profile can be hidden and keeps that preference across reloads", async ({ page }) => {
+  await mockApi(page);
+  await page.goto("/dashboard/");
+  await page.locator("tbody tr").first().click();
+
+  const toggle = page.locator("[data-chip-profile-toggle]");
+  const profile = page.locator(".chip-profile-overlay");
+  await expect(toggle).toHaveAttribute("aria-pressed", "true");
+  await expect(profile).toHaveAttribute("data-state", "ready");
+  await expect(profile.locator(".chip-profile-row")).not.toHaveCount(0);
+
+  await toggle.click();
+  await expect(toggle).toHaveAttribute("aria-pressed", "false");
+  await expect(profile).toBeHidden();
+  await page.reload();
+  await expect(page.locator("[data-chip-profile-toggle]")).toHaveAttribute("aria-pressed", "false");
+  await expect(page.locator(".chip-profile-overlay")).toBeHidden();
 });
 
 test("rapid chip selections keep the newest response and use weekly/monthly final candle dates", async ({ page }) => {
@@ -229,31 +253,38 @@ test("rapid chip selections keep the newest response and use weekly/monthly fina
     chips: {
       requested: ({ url }) => requests.push(url.searchParams.get("date")),
       responses: {
-        1: { release: firstRelease, payload: { ...chipSnapshot, requestedDate: "older", resolvedDate: "older-response" } },
-        2: { payload: { ...chipSnapshot, requestedDate: "newer", resolvedDate: "newer-response" } },
+        1: { payload: { ...chipSnapshot, requestedDate: null, resolvedDate: "latest-response" } },
+        2: { release: firstRelease, payload: { ...chipSnapshot, requestedDate: "older", resolvedDate: "older-response" } },
+        3: { payload: { ...chipSnapshot, requestedDate: "newer", resolvedDate: "newer-response" } },
       },
     },
   });
   await page.goto("/dashboard/");
   await page.locator("tbody tr").first().click();
   const chart = page.locator("#stock-chart");
-  await chart.click({ position: { x: 280, y: 180 } });
-  await expect.poll(() => requests.length).toBe(1);
-  await page.getByRole("button", { name: "Weekly" }).click();
-  await expect(page.locator("#stock-chart canvas").first()).toBeVisible();
-  await page.locator("#stock-chart").click({ position: { x: 200, y: 180 } });
+  const profile = page.locator(".chip-profile-overlay");
+  await expect(profile).toContainText("latest-response");
+  await chart.hover({ position: { x: 280, y: 180 } });
   await expect.poll(() => requests.length).toBe(2);
-  expect(bars.filter((_, index) => (index + 1) % 5 === 0).map((bar) => bar.time)).toContain(requests[1]);
-  await expect(page.locator('[data-inspector-panel="chips"]')).toContainText("newer-response");
+  await chart.hover({ position: { x: 500, y: 180 } });
+  await expect.poll(() => requests.length).toBe(3);
+  await expect(profile).toContainText("newer-response");
   releaseFirst();
   await page.waitForTimeout(30);
-  await expect(page.locator('[data-inspector-panel="chips"]')).toContainText("newer-response");
-  await expect(page.locator('[data-inspector-panel="chips"]')).not.toContainText("older-response");
+  await expect(profile).toContainText("newer-response");
+  await expect(profile).not.toContainText("older-response");
+
+  await page.getByRole("button", { name: "Weekly" }).click();
+  await expect(page.locator("#stock-chart canvas").first()).toBeVisible();
+  const beforeWeekly = requests.length;
+  await page.locator("#stock-chart").hover({ position: { x: 200, y: 180 } });
+  await expect.poll(() => requests.length).toBe(beforeWeekly + 1);
+  expect(bars.filter((_, index) => (index + 1) % 5 === 0).map((bar) => bar.time)).toContain(requests.at(-1));
 
   await page.getByRole("button", { name: "Monthly" }).click();
   await expect(page.locator("#stock-chart canvas").first()).toBeVisible();
   const before = requests.length;
-  await page.locator("#stock-chart").click({ position: { x: 500, y: 180 } });
+  await page.locator("#stock-chart").hover({ position: { x: 500, y: 180 } });
   await expect.poll(() => requests.length).toBe(before + 1);
   expect(bars.filter((_, index) => (index + 1) % 20 === 0).map((bar) => bar.time)).toContain(requests.at(-1));
 });
@@ -262,15 +293,16 @@ test("a chip response from a signed-out generation cannot overwrite the next ses
   let releaseOld;
   const oldRelease = new Promise((resolve) => { releaseOld = resolve; });
   await mockApi(page, true, bootstrap.results[0].hits, [], {
-    chips: { responses: {
-      1: { release: oldRelease, payload: { ...chipSnapshot, resolvedDate: "old-session" } },
-      2: { payload: { ...chipSnapshot, resolvedDate: "fresh-session" } },
-    } },
+    chips: {
+      payload: { ...chipSnapshot, resolvedDate: "fresh-session" },
+      responses: {
+        1: { release: oldRelease, payload: { ...chipSnapshot, resolvedDate: "old-session" } },
+      },
+    },
   });
   await page.goto("/dashboard/");
   await page.locator("tbody tr").first().click();
   await expect(page.locator("#stock-chart canvas").first()).toBeVisible();
-  await page.getByRole("tab", { name: "Chips" }).click();
   await page.locator("#settings").click();
   await page.locator("#logout").click();
   await expect(page.locator("#login-form")).toBeVisible();
@@ -281,9 +313,8 @@ test("a chip response from a signed-out generation cannot overwrite the next ses
   await page.locator("#password").fill("secret");
   await page.locator("#login-form button").click();
   await expect(page.locator("#stock-chart canvas").first()).toBeVisible();
-  await page.getByRole("tab", { name: "Chips" }).click();
-  await expect(page.locator('[data-inspector-panel="chips"]')).toContainText("fresh-session");
-  await expect(page.locator('[data-inspector-panel="chips"]')).not.toContainText("old-session");
+  await expect(page.locator(".chip-profile-overlay")).toContainText("fresh-session");
+  await expect(page.locator(".chip-profile-overlay")).not.toContainText("old-session");
 });
 
 test("company overview waits for chart mount while optional data stays local", async ({ page }) => {
@@ -984,7 +1015,7 @@ test("resizable stock information sidebar persists its desktop layout", async ({
   const workspace = page.locator(".stock-workspace");
   const resizer = page.locator(".inspector-resizer");
   await expect(inspector).toHaveCSS("width", "380px");
-  await expect(page.locator("[data-inspector-tab]")).toHaveCount(4);
+  await expect(page.locator("[data-inspector-tab]")).toHaveCount(3);
   await expect(page.locator('[data-inspector-panel="overview"]')).toContainText("1,488.50");
 
   const chartSurface = page.locator("#stock-chart > div").first();
@@ -1052,12 +1083,12 @@ test("resizable stock information sidebar reclamps and resizes its chart on live
 
   const inspector = page.locator(".stock-inspector");
   await expect(inspector).toHaveCSS("width", "600px");
-  const initialSurfaceWidth = (await page.locator("#stock-chart > div").boundingBox()).width;
+  const initialSurfaceWidth = (await page.locator("#stock-chart > .tv-lightweight-charts").boundingBox()).width;
   await page.setViewportSize({ width: 900, height: 700 });
   await expect.soft(inspector).toHaveCSS("width", "450px");
   await expect.poll(() => page.evaluate(() => ({
     host: document.querySelector("#stock-chart").getBoundingClientRect().width,
-    surface: document.querySelector("#stock-chart > div").getBoundingClientRect().width,
+    surface: document.querySelector("#stock-chart > .tv-lightweight-charts").getBoundingClientRect().width,
   })).then(({ host, surface }) => ({ matches: Math.abs(host - surface) <= 1, shrank: surface < initialSurfaceWidth }))).toEqual({ matches: true, shrank: true });
   expect(await page.evaluate(() => JSON.parse(localStorage.getItem("qbot.dashboard.inspector.v1")).width)).toBe(600);
 
@@ -1065,7 +1096,7 @@ test("resizable stock information sidebar reclamps and resizes its chart on live
   await expect(inspector).toHaveCSS("width", "600px");
   await expect.poll(() => page.evaluate(() => {
     const host = document.querySelector("#stock-chart").getBoundingClientRect().width;
-    const surface = document.querySelector("#stock-chart > div").getBoundingClientRect().width;
+    const surface = document.querySelector("#stock-chart > .tv-lightweight-charts").getBoundingClientRect().width;
     return Math.abs(host - surface);
   })).toBeLessThanOrEqual(1);
 });

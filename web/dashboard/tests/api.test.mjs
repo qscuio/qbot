@@ -75,9 +75,11 @@ test("company intelligence API omits absent cursors", async () => {
 
 test("historical chips API omits latest query and encodes an exact requested date", async () => {
   const requestedPaths = [];
+  const requestedSignals = [];
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async (path) => {
+  globalThis.fetch = async (path, options) => {
     requestedPaths.push(path);
+    requestedSignals.push(options.signal);
     return new Response(JSON.stringify({ distribution: [] }), {
       status: 200,
       headers: { "Content-Type": "application/json" },
@@ -86,7 +88,8 @@ test("historical chips API omits latest query and encodes an exact requested dat
 
   try {
     await dashboardApi.chips("60/0519.SH");
-    await dashboardApi.chips("600519.SH", "2026-07-17");
+    const controller = new AbortController();
+    await dashboardApi.chips("600519.SH", "2026-07-17", { signal: controller.signal });
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -95,4 +98,6 @@ test("historical chips API omits latest query and encodes an exact requested dat
     "/api/dashboard/stocks/60%2F0519.SH/chips",
     "/api/dashboard/stocks/600519.SH/chips?date=2026-07-17",
   ]);
+  assert.equal(requestedSignals[0], undefined);
+  assert.equal(requestedSignals[1] instanceof AbortSignal, true);
 });

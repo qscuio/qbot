@@ -2,66 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  chipPanel,
   companyPanel,
   dividendPanel,
   financialPanel,
   formatCurrency,
 } from "../js/company-panels.js";
-
-test("chipPanel renders escaped provenance, summary metrics, and bounded normalized bars", () => {
-  const html = chipPanel({
-    code: "600519.SH<script>",
-    requestedDate: "2026-07-19<bad>",
-    resolvedDate: "2026-07-17",
-    currentPrice: 1488.5,
-    averageCost: 1475,
-    winnerRate: 72.5,
-    concentration: 80,
-    dominantPeakPrice: 1500,
-    sourceLabel: "QBot 估算<img>",
-    validationLabel: "已验证",
-    modelVersion: "qbot-chip-v2<script>",
-    distribution: Array.from({ length: 100 }, (_, index) => ({
-      price: 1600 - index,
-      weight: index === 0 ? 0.2 : 0.1,
-      percentage: index === 0 ? 20 : 10,
-    })),
-  });
-
-  assert.match(html, /平均成本/);
-  assert.match(html, /当前价/);
-  assert.match(html, /主峰/);
-  assert.match(html, /获利比例/);
-  assert.match(html, /集中度/);
-  assert.match(html, /请求 2026-07-19&lt;bad&gt;/);
-  assert.match(html, /QBot 估算&lt;img&gt;/);
-  assert.match(html, /qbot-chip-v2&lt;script&gt;/);
-  assert.doesNotMatch(html, /<script>|<img>/);
-  assert.equal((html.match(/data-chip-bucket/g) || []).length, 60);
-  assert.match(html, /style="--chip-width:100%"/);
-  assert.match(html, /data-chip-latest/);
-});
-
-test("chipPanel handles missing and invalid distributions without throwing", () => {
-  const empty = chipPanel({ distribution: [] });
-  const invalid = chipPanel({ distribution: [{ price: "bad", weight: -1 }, null] });
-  const invalidPayloads = [null, undefined, "bad", 42, true].map((payload) => chipPanel(payload));
-  assert.match(empty, /暂无筹码分布/);
-  assert.match(invalid, /暂无筹码分布/);
-  invalidPayloads.forEach((html) => assert.match(html, /暂无筹码分布/));
-});
-
-test("chipPanel renders a zero-weight bucket at exactly zero width", () => {
-  const html = chipPanel({
-    distribution: [
-      { price: 12, weight: 0.5, percentage: 50 },
-      { price: 11, weight: 0, percentage: 0 },
-    ],
-  });
-  assert.match(html, /style="--chip-width:100%"/);
-  assert.match(html, /style="--chip-width:0%"/);
-});
 
 test("formatCurrency uses exact Chinese market units", () => {
   assert.equal(formatCurrency(86_240_000_000), "862.40亿");

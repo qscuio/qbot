@@ -193,7 +193,7 @@ test("dashboard HTML is fresh while versioned assets can be cached", async () =>
 
   assert.equal(versions.length, 7);
   assert.equal(new Set(versions).size, 1);
-  assert.equal(versions[0], "20260719.7");
+  assert.equal(versions[0], "20260720.1");
   assert.match(config, /set \$dashboard_cache_control "no-store";/);
   assert.match(
     config,

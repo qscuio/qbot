@@ -51,44 +51,6 @@ function revision(count) {
   return numeric(count) > 1 ? `<span class="revision-badge">修订 ${escapeHtml(count)}</span>` : "";
 }
 
-// The canonical estimator currently emits 30 buckets. Keep a defensive ceiling
-// so malformed or future payloads cannot create an unbounded inspector DOM.
-const MAX_CHIP_BUCKETS = 60;
-
-export function chipPanel(payload = {}) {
-  payload = payload && typeof payload === "object" && !Array.isArray(payload) ? payload : {};
-  const distribution = (Array.isArray(payload.distribution) ? payload.distribution : [])
-    .map((bucket) => ({
-      price: numeric(bucket?.price),
-      weight: numeric(bucket?.weight),
-      percentage: numeric(bucket?.percentage),
-    }))
-    .filter((bucket) => bucket.price !== null && bucket.price > 0 && bucket.weight !== null && bucket.weight >= 0)
-    .sort((left, right) => right.price - left.price)
-    .slice(0, MAX_CHIP_BUCKETS);
-  const maxWeight = Math.max(...distribution.map((bucket) => bucket.weight), 0);
-  const rows = distribution.map((bucket) => {
-    const width = bucket.weight > 0 && maxWeight > 0
-      ? Math.max(1, Math.min(100, bucket.weight / maxWeight * 100))
-      : 0;
-    const percentage = bucket.percentage === null ? bucket.weight * 100 : bucket.percentage;
-    return `<div class="chip-bucket" data-chip-bucket><span class="chip-price mono">${escapeHtml(fixed(bucket.price))}</span><span class="chip-bar-track"><span class="chip-bar" style="--chip-width:${escapeHtml(Number(width.toFixed(2)))}%"></span></span><span class="chip-weight mono">${escapeHtml(fixed(percentage))}%</span></div>`;
-  }).join("");
-  const requested = payload.requestedDate
-    ? `请求 ${escapeHtml(payload.requestedDate)} · 实际 ${date(payload.resolvedDate)}`
-    : `最新 · ${date(payload.resolvedDate)}`;
-  const model = payload.modelVersion || "—";
-  return `<div class="chip-panel">
-    <div class="panel-section-toolbar chip-toolbar"><strong>筹码分布</strong><button type="button" class="outline-button" data-chip-latest>Latest</button></div>
-    <div class="chip-provenance"><strong>${escapeHtml(payload.sourceLabel || "来源未知")}</strong><span>${escapeHtml(payload.validationLabel || "未验证")}</span><span class="mono">${escapeHtml(model)}</span></div>
-    <div class="chip-date-line">${requested}</div>
-    <dl class="company-metric-grid chip-summary">
-      ${metric("当前价", fixed(payload.currentPrice))}${metric("主峰", fixed(payload.dominantPeakPrice))}${metric("平均成本", fixed(payload.averageCost))}${metric("获利比例", unsignedPercent(payload.winnerRate))}${metric("集中度", unsignedPercent(payload.concentration))}${metric("更新时间", payload.sourceUpdatedAt ? date(payload.sourceUpdatedAt) : "—")}
-    </dl>
-    <section class="chip-distribution" aria-label="价格筹码分布">${rows || `<div class="panel-empty"><strong>暂无筹码分布</strong><span>该交易日没有可展示的规范化筹码桶。</span></div>`}</section>
-  </div>`;
-}
-
 export function companyPanel(company = {}) {
   const quote = company.quote || {};
   const valuation = company.valuation || {};
